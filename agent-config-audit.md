@@ -2,6 +2,10 @@
 
 Date: 2026-04-30
 
+This is a historical audit of one development machine's agent configuration
+and Homebrew tooling state. It is not current setup guidance for new users;
+use `README.md` for public installation and usage instructions.
+
 ## 1. Current global agent instruction files
 
 ### `~/.claude/CLAUDE.md` (current)

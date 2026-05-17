@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mirror_dir="/Users/Shared/orchestra"
+# Optional helper for shared mirror deployments. Override the example path with
+# ORCHESTRA_MIRROR_DIR when your mirror lives elsewhere.
+mirror_dir="${ORCHESTRA_MIRROR_DIR:-/Users/Shared/orchestra}"
 skip_python=0
 
 for arg in "$@"; do
   case "$arg" in
     --skip-python) skip_python=1 ;;
     -h|--help)
-      echo "Usage: pull_orchestra_mirror.sh [--skip-python]"
+      echo "Usage: ORCHESTRA_MIRROR_DIR=/path/to/orchestra pull_orchestra_mirror.sh [--skip-python]"
       exit 0
       ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
