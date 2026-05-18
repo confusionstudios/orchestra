@@ -556,7 +556,7 @@ class TestIcebox(unittest.TestCase):
         self.assertIn("No parked tasks", html)
 
     def test_none_tasks_listed(self):
-        t1 = db.add_task(self.conn, "Idea Alpha", branch="feat-a", coder_agent="codex")
+        db.add_task(self.conn, "Idea Alpha", branch="feat-a", coder_agent="codex")
         t2 = db.add_task(self.conn, "Idea Beta", branch="feat-b", coder_agent="gemini")
         db.update_task(self.conn, t2, status="ready")
         html = dashboard.render_icebox(self.conn)
@@ -687,8 +687,8 @@ class TestRecentlyDone(unittest.TestCase):
             tid = db.add_task(self.conn, f"Done {i}", branch="b")
             db.update_task(self.conn, tid, status="done")
         html = dashboard.render_recently_done(self.conn)
-        self.assertIn(f"/task/1", html)
-        self.assertIn(f"/task/7", html)
+        self.assertIn("/task/1", html)
+        self.assertIn("/task/7", html)
         self.assertIn('data-row-index="5" hidden', html)
         self.assertIn('data-row-index="6" hidden', html)
         self.assertIn("Show More", html)
@@ -1071,8 +1071,8 @@ class TestRunLogPanel(unittest.TestCase):
         self.assertNotIn('class="log-row log-row-picked-up"', html)
 
 
-class TestCurrentTaskCard(unittest.TestCase):
-    """Tests for render_current_task_card."""
+class TestCurrentTaskCardRunLog(unittest.TestCase):
+    """Tests for render_current_task_card run-log rendering."""
 
     def setUp(self):
         self.conn, self.db_path = _fresh_conn()

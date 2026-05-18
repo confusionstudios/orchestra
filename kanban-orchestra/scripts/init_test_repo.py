@@ -26,7 +26,6 @@ with existing commits — it does not want to clobber real work.
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path

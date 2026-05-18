@@ -13,7 +13,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -1092,7 +1091,7 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertEqual(total, cap + 5)
         # Keeps the most recent
         self.assertEqual(filtered[-1]["message"], f"m{cap + 4}")
-        self.assertEqual(filtered[0]["message"], f"m5")
+        self.assertEqual(filtered[0]["message"], "m5")
 
 
 
@@ -3190,7 +3189,7 @@ class TestHeartbeat(unittest.TestCase):
 
     def test_heartbeat_updates(self):
         orchestrator.init_runtime(self.conn)
-        rt_before = db.get_runtime(self.conn)
+        db.get_runtime(self.conn)
 
         # Use a very short interval for testing
         old_interval = orchestrator.HEARTBEAT_INTERVAL
@@ -3376,9 +3375,9 @@ class TestSupertaskDB(unittest.TestCase):
 
     def test_renumber_siblings(self):
         parent_id = db.add_task(self.conn, "Parent", kind="supertask", branch="feat")
-        c1 = db.add_task(self.conn, "Child 1", parent_task_id=parent_id, sequence_index=50, branch="feat")
-        c2 = db.add_task(self.conn, "Child 2", parent_task_id=parent_id, sequence_index=150, branch="feat")
-        c3 = db.add_task(self.conn, "Child 3", parent_task_id=parent_id, sequence_index=250, branch="feat")
+        db.add_task(self.conn, "Child 1", parent_task_id=parent_id, sequence_index=50, branch="feat")
+        db.add_task(self.conn, "Child 2", parent_task_id=parent_id, sequence_index=150, branch="feat")
+        db.add_task(self.conn, "Child 3", parent_task_id=parent_id, sequence_index=250, branch="feat")
         db.renumber_siblings(self.conn, parent_id)
         children = db.get_child_tasks(self.conn, parent_id)
         indices = [c["sequence_index"] for c in children]
@@ -3804,7 +3803,7 @@ class TestSupertaskCLI(unittest.TestCase):
     def test_set_sequence_index_reorders_siblings(self):
         parent_id = self._add_supertask()
         r_a = self._run("add", "Child A", "--parent", str(parent_id), "--sequence-index", "100")
-        r_b = self._run("add", "Child B", "--parent", str(parent_id), "--sequence-index", "200")
+        self._run("add", "Child B", "--parent", str(parent_id), "--sequence-index", "200")
         r_c = self._run("add", "Child C", "--parent", str(parent_id), "--sequence-index", "300")
         id_a = json.loads(r_a.stdout)["id"]
         id_c = json.loads(r_c.stdout)["id"]
@@ -4518,7 +4517,6 @@ class TestPickupRuntimeStep(unittest.TestCase):
 
     def _run_one_iteration(self, task):
         """Run one loop iteration of process_pinned_task, then raise to stop the loop."""
-        real_advance = orchestrator.advance
         iterations = []
 
         def fake_advance(t, conn):
@@ -5899,7 +5897,7 @@ class TestAgentPingACKGate(unittest.TestCase):
             mock_sub.Popen.return_value = mock_proc
             # AGENT_CMD needs a known agent; patch it so ping_agent doesn't bail early.
             with patch.dict(orchestrator.AGENT_CMD, {"sonnet": ["echo", "{prompt}"]}):
-                result = orchestrator.ping_agent("sonnet", 42)
+                orchestrator.ping_agent("sonnet", 42)
 
         failure_logs = [m for m in log_messages if "no output" in m or "unavailable" in m]
         self.assertTrue(failure_logs, f"Expected a 'no output / unavailable' log; got: {log_messages}")

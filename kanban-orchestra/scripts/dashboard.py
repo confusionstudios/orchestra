@@ -493,7 +493,7 @@ def render_health_card(runtime: dict | None) -> str:
     badge_cls = STATUS_BADGE_CLASS.get(display_status, "badge-none")
     hb_age = _live_age(runtime.get("last_heartbeat_at"), css_class="heartbeat-age")
     lines = [
-        f'<div class="card" id="health-card">',
+        '<div class="card" id="health-card">',
         f'  <h2>Orchestrator <span class="badge {badge_cls}">{_esc(display_status)}</span></h2>',
         f'  <p class="muted">Heartbeat: {hb_age}</p>',
     ]

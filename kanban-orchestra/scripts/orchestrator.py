@@ -1228,7 +1228,7 @@ def handle_commit_plan_review(task, conn):
         status_message=f"{reviewer} reviewing plan for '{task['title']}'",
     )
 
-    start_comment = db.add_comment(
+    db.add_comment(
         conn, task["id"],
         f"Starting commit-plan-review with reviewer: {reviewer}.",
         kind="comment", author="orchestrator",
@@ -1980,7 +1980,7 @@ def main(argv=None):
         argv = []
 
     parser = argparse.ArgumentParser(description="Run the Kanban Orchestra orchestrator.")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
     db_path = db.get_db_path()
     log_path = db.get_orchestrator_log_path(db_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -34,7 +34,7 @@ def migrate():
     print(f"Connecting to {db_path}...")
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys=OFF")
-    
+
     # Check if we need to migrate
     cur = conn.execute("PRAGMA table_info(tasks)")
     cols = [row[1] for row in cur.fetchall()]
@@ -93,7 +93,7 @@ def migrate():
     )
     """
     conn.execute(new_tasks_sql)
-    
+
     # Copy data
     conn.execute("""
         INSERT INTO tasks_new (
@@ -102,17 +102,17 @@ def migrate():
             created_at, ready_at, updated_at, kind, parent_task_id,
             sequence_index, commit_plan
         )
-        SELECT 
+        SELECT
             id, title, description, status, next_step, branch, commit_hash,
             stash_ref, coder_agent, review_round, last_review_decision,
             created_at, ready_at, updated_at, kind, parent_task_id,
             sequence_index, commit_plan
         FROM tasks
     """)
-    
+
     conn.execute("DROP TABLE tasks")
     conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
-    
+
     conn.commit()
     conn.close()
     print("Migration complete.")

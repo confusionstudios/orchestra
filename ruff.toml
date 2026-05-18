@@ -1,0 +1,9 @@
+target-version = "py313"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E402",  # imports after sys.path.insert are intentional
+    "E501",  # line length — handled by formatter if you adopt it later
+]
