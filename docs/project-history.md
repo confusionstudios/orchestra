@@ -14,20 +14,19 @@ carrying over:
 - Prompt templates and skill stubs for Claude, Gemini, and Codex.
 - A browser dashboard for monitoring progress.
 
-The initial system was organized around **features and feature-phases**: a
-feature would be decomposed into ordered phases, each phase going through
-planning, implementation, code review, and pull-request creation. The
-orchestrator ran one phase at a time, handing off between agents at each
-step.
+The initial system was organized around a rigid, linear project workflow:
+larger efforts were broken into ordered units, and each unit moved through
+planning, implementation, review, and pull-request creation. The orchestrator
+ran one unit at a time, handing off between agents at each step.
 
 ## The Kanban Rewrite (Late March — Early April 2026)
 
-Within two weeks, the feature-phase model was replaced by a **Kanban task
-queue** backed by SQLite. This was the single largest architectural shift in
-the project. Key motivations:
+Within two weeks, the linear workflow was replaced by a **Kanban task queue**
+backed by SQLite. This was the single largest architectural shift in the
+project. Key motivations:
 
-- Feature-phase orchestration was rigid — it assumed a linear sequence of
-  work that didn't match how tasks actually arrived.
+- The first workflow was rigid — it assumed a linear sequence of work that
+  didn't match how tasks actually arrived.
 - The Kanban model gave each task its own lifecycle
   (`commit-plan → commit-plan-review → commit-make → commit-review → finalize`)
   while letting the queue hold unrelated tasks in parallel.
@@ -169,7 +168,7 @@ stand out:
 
 | Period | Focus |
 |---|---|
-| Mar 15–17 | Extraction from parent repo, initial feature-phase orchestrator |
+| Mar 15–17 | Extraction from parent repo, initial linear orchestrator |
 | Mar 18–28 | Dashboard, agent config, prompt refinement |
 | Mar 29–31 | Kanban spec and initial implementation |
 | Apr 1–7 | Kanban stabilization, retry logic, dashboard rebuild |

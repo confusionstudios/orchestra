@@ -13,7 +13,7 @@ source "$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)/_ko-common"
 cd "$ORCHESTRA_DIR"
 
 if [[ $# -eq 0 ]]; then
-  set -- -q feature-phase-orchestration/scripts kanban-orchestra/scripts
+  set -- -q kanban-orchestra/scripts
 fi
 
 exec "$ko_python" -m pytest "$@"

@@ -53,12 +53,10 @@ def _write_test_ai_skills(orchestra_dir: Path) -> None:
     skills_dir = orchestra_dir / "AI-skills"
     skills_dir.mkdir(parents=True)
     for skill_name in (
-        "create-pr-for-feature-phase",
         "get-kanban-update",
         "git-commit",
         "kanban",
         "prep-branch-for-squash-merge",
-        "prep-for-feature-phase-build",
         "prep-for-review",
         "respond-to-review",
         "review-build",

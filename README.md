@@ -1,23 +1,28 @@
 # Orchestra
 
-Orchestra is a local orchestration harness for AI-agent development workflows.
-It coordinates work in a git repository through a SQLite-backed task queue,
-prompt templates, shell wrappers, and a small dashboard.
+Orchestra is a Python tool that pushes your local coding-agent CLIs through a
+task queue. The unit of work is a single git commit: one task goes in, one
+reviewed commit comes out.
 
-The project is for developers who already run coding agents from local CLIs
-and want a more structured loop around planning, implementation, review, and
-one-task-one-commit delivery. Orchestra does not provide hosted model access,
-API keys, subscriptions, or accounts for Codex, Claude, Gemini, Kilo, or any
-other model provider.
+It does not call model APIs directly. Instead, it runs the CLIs you already use
+locally, such as Codex, Claude, Gemini, or Kilo. That keeps model access,
+subscriptions, billing, and login state in your own tools, where pricing and
+permissions are different from hosted API usage.
+
+A normal task asks one agent to build the change, optionally sends the staged
+diff through one or more review/rejection cycles, then returns to the same
+builder to finalize the approved commit. Review is on by default. A separate
+planning phase can be enabled for work that needs a plan before code changes.
 
 ## What It Does
 
-- Tracks development work in a local Kanban task database.
-- Dispatches task prompts to configured agent CLIs on your machine.
-- Supports separate coder and reviewer agents per task.
-- Preserves review feedback and validation notes in task comments.
-- Provides a local browser dashboard for queue and runtime visibility.
-- Includes an older feature-phase workflow for larger planned efforts.
+- Tracks task state in a SQLite database inside the work repo.
+- Turns each task into a prompt for one of your configured local agent CLIs.
+- Treats each completed task as one git commit.
+- Supports optional planning before implementation.
+- Supports review/rejection loops before finalizing the commit.
+- Preserves review feedback, validation notes, and commit metadata.
+- Provides a local dashboard for queue and runtime visibility.
 
 Orchestra is local-first tooling, not a hosted service. It assumes you are
 comfortable with git, shell commands, and reviewing agent-generated changes.
@@ -73,20 +78,35 @@ Clone the repo and build its checkout-local Python environment:
 git clone https://github.com/dr2050/orchestra.git
 cd orchestra
 ./shared_scripts/bootstrap-python-env.sh
-export ORCHESTRA_DIR="$PWD"
-export PATH="$ORCHESTRA_DIR/bin:$PATH"
 ```
 
-For a shared machine, you can choose a stable shared checkout path instead:
+Then add the checkout to your shell startup file so the `ko-*` commands work
+from your other repositories. Replace `/path/to/orchestra` with the clone path
+you chose.
+
+For zsh:
 
 ```bash
-export ORCHESTRA_DIR=/Users/Shared/orchestra
-"$ORCHESTRA_DIR/shared_scripts/bootstrap-python-env.sh"
+cat >> ~/.zshrc <<'EOF'
+export ORCHESTRA_DIR="/path/to/orchestra"
 export PATH="$ORCHESTRA_DIR/bin:$PATH"
+EOF
+source ~/.zshrc
 ```
 
-That path is only an example. Any clone path works as long as `ORCHESTRA_DIR`
-points at it.
+For bash:
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+export ORCHESTRA_DIR="/path/to/orchestra"
+export PATH="$ORCHESTRA_DIR/bin:$PATH"
+EOF
+source ~/.bashrc
+```
+
+For a shared machine, you can choose a stable shared checkout path such as
+`/Users/Shared/orchestra`. That path is only an example. Any clone path works
+as long as `ORCHESTRA_DIR` points at it.
 
 ## Configure Agent CLIs
 
@@ -187,16 +207,6 @@ ko-task get-commit-footer <task-id>
 ko-get-update
 ```
 
-Feature-phase commands are still available for larger planned efforts:
-
-```bash
-ko-feature-orchestrator
-ko-feature-dashboard
-```
-
-See [feature-phase-orchestration/README.md](feature-phase-orchestration/README.md)
-for that older workflow.
-
 ## Testing
 
 From the Orchestra checkout:
@@ -205,8 +215,8 @@ From the Orchestra checkout:
 bin/ko-test
 ```
 
-With no arguments, this runs the unit tests for the Kanban and feature-phase
-orchestration scripts.
+With no arguments, this runs the unit tests for the Kanban orchestration
+scripts.
 
 ## Known Limitations
 
@@ -217,8 +227,6 @@ orchestration scripts.
 - Some helper scripts reflect macOS/Homebrew-oriented workflows.
 - Task state is stored in SQLite files inside the work repo.
 - The orchestrator intentionally refuses to start on a dirty worktree.
-- The feature-phase pipeline predates the Kanban task queue and is less central
-  to day-to-day use.
 - This is a small open-source project extracted from personal tooling; expect
   rough edges and read diffs carefully.
 
