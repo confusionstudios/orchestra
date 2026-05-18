@@ -43,6 +43,35 @@ class TestLogColorizer(unittest.TestCase):
         self.assertIn("[green]Task done[/green]", orchestra_ui._colorize("Task done"))
 
 
+class TestGitBranchReadout(unittest.TestCase):
+    def test_current_git_branch_uses_show_current(self):
+        with patch.object(orchestra_ui.subprocess, "run", return_value=SimpleNamespace(stdout="feature-x\n")) as run:
+            branch = orchestra_ui._current_git_branch(Path("/repo"))
+
+        self.assertEqual(branch, "feature-x")
+        run.assert_called_once_with(
+            ["git", "branch", "--show-current"],
+            cwd=Path("/repo"),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_current_git_branch_falls_back_when_detached(self):
+        with patch.object(orchestra_ui.subprocess, "run", return_value=SimpleNamespace(stdout="\n")):
+            self.assertEqual(orchestra_ui._current_git_branch(Path("/repo")), "unknown")
+
+    def test_current_git_branch_falls_back_on_git_failure(self):
+        error = orchestra_ui.subprocess.CalledProcessError(1, ["git", "branch", "--show-current"])
+
+        with patch.object(orchestra_ui.subprocess, "run", side_effect=error):
+            self.assertEqual(orchestra_ui._current_git_branch(Path("/repo")), "unknown")
+
+    def test_current_git_branch_label_is_compact(self):
+        with patch.object(orchestra_ui, "_current_git_branch", return_value="feature-x"):
+            self.assertEqual(orchestra_ui._current_git_branch_label(Path("/repo")), "branch: feature-x")
+
+
 class FakeProcess:
     def __init__(self, status="stopped", cmd=None, name="orchestrator", pid=111):
         self.status = status
