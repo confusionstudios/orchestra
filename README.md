@@ -1,9 +1,13 @@
 # Orchestra
 
-Orchestra turns your local AI coding agents into an autonomous development
-team. You describe tasks in plain language; Orchestra queues them, assigns
-agents to code and review, runs rejection cycles on the staged diffs, and
-lands approved commits — while you do something else.
+Orchestra coordinates the AI coding CLIs you already have installed —
+[Claude Code](https://claude.ai/code),
+[OpenAI Codex CLI](https://github.com/openai/codex),
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) —
+into an autonomous development team. You describe tasks in plain language;
+Orchestra queues them, assigns one CLI to code and another to review, runs
+rejection cycles on the staged diffs, and lands approved commits — while you
+do something else.
 
 <img src="docs/agent-with-kanban-skill-with-orchestrator-dashboard.png" alt="Kanban Agent & Dashboard" />
 
@@ -85,6 +89,21 @@ accounts, or billing — install and authenticate each CLI yourself.
 
    The skill handles the rest.
 
+### Remote Control
+
+The orchestrator runs continuously on your machine, polling for tasks and
+dispatching local agents to do the work. You don't need to be at the terminal
+to queue tasks. Use
+[Claude Code Remote Control](https://docs.anthropic.com/en/docs/claude-code/remote-control),
+[OpenAI Codex](https://chatgpt.com/codex) from the ChatGPT app, or any agent
+channel that reaches your machine — Discord bots, Telegram, whatever you wire
+up. Say *"queue a task to refactor the auth middleware"* from your phone, and
+the orchestrator picks it up.
+
+From there, everything happens locally: agents write the code, other agents
+review the diff, rejections loop back for another attempt, and approved commits
+land on the branch — all while you're away from your desk.
+
 ### Tips
 
 * Orchestra will not launch against a dirty worktree. Commit or stash before
@@ -114,14 +133,11 @@ export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
 
 | Path | Contents |
 |------|----------|
-| `AI-skills/` | Canonical skill instructions |
+| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` copies these into each agent's config directory |
 | `kanban-orchestra/scripts/` | Task queue, dashboard, orchestrator, and CLI |
 | `kanban-orchestra/prompts/` | Prompts injected into task agents |
 | `bin/` | Thin wrappers that run through the checkout-local venv |
 | `shared_scripts/` | Setup and helper scripts |
-
-Agent-local skill folders (`.claude/`, `.codex/`, `.gemini/`, `.agents/`) are
-generated artifacts and gitignored.
 
 ## Operating Model
 
