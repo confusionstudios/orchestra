@@ -109,6 +109,25 @@ export ORCHESTRA_DEFAULT_REVIEWER=codex
 
 You can also pass `--coder-agent` and `--reviewer-agent` when adding a task.
 
+### Agent Permissions
+
+Orchestra is a local automation harness for trusted local worktrees. It is not
+a sandbox, permission boundary, or security isolation layer.
+
+Configured agent commands may read and write files that are available to your
+local user. Run the orchestrator only in repos and branches that you are
+willing to let automation edit, and review the staged diff before landing
+changes.
+
+Automatic task execution expects non-interactive agent CLI modes, such as
+`--yolo` or `--dangerously-skip-permissions`, because agents cannot complete
+queued work if every command or file edit waits for a permission prompt. Review
+and adjust `shared_scripts/shared_config.py` for your machine and trust model
+before running the orchestrator.
+
+Branch safety is a separate workflow control: tasks on `master` or `main` are
+blocked by default unless the work repo opts in with `ALLOW_TASKS_ON_MASTER`.
+
 ## Quickstart
 
 Run these commands from a separate work repo, not from the Orchestra checkout:

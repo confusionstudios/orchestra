@@ -4,6 +4,9 @@ Shared agent invocation config for all orchestration systems.
 
 # How to invoke each agent.
 # {prompt} is replaced at runtime with the full prompt + task file content.
+# These defaults are intentionally non-interactive so queued local automation
+# can run to completion. Treat this file as local agent permission policy and
+# adjust it before running the orchestrator on a worktree.
 AGENT_CMD = {
     "haiku":   ["claude", "--model", "Haiku", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"],
     "sonnet":  ["claude", "--model", "Sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"],
