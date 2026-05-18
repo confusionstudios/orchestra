@@ -68,10 +68,10 @@ def _current_branch():
 
 def _resolve_branch_for_ready(conn, task, branch_arg):
     """Ensure task has a branch before becoming ready. Returns branch or raises."""
-    if task.get("branch"):
-        return task["branch"]
     if branch_arg:
         return branch_arg
+    if task.get("branch"):
+        return task["branch"]
     if _is_interactive():
         current = _current_branch()
         if current and current not in ("master", "main"):

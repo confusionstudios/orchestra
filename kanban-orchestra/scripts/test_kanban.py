@@ -1873,6 +1873,16 @@ class TestTaskCLI(unittest.TestCase):
         queued = json.loads(r2.stdout)
         self.assertIsNotNone(queued["ready_at"])
 
+    def test_set_status_ready_prefers_explicit_branch(self):
+        r = self._run("add", "Retarget task", "--branch", "old-branch")
+        tid = json.loads(r.stdout)["id"]
+        r2 = self._run("set", str(tid), "--branch", "new-branch", "--status", "ready")
+        self.assertEqual(r2.returncode, 0)
+        queued = json.loads(r2.stdout)
+        self.assertEqual(queued["branch"], "new-branch")
+        self.assertEqual(queued["status"], "ready")
+        self.assertIsNotNone(queued["ready_at"])
+
     def test_set_status_non_ready_clears_ready_at(self):
         r = self._run("add", "Queue task", "--branch", "my-branch")
         tid = json.loads(r.stdout)["id"]
@@ -3719,6 +3729,24 @@ class TestSupertaskCLI(unittest.TestCase):
 
         tasks = json.loads(self._run("list").stdout)
         children = [t for t in tasks if t["parent_task_id"] == parent_id]
+        for child in children:
+            self.assertEqual(child["branch"], "new-branch")
+
+    def test_set_branch_and_ready_on_supertask_updates_parent_and_children(self):
+        parent_id = self._add_supertask(branch="old-branch")
+        self._run("add", "Child A", "--parent", str(parent_id))
+        self._run("add", "Child B", "--parent", str(parent_id))
+
+        r = self._run("set", str(parent_id), "--branch", "new-branch", "--status", "ready")
+        self.assertEqual(r.returncode, 0)
+
+        parent = json.loads(r.stdout)
+        self.assertEqual(parent["branch"], "new-branch")
+        self.assertEqual(parent["status"], "ready")
+
+        tasks = json.loads(self._run("list").stdout)
+        children = [t for t in tasks if t["parent_task_id"] == parent_id]
+        self.assertEqual(len(children), 2)
         for child in children:
             self.assertEqual(child["branch"], "new-branch")
 
