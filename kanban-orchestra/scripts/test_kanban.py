@@ -5131,25 +5131,25 @@ class TestConfigEnvOverrides(unittest.TestCase):
 
     # Env var names paired with (attr_name, hardcoded_fallback)
     _CASES = [
-        ("ORCHESTRA_DEFAULT_SUPER_PLANNER", "DEFAULT_SUPER_PLANNER", "sonnet"),
+        ("ORCHESTRA_DEFAULT_SUPER_PLANNER", "DEFAULT_SUPER_PLANNER", "opus"),
         ("ORCHESTRA_DEFAULT_SUPER_REVIEWER", "DEFAULT_SUPER_REVIEWER", "codex"),
         ("ORCHESTRA_DEFAULT_PLANNER", "DEFAULT_PLANNER", "sonnet"),
         ("ORCHESTRA_DEFAULT_PLAN_REVIEWER", "DEFAULT_PLAN_REVIEWER", "codex"),
-        ("ORCHESTRA_DEFAULT_CODER", "DEFAULT_CODER", "haiku"),
+        ("ORCHESTRA_DEFAULT_CODER", "DEFAULT_CODER", "sonnet"),
         ("ORCHESTRA_DEFAULT_REVIEWER", "DEFAULT_REVIEWER", "codex"),
     ]
 
     def test_valid_env_override_applies(self):
         """Each ORCHESTRA_DEFAULT_* env var overrides the corresponding constant."""
-        # Use "opus" as an override value (different from all hard-coded defaults).
-        env = {env_key: "opus" for env_key, _, _ in self._CASES}
+        # Use one valid override value for every role.
+        env = {env_key: "gemini" for env_key, _, _ in self._CASES}
         # Remove any pre-existing overrides so only our patch is active.
         with patch.dict(os.environ, env, clear=False):
             cfg = self._load_config()
             for _, attr, _ in self._CASES:
                 self.assertEqual(
-                    getattr(cfg, attr), "opus",
-                    msg=f"{attr} should be 'opus' when env var is set",
+                    getattr(cfg, attr), "gemini",
+                    msg=f"{attr} should be 'gemini' when env var is set",
                 )
 
     def test_fallback_when_env_var_empty(self):

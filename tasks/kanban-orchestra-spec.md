@@ -64,7 +64,7 @@ A supertask is a planning container.
 
 The sticky coder is the agent assigned to `commit-make`.
 
-- Default: `claude`
+- Default: `sonnet`
 - Stored on the task as `coder_agent`
 - Reused for the life of the task unless a human changes it
 
@@ -86,11 +86,11 @@ hard-coded default is used.
 
 | Environment variable              | Constant overridden    | Hard-coded default |
 |-----------------------------------|------------------------|--------------------|
-| `ORCHESTRA_DEFAULT_SUPER_PLANNER` | `DEFAULT_SUPER_PLANNER`| `sonnet`           |
+| `ORCHESTRA_DEFAULT_SUPER_PLANNER` | `DEFAULT_SUPER_PLANNER`| `opus`             |
 | `ORCHESTRA_DEFAULT_SUPER_REVIEWER`| `DEFAULT_SUPER_REVIEWER`| `codex`           |
 | `ORCHESTRA_DEFAULT_PLANNER`       | `DEFAULT_PLANNER`      | `sonnet`           |
 | `ORCHESTRA_DEFAULT_PLAN_REVIEWER` | `DEFAULT_PLAN_REVIEWER`| `codex`            |
-| `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `haiku`            |
+| `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `sonnet`           |
 | `ORCHESTRA_DEFAULT_REVIEWER`      | `DEFAULT_REVIEWER`     | `codex`            |
 
 ### Review Round
@@ -416,7 +416,7 @@ task restore
 
 ### CLI Rules
 
-- `task add` defaults to `kind=task`, `coder_agent=claude`, and `reviewer_agent=codex`.
+- `task add` defaults to `kind=task`, `coder_agent=sonnet`, and `reviewer_agent=codex`.
 - `task set --reviewer-agent <agent>` changes the configured code reviewer for future `commit-review` runs.
 - `allow_when_blocked` defaults to `false`.
 - Task descriptions are Markdown source. Agents creating or editing tasks should

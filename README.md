@@ -55,8 +55,8 @@ Orchestra shells out to local agent CLIs. It ships with built-in support for:
 
 | Key | Agent CLI | Notes |
 |-----|-----------|-------|
-| `claude` / `sonnet` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | Default coder and reviewer |
-| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | |
+| `sonnet` / `claude` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
+| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | Default reviewer, plan reviewer, and supertask reviewer |
 | `gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | |
 | `kilo` | [Kilo Code](https://kilocode.ai) | |
 
@@ -155,11 +155,11 @@ Default agent roles can be overridden with environment variables. Set each one
 to a key from `shared_scripts/shared_config.py`:
 
 ```bash
-export ORCHESTRA_DEFAULT_CODER=haiku
+export ORCHESTRA_DEFAULT_CODER=sonnet
 export ORCHESTRA_DEFAULT_REVIEWER=codex
 export ORCHESTRA_DEFAULT_PLANNER=sonnet
 export ORCHESTRA_DEFAULT_PLAN_REVIEWER=codex
-export ORCHESTRA_DEFAULT_SUPER_PLANNER=sonnet
+export ORCHESTRA_DEFAULT_SUPER_PLANNER=opus
 export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
 ```
 
