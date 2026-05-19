@@ -6,7 +6,7 @@ and small improvements are welcome.
 ## Local Setup
 
 ```bash
-git clone https://github.com/dr2050/orchestra.git
+git clone https://github.com/confusionstudios/orchestra.git
 export ORCHESTRA_DIR="$PWD/orchestra"
 "$ORCHESTRA_DIR/shared_scripts/bootstrap-python-env.sh"
 ```

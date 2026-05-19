@@ -51,7 +51,7 @@ accounts, or billing — install and authenticate each CLI yourself.
 1. **Clone the repo:**
 
    ```bash
-   git clone https://github.com/dr2050/orchestra.git /path/to/orchestra
+   git clone https://github.com/confusionstudios/orchestra.git /path/to/orchestra
    ```
 
 2. **Set `ORCHESTRA_DIR`** in your shell startup file (`.zshrc`, `.bashrc`, or
