@@ -21,7 +21,7 @@ editing, or reordering child task records here — no code, no commits.
    Add a new child:
    ```
    task add "<child title>" \
-       --description "<description>" \
+       --description "<markdown description>" \
        --parent <supertask-id> \
        --sequence-index <sort-key>
    ```
@@ -34,7 +34,7 @@ editing, or reordering child task records here — no code, no commits.
 
    Update a child's description:
    ```
-   task set <child-id> --description "<new description>"
+   task set <child-id> --description "<new markdown description>"
    ```
 5. **Verify the plan.** List children and confirm titles, descriptions, and
    order before continuing.
@@ -54,6 +54,8 @@ editing, or reordering child task records here — no code, no commits.
 
 - Every child must have `--parent` pointing to this supertask.
 - Children inherit branch from the supertask — leave `--branch` unset.
+- Child descriptions are Markdown source. Use headings, bullets, and code spans
+  where they make the task clearer.
 - `sequence_index` controls execution: a child runs only when all siblings
   with lower indices are `done`.
 - Leave child status as the default `ready` — the orchestrator gates

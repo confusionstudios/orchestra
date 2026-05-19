@@ -3,9 +3,9 @@
 task.py — CLI for creating and managing Kanban Orchestra tasks.
 
 Usage:
-    task add "<title>" [--description "<desc>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--allow-when-blocked]
+    task add "<title>" [--description "<markdown>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--allow-when-blocked]
     task set <id> [--title ".."] [--status ..] [--next-step ..] [--branch ..]
-                  [--stash-ref <ref>] [--allow-when-blocked <bool>] ...
+                  [--description "<markdown>"] [--stash-ref <ref>] [--allow-when-blocked <bool>] ...
     task list [--status ..] [--next-step ..] [--branch ..] [--page N]
     task show <id>
     task show-comments <id>
@@ -616,7 +616,11 @@ def build_parser():
     # add
     p_add = sub.add_parser("add")
     p_add.add_argument("title")
-    p_add.add_argument("--description", default=None)
+    p_add.add_argument(
+        "--description",
+        default=None,
+        help="Task description as Markdown source.",
+    )
     p_add.add_argument("--branch", default=None)
     p_add.add_argument("--coder-agent", default=None)
     p_add.add_argument("--reviewer-agent", default=None)
@@ -632,7 +636,11 @@ def build_parser():
     p_set.add_argument("--title", default=None)
     p_set.add_argument("--status", default=None)
     p_set.add_argument("--next-step", default=None)
-    p_set.add_argument("--description", default=None)
+    p_set.add_argument(
+        "--description",
+        default=None,
+        help="Replace the task description with Markdown source.",
+    )
     p_set.add_argument("--branch", default=None)
     p_set.add_argument("--commit", default=None)
     p_set.add_argument("--stash-ref", default=None)
@@ -699,7 +707,11 @@ def build_parser():
     # follow-up
     p_follow_up = sub.add_parser("follow-up")
     p_follow_up.add_argument("task_id", type=int)
-    p_follow_up.add_argument("--description", required=True)
+    p_follow_up.add_argument(
+        "--description",
+        required=True,
+        help="Follow-up task description as Markdown source.",
+    )
 
     # requeue
     p_requeue = sub.add_parser("requeue")

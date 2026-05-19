@@ -816,6 +816,21 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertIn("claude", prompt)
         self.assertIn("coder", prompt)
 
+    def test_build_prompt_labels_description_as_markdown_source(self):
+        task = {
+            "id": 1, "title": "Fix bug",
+            "description": "## Goal\n\n- Fix `login`",
+            "branch": "fix-login", "status": "running",
+            "next_step": "commit-make", "review_round": 0,
+            "last_review_decision": "none", "commit_hash": None,
+            "stash_ref": None, "coder_agent": "claude",
+        }
+
+        prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
+
+        self.assertIn("- description_markdown:\n  ```markdown\n  ## Goal", prompt)
+        self.assertIn("  - Fix `login`\n  ```", prompt)
+
     def test_build_prompt_surfaces_allow_tasks_on_master_policy_for_master_task(self):
         task = {
             "id": 2, "title": "Master task",
@@ -5116,25 +5131,25 @@ class TestConfigEnvOverrides(unittest.TestCase):
 
     # Env var names paired with (attr_name, hardcoded_fallback)
     _CASES = [
-        ("ORCHESTRA_DEFAULT_SUPER_PLANNER", "DEFAULT_SUPER_PLANNER", "sonnet"),
+        ("ORCHESTRA_DEFAULT_SUPER_PLANNER", "DEFAULT_SUPER_PLANNER", "opus"),
         ("ORCHESTRA_DEFAULT_SUPER_REVIEWER", "DEFAULT_SUPER_REVIEWER", "codex"),
         ("ORCHESTRA_DEFAULT_PLANNER", "DEFAULT_PLANNER", "sonnet"),
         ("ORCHESTRA_DEFAULT_PLAN_REVIEWER", "DEFAULT_PLAN_REVIEWER", "codex"),
-        ("ORCHESTRA_DEFAULT_CODER", "DEFAULT_CODER", "haiku"),
+        ("ORCHESTRA_DEFAULT_CODER", "DEFAULT_CODER", "sonnet"),
         ("ORCHESTRA_DEFAULT_REVIEWER", "DEFAULT_REVIEWER", "codex"),
     ]
 
     def test_valid_env_override_applies(self):
         """Each ORCHESTRA_DEFAULT_* env var overrides the corresponding constant."""
-        # Use "opus" as an override value (different from all hard-coded defaults).
-        env = {env_key: "opus" for env_key, _, _ in self._CASES}
+        # Use one valid override value for every role.
+        env = {env_key: "gemini" for env_key, _, _ in self._CASES}
         # Remove any pre-existing overrides so only our patch is active.
         with patch.dict(os.environ, env, clear=False):
             cfg = self._load_config()
             for _, attr, _ in self._CASES:
                 self.assertEqual(
-                    getattr(cfg, attr), "opus",
-                    msg=f"{attr} should be 'opus' when env var is set",
+                    getattr(cfg, attr), "gemini",
+                    msg=f"{attr} should be 'gemini' when env var is set",
                 )
 
     def test_fallback_when_env_var_empty(self):

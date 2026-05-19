@@ -43,13 +43,13 @@ def get_agent_display_name(agent: str) -> str:
     return get_agent_display_label(agent)
 
 
-DEFAULT_SUPER_PLANNER = _agent_default("ORCHESTRA_DEFAULT_SUPER_PLANNER", "sonnet")
+DEFAULT_SUPER_PLANNER = _agent_default("ORCHESTRA_DEFAULT_SUPER_PLANNER", "opus")
 DEFAULT_SUPER_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_SUPER_REVIEWER", "codex")
 
 DEFAULT_PLANNER = _agent_default("ORCHESTRA_DEFAULT_PLANNER", "sonnet")
 DEFAULT_PLAN_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_PLAN_REVIEWER", "codex")
 
-DEFAULT_CODER = _agent_default("ORCHESTRA_DEFAULT_CODER", "haiku")
+DEFAULT_CODER = _agent_default("ORCHESTRA_DEFAULT_CODER", "sonnet")
 DEFAULT_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_REVIEWER", "codex")
 
 MAX_REVIEW_ROUNDS = 5

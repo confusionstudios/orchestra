@@ -64,7 +64,7 @@ A supertask is a planning container.
 
 The sticky coder is the agent assigned to `commit-make`.
 
-- Default: `claude`
+- Default: `sonnet`
 - Stored on the task as `coder_agent`
 - Reused for the life of the task unless a human changes it
 
@@ -86,11 +86,11 @@ hard-coded default is used.
 
 | Environment variable              | Constant overridden    | Hard-coded default |
 |-----------------------------------|------------------------|--------------------|
-| `ORCHESTRA_DEFAULT_SUPER_PLANNER` | `DEFAULT_SUPER_PLANNER`| `sonnet`           |
+| `ORCHESTRA_DEFAULT_SUPER_PLANNER` | `DEFAULT_SUPER_PLANNER`| `opus`             |
 | `ORCHESTRA_DEFAULT_SUPER_REVIEWER`| `DEFAULT_SUPER_REVIEWER`| `codex`           |
 | `ORCHESTRA_DEFAULT_PLANNER`       | `DEFAULT_PLANNER`      | `sonnet`           |
 | `ORCHESTRA_DEFAULT_PLAN_REVIEWER` | `DEFAULT_PLAN_REVIEWER`| `codex`            |
-| `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `haiku`            |
+| `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `sonnet`           |
 | `ORCHESTRA_DEFAULT_REVIEWER`      | `DEFAULT_REVIEWER`     | `codex`            |
 
 ### Review Round
@@ -404,8 +404,8 @@ task show-run-log <task-id>
 ### Mutation Commands
 
 ```bash
-task add "<title>" [--description "<description>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--kind <task|supertask>] [--parent <task-id>] [--sequence-index <n>] [--skip <step>] [--allow-when-blocked]
-task set <task-id> [--title "<title>"] [--description "<description>"] [--status <status>] [--next-step <step>] [--branch <branch>] [--commit <hash>] [--stash-ref <ref>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--review-round <n>] [--last-review-decision <decision>] [--sequence-index <n>] [--commit-plan "<text>"] [--allow-when-blocked <bool>] [--add-skip <step> | --remove-skip <step>]
+task add "<title>" [--description "<description-as-markdown>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--kind <task|supertask>] [--parent <task-id>] [--sequence-index <n>] [--skip <step>] [--allow-when-blocked]
+task set <task-id> [--title "<title>"] [--description "<description-as-markdown>"] [--status <status>] [--next-step <step>] [--branch <branch>] [--commit <hash>] [--stash-ref <ref>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--review-round <n>] [--last-review-decision <decision>] [--sequence-index <n>] [--commit-plan "<text>"] [--allow-when-blocked <bool>] [--add-skip <step> | --remove-skip <step>]
 task comment <task-id> [<message> | --message-stdin] [--comment | --approval | --rejection | --commit-message | --validation | --plan-approval | --plan-rejection] [--author <name>] [--review-round <n>]
 task log <task-id> "<message>"
 task delete <task-id>
@@ -416,9 +416,11 @@ task restore
 
 ### CLI Rules
 
-- `task add` defaults to `kind=task`, `coder_agent=claude`, and `reviewer_agent=codex`.
+- `task add` defaults to `kind=task`, `coder_agent=sonnet`, and `reviewer_agent=codex`.
 - `task set --reviewer-agent <agent>` changes the configured code reviewer for future `commit-review` runs.
 - `allow_when_blocked` defaults to `false`.
+- Task descriptions are Markdown source. Agents creating or editing tasks should
+  use Markdown structure such as headings, bullets, and code spans where useful.
 - Supertasks start with `next_step=commit-make-supertask`.
 - Regular tasks default to skipping planning (`commit-plan`) and start with `next_step=commit-make`. Passing any `--skip` explicitly overrides this default.
 - Parented child tasks inherit the parent branch.
@@ -868,7 +870,9 @@ intervention, triage, and requeue decisions.
 Typical flow:
 
 ```bash
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py add "Task title" --description "What should happen" --branch my-branch
+python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py add "Task title" --description "## Goal
+
+What should happen" --branch my-branch
 python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py set <task-id> --status ready
 ```
 

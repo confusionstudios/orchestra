@@ -358,12 +358,18 @@ def build_prompt(task, verb, agent_name, comments):
     is_supertask_verb = verb in ("commit-make-supertask", "commit-review-supertask")
     role = "coder" if is_coder else "reviewer"
 
-    # Build filtered task context
+    description = task["description"] or "(none)"
+
+    # Build filtered task context. Task descriptions are authored as Markdown,
+    # so keep the source block intact instead of flattening it into a list item.
     context_lines = [
         "## Task Context",
         f"- id: {task['id']}",
         f"- title: {task['title']}",
-        f"- description: {task['description'] or '(none)'}",
+        "- description_markdown:",
+        "  ```markdown",
+        *[f"  {line}" for line in description.splitlines()],
+        "  ```",
         f"- branch: {task['branch']}",
         f"- coder_agent: {task.get('coder_agent') or DEFAULT_CODER}",
         f"- reviewer_agent: {_task_reviewer(task)}",

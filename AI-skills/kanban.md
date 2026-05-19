@@ -130,7 +130,7 @@ task show-run-log <task-id>
 
 task set <task-id> \
     [--status <status>] [--next-step <step>] [--branch <branch>] \
-    [--description "<...>"] [--commit <hash>] [--coder-agent <agent>] [--reviewer-agent <agent>] \
+    [--description "<description-as-markdown>"] [--commit <hash>] [--coder-agent <agent>] [--reviewer-agent <agent>] \
     [--review-round <n>] [--last-review-decision <decision>] \
     [--commit-plan "<text>"] [--allow-when-blocked <bool>] \
     [--add-skip <step>] [--remove-skip <step>]

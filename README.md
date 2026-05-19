@@ -9,7 +9,21 @@ Orchestra queues them, assigns one CLI to code and another to review, runs
 rejection cycles on the staged diffs, and lands approved commits — while you
 do something else.
 
-<img src="docs/agent-with-kanban-skill-with-orchestrator-dashboard.png" alt="Kanban Agent & Dashboard" />
+<table>
+  <tr>
+    <td colspan="2">
+      <img src="docs/agent-with-kanban-skill-with-orchestrator-dashboard.png" alt="Kanban Agent and Dashboard" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/dashboard1.jpg" alt="Kanban dashboard task overview" width="100%" />
+    </td>
+    <td width="50%">
+      <img src="docs/dashboard2.jpg" alt="Kanban dashboard task detail" width="100%" />
+    </td>
+  </tr>
+</table>
 
 ## How It Works
 
@@ -24,14 +38,25 @@ by hand. You install the skill into your agent, then talk to it: *"Queue a
 task to fix X."* The skill handles bootstrapping, task creation, status
 checks, and all wrapper commands.
 
+## Operator Visibility
+
+Everything the orchestrator does is visible. The live dashboard shows active
+tasks, ready and blocked queues, recent completions, and the orchestrator's own
+heartbeat. Each task carries durable comments — reviewer feedback, validation
+results, commit messages — so you can trace every decision without reading
+agent logs. Run logs capture the full session, and control commands let you
+pause, resume, or inspect any task from another terminal or a remote agent
+session. If something stalls or fails, you see it immediately and can
+intervene.
+
 ## Supported Agents
 
 Orchestra shells out to local agent CLIs. It ships with built-in support for:
 
 | Key | Agent CLI | Notes |
 |-----|-----------|-------|
-| `claude` / `sonnet` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | Default coder and reviewer |
-| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | |
+| `sonnet` / `claude` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
+| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | Default reviewer, plan reviewer, and supertask reviewer |
 | `gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | |
 | `kilo` | [Kilo Code](https://kilocode.ai) | |
 
@@ -130,11 +155,11 @@ Default agent roles can be overridden with environment variables. Set each one
 to a key from `shared_scripts/shared_config.py`:
 
 ```bash
-export ORCHESTRA_DEFAULT_CODER=haiku
+export ORCHESTRA_DEFAULT_CODER=sonnet
 export ORCHESTRA_DEFAULT_REVIEWER=codex
 export ORCHESTRA_DEFAULT_PLANNER=sonnet
 export ORCHESTRA_DEFAULT_PLAN_REVIEWER=codex
-export ORCHESTRA_DEFAULT_SUPER_PLANNER=sonnet
+export ORCHESTRA_DEFAULT_SUPER_PLANNER=opus
 export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
 ```
 

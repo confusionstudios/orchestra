@@ -18,12 +18,13 @@ You are building (or reworking) the commit.
 3. **Optional: declare a follow-up task.** If implementation reveals related
    work that belongs in its own commit:
    ```
-   task follow-up <id> --description "<what the follow-up does>"
+   task follow-up <id> --description "<markdown description of the follow-up>"
    ```
    This auto-numbers the current task `1/2` (if not already numbered) and
    creates the follow-up as `2/2` (or extends an existing `n/x`). The
    orchestrator queues the follow-up immediately after this task. Call at
-   most once per task.
+   most once per task. Follow-up descriptions are Markdown source; use
+   headings, bullets, and code spans where they make the task clearer.
 4. **Run the build.** Check `AGENTS.md` (and any file it references, e.g.
    `Orchestration/project-instructions.md`) for the documented build command
    and run that exact command — use it verbatim, not a lighter substitute.

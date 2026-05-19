@@ -12,10 +12,14 @@ There is no build step for this repo.
 
 ALLOW_TASKS_ON_MASTER
 
-Before staging changes, run the unit tests from this checkout:
+Before staging changes that could affect executable behavior, run the unit tests
+from this checkout:
 
 ```bash
 bin/ko-test
 ```
+
+Pure documentation, instruction text, screenshots, images, and other static
+assets do not require a test run unless they are part of a behavior change.
 
 Use the repo-local paths above directly.
