@@ -1280,6 +1280,7 @@ class TestTaskEditingRoutes(unittest.TestCase):
         resp = client.post(
             f"/task/{self.tid}/edit",
             data={"title": "Updated title", "description": "## Heading\n\nNew text"},
+            headers={"origin": "http://127.0.0.1:8427"},
             follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 303)
@@ -1300,6 +1301,7 @@ class TestTaskEditingRoutes(unittest.TestCase):
         resp = client.post(
             f"/task/{self.tid}/edit",
             data={"title": "Editable task", "description": ""},
+            headers={"origin": "http://127.0.0.1:8427"},
             follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 303)
@@ -1318,11 +1320,34 @@ class TestTaskEditingRoutes(unittest.TestCase):
         resp = client.post(
             f"/task/{self.tid}/edit",
             data={"title": "   ", "description": "keep this"},
+            headers={"origin": "http://127.0.0.1:8427"},
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Title is required.", resp.text)
         self.assertIn("keep this", resp.text)
         self.assertNotIn('task-edit-wrap', resp.text)
+
+
+    def test_post_edit_rejects_cross_origin(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{self.tid}/edit",
+            data={"title": "evil", "description": "injected"},
+            headers={"origin": "http://evil.example.com"},
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_post_edit_rejects_missing_origin(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{self.tid}/edit",
+            data={"title": "evil", "description": "injected"},
+        )
+        self.assertEqual(resp.status_code, 403)
 
 
 class TestOverviewPage(unittest.TestCase):

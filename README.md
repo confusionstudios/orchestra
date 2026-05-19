@@ -51,7 +51,7 @@ accounts, or billing — install and authenticate each CLI yourself.
 1. **Clone the repo:**
 
    ```bash
-   git clone https://github.com/dr2050/orchestra.git /path/to/orchestra
+   git clone https://github.com/confusionstudios/orchestra.git /path/to/orchestra
    ```
 
 2. **Set `ORCHESTRA_DIR`** in your shell startup file (`.zshrc`, `.bashrc`, or
@@ -104,6 +104,15 @@ From there, everything happens locally: agents write the code, other agents
 review the diff, rejections loop back for another attempt, and approved commits
 land on the branch — all while you're away from your desk.
 
+### Hardening
+
+Agent commands run as your local user with no sandbox. Always run
+Orchestra under a **separate macOS user account**, an OrbStack/Docker
+container, or a `sandbox-exec` profile. A prompt-injected or
+misbehaving agent can read, modify, or exfiltrate anything your user
+account can access — credentials, SSH keys, other repos, browser
+state. See [SECURITY.md](SECURITY.md) for the full threat model.
+
 ### Tips
 
 * Orchestra will not launch against a dirty worktree. Commit or stash before
@@ -153,7 +162,9 @@ blocks rather than continuing through unexpected uncommitted changes.
 ## Policies
 
 Orchestra is not a sandbox or permission boundary. Agent commands run as your
-local user and can read or write any files available to that user.
+local user and can read or write any files available to that user. Run
+Orchestra under a dedicated user account or container — see
+[Hardening](#hardening).
 
 Automatic task execution requires non-interactive agent CLI modes. If an agent
 needs a permission prompt for every command, queued work will not complete

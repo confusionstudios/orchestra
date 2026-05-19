@@ -28,8 +28,10 @@ echo "+ $venv_dir/bin/python -m pip install --upgrade pip"
 echo "+ $venv_dir/bin/python -m pip install -r $requirements"
 "$venv_dir/bin/python" -m pip install --disable-pip-version-check --no-cache-dir --quiet -r "$requirements"
 
-# In /Users/Shared deployments, keep the environment usable by a shared group
-# when the filesystem permissions allow it.
-chmod -R g+rwX "$venv_dir" 2>/dev/null || true
+# In /Users/Shared deployments, keep the environment usable by a shared group.
+# Skip for single-user installs where opening group write is unnecessary.
+case "$venv_dir" in
+  /Users/Shared/*) chmod -R g+rwX "$venv_dir" 2>/dev/null || true ;;
+esac
 
 echo "Orchestra Python environment ready: $venv_dir"

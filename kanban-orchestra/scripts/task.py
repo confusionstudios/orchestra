@@ -40,6 +40,7 @@ AGENTS = config.AGENTS
 VALID_SKIPS = {"commit-plan", "commit-plan-review", "commit-review", "commit-review-supertask"}
 NORMAL_TASK_SKIPS = {"commit-plan", "commit-plan-review", "commit-review"}
 SUPERTASK_SKIPS = {"commit-review-supertask"}
+BRANCH_NAME_RE = re.compile(r'^[A-Za-z0-9._/][A-Za-z0-9._/ -]*$')
 MASTER_BRANCHES = {"master", "main"}
 MASTER_TASKS_DISABLED_ERROR = (
     "Error: tasks on master/main are disabled by default. "
@@ -88,6 +89,12 @@ def _is_master_branch(branch):
 
 def _allow_tasks_on_master():
     return repo_policy.read_allow_tasks_on_master(_repo_root_for_policy())
+
+
+def _validate_branch_name(branch):
+    if not BRANCH_NAME_RE.match(branch):
+        print(f"Error: invalid branch name '{branch}'.", file=sys.stderr)
+        sys.exit(1)
 
 
 def _reject_master_branch_without_marker(branch):
@@ -187,6 +194,7 @@ def cmd_add(args, conn):
         branch = parent["branch"]
 
     if branch is not None:
+        _validate_branch_name(branch)
         _reject_master_branch_without_marker(branch)
 
     child_status = "ready" if parent_task_id is not None else None
@@ -224,6 +232,7 @@ def cmd_set(args, conn):
                 file=sys.stderr,
             )
             sys.exit(1)
+        _validate_branch_name(args.branch)
         _reject_master_branch_without_marker(args.branch)
         fields["branch"] = args.branch
     if args.commit is not None:
@@ -284,6 +293,7 @@ def cmd_set(args, conn):
     if args.status is not None:
         if args.status == "ready":
             branch = _resolve_branch_for_ready(conn, task, fields.get("branch"))
+            _validate_branch_name(branch)
             _reject_master_branch_without_marker(branch)
             fields["branch"] = branch
         fields["status"] = args.status

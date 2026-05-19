@@ -1768,8 +1768,22 @@ def task_detail(task_id: int):
     return response
 
 
+def _is_local_origin(request: Request) -> bool:
+    """Reject cross-origin POST requests to prevent CSRF."""
+    for header in ("origin", "referer"):
+        value = request.headers.get(header)
+        if value:
+            if value.startswith("http://127.0.0.1:") or value.startswith("http://localhost:"):
+                return True
+            return False
+    return False
+
+
 @app.post("/task/{task_id}/edit")
 async def task_edit(task_id: int, request: Request):
+    if not _is_local_origin(request):
+        return HTMLResponse("<p>Forbidden: cross-origin request.</p>", status_code=403)
+
     conn = _open_conn()
     if conn is None:
         body = '<div class="card"><p class="muted">Database not available.</p></div>'

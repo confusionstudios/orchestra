@@ -9,6 +9,7 @@ Sequential: one task at a time, exclusive repo access assumed.
 """
 
 import os
+import re
 import select
 import signal
 import shlex
@@ -800,8 +801,14 @@ def ensure_branch(task, conn):
         )
         return False
     branch = branch.strip()
+    if not re.match(r'^[A-Za-z0-9._/][A-Za-z0-9._/ -]*$', branch):
+        db.add_comment(
+            conn, task["id"],
+            f"Branch error: invalid branch name '{branch}'.",
+            kind="comment", author="orchestrator",
+        )
+        return False
     try:
-        # Check if branch exists
         result = subprocess.run(
             ["git", "rev-parse", "--verify", branch],
             capture_output=True, text=True,
@@ -810,8 +817,6 @@ def ensure_branch(task, conn):
             subprocess.run(["git", "checkout", branch], capture_output=True, text=True, check=True)
             return True
 
-        # Branch doesn't exist — try to create from current HEAD
-        # Only if we're on the expected base (master/main)
         current = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, check=True,
