@@ -24,6 +24,17 @@ by hand. You install the skill into your agent, then talk to it: *"Queue a
 task to fix X."* The skill handles bootstrapping, task creation, status
 checks, and all wrapper commands.
 
+## Operator Visibility
+
+Everything the orchestrator does is visible. The live dashboard shows active
+tasks, ready and blocked queues, recent completions, and the orchestrator's own
+heartbeat. Each task carries durable comments — reviewer feedback, validation
+results, commit messages — so you can trace every decision without reading
+agent logs. Run logs capture the full session, and control commands let you
+pause, resume, or inspect any task from another terminal or a remote agent
+session. If something stalls or fails, you see it immediately and can
+intervene.
+
 ## Supported Agents
 
 Orchestra shells out to local agent CLIs. It ships with built-in support for:
