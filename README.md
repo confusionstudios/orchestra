@@ -104,6 +104,15 @@ From there, everything happens locally: agents write the code, other agents
 review the diff, rejections loop back for another attempt, and approved commits
 land on the branch — all while you're away from your desk.
 
+### Hardening
+
+Agent commands run as your local user with no sandbox. Before routing
+tasks from remote channels (Discord, Telegram, Remote Control), run
+Orchestra under a **separate macOS user account**, an OrbStack/Docker
+container, or a `sandbox-exec` profile so that a compromised or
+prompt-injected task cannot access your primary account's files and
+credentials. See [SECURITY.md](SECURITY.md) for the full threat model.
+
 ### Tips
 
 * Orchestra will not launch against a dirty worktree. Commit or stash before
