@@ -111,9 +111,7 @@ Orchestra under a **separate macOS user account**, an OrbStack/Docker
 container, or a `sandbox-exec` profile. A prompt-injected or
 misbehaving agent can read, modify, or exfiltrate anything your user
 account can access — credentials, SSH keys, other repos, browser
-state. This applies even for local-only use; it is essential when
-tasks arrive from remote channels. See [SECURITY.md](SECURITY.md) for
-the full threat model.
+state. See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ### Tips
 
