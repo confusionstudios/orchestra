@@ -102,10 +102,10 @@ accounts, or billing — install and authenticate each CLI yourself.
 5. **Start the dashboard** for the work repo:
 
    ```bash
-   "$ORCHESTRA_DIR/bin/ko-ui"
+   "$ORCHESTRA_DIR/bin/ko-dashboard"
    ```
 
-   Use the Browser button in `orchestra-ui` to open the HTML dashboard.
+   Open the local URL it prints in your browser.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:
@@ -128,6 +128,36 @@ the orchestrator picks it up.
 From there, everything happens locally: agents write the code, other agents
 review the diff, rejections loop back for another attempt, and approved commits
 land on the branch — all while you're away from your desk.
+
+### Using Codex as the Operator
+
+Codex can own the day-to-day control loop for a work repo without being the
+durable process host. In that model, the work repo owns the state
+(`kanban-orchestra.db`, runtime files, and logs), the orchestrator process runs
+locally from that repo's working directory, and Codex is the interface you use
+to queue tasks, inspect status, restart stale workers, and open the dashboard
+only when you need it.
+
+For short experiments, Codex can start the orchestrator as a foreground command
+and monitor it directly. For normal use, a repo-local `nohup` launch is often
+enough: it detaches the orchestrator from the current terminal or Codex command
+while keeping the working directory, database, and logs tied to the work repo.
+
+```bash
+cd /path/to/work-repo
+mkdir -p .kanban-orchestra
+nohup "$ORCHESTRA_DIR/bin/ko-orchestrator" \
+  >> .kanban-orchestra/orchestrator.log 2>&1 &
+echo $! > .kanban-orchestra/orchestrator.pid
+```
+
+Use `launchd` instead when you want the orchestrator to start at login or
+restart automatically after an unexpected exit.
+
+The dashboard is optional in this setup. Start `ko-dashboard` only when you
+want the local visual interface; the orchestrator and SQLite database are the
+durable parts that keep work moving while Codex, the terminal, or the
+dashboard are not open.
 
 ### Hardening
 
