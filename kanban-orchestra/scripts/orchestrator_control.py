@@ -61,6 +61,28 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def read_singleton_lock_metadata(
+    db_path: str | None = None,
+    *,
+    lock_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Read best-effort identity metadata from the repo singleton lock file."""
+    path = Path(lock_path).resolve() if lock_path is not None else db.get_lock_path(db_path)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+
+    metadata = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and key:
+            metadata[key] = value
+    return metadata
+
+
 def _safe_unlink(path: Path) -> None:
     try:
         path.unlink()
@@ -90,11 +112,11 @@ def is_pid_alive(pid: int | None) -> bool:
 def write_supervisor_heartbeat(payload: dict[str, Any] | None = None, db_path: str | None = None) -> None:
     """Write the live orchestra-ui supervisor heartbeat for control clients."""
     paths = _paths(db_path)
+    identity = db.get_instance_identity(db_path)
     body = {
+        **identity,
         "pid": os.getpid(),
         "updated_at": _now_iso(),
-        "db_path": db.get_db_path(db_path),
-        "repo_root": str(Path(db.get_db_path(db_path)).resolve().parent),
     }
     if payload:
         body.update(payload)
@@ -111,6 +133,10 @@ def supervisor_status(db_path: str | None = None, stale_seconds: float = SUPERVI
         return False, "The orchestra-ui supervisor heartbeat is stale.", payload
     if not is_pid_alive(_coerce_int(payload.get("pid"))):
         return False, "The orchestra-ui supervisor process is no longer running.", payload
+    expected = db.get_instance_identity(db_path)
+    heartbeat_repo = payload.get("repo_root")
+    if heartbeat_repo and str(Path(heartbeat_repo).expanduser().resolve()) != expected["repo_root"]:
+        return False, "The orchestra-ui supervisor heartbeat belongs to a different repo.", payload
     return True, "Supervisor is live.", payload
 
 
@@ -123,7 +149,7 @@ def _coerce_int(value: Any) -> int | None:
 
 def singleton_lock_available(db_path: str | None = None) -> bool:
     """Return whether the repo-scoped orchestrator singleton lock is free."""
-    lock_path = Path(db.get_db_path(db_path)).resolve().with_name("kanban-orchestra.lock")
+    lock_path = db.get_lock_path(db_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
     try:
@@ -183,6 +209,7 @@ def submit_control_command(
     clear_control_response(db_path)
     request_id = uuid.uuid4().hex
     request = {
+        **db.get_instance_identity(db_path),
         "id": request_id,
         "command": command,
         "pid": os.getpid(),

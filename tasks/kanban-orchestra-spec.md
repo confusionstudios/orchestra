@@ -242,6 +242,10 @@ Runtime status values:
 
 ### Runtime Files
 
+- `kanban-orchestra.lock`: repo-scoped singleton lock for the real orchestrator
+  process. Its metadata records the process PID, launch repo root, repo label,
+  database path, runtime directory, and lock path so local agents can identify
+  the orchestrator for the current repo without process hunting.
 - `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
 - `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts
 - `.kanban-orchestra/orchestra-ui-supervisor.json`: live heartbeat for the local `orchestra-ui` supervisor

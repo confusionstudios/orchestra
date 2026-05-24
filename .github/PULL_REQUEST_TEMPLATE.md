@@ -1,6 +1,9 @@
 ## What
 
-<!-- Describe the main story: what changes for humans using or reviewing this branch. -->
+<!-- One short sentence describing the main story. -->
+
+- <!-- Concrete change or behavior reviewers should understand. -->
+- <!-- Concrete change or behavior reviewers should understand. -->
 
 ## Why
 

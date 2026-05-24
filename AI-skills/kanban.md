@@ -158,7 +158,13 @@ task log <task-id> "<message>"
 ```
 
 When `ko-ui` is running, it supervises both the dashboard and orchestrator.
-Use its local control path for operator actions instead of PID hunting:
+Resolve the current git repo root and treat that launch directory as the
+Orchestra instance identity. The real orchestrator records that identity in the
+repo-scoped `kanban-orchestra.lock`; agents should inspect the current repo's
+lock, `.kanban-orchestra/orchestra-ui-supervisor.json`, and runtime row before
+looking at unrelated system processes.
+
+Use the local control path for operator actions instead of PID hunting:
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control status

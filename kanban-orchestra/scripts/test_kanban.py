@@ -336,6 +336,111 @@ class TestDB(unittest.TestCase):
                 if os.path.exists(path):
                     os.unlink(path)
 
+    def test_skip_commit_plan_column_migrates_to_task_skips(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            legacy = sqlite3.connect(tmp.name)
+            legacy.executescript(
+                """CREATE TABLE tasks (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title                   TEXT NOT NULL,
+                    description             TEXT,
+                    status                  TEXT NOT NULL DEFAULT 'none'
+                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked',
+                                         'pending_subtasks')),
+                    next_step               TEXT NOT NULL DEFAULT 'commit-make'
+                        CHECK(next_step IN ('commit-make', 'commit-review',
+                                            'commit-make-supertask', 'commit-review-supertask',
+                                            'commit-plan', 'commit-plan-review',
+                                            'none')),
+                    branch                  TEXT,
+                    commit_hash             TEXT,
+                    stash_ref               TEXT,
+                    coder_agent             TEXT,
+                    review_round            INTEGER DEFAULT 0,
+                    last_review_decision    TEXT DEFAULT 'none'
+                        CHECK(last_review_decision IN ('none', 'approve', 'reject')),
+                    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ready_at                DATETIME DEFAULT NULL,
+                    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    kind                    TEXT NOT NULL DEFAULT 'task'
+                        CHECK(kind IN ('task', 'supertask')),
+                    parent_task_id          INTEGER REFERENCES tasks(id),
+                    sequence_index          INTEGER,
+                    skip_commit_plan        INTEGER NOT NULL DEFAULT 0
+                        CHECK(skip_commit_plan IN (0, 1)),
+                    commit_plan             TEXT
+                );
+                CREATE TABLE run_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id     INTEGER REFERENCES tasks(id),
+                    verb        TEXT,
+                    author      TEXT,
+                    message     TEXT,
+                    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE comments (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id        INTEGER REFERENCES tasks(id),
+                    review_round   INTEGER,
+                    verb           TEXT,
+                    author         TEXT,
+                    message        TEXT,
+                    kind           TEXT DEFAULT 'comment'
+                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
+                                       'validation', 'plan-approval', 'plan-rejection')),
+                    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE orchestrator_runtime (
+                    singleton            INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    status               TEXT NOT NULL
+                        CHECK(status IN ('idle', 'running', 'starting', 'stopping', 'stopped',
+                                         'hard-break', 'error')),
+                    pid                  INTEGER,
+                    started_at           DATETIME,
+                    last_heartbeat_at    DATETIME,
+                    current_task_id      INTEGER REFERENCES tasks(id),
+                    current_step         TEXT
+                        CHECK(current_step IN ('commit-make', 'commit-review',
+                                               'commit-make-supertask', 'commit-review-supertask',
+                                               'commit-plan', 'commit-plan-review', 'none')),
+                    current_branch       TEXT,
+                    review_round         INTEGER,
+                    active_agents        INTEGER NOT NULL DEFAULT 0,
+                    status_message       TEXT,
+                    updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO tasks (title, status, next_step, skip_commit_plan)
+                    VALUES ('Skip planning', 'done', 'commit-make', 1);
+                INSERT INTO tasks (title, status, next_step, skip_commit_plan)
+                    VALUES ('Keep planning', 'done', 'commit-plan', 0);
+                """
+            )
+            legacy.commit()
+            legacy.close()
+
+            conn = db.connect(tmp.name)
+            try:
+                task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+                self.assertNotIn("skip_commit_plan", task_cols)
+                self.assertIn("reviewer_agent", task_cols)
+                self.assertIn("follow_up_task_id", task_cols)
+                self.assertIn("allow_when_blocked", task_cols)
+
+                skipped = db.get_task(conn, 1)
+                planned = db.get_task(conn, 2)
+                self.assertEqual(skipped["skips"], ["commit-plan"])
+                self.assertEqual(planned["skips"], [])
+                self.assertEqual(skipped["title"], "Skip planning")
+            finally:
+                conn.close()
+        finally:
+            for suffix in ("", "-shm", "-wal"):
+                path = tmp.name + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
+
 
     def test_legacy_db_with_koid_raises_error(self):
         """connect() must raise RuntimeError on a legacy schema that still has koid."""
@@ -2500,6 +2605,30 @@ class TestWorkspaceResolution(unittest.TestCase):
             self.assertEqual(workspace["repo_root"], Path(tmpdir).resolve())
             self.assertEqual(workspace["db_path"], Path(tmpdir).resolve() / "kanban-orchestra.db")
 
+    def test_get_instance_identity_uses_launch_repo_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init", "-q"], cwd=tmpdir, check=True)
+            nested = Path(tmpdir) / "a" / "b"
+            nested.mkdir(parents=True)
+            custom_db = Path(tmpdir) / "state" / "custom.sqlite3"
+
+            identity = db.get_instance_identity(str(custom_db), cwd=str(nested))
+
+            self.assertEqual(identity["repo_root"], str(Path(tmpdir).resolve()))
+            self.assertEqual(identity["repo_label"], Path(tmpdir).name)
+            self.assertEqual(identity["db_path"], str(custom_db.resolve()))
+            self.assertEqual(identity["runtime_root"], str((custom_db.parent / ".kanban-orchestra").resolve()))
+            self.assertEqual(identity["lock_path"], str((custom_db.parent / "kanban-orchestra.lock").resolve()))
+
+    def test_get_instance_identity_falls_back_to_db_parent_outside_git(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "kanban.db"
+
+            identity = db.get_instance_identity(str(db_path), cwd=tmpdir)
+
+            self.assertEqual(identity["repo_root"], str(Path(tmpdir).resolve()))
+            self.assertEqual(identity["repo_label"], Path(tmpdir).name)
+
     def test_get_orchestra_dir_uses_env_var(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             orchestra_dir = Path(tmpdir) / "orchestra-src"
@@ -3314,12 +3443,16 @@ class TestSingletonLock(unittest.TestCase):
         contents = self.lock_path.read_text(encoding="utf-8")
         self.assertIn("pid=", contents)
         self.assertIn("started_at=", contents)
+        self.assertIn("role=orchestrator", contents)
+        self.assertIn(f"repo_root={Path(self.tmpdir.name).resolve()}", contents)
+        self.assertIn(f"lock_path={self.lock_path.resolve()}", contents)
 
     def test_second_process_cannot_acquire_while_locked(self):
         orchestrator.acquire_singleton_lock(lock_path=self.lock_path)
         probe = self._run_lock_probe()
         self.assertEqual(probe.returncode, 1)
         self.assertIn("already running", probe.stdout)
+        self.assertIn(str(Path(self.tmpdir.name).resolve()), probe.stdout)
 
     def test_release_allows_another_process_to_acquire(self):
         orchestrator.acquire_singleton_lock(lock_path=self.lock_path)
@@ -3353,6 +3486,46 @@ class TestSingletonLock(unittest.TestCase):
         mock_lock.assert_not_called()
         mock_connect.assert_not_called()
         self.assertTrue(any("dirty" in str(c).lower() for c in mock_log.call_args_list))
+
+
+class TestOrchestratorControlIdentity(unittest.TestCase):
+    """Test repo identity metadata in filesystem-backed control helpers."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "kanban.db")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_write_supervisor_heartbeat_includes_instance_identity(self):
+        orchestrator_control.write_supervisor_heartbeat(db_path=self.db_path)
+
+        heartbeat_path = db.get_runtime_root(self.db_path) / orchestrator_control.SUPERVISOR_HEARTBEAT_FILE
+        payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["repo_root"], str(Path(self.tmpdir.name).resolve()))
+        self.assertEqual(payload["repo_label"], Path(self.tmpdir.name).name)
+        self.assertEqual(payload["db_path"], str(Path(self.db_path).resolve()))
+        self.assertEqual(payload["runtime_root"], str((Path(self.tmpdir.name) / ".kanban-orchestra").resolve()))
+        self.assertEqual(payload["lock_path"], str((Path(self.tmpdir.name) / "kanban-orchestra.lock").resolve()))
+
+    def test_supervisor_status_rejects_heartbeat_for_other_repo(self):
+        heartbeat_path = db.get_runtime_root(self.db_path) / orchestrator_control.SUPERVISOR_HEARTBEAT_FILE
+        heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            **db.get_instance_identity(self.db_path),
+            "repo_root": str((Path(self.tmpdir.name) / "other-repo").resolve()),
+            "pid": os.getpid(),
+            "updated_at": "2026-05-24T00:00:00+00:00",
+        }
+        heartbeat_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        live, reason, read_payload = orchestrator_control.supervisor_status(self.db_path)
+
+        self.assertFalse(live)
+        self.assertIn("different repo", reason)
+        self.assertEqual(read_payload["repo_root"], payload["repo_root"])
 
 
 class TestSupertaskDB(unittest.TestCase):

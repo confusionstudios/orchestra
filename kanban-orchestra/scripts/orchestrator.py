@@ -105,7 +105,7 @@ def _singleton_lock_path(db_path=None, lock_path=None):
     """Resolve the singleton lock file path for the current workspace."""
     if lock_path is not None:
         return Path(lock_path).resolve()
-    return Path(db.get_db_path(db_path)).resolve().with_name("kanban-orchestra.lock")
+    return db.get_lock_path(db_path)
 
 
 def acquire_singleton_lock(db_path=None, lock_path=None):
@@ -120,14 +120,26 @@ def acquire_singleton_lock(db_path=None, lock_path=None):
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
+        metadata = orchestrator_control.read_singleton_lock_metadata(lock_path=path)
+        repo_root = metadata.get("repo_root") or str(path.parent)
+        pid = metadata.get("pid")
+        pid_detail = f" (PID {pid})" if pid else ""
         handle.close()
         raise SingletonLockError(
-            f"Another Kanban orchestrator instance is already running for {path.parent}."
+            f"Another Kanban orchestrator instance is already running for {repo_root}{pid_detail}."
         ) from exc
 
+    identity = db.get_instance_identity(db_path, lock_path=path)
     handle.seek(0)
     handle.truncate()
-    handle.write(f"pid={os.getpid()}\nstarted_at={datetime.now().isoformat()}\n")
+    lock_fields = {
+        "schema_version": "1",
+        "role": "orchestrator",
+        "pid": str(os.getpid()),
+        "started_at": datetime.now().isoformat(),
+        **identity,
+    }
+    handle.write("".join(f"{key}={value}\n" for key, value in lock_fields.items()))
     handle.flush()
     _singleton_lock_handle = handle
     return path

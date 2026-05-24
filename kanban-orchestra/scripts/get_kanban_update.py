@@ -93,6 +93,11 @@ def _format_skips(skips: list[str] | None) -> str:
 
 def build_update(conn) -> str:
     lines = []
+    identity = db.get_instance_identity(db.get_connection_db_path(conn))
+
+    lines.append(f"INSTANCE: {identity['repo_label']}  ({identity['repo_root']})")
+    lines.append(f"  lock: {identity['lock_path']}")
+    lines.append("")
 
     # ── Orchestrator health ──────────────────────────────────────────────
     runtime = db.get_runtime(conn)

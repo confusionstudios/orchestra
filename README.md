@@ -105,28 +105,31 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-sync-skills"
    ```
 
-5. **Start the dashboard** for the work repo:
+5. **Start the orchestrator** from the work repo root and keep it running:
+
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-orchestrator"
+   ```
+
+   For first use, run it in a dedicated terminal. The important part is the
+   launch directory: the orchestrator uses the current git repo as the work
+   repo and stores state there.
+
+   Check status from another terminal or through the Kanban skill:
+
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-get-update"
+   ```
+
+   The dashboard is optional. Start it when you want the local visual interface:
 
    ```bash
    "$ORCHESTRA_DIR/bin/ko-dashboard"
    ```
 
-   Open the local URL it prints in your browser.
-
-   If you loaded the zsh helpers, run these commands from the root of the work
-   repo:
-
-   ```zsh
-   orchestra          # open the process manager TUI
-   orchestra-dashboard
-   orchestra-status
-   orchestra-start
-   orchestra-stop
-   orchestra-break
-   ```
-
-   Short aliases are also provided for frequent use: `odash`, `ostatus`,
-   `ostart`, `ostop`, and `obreak`.
+   If you loaded the zsh helpers, `orchestra` starts the process-manager TUI
+   from the current repo, and `orchestra-dashboard` / `odash` start the
+   dashboard.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:
@@ -150,44 +153,40 @@ From there, everything happens locally: agents write the code, other agents
 review the diff, rejections loop back for another attempt, and approved commits
 land on the branch — all while you're away from your desk.
 
-### Using Codex as the Operator
+### Running The Orchestrator
 
-Codex can own the day-to-day control loop for a work repo without being the
-durable process host. In that model, the work repo owns the state
-(`kanban-orchestra.db`, runtime files, and logs), the orchestrator process runs
-locally from that repo's working directory, and Codex is the interface you use
-to queue tasks, inspect status, restart stale workers, and open the dashboard
-only when you need it.
+The orchestrator is the durable worker. Start it from the root of each work
+repo where you want tasks processed, and keep it alive in whatever way you
+normally keep local development processes alive. The work repo owns the state
+(`kanban-orchestra.db`, runtime files, and logs); the Orchestra checkout only
+provides the tools.
 
-For short experiments, Codex can start the orchestrator as a foreground command
-and monitor it directly. For normal use, a repo-local `nohup` launch is often
-enough: it detaches the orchestrator from the current terminal or Codex command
-while keeping the working directory, database, and logs tied to the work repo.
+For first use, run it directly in a dedicated terminal:
 
 ```bash
 cd /path/to/work-repo
-mkdir -p .kanban-orchestra
-nohup "$ORCHESTRA_DIR/bin/ko-orchestrator" \
-  >> .kanban-orchestra/orchestrator.log 2>&1 &
-echo $! > .kanban-orchestra/orchestrator.pid
+"$ORCHESTRA_DIR/bin/ko-orchestrator"
 ```
 
-Use `launchd` instead when you want the orchestrator to start at login or
-restart automatically after an unexpected exit.
+Codex, Claude, or another agent can still be your operator interface: ask it to
+queue tasks, check status, or start the dashboard when you need to inspect the
+queue visually. It should not be the long-lived process host unless you are
+doing a short experiment and are comfortable with the orchestrator stopping
+when that session ends.
 
-The dashboard is optional in this setup. Start `ko-dashboard` only when you
-want the local visual interface; the orchestrator and SQLite database are the
-durable parts that keep work moving while Codex, the terminal, or the
-dashboard are not open.
+### YOLO Mode and Hardening
 
-### Hardening
+Orchestra delegates work to local AI coding CLIs in their non-interactive
+YOLO-style modes, where the agent can run shell commands without stopping for
+per-command permission prompts. Those agent processes run as your local user.
+If a prompt-injected or misbehaving agent decides to read, change, or
+exfiltrate files, it can reach whatever that user account can reach: SSH keys,
+GitHub credentials, browser state, other repos, private notes, and unrelated
+project files.
 
-Agent commands run as your local user with no sandbox. Always run
-Orchestra under a **separate macOS user account**, an OrbStack/Docker
-container, or a `sandbox-exec` profile. A prompt-injected or
-misbehaving agent can read, modify, or exfiltrate anything your user
-account can access — credentials, SSH keys, other repos, browser
-state. See [SECURITY.md](SECURITY.md) for the full threat model.
+You should always run Orchestra and the agent CLIs under a separate macOS user
+account, an OrbStack/Docker container, or a `sandbox-exec` profile. See
+[SECURITY.md](SECURITY.md) for the full threat model.
 
 ### Tips
 
@@ -240,7 +239,7 @@ blocks rather than continuing through unexpected uncommitted changes.
 Orchestra is not a sandbox or permission boundary. Agent commands run as your
 local user and can read or write any files available to that user. Run
 Orchestra under a dedicated user account or container — see
-[Hardening](#hardening).
+[YOLO Mode and Hardening](#yolo-mode-and-hardening).
 
 Automatic task execution requires non-interactive agent CLI modes. If an agent
 needs a permission prompt for every command, queued work will not complete

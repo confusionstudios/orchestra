@@ -23,6 +23,9 @@ Runs the canonical status wrapper from `$ORCHESTRA_DIR` against the current repo
 
 - `$ORCHESTRA_DIR` must point at the Orchestra checkout root and contain `bin/ko-get-update`
 - The current repo root must contain `kanban-orchestra.db`
+- The current repo root is the Orchestra instance identity; the
+  `kanban-orchestra.lock` metadata and `.kanban-orchestra/` files apply only to
+  that repo.
 
 ## Command
 
@@ -58,7 +61,8 @@ The **ATTENTION** line is the quick answer. Common values:
 
 ## Steps
 
-1. Resolve the repo root with `git rev-parse --show-toplevel`.
+1. Resolve the repo root with `git rev-parse --show-toplevel`; this is the
+   Orchestra instance identity.
 2. If this fails, stop and tell the user they must run from inside a git repo.
 3. Check that `$ORCHESTRA_DIR` is set and that `"$ORCHESTRA_DIR/bin/ko-get-update"` exists. If not, stop and tell the user the Orchestra tooling environment is not configured.
 4. Check that `$(git rev-parse --show-toplevel)/kanban-orchestra.db` exists. If not, stop and tell the user this repo does not have Kanban Orchestra initialized.

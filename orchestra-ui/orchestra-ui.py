@@ -766,6 +766,7 @@ class OrchestraApp(App):
         orchestrator = self._orchestrator_process()
         dashboard = self._dashboard_process()
         return {
+            "instance": kanban_db.get_instance_identity(),
             "supervisor_pid": os.getpid(),
             "orchestrator": {
                 "status": orchestrator.status,
