@@ -26,11 +26,11 @@ printf '%s\n' "$codex_review_help" | rg -- "--uncommitted" >/dev/null &&
 # Claude or Gemini asking Codex to review
 review_out="$(mktemp -t cross-review-codex.XXXXXX)"
 trap 'rm -f "$review_out"' EXIT
-perl -e 'alarm shift; exec @ARGV' 180 codex exec review --uncommitted -o "$review_out" "<review prompt>" || echo "Codex reviewer failed or timed out."
+perl -e 'alarm shift; exec @ARGV' 300 codex exec review --uncommitted -o "$review_out" "<review prompt>" || echo "Codex reviewer failed or timed out."
 cat "$review_out"
 
 # Codex asking Claude to review
-perl -e 'alarm shift; exec @ARGV' 180 claude -p "<review prompt>" --output-format text \
+perl -e 'alarm shift; exec @ARGV' 300 claude -p "<review prompt>" --output-format text \
   --allowedTools "Bash(git status*)" "Bash(git diff*)" "Bash(git log*)" "Bash(git show*)" "Bash(rg *)" Read Glob Grep \
   --disallowedTools Edit Write MultiEdit NotebookEdit
 ```
@@ -39,7 +39,7 @@ The `codex exec review --uncommitted -o` form is supported by the repo's install
 
 If the preferred reviewer CLI is unavailable, report the blocker and do not substitute the same model family as the reviewer unless the user explicitly approves.
 
-The command examples assume a macOS/Linux shell with `perl` and `rg`. If those tools are unavailable, use an equivalent shell-level timeout and help-output check.
+The command examples assume a macOS/Linux shell with `perl` and `rg`. If those tools are unavailable, use an equivalent shell-level timeout and help-output check. Use a longer timeout when the diff is broad, schema-sensitive, or otherwise likely to require deeper context.
 
 The Codex review subcommand gathers staged, unstaged, and untracked changes. Gemini should run the same Codex review command through its shell tool. Neither Codex nor Claude is mechanically prevented from editing files in every environment, so the prompt must explicitly say `Do not edit files`. Prefer read/review-specific CLI modes and deny edit tools where the reviewer CLI supports it.
 
@@ -76,7 +76,7 @@ Add one sentence of task-specific context when it would materially improve the r
 
 ## Guardrails
 
-- Do not let a reviewer process run indefinitely. If it produces no output for 3 minutes, interrupt it and retry once with a tighter prompt or a shell-level timeout.
+- Do not let a reviewer process run indefinitely. If it produces no output for 5 minutes, interrupt it and retry once with a tighter prompt or a longer shell-level timeout for broad or schema-sensitive diffs.
 - Do not commit unless the user asked to commit or the active workflow requires it.
 - Do not stage unrelated files.
 - If reviewer output conflicts with repo policy or user instructions, follow the higher-priority instruction and explain the conflict.
