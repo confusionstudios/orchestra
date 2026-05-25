@@ -430,8 +430,8 @@ def _build_pull_request_reviewer_handoff(task, comments):
 {metadata}
 
 **Your primary job** is to review the PR title and body quality, including whether
-the branch summary accurately reflects the branch against `master`. Do not perform
-implementation code review for this task kind.
+the branch summary accurately reflects the branch against `master`.
+Do not perform implementation code review for this task kind.
 """
 
 

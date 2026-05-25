@@ -176,7 +176,7 @@ def cmd_add(args, conn):
     if parent_task_id is not None:
         if kind != "task":
             print(
-                "Error: only kind='task' is allowed for child tasks",
+                f"Error: child tasks must use kind='task'; got kind='{kind}'",
                 file=sys.stderr,
             )
             sys.exit(1)

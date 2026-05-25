@@ -570,8 +570,8 @@ class TestDB(unittest.TestCase):
         finally:
             os.unlink(tmp.name)
 
-    def test_outdated_next_step_constraint_raises_error(self):
-        """connect() must raise RuntimeError when next_step CHECK lacks 'commit-plan'."""
+    def test_outdated_next_step_constraint_auto_migrates(self):
+        """connect() auto-migrates next_step CHECK constraints."""
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.close()
         try:
@@ -613,12 +613,21 @@ class TestDB(unittest.TestCase):
             legacy.commit()
             legacy.close()
 
-            with self.assertRaises(RuntimeError) as ctx:
-                db.connect(tmp.name)
-            self.assertIn("outdated", str(ctx.exception))
-            self.assertIn("commit-plan", str(ctx.exception))
+            conn = db.connect(tmp.name)
+            try:
+                schema = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+                ).fetchone()[0]
+                self.assertIn("commit-plan", schema)
+                self.assertIn("pull-request-make", schema)
+                self.assertIn("pull_request", schema)
+            finally:
+                conn.close()
         finally:
-            os.unlink(tmp.name)
+            for suffix in ("", "-shm", "-wal"):
+                path = tmp.name + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
 
     def test_stale_comments_schema_missing_plan_kinds_auto_migrates(self):
         """connect() auto-migrates the comments table when kind CHECK is outdated."""
