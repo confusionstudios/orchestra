@@ -57,6 +57,49 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertEqual(dashboard_pid, "-")
             self.assertEqual(session, "-")
 
+    def test_status_prints_dashboard_url_when_metadata_is_live(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "repo_root": str(root),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "tmux_has_session", return_value=False), redirect_stdout(out):
+                fleet.print_status([repo])
+
+            text = out.getvalue()
+            self.assertIn("dash_url", text)
+            self.assertIn("http://127.0.0.1:8427", text)
+
+    def test_status_prints_dash_without_dashboard_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "tmux_has_session", return_value=False), redirect_stdout(out):
+                fleet.print_status([repo])
+
+            lines = out.getvalue().splitlines()
+            self.assertIn("dash_url", lines[0])
+            columns = lines[2].split()
+            self.assertEqual(columns[-2], "-")
+            self.assertEqual(columns[-1], str(root))
+
     def test_start_launches_orchestrator_from_selected_repo_root(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
 

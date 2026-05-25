@@ -230,6 +230,17 @@ def dashboard_endpoint_ready(payload: dict, *, timeout: float = 0.25) -> bool:
         return False
 
 
+def dashboard_status_url(repo: FleetRepo) -> str:
+    payload = read_key_value_or_json(repo.dashboard_metadata_path)
+    url = payload.get("url")
+    if not url or not metadata_matches_repo(payload, repo):
+        return "-"
+    pid = metadata_pid(repo.dashboard_metadata_path, "dashboard", repo)
+    if not pid_alive(pid):
+        return "-"
+    return str(url)
+
+
 def tmux_has_session(session: str) -> bool:
     return subprocess.run(
         ["tmux", "has-session", "-t", session],
@@ -309,7 +320,8 @@ def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
         status, orch_pid, dashboard_pid, session = repo_process_state(repo)
-        rows.append((repo.label, status, orch_pid, dashboard_pid, session, str(repo.root or repo.path)))
+        dashboard_url = dashboard_status_url(repo)
+        rows.append((repo.label, status, orch_pid, dashboard_pid, session, dashboard_url, str(repo.root or repo.path)))
 
     widths = [
         max(len("repo"), *(len(row[0]) for row in rows)),
@@ -317,19 +329,23 @@ def print_status(repos: list[FleetRepo]) -> None:
         max(len("orch"), *(len(row[2]) for row in rows)),
         max(len("dash"), *(len(row[3]) for row in rows)),
         max(len("session"), *(len(row[4]) for row in rows)),
+        max(len("dash_url"), *(len(row[5]) for row in rows)),
     ]
     print(
         f"{'repo':<{widths[0]}}  {'status':<{widths[1]}}  "
-        f"{'orch':>{widths[2]}}  {'dash':>{widths[3]}}  {'session':<{widths[4]}}  root"
+        f"{'orch':>{widths[2]}}  {'dash':>{widths[3]}}  {'session':<{widths[4]}}  "
+        f"{'dash_url':<{widths[5]}}  root"
     )
     print(
         f"{'-' * widths[0]}  {'-' * widths[1]}  "
-        f"{'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  ----"
+        f"{'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  "
+        f"{'-' * widths[5]}  ----"
     )
-    for label, status, orch_pid, dashboard_pid, session, root in rows:
+    for label, status, orch_pid, dashboard_pid, session, dashboard_url, root in rows:
         print(
             f"{label:<{widths[0]}}  {status:<{widths[1]}}  "
-            f"{orch_pid:>{widths[2]}}  {dashboard_pid:>{widths[3]}}  {session:<{widths[4]}}  {root}"
+            f"{orch_pid:>{widths[2]}}  {dashboard_pid:>{widths[3]}}  {session:<{widths[4]}}  "
+            f"{dashboard_url:<{widths[5]}}  {root}"
         )
 
 
