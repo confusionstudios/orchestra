@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-_ko_script="${BASH_SOURCE[0]}"
-while [[ -L "$_ko_script" ]]; do
-  _ko_dir="$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)"
-  _ko_target="$(readlink "$_ko_script")"
-  [[ "$_ko_target" == /* ]] || _ko_target="$_ko_dir/$_ko_target"
-  _ko_script="$_ko_target"
-done
-source "$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)/_ko-common"
 
-echo "ko-ui is deprecated; use ko-orchestrator for the repo instance or ko-fleet for multiple repos." >&2
-exec "$ko_python" "$ORCHESTRA_DIR/orchestra-ui/orchestra-ui.py" "$@"
+echo "ko-ui has been removed. Use ko-orchestrator for this repo, ko-fleet for multiple repos, or ko-get-update for status." >&2
+exit 2

@@ -11,11 +11,6 @@ do something else.
 
 <table>
   <tr>
-    <td colspan="2">
-      <img src="docs/agent-with-kanban-skill-with-orchestrator-dashboard.png" alt="Kanban Agent and Dashboard" width="100%" />
-    </td>
-  </tr>
-  <tr>
     <td width="50%">
       <img src="docs/dashboard1.jpg" alt="Kanban dashboard task overview" width="100%" />
     </td>
@@ -42,12 +37,13 @@ checks, and all wrapper commands.
 
 Everything the orchestrator does is visible. The live dashboard shows active
 tasks, ready and blocked queues, recent completions, and the orchestrator's own
-heartbeat. Each task carries durable comments — reviewer feedback, validation
-results, commit messages — so you can trace every decision without reading
-agent logs. Run logs capture the full session, and control commands let you
-pause, resume, or inspect any task from another terminal or a remote agent
-session. If something stalls or fails, you see it immediately and can
-intervene.
+heartbeat. This dashboard is the real repo-scoped status surface; the old
+process-manager UI has been removed and is not a compatibility path. Each task
+carries durable comments — reviewer feedback, validation results, commit
+messages — so you can trace every decision without reading agent logs. Run logs
+capture the full session, and CLI commands let you inspect or update any task
+from another terminal or a remote agent session. If something stalls or fails,
+you see it immediately and can intervene.
 
 ## Supported Agents
 
@@ -123,19 +119,26 @@ accounts, or billing — install and authenticate each CLI yourself.
 
    The dashboard is attached to that same repo instance. If you loaded the zsh
    helpers, `orchestra` starts the orchestrator/dashboard pair from the current
-   repo root. `orchestra-dashboard` / `odash` remains only as a compatibility
-   shortcut for ad-hoc dashboard inspection.
+   repo root. `orchestra-dashboard` / `odash` opens only that per-repo
+   dashboard; it does not start or replace the removed process-manager UI.
 
    For multiple repos, create a private fleet list:
 
    ```bash
    "$ORCHESTRA_DIR/bin/ko-fleet" init
    "$ORCHESTRA_DIR/bin/ko-fleet" add .
+   "$ORCHESTRA_DIR/bin/ko-fleet" status
    "$ORCHESTRA_DIR/bin/ko-fleet" start
    ```
 
    The fleet config is `~/.config/orchestra/fleet.repos`: one git repo root per
    line, with blank lines and `#` comments allowed.
+   `ko-fleet stop`, `restart`, `attach`, `logs`, and `dashboard` operate on the
+   selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
+   for opening the repo dashboard. The removed process-manager `BREAK` control
+   has no remote replacement; stop or interrupt the repo instance, inspect with
+   `ko-get-update`, update the affected task with `ko-task`, and restart
+   explicitly.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:

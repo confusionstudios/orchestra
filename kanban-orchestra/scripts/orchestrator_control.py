@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Filesystem-backed control helpers for the orchestra-ui supervisor."""
+"""Deprecated filesystem-backed control helpers for the orchestra-ui supervisor."""
 
 import json
 import os
-import signal
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,7 +18,6 @@ import db
 REQUEST_FILE = "orchestrator-control-request.json"
 RESPONSE_FILE = "orchestrator-control-response.json"
 SUPERVISOR_HEARTBEAT_FILE = "orchestra-ui-supervisor.json"
-ACTIVE_AGENTS_FILE = "active-agent-processes.json"
 CONTROL_COMMANDS = {"status", "start", "stop", "break"}
 SUPERVISOR_STALE_SECONDS = 20.0
 PENDING_REQUEST_STALE_SECONDS = 30.0
@@ -40,7 +38,6 @@ def _paths(db_path: str | None = None) -> dict[str, Path]:
         "request": root / REQUEST_FILE,
         "response": root / RESPONSE_FILE,
         "supervisor": root / SUPERVISOR_HEARTBEAT_FILE,
-        "active_agents": root / ACTIVE_AGENTS_FILE,
         "stop_after_task": Path(db.get_db_path(db_path)).resolve().parent / config.STOP_AFTER_TASK_FILE,
     }
 
@@ -232,123 +229,6 @@ def submit_control_command(
     if current and current.get("id") == request_id:
         clear_control_request(db_path)
     raise ControlError(f"Timed out waiting for orchestra-ui supervisor response to {command}.")
-
-
-def _read_active_agents(db_path: str | None = None) -> list[dict[str, Any]]:
-    payload = _read_json(_paths(db_path)["active_agents"])
-    if not payload:
-        return []
-    records = payload.get("agents", [])
-    return records if isinstance(records, list) else []
-
-
-def _write_active_agents(records: list[dict[str, Any]], db_path: str | None = None) -> None:
-    path = _paths(db_path)["active_agents"]
-    live_records = [record for record in records if is_pid_alive(_coerce_int(record.get("pid")))]
-    if not live_records:
-        _safe_unlink(path)
-        return
-    _atomic_write_json(
-        path,
-        {
-            "updated_at": _now_iso(),
-            "agents": live_records,
-        },
-    )
-
-
-def register_active_agent(
-    *,
-    task_id: int,
-    verb: str,
-    agent_name: str,
-    pid: int,
-    db_path: str | None = None,
-) -> str:
-    """Record an active agent process so STOP/BREAK can terminate it by process group."""
-    pid_value = _coerce_int(pid)
-    if pid_value is None:
-        return ""
-    pid = pid_value
-    record_id = f"{task_id}:{verb}:{agent_name}:{pid}"
-    try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        pgid = pid
-    records = [
-        record for record in _read_active_agents(db_path)
-        if record.get("id") != record_id and is_pid_alive(_coerce_int(record.get("pid")))
-    ]
-    records.append(
-        {
-            "id": record_id,
-            "task_id": task_id,
-            "verb": verb,
-            "agent_name": agent_name,
-            "pid": pid,
-            "pgid": pgid,
-            "started_at": _now_iso(),
-        }
-    )
-    _write_active_agents(records, db_path)
-    return record_id
-
-
-def clear_active_agent(record_id: str | None = None, *, pid: int | None = None, db_path: str | None = None) -> None:
-    records = _read_active_agents(db_path)
-    if record_id is None and pid is None:
-        _write_active_agents([], db_path)
-        return
-    kept = []
-    for record in records:
-        if record_id is not None and record.get("id") == record_id:
-            continue
-        if pid is not None and _coerce_int(record.get("pid")) == pid:
-            continue
-        kept.append(record)
-    _write_active_agents(kept, db_path)
-
-
-def kill_active_agents(db_path: str | None = None, *, timeout: float = 2.0) -> list[dict[str, Any]]:
-    """Terminate recorded active agent process groups and clear the metadata file."""
-    records = _read_active_agents(db_path)
-    killed = []
-    current_pgid = os.getpgrp()
-    for record in records:
-        pid = _coerce_int(record.get("pid"))
-        pgid = _coerce_int(record.get("pgid")) or pid
-        if not pid or not is_pid_alive(pid):
-            continue
-        try:
-            if pgid and pgid != current_pgid:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                os.kill(pid, signal.SIGTERM)
-            killed.append(record)
-        except (ProcessLookupError, PermissionError):
-            continue
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if all(not is_pid_alive(_coerce_int(record.get("pid"))) for record in killed):
-            break
-        time.sleep(0.05)
-
-    for record in killed:
-        pid = _coerce_int(record.get("pid"))
-        pgid = _coerce_int(record.get("pgid")) or pid
-        if not pid or not is_pid_alive(pid):
-            continue
-        try:
-            if pgid and pgid != current_pgid:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    clear_active_agent(db_path=db_path)
-    return killed
 
 
 def remove_stop_after_task_marker(db_path: str | None = None) -> bool:

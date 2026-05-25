@@ -101,9 +101,27 @@ def _read_key_value_or_json(path: Path) -> dict:
         return payload
 
 
-def _metadata_pid(path: Path, role: str) -> int | None:
+def _metadata_matches_identity(payload: dict, identity: dict | None) -> bool:
+    if identity is None:
+        return True
+    for key in ("repo_root", "db_path", "runtime_root", "lock_path"):
+        expected = identity.get(key)
+        actual = payload.get(key)
+        if not expected or not actual:
+            continue
+        try:
+            if Path(str(actual)).expanduser().resolve() != Path(str(expected)).expanduser().resolve():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _metadata_pid(path: Path, role: str, identity: dict | None = None) -> int | None:
     payload = _read_key_value_or_json(path)
     if payload.get("role") != role:
+        return None
+    if not _metadata_matches_identity(payload, identity):
         return None
     try:
         return int(payload["pid"])
@@ -118,7 +136,7 @@ def _kanban_pids(identity: dict) -> list[tuple[int, str]]:
         (Path(identity["lock_path"]), "orchestrator"),
         (Path(identity["runtime_root"]) / "dashboard.json", "dashboard"),
     ):
-        pid = _metadata_pid(path, role)
+        pid = _metadata_pid(path, role, identity)
         if _pid_alive(pid):
             results.append((pid, role))
     return results

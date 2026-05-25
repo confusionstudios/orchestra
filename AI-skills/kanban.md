@@ -171,6 +171,10 @@ Use status commands and repo-local metadata instead of PID hunting:
 "$ORCHESTRA_DIR/bin/ko-fleet" precheck
 "$ORCHESTRA_DIR/bin/ko-fleet" start
 "$ORCHESTRA_DIR/bin/ko-fleet" stop <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" restart <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" attach <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" logs <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
 Fleet config lives at `~/.config/orchestra/fleet.repos` by default. It is a
@@ -191,10 +195,14 @@ detection, deletes the file, and exits.
 
 Notes:
 - Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
+- Use `ko-fleet dashboard-open <repo-label>` when a script wants an explicit
+  open verb; it is an alias for `dashboard`.
 - The dashboard chooses a free port at runtime and records it in
   `.kanban-orchestra/dashboard.json`.
-- `ko-ui` is deprecated process-manager compatibility; do not use it for new
-  workflows.
+- The dashboard is the repo-scoped read-only status surface. The old
+  process-manager UI and its `BREAK` command have been removed; stop or
+  interrupt the repo instance, inspect with `ko-get-update`, use `ko-task` to
+  record or unblock the affected task, and restart explicitly.
 
 ## Default operating pattern
 
@@ -258,8 +266,8 @@ Read the result like this:
   waiting for an agent ping acknowledgment and retries every 60 seconds.
 - An old `last_heartbeat_at` means stale or dead.
 - `status = stopped` means the supervised orchestrator was stopped or paused.
-- `status = hard-break` means BREAK cleared stale active runtime fields; check
-  the blocked task comment and worktree before restarting.
+- `status = hard-break` means an emergency interruption state was recorded;
+  check the blocked task comment and worktree before restarting.
 - `status = error` means an orchestrator-level failure.
 - List blocked tasks with `task list --status blocked`.
 

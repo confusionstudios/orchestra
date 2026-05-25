@@ -4,5 +4,4 @@ markdown-it-py
 pytest
 pytest-cov
 rich
-textual
 uvicorn

@@ -61,11 +61,6 @@ orchestra() {
   _orchestra_run_from_git_root ko-orchestrator "$@"
 }
 
-orchestra-ui() {
-  print -u2 "orchestra-ui is deprecated; use 'orchestra' for the repo orchestrator/dashboard instance."
-  _orchestra_run_from_git_root ko-ui "$@"
-}
-
 orchestra-dashboard() {
   _orchestra_run_from_git_root ko-dashboard "$@"
 }
@@ -88,18 +83,15 @@ orchestra-start() {
 }
 
 orchestra-stop() {
-  print -u2 "orchestra-stop is deprecated; stop the foreground orchestrator with Ctrl-C, touch kanban-orchestra.ko-stop-after-task in the repo, or use 'orchestra-fleet stop <repo>'."
+  print -u2 "orchestra-stop is deprecated; stop the foreground orchestrator with Ctrl-C, touch KANBAN_ORCHESTRATOR_STOP_AFTER_TASK in the repo, or use 'orchestra-fleet stop <repo>'."
   return 2
 }
 
 orchestra-break() {
-  print -u2 "orchestra-break is deprecated with the process-manager UI; inspect the blocked task and use ko-task directly."
+  print -u2 "orchestra-break was removed with the process-manager UI; inspect the blocked task and use ko-task directly."
   return 2
 }
 
 alias odash='orchestra-dashboard'
 alias ofleet='orchestra-fleet'
 alias ostatus='orchestra-status'
-alias ostart='orchestra-start'
-alias ostop='orchestra-stop'
-alias obreak='orchestra-break'

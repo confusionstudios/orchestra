@@ -39,6 +39,11 @@ def _load_local_module(alias, filename, canonical_name=None):
 
 
 db = _load_local_module("kanban_test_db", "db.py", canonical_name="db")
+active_agent_processes = _load_local_module(
+    "kanban_test_active_agent_processes",
+    "active_agent_processes.py",
+    canonical_name="active_agent_processes",
+)
 orchestrator_control = _load_local_module("kanban_test_orchestrator_control", "orchestrator_control.py", canonical_name="orchestrator_control")
 orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
 config = _load_local_module("kanban_test_config", "config.py")
@@ -2469,8 +2474,8 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         with patch.dict(orchestrator.AGENT_CMD, {"codex": ["codex", "{prompt}"]}, clear=False), \
              patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc), \
              patch.object(orchestrator.db, "get_db_path", return_value=self.db_path), \
-             patch.object(orchestrator.orchestrator_control, "register_active_agent", return_value="rec-1") as mock_register, \
-             patch.object(orchestrator.orchestrator_control, "clear_active_agent") as mock_clear:
+             patch.object(orchestrator.active_agent_processes, "register_active_agent", return_value="rec-1") as mock_register, \
+             patch.object(orchestrator.active_agent_processes, "clear_active_agent") as mock_clear:
             exit_code = orchestrator.run_agent(
                 "codex",
                 "prompt body",
@@ -3669,6 +3674,40 @@ class TestOrchestratorControlIdentity(unittest.TestCase):
         self.assertFalse(live)
         self.assertIn("different repo", reason)
         self.assertEqual(read_payload["repo_root"], payload["repo_root"])
+
+
+class TestActiveAgentProcesses(unittest.TestCase):
+    """Test runtime metadata for active agent child processes."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "kanban.db")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_register_and_clear_active_agent_metadata(self):
+        with patch.object(active_agent_processes, "is_pid_alive", return_value=True), \
+             patch.object(active_agent_processes.os, "getpgid", return_value=4242):
+            record_id = active_agent_processes.register_active_agent(
+                task_id=123,
+                verb="commit-make",
+                agent_name="codex",
+                pid=4242,
+                db_path=self.db_path,
+            )
+
+        metadata_path = db.get_runtime_root(self.db_path) / active_agent_processes.ACTIVE_AGENTS_FILE
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record_id, "123:commit-make:codex:4242")
+        self.assertEqual(payload["agents"][0]["id"], record_id)
+        self.assertEqual(payload["agents"][0]["task_id"], 123)
+        self.assertEqual(payload["agents"][0]["agent_name"], "codex")
+
+        active_agent_processes.clear_active_agent(record_id, db_path=self.db_path)
+
+        self.assertFalse(metadata_path.exists())
 
 
 class TestFleetConfig(unittest.TestCase):

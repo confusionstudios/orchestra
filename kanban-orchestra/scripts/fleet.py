@@ -189,9 +189,24 @@ def read_key_value_or_json(path: Path | None) -> dict:
         return payload
 
 
-def metadata_pid(path: Path | None, role: str) -> int | None:
+def metadata_matches_repo(payload: dict, repo: FleetRepo) -> bool:
+    """Return whether runtime metadata belongs to the selected repo instance."""
+    if repo.root is None:
+        return False
+    repo_root = payload.get("repo_root")
+    if not repo_root:
+        return True
+    try:
+        return Path(str(repo_root)).expanduser().resolve() == repo.root.resolve()
+    except OSError:
+        return False
+
+
+def metadata_pid(path: Path | None, role: str, repo: FleetRepo | None = None) -> int | None:
     payload = read_key_value_or_json(path)
     if payload.get("role") != role:
+        return None
+    if repo is not None and not metadata_matches_repo(payload, repo):
         return None
     try:
         return int(payload["pid"])
@@ -228,8 +243,8 @@ def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
         return "invalid", "-", "-", repo.error
 
     session_alive = tmux_has_session(repo.session)
-    orch_pid = metadata_pid(repo.lock_path, "orchestrator")
-    dashboard_pid = metadata_pid(repo.dashboard_metadata_path, "dashboard")
+    orch_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
+    dashboard_pid = metadata_pid(repo.dashboard_metadata_path, "dashboard", repo)
     orch_alive = pid_alive(orch_pid)
     dashboard_alive = pid_alive(dashboard_pid)
 
@@ -412,7 +427,7 @@ def wait_stopped(repos: list[FleetRepo], *, timeout: float = 12.0) -> None:
         for repo in repos:
             if repo.error:
                 continue
-            orch_pid = metadata_pid(repo.lock_path, "orchestrator")
+            orch_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
             if pid_alive(orch_pid):
                 running.append((repo, orch_pid))
         if not running:
@@ -452,7 +467,9 @@ def open_dashboard(repo: FleetRepo) -> None:
     url = payload.get("url")
     if not url:
         die(f"no dashboard metadata found for {repo.label}")
-    pid = metadata_pid(repo.dashboard_metadata_path, "dashboard")
+    if not metadata_matches_repo(payload, repo):
+        die(f"dashboard metadata belongs to a different repo for {repo.label}")
+    pid = metadata_pid(repo.dashboard_metadata_path, "dashboard", repo)
     if not pid_alive(pid):
         die(f"dashboard is not running for {repo.label}")
     if not dashboard_endpoint_ready(payload):
@@ -530,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name)
         p.add_argument("repos", nargs="*", help="optional repo labels or paths")
 
-    for name in ("attach", "logs", "dashboard"):
+    for name in ("attach", "logs", "dashboard", "dashboard-open"):
         p = sub.add_parser(name)
         p.add_argument("repo", nargs=1, help="repo label or path")
 
@@ -569,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
         attach(one_repo(args.repo))
     elif args.command == "logs":
         logs(one_repo(args.repo))
-    elif args.command == "dashboard":
+    elif args.command in {"dashboard", "dashboard-open"}:
         open_dashboard(one_repo(args.repo))
     elif args.command == "init":
         init_config()

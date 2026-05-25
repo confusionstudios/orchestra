@@ -29,6 +29,7 @@ import db
 import config
 import repo_policy
 import orchestrator_control
+import active_agent_processes
 
 # Import shared agent config from the orchestra repo
 ORCHESTRA_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -603,7 +604,7 @@ def ping_agent(agent_name, task_id):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=0, start_new_session=True, cwd=proc_cwd,
         )
-        active_record_id = orchestrator_control.register_active_agent(
+        active_record_id = active_agent_processes.register_active_agent(
             task_id=task_id,
             verb="ping",
             agent_name=agent_name,
@@ -638,7 +639,7 @@ def ping_agent(agent_name, task_id):
         pass
     proc.wait()
     if active_record_id:
-        orchestrator_control.clear_active_agent(active_record_id, db_path=db.get_db_path())
+        active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
 
     if acked:
         log(f"Pre-flight ping: {agent_name} responded — proceeding with task {task_id}", task_id)
@@ -742,7 +743,7 @@ def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_r
         launch_message += f". Transcript: {transcript_path}"
     db.add_run_log(conn, task_id, launch_message, verb=verb, author="orchestrator")
 
-    active_record_id = orchestrator_control.register_active_agent(
+    active_record_id = active_agent_processes.register_active_agent(
         task_id=task_id,
         verb=verb,
         agent_name=agent_name,
@@ -792,7 +793,7 @@ def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_r
             pass
         proc.wait()
         if active_record_id:
-            orchestrator_control.clear_active_agent(active_record_id, db_path=db.get_db_path())
+            active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
         cancel_message = f"{agent_name} cancelled during {verb}"
         if transcript_path is not None:
             cancel_message += f". Partial transcript: {transcript_path}"
@@ -801,7 +802,7 @@ def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_r
 
     proc.wait()
     if active_record_id:
-        orchestrator_control.clear_active_agent(active_record_id, db_path=db.get_db_path())
+        active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
     log(f"{agent_name} exited with code {proc.returncode}", task_id)
     tail_summary = _summarize_transcript_tail(transcript_tail)
     if proc.returncode == 0:

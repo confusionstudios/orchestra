@@ -55,7 +55,7 @@ The **ATTENTION** line is the quick answer. Common values:
 - `orchestrator is in error state — investigate: <message>` — read the message and fix
 - `orchestrator is starting — wait for runtime to become idle or running` — startup was requested through a launcher
 - `orchestrator is stopped but N task(s) are ready — restart the orchestrator` — restart to resume work
-- `hard BREAK completed — inspect blocked task/worktree before restarting` — emergency break completed and needs human review
+- `hard-break state recorded — inspect blocked task/worktree before restarting` — emergency interruption state needs human review
 - `N task(s) are blocked — review and unblock them` — inspect blocked tasks and resolve
 - `queue is empty and orchestrator is idle — add tasks when ready` — pipeline is waiting for new work
 

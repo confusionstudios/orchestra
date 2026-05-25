@@ -4,6 +4,7 @@ Tests for get_kanban_update.py.
 """
 
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -125,3 +126,45 @@ class TestBuildUpdate(unittest.TestCase):
 
         self.assertIn("ORCHESTRATOR: stale", update)
         self.assertIn("orchestrator heartbeat is stale", update)
+
+    def test_process_pids_ignore_metadata_for_other_repo_identity(self):
+        identity = db.get_instance_identity(self.db_path)
+        lock_path = Path(identity["lock_path"])
+        lock_path.write_text(
+            "\n".join(
+                [
+                    "role=orchestrator",
+                    f"pid={os.getpid()}",
+                    f"repo_root={lock_path.parent / 'other-repo'}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        dashboard_path = Path(identity["runtime_root"]) / "dashboard.json"
+        dashboard_path.parent.mkdir(parents=True, exist_ok=True)
+        dashboard_path.write_text(
+            json.dumps(
+                {
+                    "role": "dashboard",
+                    "pid": os.getpid(),
+                    "repo_root": str(lock_path.parent / "other-repo"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        db.upsert_runtime(
+            self.conn,
+            status="idle",
+            pid=os.getpid(),
+            started_at=None,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            current_task_id=None,
+            current_step="none",
+            active_agents=0,
+            status_message="idle",
+        )
+
+        update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn("processes: none found", update)
