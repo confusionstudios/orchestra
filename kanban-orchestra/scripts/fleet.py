@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""Manage Orchestra instances for a private list of work repositories."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
+DEFAULT_CONFIG_PATH = Path("~/.config/orchestra/fleet.repos").expanduser()
+
+
+@dataclass(frozen=True)
+class FleetRepo:
+    label: str
+    path: Path
+    root: Path | None
+    error: str | None = None
+
+    @property
+    def session(self) -> str:
+        return f"orch-{self.label}"
+
+    @property
+    def lock_path(self) -> Path | None:
+        if self.root is None:
+            return None
+        return self.root / "kanban-orchestra.lock"
+
+    @property
+    def runtime_root(self) -> Path | None:
+        if self.root is None:
+            return None
+        return self.root / ".kanban-orchestra"
+
+    @property
+    def log_path(self) -> Path | None:
+        if self.runtime_root is None:
+            return None
+        return self.runtime_root / "orchestrator.log"
+
+    @property
+    def dashboard_metadata_path(self) -> Path | None:
+        if self.runtime_root is None:
+            return None
+        return self.runtime_root / "dashboard.json"
+
+
+def config_path() -> Path:
+    return Path(os.environ.get("ORCHESTRA_FLEET_REPOS", DEFAULT_CONFIG_PATH)).expanduser()
+
+
+def run(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"ko-fleet: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        die(f"required tool not found on PATH: {name}")
+
+
+def orchestra_bin(name: str) -> Path:
+    path = ORCHESTRA_ROOT / "bin" / name
+    if not path.exists():
+        die(f"expected executable not found: {path}")
+    if not os.access(path, os.X_OK):
+        die(f"expected executable is not executable: {path}")
+    return path
+
+
+def label_for(path: Path) -> str:
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", path.name).strip("-")
+    return label or "repo"
+
+
+def parse_config_lines(text: str) -> list[str]:
+    paths: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        paths.append(line)
+    return paths
+
+
+def expand_repo_path(raw_path: str) -> Path:
+    return Path(os.path.expandvars(raw_path)).expanduser()
+
+
+def discover_repo(raw_path: str) -> FleetRepo:
+    path = expand_repo_path(raw_path)
+    label = label_for(path)
+    if not path.exists():
+        return FleetRepo(label, path, None, "path does not exist")
+    if not path.is_dir():
+        return FleetRepo(label, path, None, "path is not a directory")
+
+    result = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+    if result.returncode != 0:
+        return FleetRepo(label, path, None, "not inside a git repo")
+
+    root = Path(result.stdout.strip()).resolve()
+    physical_path = path.resolve()
+    label = label_for(root)
+    if physical_path != root:
+        return FleetRepo(label, physical_path, root, f"configured path is not the git root: {root}")
+    return FleetRepo(label, physical_path, root)
+
+
+def load_repos() -> list[FleetRepo]:
+    path = config_path()
+    if not path.exists():
+        die(f"fleet config not found: {path}\nRun `ko-fleet init` or `ko-fleet add .`.")
+    return [discover_repo(raw) for raw in parse_config_lines(path.read_text(encoding="utf-8"))]
+
+
+def repo_matches(repo: FleetRepo, query: str) -> bool:
+    return query in {repo.label, repo.path.name, str(repo.path), str(repo.root or "")}
+
+
+def select_repos(queries: list[str]) -> list[FleetRepo]:
+    repos = load_repos()
+    if not queries:
+        return repos
+
+    selected: list[FleetRepo] = []
+    unmatched: list[str] = []
+    for query in queries:
+        matches = [repo for repo in repos if repo_matches(repo, query)]
+        if not matches:
+            unmatched.append(query)
+            continue
+        for repo in matches:
+            if repo not in selected:
+                selected.append(repo)
+    if unmatched:
+        die(f"unknown repo selector(s): {', '.join(unmatched)}")
+    return selected
+
+
+def pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_key_value_or_json(path: Path | None) -> dict:
+    if path is None or not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        payload = {}
+        for line in text.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                payload[key.strip()] = value.strip()
+        return payload
+
+
+def metadata_pid(path: Path | None, role: str) -> int | None:
+    payload = read_key_value_or_json(path)
+    if payload.get("role") != role:
+        return None
+    try:
+        return int(payload["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def dashboard_endpoint_ready(payload: dict, *, timeout: float = 0.25) -> bool:
+    host = payload.get("host")
+    port = payload.get("port")
+    if not host or port is None:
+        return False
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.create_connection((str(host), port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def tmux_has_session(session: str) -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
+    if repo.error:
+        return "invalid", "-", "-", repo.error
+
+    session_alive = tmux_has_session(repo.session)
+    orch_pid = metadata_pid(repo.lock_path, "orchestrator")
+    dashboard_pid = metadata_pid(repo.dashboard_metadata_path, "dashboard")
+    orch_alive = pid_alive(orch_pid)
+    dashboard_alive = pid_alive(dashboard_pid)
+
+    if session_alive and orch_alive and dashboard_alive:
+        status = "running"
+    elif session_alive and orch_alive:
+        status = "no-dashboard"
+    elif session_alive:
+        status = "session-only"
+    elif orch_alive:
+        status = "running-external"
+    else:
+        status = "stopped"
+
+    return (
+        status,
+        str(orch_pid) if orch_pid is not None else "-",
+        str(dashboard_pid) if dashboard_pid is not None else "-",
+        repo.session if session_alive else "-",
+    )
+
+
+def dirty_lines(repo: FleetRepo) -> list[str]:
+    if repo.root is None:
+        return []
+    result = run(["git", "-C", str(repo.root), "status", "--porcelain", "--untracked-files=normal"])
+    if result.returncode != 0:
+        return [f"?? could not read git status: {result.stderr.strip()}"]
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def invalid_repos(repos: list[FleetRepo]) -> list[FleetRepo]:
+    return [repo for repo in repos if repo.error]
+
+
+def require_startable(repos: list[FleetRepo]) -> None:
+    invalid = invalid_repos(repos)
+    dirty = []
+    for repo in repos:
+        if repo.error:
+            continue
+        lines = dirty_lines(repo)
+        if lines:
+            dirty.append((repo, lines))
+    if not invalid and not dirty:
+        return
+
+    print("Fleet precheck failed; not starting anything.", file=sys.stderr)
+    for repo in invalid:
+        print(f"\n{repo.label}: {repo.path}", file=sys.stderr)
+        print(f"  {repo.error}", file=sys.stderr)
+    for repo, lines in dirty:
+        print(f"\n{repo.label}: {repo.root}", file=sys.stderr)
+        for line in lines[:12]:
+            print(f"  {line}", file=sys.stderr)
+        if len(lines) > 12:
+            print(f"  ... {len(lines) - 12} more", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def print_status(repos: list[FleetRepo]) -> None:
+    rows = []
+    for repo in repos:
+        status, orch_pid, dashboard_pid, session = repo_process_state(repo)
+        rows.append((repo.label, status, orch_pid, dashboard_pid, session, str(repo.root or repo.path)))
+
+    widths = [
+        max(len("repo"), *(len(row[0]) for row in rows)),
+        max(len("status"), *(len(row[1]) for row in rows)),
+        max(len("orch"), *(len(row[2]) for row in rows)),
+        max(len("dash"), *(len(row[3]) for row in rows)),
+        max(len("session"), *(len(row[4]) for row in rows)),
+    ]
+    print(
+        f"{'repo':<{widths[0]}}  {'status':<{widths[1]}}  "
+        f"{'orch':>{widths[2]}}  {'dash':>{widths[3]}}  {'session':<{widths[4]}}  root"
+    )
+    print(
+        f"{'-' * widths[0]}  {'-' * widths[1]}  "
+        f"{'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  ----"
+    )
+    for label, status, orch_pid, dashboard_pid, session, root in rows:
+        print(
+            f"{label:<{widths[0]}}  {status:<{widths[1]}}  "
+            f"{orch_pid:>{widths[2]}}  {dashboard_pid:>{widths[3]}}  {session:<{widths[4]}}  {root}"
+        )
+
+
+def precheck(repos: list[FleetRepo]) -> int:
+    rows = []
+    dirty = []
+    exit_code = 0
+    for repo in repos:
+        if repo.error:
+            rows.append((repo.label, "invalid", "-", repo.error))
+            exit_code = 1
+            continue
+        lines = dirty_lines(repo)
+        if lines:
+            rows.append((repo.label, "dirty", str(len(lines)), str(repo.root)))
+            dirty.append((repo, lines))
+            exit_code = 1
+        else:
+            rows.append((repo.label, "clean", "0", str(repo.root)))
+
+    widths = [
+        max(len("repo"), *(len(row[0]) for row in rows)),
+        max(len("state"), *(len(row[1]) for row in rows)),
+        max(len("dirty"), *(len(row[2]) for row in rows)),
+    ]
+    print(f"{'repo':<{widths[0]}}  {'state':<{widths[1]}}  {'dirty':>{widths[2]}}  root/error")
+    print(f"{'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}  ----------")
+    for label, state, dirty_count, detail in rows:
+        print(f"{label:<{widths[0]}}  {state:<{widths[1]}}  {dirty_count:>{widths[2]}}  {detail}")
+
+    if dirty:
+        print("\nDirty details:")
+        for repo, lines in dirty:
+            print(f"\n{repo.label}: {repo.root}")
+            for line in lines[:12]:
+                print(f"  {line}")
+            if len(lines) > 12:
+                print(f"  ... {len(lines) - 12} more")
+    return exit_code
+
+
+def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
+    require_tool("tmux")
+    if precheck:
+        require_startable(repos)
+    orchestrator = orchestra_bin("ko-orchestrator")
+    for repo in repos:
+        if repo.root is None:
+            die(f"{repo.label}: invalid config ({repo.error or 'missing git root'})")
+        status, orch_pid, _, session = repo_process_state(repo)
+        if status in {"running", "no-dashboard", "running-external"}:
+            print(f"{repo.label}: already running (orchestrator {orch_pid})")
+            continue
+        if status == "session-only":
+            print(f"{repo.label}: tmux session already exists without a live orchestrator ({session})")
+            continue
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root), str(orchestrator)],
+            check=True,
+        )
+        print(f"{repo.label}: started ({repo.session})")
+    time.sleep(0.5)
+    print()
+    print_status(repos)
+
+
+def stop(repos: list[FleetRepo]) -> None:
+    require_tool("tmux")
+    invalid = invalid_repos(repos)
+    if invalid:
+        for repo in invalid:
+            print(f"{repo.label}: invalid config ({repo.error})")
+        raise SystemExit(1)
+    for repo in repos:
+        if tmux_has_session(repo.session):
+            subprocess.run(["tmux", "send-keys", "-t", repo.session, "C-c"], check=False)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and tmux_has_session(repo.session):
+                time.sleep(0.1)
+            if tmux_has_session(repo.session):
+                subprocess.run(["tmux", "kill-session", "-t", repo.session], check=False)
+            print(f"{repo.label}: stopped tmux session")
+        else:
+            status, orch_pid, _, _ = repo_process_state(repo)
+            if status == "running-external":
+                print(f"{repo.label}: running outside fleet tmux session (orchestrator {orch_pid}); left alone")
+            else:
+                print(f"{repo.label}: not running")
+
+
+def wait_stopped(repos: list[FleetRepo], *, timeout: float = 12.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        running = []
+        for repo in repos:
+            if repo.error:
+                continue
+            orch_pid = metadata_pid(repo.lock_path, "orchestrator")
+            if pid_alive(orch_pid):
+                running.append((repo, orch_pid))
+        if not running:
+            return
+        if time.monotonic() >= deadline:
+            labels = ", ".join(f"{repo.label} ({pid})" for repo, pid in running)
+            die(f"timed out waiting for orchestrator shutdown: {labels}")
+        time.sleep(0.2)
+
+
+def one_repo(queries: list[str]) -> FleetRepo:
+    if len(queries) != 1:
+        die("this command requires exactly one repo label or path")
+    repos = select_repos(queries)
+    if len(repos) != 1:
+        die("selector matched more than one repo")
+    if repos[0].error:
+        die(f"{repos[0].label}: {repos[0].error}")
+    return repos[0]
+
+
+def attach(repo: FleetRepo) -> None:
+    require_tool("tmux")
+    if not tmux_has_session(repo.session):
+        die(f"no fleet tmux session for {repo.label}")
+    os.execvp("tmux", ["tmux", "attach", "-t", repo.session])
+
+
+def logs(repo: FleetRepo) -> None:
+    if repo.log_path is None or not repo.log_path.exists():
+        die(f"no orchestrator log found for {repo.label}: {repo.log_path}")
+    os.execvp("tail", ["tail", "-f", str(repo.log_path)])
+
+
+def open_dashboard(repo: FleetRepo) -> None:
+    payload = read_key_value_or_json(repo.dashboard_metadata_path)
+    url = payload.get("url")
+    if not url:
+        die(f"no dashboard metadata found for {repo.label}")
+    pid = metadata_pid(repo.dashboard_metadata_path, "dashboard")
+    if not pid_alive(pid):
+        die(f"dashboard is not running for {repo.label}")
+    if not dashboard_endpoint_ready(payload):
+        die(f"dashboard is not accepting connections for {repo.label}: {url}")
+    if sys.platform == "darwin" and shutil.which("open"):
+        subprocess.run(["open", url], check=False)
+    print(url)
+
+
+def init_config() -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        die(f"config already exists: {path}")
+    path.write_text(
+        "# One git repo root per line. Blank lines and # comments are ignored.\n"
+        "# ~/Documents/work/my-repo\n",
+        encoding="utf-8",
+    )
+    print(path)
+
+
+def repo_root_for_add(raw_path: str) -> Path:
+    path = expand_repo_path(raw_path)
+    result = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+    if result.returncode != 0:
+        die(f"not inside a git repo: {path}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def add_repo(raw_path: str) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = repo_root_for_add(raw_path)
+    existing = []
+    if path.exists():
+        existing = [discover_repo(raw).root for raw in parse_config_lines(path.read_text(encoding="utf-8"))]
+    if root in existing:
+        print(f"already present: {root}")
+        return
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{root}\n")
+    print(f"added: {root}")
+
+
+def remove_repo(selector: str) -> None:
+    path = config_path()
+    if not path.exists():
+        die(f"fleet config not found: {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept: list[str] = []
+    removed: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(line)
+            continue
+        repo = discover_repo(stripped)
+        if repo_matches(repo, selector):
+            removed.append(str(repo.root or repo.path))
+        else:
+            kept.append(line)
+    if not removed:
+        die(f"no repo matched: {selector}")
+    path.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+    for item in removed:
+        print(f"removed: {item}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command")
+
+    for name in ("status", "precheck", "start", "stop", "restart"):
+        p = sub.add_parser(name)
+        p.add_argument("repos", nargs="*", help="optional repo labels or paths")
+
+    for name in ("attach", "logs", "dashboard"):
+        p = sub.add_parser(name)
+        p.add_argument("repo", nargs=1, help="repo label or path")
+
+    sub.add_parser("init")
+    p_add = sub.add_parser("add")
+    p_add.add_argument("path")
+    p_remove = sub.add_parser("remove")
+    p_remove.add_argument("repo")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["status"]
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "status":
+        print_status(select_repos(args.repos))
+    elif args.command == "precheck":
+        return precheck(select_repos(args.repos))
+    elif args.command == "start":
+        start(select_repos(args.repos))
+    elif args.command == "stop":
+        stop(select_repos(args.repos))
+    elif args.command == "restart":
+        repos = select_repos(args.repos)
+        require_startable(repos)
+        stop(repos)
+        wait_stopped(repos)
+        start(repos, precheck=False)
+    elif args.command == "attach":
+        attach(one_repo(args.repo))
+    elif args.command == "logs":
+        logs(one_repo(args.repo))
+    elif args.command == "dashboard":
+        open_dashboard(one_repo(args.repo))
+    elif args.command == "init":
+        init_config()
+    elif args.command == "add":
+        add_repo(args.path)
+    elif args.command == "remove":
+        remove_repo(args.repo)
+    else:
+        parser.print_help()
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

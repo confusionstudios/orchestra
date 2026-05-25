@@ -95,6 +95,8 @@ def _task_reviewer(task):
 _heartbeat_stop = threading.Event()
 _heartbeat_thread = None
 _singleton_lock_handle = None
+_dashboard_process = None
+_dashboard_metadata_path_for_process = None
 
 
 class SingletonLockError(RuntimeError):
@@ -200,6 +202,98 @@ def set_runtime_idle(conn, status_message="Waiting for ready tasks"):
         status_message=status_message,
         last_heartbeat_at="CURRENT_TIMESTAMP",
     )
+
+
+def _dashboard_metadata_path(db_path=None):
+    return db.get_runtime_root(db_path) / "dashboard.json"
+
+
+def _remove_dashboard_metadata(path=None, db_path=None):
+    if path is None:
+        path = _dashboard_metadata_path(db_path)
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log(f"Could not remove dashboard metadata: {exc}")
+
+
+def start_dashboard(db_path=None, *, host="127.0.0.1", preferred_port=None):
+    """Start the matching repo dashboard as a child of this orchestrator."""
+    global _dashboard_metadata_path_for_process, _dashboard_process
+
+    if _dashboard_process is not None and _dashboard_process.poll() is None:
+        return _dashboard_process
+
+    metadata_path = _dashboard_metadata_path(db_path)
+    _remove_dashboard_metadata(metadata_path)
+    dashboard_path = Path(__file__).resolve().parent / "dashboard.py"
+    env = os.environ.copy()
+    if preferred_port is not None:
+        env["KO_DASH_PORT"] = str(preferred_port)
+    env["KO_DASHBOARD_METADATA_PATH"] = str(metadata_path)
+    stdout = _log_fh if _log_fh is not None else subprocess.DEVNULL
+    process = subprocess.Popen(
+        [sys.executable, str(dashboard_path)],
+        cwd=str(Path(db.get_db_path(db_path)).resolve().parent),
+        env=env,
+        stdout=stdout,
+        stderr=subprocess.STDOUT if _log_fh is not None else subprocess.DEVNULL,
+    )
+    _dashboard_process = process
+    _dashboard_metadata_path_for_process = metadata_path
+    log(f"Dashboard started with PID {process.pid}; metadata: {env['KO_DASHBOARD_METADATA_PATH']}")
+    return process
+
+
+def stop_dashboard():
+    """Stop the dashboard process owned by this orchestrator, if any."""
+    global _dashboard_metadata_path_for_process, _dashboard_process
+
+    process = _dashboard_process
+    metadata_path = _dashboard_metadata_path_for_process
+    _dashboard_process = None
+    _dashboard_metadata_path_for_process = None
+    if process is None:
+        if metadata_path is not None:
+            _remove_dashboard_metadata(metadata_path)
+        return
+    if process.poll() is not None:
+        _remove_dashboard_metadata(metadata_path)
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log(f"Dashboard process {process.pid} did not exit after SIGKILL")
+    finally:
+        _remove_dashboard_metadata(metadata_path)
+
+
+def check_dashboard_process(conn):
+    """Log dashboard failure without stopping task processing."""
+    global _dashboard_metadata_path_for_process, _dashboard_process
+    process = _dashboard_process
+    metadata_path = _dashboard_metadata_path_for_process
+    if process is None:
+        return
+    exit_code = process.poll()
+    if exit_code is None:
+        return
+    db.update_runtime(
+        conn,
+        status_message=f"Dashboard exited with code {exit_code}; orchestrator still running",
+        last_heartbeat_at="CURRENT_TIMESTAMP",
+    )
+    log(f"Dashboard exited with code {exit_code}; orchestrator still running")
+    _dashboard_process = None
+    _dashboard_metadata_path_for_process = None
+    _remove_dashboard_metadata(metadata_path)
 
 
 # ── Prompt assembly ────────────────────────────────────────────────────
@@ -1958,6 +2052,7 @@ def main_loop(conn):
     blocked_gate_logged_task_ids = set()
 
     while True:
+        check_dashboard_process(conn)
         if stop_file.exists():
             log(f"Found {STOP_AFTER_TASK_FILE} — stopping cleanly. Deleting file.")
             stop_file.unlink()
@@ -2003,7 +2098,18 @@ def main(argv=None):
         argv = []
 
     parser = argparse.ArgumentParser(description="Run the Kanban Orchestra orchestrator.")
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Run only the orchestrator worker. The default starts the matching repo dashboard too.",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=None,
+        help="Preferred dashboard port. If unavailable, the dashboard chooses the next free port.",
+    )
+    args = parser.parse_args(argv)
     db_path = db.get_db_path()
     log_path = db.get_orchestrator_log_path(db_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2031,6 +2137,8 @@ def main(argv=None):
             return 2
         lock_path = acquire_singleton_lock(db_path=db_path)
         log(f"Acquired singleton lock: {lock_path}")
+        if not args.no_dashboard:
+            start_dashboard(db_path, preferred_port=args.dashboard_port)
 
         conn = db.connect(db_path)
         global _log_conn
@@ -2059,6 +2167,7 @@ def main(argv=None):
         except ProcessLookupError:
             pass
     finally:
+        stop_dashboard()
         stop_heartbeat()
         if conn is not None:
             conn.close()

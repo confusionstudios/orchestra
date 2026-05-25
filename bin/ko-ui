@@ -10,4 +10,5 @@ while [[ -L "$_ko_script" ]]; do
 done
 source "$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)/_ko-common"
 
+echo "ko-ui is deprecated; use ko-orchestrator for the repo instance or ko-fleet for multiple repos." >&2
 exec "$ko_python" "$ORCHESTRA_DIR/orchestra-ui/orchestra-ui.py" "$@"

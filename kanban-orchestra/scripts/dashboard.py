@@ -15,6 +15,7 @@ Routes:
   GET /events/{id}   — SSE stream for task-detail fragments
 """
 
+import atexit
 import errno
 import json
 import os
@@ -1926,6 +1927,7 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
             raise SystemExit(1)
 
     port = _find_free_port(host, preferred_port)
+    _write_dashboard_metadata(host, port)
     if port != preferred_port:
         print(
             f"Port {preferred_port} is in use; dashboard starting on port {port}.",
@@ -1940,6 +1942,42 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
             log_level="info",
         )
     except KeyboardInterrupt:
+        pass
+
+
+def _write_dashboard_metadata(host: str, port: int) -> None:
+    """Write optional repo-local dashboard metadata for orchestrator/fleet status."""
+    metadata_path = os.environ.get("KO_DASHBOARD_METADATA_PATH")
+    if not metadata_path:
+        return
+    path = Path(metadata_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        **db.get_instance_identity(),
+        "role": "dashboard",
+        "pid": os.getpid(),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp.replace(path)
+    atexit.register(_remove_dashboard_metadata)
+
+
+def _remove_dashboard_metadata() -> None:
+    """Remove optional dashboard metadata when the dashboard process exits."""
+    metadata_path = os.environ.get("KO_DASHBOARD_METADATA_PATH")
+    if not metadata_path:
+        return
+    path = Path(metadata_path).expanduser().resolve()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
         pass
 
 

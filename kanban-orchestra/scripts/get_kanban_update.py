@@ -11,7 +11,8 @@ Exit codes:
 """
 
 import argparse
-import subprocess
+import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,18 +71,56 @@ def _display_status(status: str, last_heartbeat: str | None) -> str:
     return status
 
 
-def _kanban_pids() -> list[tuple[int, str]]:
-    """Return [(pid, role), ...] for running orchestrator and dashboard processes."""
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_key_value_or_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        payload = {}
+        for line in text.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                payload[key.strip()] = value.strip()
+        return payload
+
+
+def _metadata_pid(path: Path, role: str) -> int | None:
+    payload = _read_key_value_or_json(path)
+    if payload.get("role") != role:
+        return None
+    try:
+        return int(payload["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _kanban_pids(identity: dict) -> list[tuple[int, str]]:
+    """Return repo-local [(pid, role), ...] for orchestrator and dashboard."""
     results = []
-    for script, role in [("orchestrator.py", "orchestrator"), ("dashboard.py", "dashboard")]:
-        try:
-            pids_out = subprocess.check_output(
-                ["pgrep", "-f", script], text=True, stderr=subprocess.DEVNULL
-            ).split()
-            for pid_str in pids_out:
-                results.append((int(pid_str), role))
-        except (subprocess.CalledProcessError, ValueError):
-            pass
+    for path, role in (
+        (Path(identity["lock_path"]), "orchestrator"),
+        (Path(identity["runtime_root"]) / "dashboard.json", "dashboard"),
+    ):
+        pid = _metadata_pid(path, role)
+        if _pid_alive(pid):
+            results.append((pid, role))
     return results
 
 
@@ -117,7 +156,7 @@ def build_update(conn) -> str:
             lines.append(f"  message: {runtime['status_message']}")
 
         # ── Process PIDs ─────────────────────────────────────────────────
-        pids = _kanban_pids()
+        pids = _kanban_pids(identity)
         if pids:
             pid_parts = [f"{role} PID {pid}" for pid, role in pids]
             lines.append(f"  processes: {', '.join(pid_parts)}")

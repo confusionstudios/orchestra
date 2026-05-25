@@ -105,7 +105,7 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-sync-skills"
    ```
 
-5. **Start the orchestrator** from the work repo root and keep it running:
+5. **Start the repo instance** from the work repo root and keep it running:
 
    ```bash
    "$ORCHESTRA_DIR/bin/ko-orchestrator"
@@ -113,7 +113,7 @@ accounts, or billing — install and authenticate each CLI yourself.
 
    For first use, run it in a dedicated terminal. The important part is the
    launch directory: the orchestrator uses the current git repo as the work
-   repo and stores state there.
+   repo, stores state there, and starts the matching dashboard for that repo.
 
    Check status from another terminal or through the Kanban skill:
 
@@ -121,15 +121,21 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-get-update"
    ```
 
-   The dashboard is optional. Start it when you want the local visual interface:
+   The dashboard is attached to that same repo instance. If you loaded the zsh
+   helpers, `orchestra` starts the orchestrator/dashboard pair from the current
+   repo root. `orchestra-dashboard` / `odash` remains only as a compatibility
+   shortcut for ad-hoc dashboard inspection.
+
+   For multiple repos, create a private fleet list:
 
    ```bash
-   "$ORCHESTRA_DIR/bin/ko-dashboard"
+   "$ORCHESTRA_DIR/bin/ko-fleet" init
+   "$ORCHESTRA_DIR/bin/ko-fleet" add .
+   "$ORCHESTRA_DIR/bin/ko-fleet" start
    ```
 
-   If you loaded the zsh helpers, `orchestra` starts the process-manager TUI
-   from the current repo, and `orchestra-dashboard` / `odash` start the
-   dashboard.
+   The fleet config is `~/.config/orchestra/fleet.repos`: one git repo root per
+   line, with blank lines and `#` comments allowed.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:
@@ -157,9 +163,10 @@ land on the branch — all while you're away from your desk.
 
 The orchestrator is the durable worker. Start it from the root of each work
 repo where you want tasks processed, and keep it alive in whatever way you
-normally keep local development processes alive. The work repo owns the state
-(`kanban-orchestra.db`, runtime files, and logs); the Orchestra checkout only
-provides the tools.
+normally keep local development processes alive. It starts the matching
+dashboard for that same repo instance. The work repo owns the state
+(`kanban-orchestra.db`, runtime files, dashboard metadata, and logs); the
+Orchestra checkout only provides the tools.
 
 For first use, run it directly in a dedicated terminal:
 
@@ -169,10 +176,24 @@ cd /path/to/work-repo
 ```
 
 Codex, Claude, or another agent can still be your operator interface: ask it to
-queue tasks, check status, or start the dashboard when you need to inspect the
+queue tasks, check status, or open the dashboard when you need to inspect the
 queue visually. It should not be the long-lived process host unless you are
 doing a short experiment and are comfortable with the orchestrator stopping
 when that session ends.
+
+For several repo instances, use the fleet command:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-fleet" init
+"$ORCHESTRA_DIR/bin/ko-fleet" add /path/to/work-repo
+"$ORCHESTRA_DIR/bin/ko-fleet" precheck
+"$ORCHESTRA_DIR/bin/ko-fleet" start
+```
+
+`ko-fleet` reads `~/.config/orchestra/fleet.repos`, a private flat list with
+one repo root per line. It derives display names from each path. `start` is
+all-or-nothing for selected repos: if any selected repo is dirty or invalid,
+nothing launches.
 
 ### YOLO Mode and Hardening
 

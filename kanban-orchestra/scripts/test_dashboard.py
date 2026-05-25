@@ -8,6 +8,7 @@ Does not start an HTTP server; tests import dashboard directly.
 
 import asyncio
 import errno as errno_mod
+import json
 import os
 import sys
 import tempfile
@@ -68,6 +69,30 @@ class TestHelpers(unittest.TestCase):
         label = dashboard._server_tz_label()
         self.assertIsInstance(label, str)
         self.assertGreater(len(label), 0)
+
+    def test_dashboard_metadata_is_written_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata_path = Path(tmpdir) / "dashboard.json"
+            identity = {
+                "repo_root": tmpdir,
+                "repo_label": "repo",
+                "db_path": str(Path(tmpdir) / "kanban-orchestra.db"),
+                "runtime_root": str(Path(tmpdir) / ".kanban-orchestra"),
+                "lock_path": str(Path(tmpdir) / "kanban-orchestra.lock"),
+            }
+            with patch.dict(os.environ, {"KO_DASHBOARD_METADATA_PATH": str(metadata_path)}, clear=False), \
+                 patch.object(dashboard.db, "get_instance_identity", return_value=identity):
+                dashboard._write_dashboard_metadata("127.0.0.1", 8430)
+
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["role"], "dashboard")
+                self.assertEqual(payload["host"], "127.0.0.1")
+                self.assertEqual(payload["port"], 8430)
+                self.assertEqual(payload["url"], "http://127.0.0.1:8430")
+
+                dashboard._remove_dashboard_metadata()
+                self.assertFalse(metadata_path.exists())
+            self.assertEqual(payload["repo_root"], tmpdir)
 
     def test_abbreviate_home_replaces_home_prefix(self):
         with patch("pathlib.Path.home", return_value=Path("/Users/alex")):

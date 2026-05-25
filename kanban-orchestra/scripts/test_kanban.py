@@ -8,6 +8,7 @@ comment aggregation.
 
 import json
 import importlib.util
+import io
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -40,6 +43,7 @@ orchestrator_control = _load_local_module("kanban_test_orchestrator_control", "o
 orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
 config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
+fleet = _load_local_module("kanban_test_fleet", "fleet.py")
 import shared_config
 skill_wrappers = _load_local_module("kanban_test_skill_wrappers", str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_ai_skill_wrappers.py"))
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
@@ -184,6 +188,48 @@ class TestDB(unittest.TestCase):
         tid = db.add_task(self.conn, "Blocked gate default")
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["allow_when_blocked"], 0)
+
+    def test_task_add_defaults_normal_tasks_to_build_step(self):
+        args = SimpleNamespace(
+            title="Default skip planning",
+            description=None,
+            branch="feat-default-skip",
+            coder_agent=None,
+            reviewer_agent=None,
+            kind="task",
+            parent=None,
+            sequence_index=None,
+            skip=None,
+            allow_when_blocked=False,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            task_module.cmd_add(args, self.conn)
+
+        task = db.list_tasks(self.conn)[0]
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["skips"], ["commit-plan", "commit-plan-review"])
+
+    def test_task_add_unions_default_plan_skips_with_user_skips(self):
+        args = SimpleNamespace(
+            title="Default and explicit skip",
+            description=None,
+            branch="feat-default-and-explicit",
+            coder_agent=None,
+            reviewer_agent=None,
+            kind="task",
+            parent=None,
+            sequence_index=None,
+            skip=["commit-review"],
+            allow_when_blocked=False,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            task_module.cmd_add(args, self.conn)
+
+        task = db.list_tasks(self.conn)[0]
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["skips"], ["commit-plan", "commit-plan-review", "commit-review"])
 
     def test_missing_allow_when_blocked_column_is_migrated(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -3487,6 +3533,103 @@ class TestSingletonLock(unittest.TestCase):
         mock_connect.assert_not_called()
         self.assertTrue(any("dirty" in str(c).lower() for c in mock_log.call_args_list))
 
+    def test_start_dashboard_uses_repo_runtime_metadata_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orchestrator._dashboard_process = None
+            db_path = str(Path(tmpdir) / "kanban-orchestra.db")
+            fake_process = MagicMock()
+            fake_process.pid = 1234
+            fake_process.poll.return_value = None
+
+            with patch.object(orchestrator.subprocess, "Popen", return_value=fake_process) as mock_popen, \
+                 patch.object(orchestrator, "log"):
+                process = orchestrator.start_dashboard(db_path, preferred_port=8765)
+
+            self.assertIs(process, fake_process)
+            popen_args = mock_popen.call_args.args[0]
+            popen_kwargs = mock_popen.call_args.kwargs
+            self.assertEqual(popen_args[0], sys.executable)
+            self.assertTrue(popen_args[1].endswith("dashboard.py"))
+            self.assertEqual(popen_kwargs["cwd"], str(Path(tmpdir).resolve()))
+            self.assertEqual(popen_kwargs["env"]["KO_DASH_PORT"], "8765")
+            self.assertEqual(
+                popen_kwargs["env"]["KO_DASHBOARD_METADATA_PATH"],
+                str(Path(tmpdir).resolve() / ".kanban-orchestra" / "dashboard.json"),
+            )
+            self.assertEqual(
+                orchestrator._dashboard_metadata_path_for_process,
+                Path(tmpdir).resolve() / ".kanban-orchestra" / "dashboard.json",
+            )
+            orchestrator._dashboard_process = None
+            orchestrator._dashboard_metadata_path_for_process = None
+
+    def test_stop_dashboard_terminates_owned_process(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata_path = Path(tmpdir) / ".kanban-orchestra" / "dashboard.json"
+            metadata_path.parent.mkdir()
+            metadata_path.write_text("{}", encoding="utf-8")
+            fake_process = MagicMock()
+            fake_process.poll.return_value = None
+            orchestrator._dashboard_process = fake_process
+            orchestrator._dashboard_metadata_path_for_process = metadata_path
+
+            with patch.object(orchestrator, "_dashboard_metadata_path", side_effect=AssertionError("wrong path")):
+                orchestrator.stop_dashboard()
+
+            fake_process.terminate.assert_called_once()
+            fake_process.wait.assert_called_once_with(timeout=5)
+            self.assertIsNone(orchestrator._dashboard_process)
+            self.assertIsNone(orchestrator._dashboard_metadata_path_for_process)
+            self.assertFalse(metadata_path.exists())
+
+    def test_stop_dashboard_logs_when_killed_process_does_not_exit(self):
+        fake_process = MagicMock()
+        fake_process.pid = 1234
+        fake_process.poll.return_value = None
+        fake_process.wait.side_effect = subprocess.TimeoutExpired("dashboard", 5)
+        orchestrator._dashboard_process = fake_process
+        metadata_path = Path("/tmp/dashboard.json")
+        orchestrator._dashboard_metadata_path_for_process = metadata_path
+
+        with patch.object(orchestrator, "_remove_dashboard_metadata") as mock_remove, \
+             patch.object(orchestrator, "log") as mock_log:
+            orchestrator.stop_dashboard()
+
+        fake_process.terminate.assert_called_once()
+        fake_process.kill.assert_called_once()
+        self.assertEqual(fake_process.wait.call_count, 2)
+        mock_remove.assert_called_once_with(metadata_path)
+        self.assertTrue(any("did not exit" in str(call) for call in mock_log.call_args_list))
+
+    def test_stop_dashboard_without_started_process_does_not_clean_default_path(self):
+        orchestrator._dashboard_process = None
+        orchestrator._dashboard_metadata_path_for_process = None
+
+        with patch.object(orchestrator, "_remove_dashboard_metadata") as mock_remove:
+            orchestrator.stop_dashboard()
+
+        mock_remove.assert_not_called()
+
+    def test_check_dashboard_process_logs_failure_without_stopping_runtime(self):
+        fake_process = MagicMock()
+        fake_process.poll.return_value = 7
+        orchestrator._dashboard_process = fake_process
+        metadata_path = Path("/tmp/dashboard.json")
+        orchestrator._dashboard_metadata_path_for_process = metadata_path
+        conn = MagicMock()
+
+        with patch.object(orchestrator.db, "update_runtime") as mock_update, \
+             patch.object(orchestrator, "_remove_dashboard_metadata") as mock_remove, \
+             patch.object(orchestrator, "log") as mock_log:
+            orchestrator.check_dashboard_process(conn)
+
+        mock_update.assert_called_once()
+        self.assertIn("Dashboard exited", mock_update.call_args.kwargs["status_message"])
+        mock_log.assert_called_once()
+        mock_remove.assert_called_once_with(metadata_path)
+        self.assertIsNone(orchestrator._dashboard_process)
+        self.assertIsNone(orchestrator._dashboard_metadata_path_for_process)
+
 
 class TestOrchestratorControlIdentity(unittest.TestCase):
     """Test repo identity metadata in filesystem-backed control helpers."""
@@ -3526,6 +3669,180 @@ class TestOrchestratorControlIdentity(unittest.TestCase):
         self.assertFalse(live)
         self.assertIn("different repo", reason)
         self.assertEqual(read_payload["repo_root"], payload["repo_root"])
+
+
+class TestFleetConfig(unittest.TestCase):
+    """Test flat fleet repo configuration and validation helpers."""
+
+    def test_parse_config_lines_ignores_blanks_and_comments(self):
+        text = """
+        # local repos
+        ~/work/one
+
+        /srv/two
+        """
+        self.assertEqual(fleet.parse_config_lines(text), ["~/work/one", "/srv/two"])
+
+    def test_discover_repo_requires_configured_git_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            nested = root / "nested"
+            nested.mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+
+            repo = fleet.discover_repo(str(nested))
+
+            self.assertEqual(repo.root, root.resolve())
+            self.assertIn("not the git root", repo.error)
+
+    def test_precheck_reports_dirty_repo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            (root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            repo = fleet.discover_repo(str(root))
+
+            with redirect_stdout(io.StringIO()):
+                exit_code = fleet.precheck([repo])
+
+            self.assertEqual(exit_code, 1)
+
+    def test_process_state_reports_dashboard_and_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            lock_path = root / "kanban-orchestra.lock"
+            lock_path.write_text(f"role=orchestrator\npid={os.getpid()}\n", encoding="utf-8")
+            (runtime / "dashboard.json").write_text(
+                json.dumps({"role": "dashboard", "pid": os.getpid()}),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+
+            with patch.object(fleet, "tmux_has_session", return_value=True):
+                state, orch_pid, dashboard_pid, session = fleet.repo_process_state(repo)
+
+            self.assertEqual(state, "running")
+            self.assertEqual(orch_pid, str(os.getpid()))
+            self.assertEqual(dashboard_pid, str(os.getpid()))
+            self.assertEqual(session, "orch-repo")
+
+    def test_open_dashboard_refuses_dead_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": 12345,
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+
+            with patch.object(fleet, "pid_alive", return_value=False), \
+                 self.assertRaises(SystemExit):
+                fleet.open_dashboard(repo)
+
+    def test_open_dashboard_requires_accepting_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+
+            with patch.object(fleet, "dashboard_endpoint_ready", return_value=False), \
+                 self.assertRaises(SystemExit):
+                fleet.open_dashboard(repo)
+
+    def test_open_dashboard_prints_live_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
+                 patch.object(fleet.shutil, "which", return_value=None), \
+                 redirect_stdout(out):
+                fleet.open_dashboard(repo)
+
+            self.assertIn("http://127.0.0.1:8427", out.getvalue())
+
+    def test_wait_stopped_polls_until_orchestrator_pid_exits(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+
+        with patch.object(fleet, "metadata_pid", side_effect=[12345, None]) as mock_metadata, \
+             patch.object(fleet, "pid_alive", side_effect=[True, False]), \
+             patch.object(fleet.time, "sleep") as mock_sleep:
+            fleet.wait_stopped([repo], timeout=1)
+
+        self.assertEqual(mock_metadata.call_count, 2)
+        mock_sleep.assert_called_once_with(0.2)
+
+    def test_wait_stopped_times_out_while_orchestrator_pid_lives(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+
+        with patch.object(fleet, "metadata_pid", return_value=12345), \
+             patch.object(fleet, "pid_alive", return_value=True), \
+             patch.object(fleet.time, "monotonic", side_effect=[0, 2]), \
+             self.assertRaises(SystemExit):
+            fleet.wait_stopped([repo], timeout=1)
+
+    def test_start_rejects_repo_without_root_even_without_precheck(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), None, "missing root")
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/tmp/ko-orchestrator")), \
+             self.assertRaises(SystemExit):
+            fleet.start([repo], precheck=False)
+
+    def test_restart_waits_for_shutdown_before_starting(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+        calls = []
+
+        with patch.object(fleet, "select_repos", return_value=[repo]), \
+             patch.object(fleet, "require_startable", side_effect=lambda repos: calls.append("require")), \
+             patch.object(fleet, "stop", side_effect=lambda repos: calls.append("stop")), \
+             patch.object(fleet, "wait_stopped", side_effect=lambda repos: calls.append("wait")), \
+             patch.object(fleet, "start", side_effect=lambda repos, precheck=True: calls.append(f"start:{precheck}")):
+            exit_code = fleet.main(["restart"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, ["require", "stop", "wait", "start:False"])
 
 
 class TestSupertaskDB(unittest.TestCase):
@@ -4303,13 +4620,13 @@ class TestTaskPlanningCLI(unittest.TestCase):
         )
 
     def test_add_defaults_to_commit_make(self):
-        """task add for a normal task defaults to skips=['commit-plan'] and next_step=commit-make."""
+        """task add for a normal task skips planning and starts at commit-make."""
         r = self._run("add", "Planning task", "--branch", "b")
         self.assertEqual(r.returncode, 0)
         tid = json.loads(r.stdout)["id"]
         task = json.loads(self._run("show", str(tid)).stdout)
         self.assertEqual(task["next_step"], "commit-make")
-        self.assertEqual(task["skips"], ["commit-plan"])
+        self.assertEqual(task["skips"], ["commit-plan", "commit-plan-review"])
 
     def test_add_with_skip_starts_at_commit_make(self):
         """task add --skip commit-plan starts at commit-make."""
@@ -4318,7 +4635,7 @@ class TestTaskPlanningCLI(unittest.TestCase):
         tid = json.loads(r.stdout)["id"]
         task = json.loads(self._run("show", str(tid)).stdout)
         self.assertEqual(task["next_step"], "commit-make")
-        self.assertEqual(task["skips"], ["commit-plan"])
+        self.assertEqual(task["skips"], ["commit-plan", "commit-plan-review"])
 
     def test_add_with_skip_unions_with_default(self):
         """task add --skip commit-review keeps the default commit-plan skip too."""
@@ -4327,7 +4644,10 @@ class TestTaskPlanningCLI(unittest.TestCase):
         tid = json.loads(r.stdout)["id"]
         task = json.loads(self._run("show", str(tid)).stdout)
         self.assertEqual(task["next_step"], "commit-make")
-        self.assertEqual(sorted(task["skips"]), ["commit-plan", "commit-review"])
+        self.assertEqual(
+            sorted(task["skips"]),
+            ["commit-plan", "commit-plan-review", "commit-review"],
+        )
 
     def test_show_displays_skips_and_commit_plan(self):
         """task show includes skips and commit_plan fields."""
@@ -4360,13 +4680,15 @@ class TestTaskPlanningCLI(unittest.TestCase):
         """task set --add-skip and --remove-skip update the skips list."""
         r = self._run("add", "Toggle plan")
         tid = json.loads(r.stdout)["id"]
-        # Newly-added task defaults to skips=["commit-plan"]
+        # Newly-added task defaults to skipping both planning steps.
         task_before = json.loads(self._run("show", str(tid)).stdout)
-        self.assertEqual(task_before["skips"], ["commit-plan"])
+        self.assertEqual(task_before["skips"], ["commit-plan", "commit-plan-review"])
 
-        # Remove skip
+        # Remove default skips
         r2 = self._run("set", str(tid), "--remove-skip", "commit-plan")
         self.assertEqual(r2.returncode, 0)
+        r2b = self._run("set", str(tid), "--remove-skip", "commit-plan-review")
+        self.assertEqual(r2b.returncode, 0)
         task_after_remove = json.loads(self._run("show", str(tid)).stdout)
         self.assertEqual(task_after_remove["skips"], [])
 

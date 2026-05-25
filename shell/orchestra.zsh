@@ -57,7 +57,12 @@ _orchestra_run_from_git_root() {
   "$ORCHESTRA_DIR/bin/$command_name" "$@"
 }
 
+orchestra() {
+  _orchestra_run_from_git_root ko-orchestrator "$@"
+}
+
 orchestra-ui() {
+  print -u2 "orchestra-ui is deprecated; use 'orchestra' for the repo orchestrator/dashboard instance."
   _orchestra_run_from_git_root ko-ui "$@"
 }
 
@@ -65,28 +70,35 @@ orchestra-dashboard() {
   _orchestra_run_from_git_root ko-dashboard "$@"
 }
 
+orchestra-fleet() {
+  if [[ -z "${ORCHESTRA_DIR:-}" ]]; then
+    print -u2 "orchestra: ORCHESTRA_DIR is not set"
+    return 2
+  fi
+  "$ORCHESTRA_DIR/bin/ko-fleet" "$@"
+}
+
 orchestra-status() {
-  # Forward additional arguments so options such as --control-timeout still work.
-  _orchestra_run_from_git_root ko-ui --orchestrator-control status "$@"
+  _orchestra_run_from_git_root ko-get-update "$@"
 }
 
 orchestra-start() {
-  # Forward additional arguments so options such as --control-timeout still work.
-  _orchestra_run_from_git_root ko-ui --orchestrator-control start "$@"
+  print -u2 "orchestra-start is deprecated; use 'orchestra' from the repo root."
+  _orchestra_run_from_git_root ko-orchestrator "$@"
 }
 
 orchestra-stop() {
-  # Forward additional arguments so options such as --control-timeout still work.
-  _orchestra_run_from_git_root ko-ui --orchestrator-control stop "$@"
+  print -u2 "orchestra-stop is deprecated; stop the foreground orchestrator with Ctrl-C, touch kanban-orchestra.ko-stop-after-task in the repo, or use 'orchestra-fleet stop <repo>'."
+  return 2
 }
 
 orchestra-break() {
-  # Forward additional arguments so options such as --control-timeout still work.
-  _orchestra_run_from_git_root ko-ui --orchestrator-control break "$@"
+  print -u2 "orchestra-break is deprecated with the process-manager UI; inspect the blocked task and use ko-task directly."
+  return 2
 }
 
-alias orchestra='orchestra-ui'
 alias odash='orchestra-dashboard'
+alias ofleet='orchestra-fleet'
 alias ostatus='orchestra-status'
 alias ostart='orchestra-start'
 alias ostop='orchestra-stop'

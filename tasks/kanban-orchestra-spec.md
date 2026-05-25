@@ -247,10 +247,15 @@ Runtime status values:
   database path, runtime directory, and lock path so local agents can identify
   the orchestrator for the current repo without process hunting.
 - `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
+- `.kanban-orchestra/dashboard.json`: repo-scoped metadata for the dashboard
+  owned by the orchestrator instance, including PID, host, port, and URL.
 - `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts
-- `.kanban-orchestra/orchestra-ui-supervisor.json`: live heartbeat for the local `orchestra-ui` supervisor
-- `.kanban-orchestra/orchestrator-control-request.json`: transient local control request consumed by `orchestra-ui`
-- `.kanban-orchestra/orchestrator-control-response.json`: transient local control response for the requester
+- `.kanban-orchestra/orchestra-ui-supervisor.json`: deprecated compatibility
+  heartbeat for the old Textual process manager
+- `.kanban-orchestra/orchestrator-control-request.json`: deprecated
+  compatibility control request consumed by `orchestra-ui`
+- `.kanban-orchestra/orchestrator-control-response.json`: deprecated
+  compatibility control response for the requester
 - `.kanban-orchestra/active-agent-processes.json`: transient process-group metadata for active agent children
 
 ## Task States
@@ -669,45 +674,41 @@ When the file is detected:
 
 The file is a one-shot signal: deletion is the acknowledgment, so the orchestrator will not stop again on the next run unless the file is recreated.
 
-### `orchestra-ui` Operator Control
+### Instance and Fleet Control
 
-When `orchestra-ui` is running, local operators can control the orchestrator it
-supervises through repo-local JSON control files:
+The primary runtime unit is a repo instance: one orchestrator process and one
+dashboard process for the same git repo root. Start it from the work repo root:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control status
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control start
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control stop
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control break
+"$ORCHESTRA_DIR/bin/ko-orchestrator"
 ```
 
-The control path is local-only and requires a live `orchestra-ui` supervisor
-heartbeat. If no supervisor is alive, commands fail instead of launching an
-unmanaged orchestrator.
+For multiple repos, `ko-fleet` reads a private flat path list from
+`~/.config/orchestra/fleet.repos` by default. Each non-empty non-comment line
+is one git repo root. `~` and environment variables are expanded, and display
+names are derived from the basename of the resolved repo path.
 
-`start`:
-- launches the orchestrator only as an `orchestra-ui` supervised process
-- refuses to start when the supervised orchestrator is already running
-- refuses to start when another orchestrator holds the singleton lock
-- refuses to start when any task is still `status=running`
-- sets runtime `status=starting` before spawning
+```bash
+"$ORCHESTRA_DIR/bin/ko-fleet" init
+"$ORCHESTRA_DIR/bin/ko-fleet" add /path/to/work-repo
+"$ORCHESTRA_DIR/bin/ko-fleet" precheck
+"$ORCHESTRA_DIR/bin/ko-fleet" start
+"$ORCHESTRA_DIR/bin/ko-fleet" stop <repo-label>
+```
 
-`stop` / pause:
-- stops the supervised orchestrator and recorded active agent child process groups
-- does not change task statuses, git state, staging, stash state, or worktree files
-- sets runtime `status=stopped`
-- preserves active runtime task/step/branch fields so the paused work remains visible
+`ko-fleet start`:
+- starts the orchestrator/dashboard pair for every selected configured repo
+- refuses duplicates when the repo singleton lock is already live
+- refuses all selected starts when any selected repo is dirty or invalid
+- keeps process-supervision details behind the fleet command
 
-`break`:
-- snapshots runtime active task/step/branch/review round before stopping processes
-- stops the supervised orchestrator and recorded active agent child process groups
-- removes the graceful stop marker and transient active-agent metadata
-- if the snapped active task is still `status=running`, parks it as `blocked`
-  with a durable comment recording the interrupted step, branch, review round,
-  and that git/worktree changes were left untouched
-- if the interrupted task is a child task, blocks/comments the parent supertask
-  consistently with normal child-block behavior
-- clears runtime active fields and sets runtime `status=hard-break`
+`ko-fleet stop`:
+- stops fleet-owned terminal sessions for selected repos
+- leaves externally managed instances alone and reports them
+
+`orchestra-ui` and its JSON control files are deprecated compatibility
+surfaces. New workflows should use `ko-orchestrator`, `ko-fleet`, `ko-task`,
+and `ko-get-update`.
 
 ### Pinned Task Execution
 
@@ -797,6 +798,7 @@ Primary questions:
 ### Runtime Semantics
 
 - The orchestrator writes a singleton runtime row on startup.
+- The orchestrator starts the matching dashboard for the same repo instance.
 - Heartbeat updates every `10` seconds.
 - A stale heartbeat indicates a dead or wedged orchestrator even if stored status still says `running`.
 - Runtime `current_step` is normalized to one of the orchestrator step names

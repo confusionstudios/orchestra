@@ -145,10 +145,12 @@ def cmd_add(args, conn):
     branch = args.branch
     skips = list(args.skip or [])
 
-    # Normal tasks always skip commit-plan by default; union with any user-supplied
-    # skips rather than overwriting, so e.g. `--skip commit-review` keeps commit-plan.
-    if kind == "task" and "commit-plan" not in skips:
-        skips.insert(0, "commit-plan")
+    # Normal tasks skip planning by default; union with any user-supplied skips
+    # so e.g. `--skip commit-review` keeps the default plan skips.
+    if kind == "task":
+        for default_skip in ("commit-plan-review", "commit-plan"):
+            if default_skip not in skips:
+                skips.insert(0, default_skip)
 
     # Validate skips
     for s in skips:

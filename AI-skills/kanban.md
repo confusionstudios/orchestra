@@ -30,7 +30,7 @@ commands, and quick stuck/not-stuck checks.
 
 This skill requires `$ORCHESTRA_DIR` to point at the Orchestra installation
 or checkout root. That installation provides the wrapper commands, including
-`ko-kanban`, `ko-task`, and `ko-ui`. Invoke them through
+`ko-kanban`, `ko-task`, `ko-orchestrator`, `ko-fleet`, and `ko-get-update`. Invoke them through
 `"$ORCHESTRA_DIR/bin/..."`; do not assume they are on `PATH`.
 
 ## Task CLI shorthand
@@ -154,45 +154,30 @@ task log <task-id> "<message>"
 ## Process control
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-ui"
+"$ORCHESTRA_DIR/bin/ko-orchestrator"
 ```
 
-When `ko-ui` is running, it supervises both the dashboard and orchestrator.
-Resolve the current git repo root and treat that launch directory as the
-Orchestra instance identity. The real orchestrator records that identity in the
-repo-scoped `kanban-orchestra.lock`; agents should inspect the current repo's
-lock, `.kanban-orchestra/orchestra-ui-supervisor.json`, and runtime row before
-looking at unrelated system processes.
+`ko-orchestrator` is the repo instance: it runs the durable worker and starts
+the matching dashboard for the same git repo root. Resolve the current git repo
+root and treat that launch directory as the Orchestra instance identity. The
+orchestrator records that identity in the repo-scoped `kanban-orchestra.lock`,
+and the dashboard writes `.kanban-orchestra/dashboard.json`.
 
-Use the local control path for operator actions instead of PID hunting:
+Use status commands and repo-local metadata instead of PID hunting:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control status
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control start
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control stop
-"$ORCHESTRA_DIR/bin/ko-ui" --orchestrator-control break
+"$ORCHESTRA_DIR/bin/ko-get-update"
+"$ORCHESTRA_DIR/bin/ko-fleet" status
+"$ORCHESTRA_DIR/bin/ko-fleet" precheck
+"$ORCHESTRA_DIR/bin/ko-fleet" start
+"$ORCHESTRA_DIR/bin/ko-fleet" stop <repo-label>
 ```
 
-Control semantics:
-- `status` reports the live `orchestra-ui` supervisor, supervised
-  orchestrator process, dashboard process, and runtime row.
-- `start` launches one supervised orchestrator and refuses duplicates. It
-  also refuses to start while any task is still `status=running`; resolve the
-  task manually or use `break` first.
-- `stop` / pause stops the supervised orchestrator and recorded active agent
-  children without changing task statuses, git state, staging, stash state, or
-  worktree files. Use it when a human or agent needs to inspect or edit the
-  repo exactly as-is.
-- `break` is for wrong-task, wedged-run, or emergency interruption. It stops
-  the supervised orchestrator and recorded active agent children, removes
-  transient stop/control markers, clears stale runtime active-task fields, and
-  parks an interrupted `status=running` task as `blocked` with a durable
-  comment. It intentionally leaves git/worktree changes untouched.
-
-Agents may use `stop` when asked to pause the supervised run or before a
-manual inspection that must preserve state. Use `break` only when continuing
-would make the task history less truthful or the run is wedged. After `break`,
-inspect the blocked task and worktree before restarting.
+Fleet config lives at `~/.config/orchestra/fleet.repos` by default. It is a
+private flat list: one git repo root per non-empty line, with `~`, environment
+variables, blank lines, and `#` comments supported. Every configured repo gets
+one orchestrator and one matching dashboard. `ko-fleet start` refuses to launch
+anything if any selected repo is dirty or invalid.
 
 Graceful stop after the current task finishes:
 
@@ -205,11 +190,11 @@ at the top of the next polling loop after the current task finishes, logs the
 detection, deletes the file, and exits.
 
 Notes:
-- Use `ko-ui` for normal operator control. It owns the supervised dashboard
-  and orchestrator lifecycle.
-- `orchestrator.py` has no argument parser; running `--help` starts the loop.
-- The dashboard chooses a free port at runtime. Use the Browser button in
-  `ko-ui` to open the HTML dashboard instead of assuming a fixed port.
+- Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
+- The dashboard chooses a free port at runtime and records it in
+  `.kanban-orchestra/dashboard.json`.
+- `ko-ui` is deprecated process-manager compatibility; do not use it for new
+  workflows.
 
 ## Default operating pattern
 
@@ -247,15 +232,15 @@ Notes:
 
 ## Stuck/not-stuck checks
 
-First choice: `orchestra-ui`.
+First choice: `ko-get-update`.
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-ui"
+"$ORCHESTRA_DIR/bin/ko-get-update"
 ```
 
-Use the Browser button in `orchestra-ui` to open the HTML dashboard. The UI
-also shows orchestrator status, the active task, reviewer state, and current
-orchestrator output.
+Use `ko-fleet dashboard <repo-label>` to open the HTML dashboard for a running
+fleet instance. The dashboard shows orchestrator status, the active task,
+reviewer state, and current orchestrator output.
 
 CLI-level state check via `orchestrator_runtime`:
 
@@ -265,8 +250,8 @@ sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, curre
 
 Read the result like this:
 - `status = running` with a fresh heartbeat usually means active work.
-- `status = starting` means `orchestra-ui` accepted a start request and is
-  launching the supervised orchestrator.
+- `status = starting` means a launcher accepted a start request and is
+  launching the orchestrator.
 - `status = idle` with a fresh heartbeat means the orchestrator is healthy
   and waiting.
 - `status_message` starting with `STALLED:` means the orchestrator is

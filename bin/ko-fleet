@@ -10,5 +10,4 @@ while [[ -L "$_ko_script" ]]; do
 done
 source "$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)/_ko-common"
 
-echo "ko-dashboard is a compatibility command; ko-orchestrator starts the matching dashboard automatically." >&2
-exec "$ko_python" "$ORCHESTRA_DIR/kanban-orchestra/scripts/dashboard.py" "$@"
+exec "$ko_python" "$ORCHESTRA_DIR/kanban-orchestra/scripts/fleet.py" "$@"
