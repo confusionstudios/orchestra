@@ -37,13 +37,11 @@ checks, and all wrapper commands.
 
 Everything the orchestrator does is visible. The live dashboard shows active
 tasks, ready and blocked queues, recent completions, and the orchestrator's own
-heartbeat. This dashboard is the real repo-scoped status surface; the old
-process-manager UI has been removed and is not a compatibility path. Each task
-carries durable comments — reviewer feedback, validation results, commit
-messages — so you can trace every decision without reading agent logs. Run logs
-capture the full session, and CLI commands let you inspect or update any task
-from another terminal or a remote agent session. If something stalls or fails,
-you see it immediately and can intervene.
+heartbeat. Each task carries durable comments — reviewer feedback, validation
+results, commit messages — so you can trace every decision without reading
+agent logs. Run logs capture the full session, and `ko-task` lets you inspect
+or update any task from another terminal or a remote agent session. If something
+stalls or fails, you see it immediately and can intervene.
 
 ## Supported Agents
 
@@ -119,8 +117,7 @@ accounts, or billing — install and authenticate each CLI yourself.
 
    The dashboard is attached to that same repo instance. If you loaded the zsh
    helpers, `orchestra` starts the orchestrator/dashboard pair from the current
-   repo root. `orchestra-dashboard` / `odash` opens only that per-repo
-   dashboard; it does not start or replace the removed process-manager UI.
+   repo root, and `orchestra-dashboard` / `odash` opens that repo dashboard.
 
    For multiple repos, create a private fleet list:
 
@@ -135,10 +132,8 @@ accounts, or billing — install and authenticate each CLI yourself.
    line, with blank lines and `#` comments allowed.
    `ko-fleet stop`, `restart`, `attach`, `logs`, and `dashboard` operate on the
    selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
-   for opening the repo dashboard. The removed process-manager `BREAK` control
-   has no remote replacement; stop or interrupt the repo instance, inspect with
-   `ko-get-update`, update the affected task with `ko-task`, and restart
-   explicitly.
+   for opening the repo dashboard. Use `ko-get-update` for a concise status
+   snapshot and `ko-task` to inspect, comment on, or update individual tasks.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:
