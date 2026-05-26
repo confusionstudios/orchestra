@@ -231,13 +231,21 @@ def metadata_pid(path: Path | None, role: str, repo: FleetRepo | None = None) ->
         return None
 
 
-def request_dashboard_start(repo: FleetRepo) -> Path:
+def dashboard_port_for_index(index: int) -> int:
+    """Return Fleet's preferred dashboard port for a repo position."""
+    return config.DASHBOARD_PORT_BASE + index
+
+
+def request_dashboard_start(repo: FleetRepo, *, preferred_port: int | None = None) -> Path:
     if repo.runtime_root is None:
         die(f"{repo.label}: invalid config ({repo.error or 'missing runtime root'})")
     path = repo.runtime_root / config.DASHBOARD_START_REQUEST_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text("start\n", encoding="utf-8")
+    content = "start\n"
+    if preferred_port is not None:
+        content += f"port={preferred_port}\n"
+    tmp.write_text(content, encoding="utf-8")
     tmp.replace(path)
     return path
 
@@ -259,6 +267,10 @@ def dashboard_endpoint_ready(payload: dict, *, timeout: float = 0.25) -> bool:
 
 
 def dashboard_status_url(repo: FleetRepo) -> str:
+    orch_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
+    if not pid_alive(orch_pid):
+        return "-"
+
     payload = read_key_value_or_json(repo.dashboard_metadata_path)
     url = payload.get("url")
     if not url or not metadata_matches_repo(payload, repo):
@@ -287,16 +299,11 @@ def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     orch_alive = pid_alive(orch_pid)
     dashboard_alive = pid_alive(dashboard_pid)
 
-    if orch_alive and not dashboard_alive:
-        status = "no-dashboard"
-    elif session_alive and orch_alive and dashboard_alive:
+    if orch_alive:
         status = "running"
-    elif session_alive:
-        status = "session-only"
-    elif orch_alive:
-        status = "running-external"
     else:
         status = "stopped"
+        dashboard_pid = None
 
     return (
         status,
@@ -420,22 +427,26 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
     if precheck:
         require_startable(repos)
     orchestrator = orchestra_bin("ko-orchestrator")
-    for repo in repos:
+    for index, repo in enumerate(repos):
         if repo.root is None:
             die(f"{repo.label}: invalid config ({repo.error or 'missing git root'})")
-        status, orch_pid, _, session = repo_process_state(repo)
-        if status == "no-dashboard":
-            request_dashboard_start(repo)
-            print(f"{repo.label}: dashboard start requested (orchestrator {orch_pid})")
+        preferred_port = dashboard_port_for_index(index)
+        status, orch_pid, dashboard_pid, session = repo_process_state(repo)
+        if status == "running":
+            if dashboard_pid == "-":
+                request_dashboard_start(repo, preferred_port=preferred_port)
+                print(f"{repo.label}: dashboard start requested (orchestrator {orch_pid})")
+            else:
+                print(f"{repo.label}: already running (orchestrator {orch_pid})")
             continue
-        if status in {"running", "running-external"}:
-            print(f"{repo.label}: already running (orchestrator {orch_pid})")
-            continue
-        if status == "session-only":
+        if session != "-":
             print(f"{repo.label}: tmux session already exists without a live orchestrator ({session})")
             continue
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root), str(orchestrator)],
+            [
+                "tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root),
+                str(orchestrator), "--dashboard-port", str(preferred_port),
+            ],
             check=True,
         )
         print(f"{repo.label}: started ({repo.session})")

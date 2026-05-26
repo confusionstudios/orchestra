@@ -3756,6 +3756,13 @@ class TestSingletonLock(unittest.TestCase):
         self.assertEqual(request_path.read_text(encoding="utf-8"), "start\n")
         self.assertTrue(orchestrator._read_dashboard_start_request(db_path))
 
+    def test_read_dashboard_start_request_returns_preferred_port(self):
+        db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        request_path = orchestrator.request_dashboard_start(db_path)
+        request_path.write_text("start\nport=8433\n", encoding="utf-8")
+
+        self.assertEqual(orchestrator._read_dashboard_start_request(db_path), 8433)
+
     def test_main_refuses_to_start_on_dirty_worktree(self):
         with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
              patch.object(orchestrator, "acquire_singleton_lock") as mock_lock, \
@@ -3894,10 +3901,25 @@ class TestSingletonLock(unittest.TestCase):
             orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
         clear_request.assert_called_once_with("/tmp/kanban.db")
-        start_dashboard.assert_called_once_with("/tmp/kanban.db")
+        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=None)
         mock_update.assert_called_once()
         self.assertIn("explicit request", mock_update.call_args.kwargs["status_message"])
         mock_log.assert_called_once_with("Dashboard started with PID 4321 by explicit request")
+
+    def test_handle_dashboard_start_request_uses_preferred_port(self):
+        conn = MagicMock()
+        restarted_process = MagicMock()
+        restarted_process.pid = 4321
+        orchestrator._dashboard_process = None
+
+        with patch.object(orchestrator, "_read_dashboard_start_request", return_value=8433), \
+             patch.object(orchestrator, "_clear_dashboard_start_request"), \
+             patch.object(orchestrator, "start_dashboard", return_value=restarted_process) as start_dashboard, \
+             patch.object(orchestrator.db, "update_runtime"), \
+             patch.object(orchestrator, "log"):
+            orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
+
+        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=8433)
 
     def test_handle_dashboard_start_request_noops_when_dashboard_is_running(self):
         conn = MagicMock()
@@ -4081,7 +4103,7 @@ class TestFleetConfig(unittest.TestCase):
             self.assertEqual(dashboard_pid, str(os.getpid()))
             self.assertEqual(session, "orch-repo")
 
-    def test_process_state_reports_no_dashboard_for_external_orchestrator(self):
+    def test_process_state_reports_running_without_dashboard_for_external_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
             lock_path = root / "kanban-orchestra.lock"
@@ -4094,7 +4116,7 @@ class TestFleetConfig(unittest.TestCase):
             with patch.object(fleet, "tmux_has_session", return_value=False):
                 state, orch_pid, dashboard_pid, session = fleet.repo_process_state(repo)
 
-            self.assertEqual(state, "no-dashboard")
+            self.assertEqual(state, "running")
             self.assertEqual(orch_pid, str(os.getpid()))
             self.assertEqual(dashboard_pid, "-")
             self.assertEqual(session, "-")
@@ -4200,14 +4222,14 @@ class TestFleetConfig(unittest.TestCase):
              self.assertRaises(SystemExit):
             fleet.start([repo], precheck=False)
 
-    def test_start_requests_dashboard_for_no_dashboard_repo(self):
+    def test_start_requests_dashboard_for_running_repo_without_dashboard(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
         out = io.StringIO()
 
         with patch.object(fleet, "require_tool"), \
              patch.object(fleet, "require_startable"), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/tmp/ko-orchestrator")), \
-             patch.object(fleet, "repo_process_state", return_value=("no-dashboard", "123", "-", "orch-repo")), \
+             patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "orch-repo")), \
              patch.object(fleet, "request_dashboard_start") as request_start, \
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet.time, "sleep"), \
@@ -4215,7 +4237,7 @@ class TestFleetConfig(unittest.TestCase):
              redirect_stdout(out):
             fleet.start([repo])
 
-        request_start.assert_called_once_with(repo)
+        request_start.assert_called_once_with(repo, preferred_port=8427)
         run.assert_not_called()
         self.assertIn("dashboard start requested", out.getvalue())
 

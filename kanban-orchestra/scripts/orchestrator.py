@@ -228,13 +228,22 @@ def request_dashboard_start(db_path=None):
 def _read_dashboard_start_request(db_path=None):
     path = _dashboard_start_request_path(db_path)
     try:
-        path.stat()
-        return True
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except OSError as exc:
         log(f"Could not read dashboard start request: {exc}")
         return False
+
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "port":
+            try:
+                return int(value.strip())
+            except ValueError:
+                log(f"Ignoring invalid dashboard start request port: {value.strip()!r}")
+                return True
+    return True
 
 
 def _clear_dashboard_start_request(db_path=None):
@@ -347,7 +356,8 @@ def handle_dashboard_start_request(conn, db_path=None):
         log("Dashboard start requested; dashboard is already running")
         return
 
-    process = start_dashboard(db_path)
+    preferred_port = request if type(request) is int else None
+    process = start_dashboard(db_path, preferred_port=preferred_port)
     db.update_runtime(
         conn,
         status_message=f"Dashboard started with PID {process.pid} by explicit request",
