@@ -194,6 +194,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
              patch.object(fleet.subprocess, "run") as run, \
+             patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
              patch.object(fleet, "print_status"):
             fleet.start([repo])
@@ -227,6 +228,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
              patch.object(fleet.subprocess, "run") as run, \
+             patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
              patch.object(fleet, "print_status"):
             fleet.start(repos)
@@ -234,6 +236,32 @@ class TestFleetOperatorFlows(unittest.TestCase):
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["--dashboard-port", "8427"], [cmd[-2:] for cmd in commands])
         self.assertIn(["--dashboard-port", "8428"], [cmd[-2:] for cmd in commands])
+
+    def test_start_waits_for_each_dashboard_before_next_repo(self):
+        repos = [
+            fleet.FleetRepo("one", Path("/tmp/one"), Path("/tmp/one")),
+            fleet.FleetRepo("two", Path("/tmp/two"), Path("/tmp/two")),
+        ]
+        events = []
+
+        def fake_run(args, check=False):
+            events.append(f"run:{args[args.index('-c') + 1]}")
+
+        def fake_wait(repo):
+            events.append(f"wait:{repo.label}")
+            return True
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "require_startable"), \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
+             patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
+             patch.object(fleet.subprocess, "run", side_effect=fake_run), \
+             patch.object(fleet, "wait_dashboard_ready", side_effect=fake_wait), \
+             patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "print_status"):
+            fleet.start(repos)
+
+        self.assertEqual(events, ["run:/tmp/one", "wait:one", "run:/tmp/two", "wait:two"])
 
     def test_start_requests_dashboard_for_running_repo_without_dashboard(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
@@ -244,6 +272,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "orch-repo")), \
              patch.object(fleet, "request_dashboard_start") as request_start, \
+             patch.object(fleet, "wait_dashboard_ready", return_value=True) as wait_dashboard, \
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet.time, "sleep"), \
              patch.object(fleet, "print_status"), \
@@ -251,8 +280,9 @@ class TestFleetOperatorFlows(unittest.TestCase):
             fleet.start([repo])
 
         request_start.assert_called_once_with(repo, preferred_port=8427)
+        wait_dashboard.assert_called_once_with(repo)
         run.assert_not_called()
-        self.assertIn("dashboard start requested", out.getvalue())
+        self.assertIn("dashboard started", out.getvalue())
 
     def test_stop_stops_fleet_owned_session(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))

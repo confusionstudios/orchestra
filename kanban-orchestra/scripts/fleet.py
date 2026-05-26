@@ -281,6 +281,16 @@ def dashboard_status_url(repo: FleetRepo) -> str:
     return str(url)
 
 
+def wait_dashboard_ready(repo: FleetRepo, *, timeout: float = 12.0) -> bool:
+    """Wait for Fleet-visible dashboard metadata for one running repo."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if dashboard_status_url(repo) != "-":
+            return True
+        time.sleep(0.2)
+    return dashboard_status_url(repo) != "-"
+
+
 def tmux_has_session(session: str) -> bool:
     return subprocess.run(
         ["tmux", "has-session", "-t", session],
@@ -434,7 +444,10 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
         if status == "running":
             if dashboard_pid == "-":
                 request_dashboard_start(repo, preferred_port=preferred_port)
-                print(f"{repo.label}: dashboard start requested (orchestrator {orch_pid})")
+                if wait_dashboard_ready(repo):
+                    print(f"{repo.label}: dashboard started (orchestrator {orch_pid})")
+                else:
+                    print(f"{repo.label}: dashboard start requested (orchestrator {orch_pid}); still pending")
             else:
                 print(f"{repo.label}: already running (orchestrator {orch_pid})")
             continue
@@ -448,7 +461,10 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
             ],
             check=True,
         )
-        print(f"{repo.label}: started ({repo.session})")
+        if wait_dashboard_ready(repo):
+            print(f"{repo.label}: started ({repo.session})")
+        else:
+            print(f"{repo.label}: started ({repo.session}); dashboard still pending")
     time.sleep(0.5)
     print()
     print_status(repos)
