@@ -4246,6 +4246,7 @@ class TestFleetConfig(unittest.TestCase):
              patch.object(fleet, "orchestra_bin", return_value=Path("/tmp/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "orch-repo")), \
              patch.object(fleet, "request_dashboard_start") as request_start, \
+             patch.object(fleet, "wait_dashboard_ready", return_value=True) as wait_dashboard, \
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet.time, "sleep"), \
              patch.object(fleet, "print_status"), \
@@ -4253,8 +4254,9 @@ class TestFleetConfig(unittest.TestCase):
             fleet.start([repo])
 
         request_start.assert_called_once_with(repo, preferred_port=8427)
+        wait_dashboard.assert_called_once_with(repo)
         run.assert_not_called()
-        self.assertIn("dashboard start requested", out.getvalue())
+        self.assertIn("dashboard started", out.getvalue())
 
     def test_restart_waits_for_shutdown_before_starting(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
