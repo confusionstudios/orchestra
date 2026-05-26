@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import config
+
 
 ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
 DEFAULT_CONFIG_PATH = Path("~/.config/orchestra/fleet.repos").expanduser()
@@ -229,6 +231,22 @@ def metadata_pid(path: Path | None, role: str, repo: FleetRepo | None = None) ->
         return None
 
 
+def request_dashboard_start(repo: FleetRepo) -> Path:
+    if repo.runtime_root is None:
+        die(f"{repo.label}: invalid config ({repo.error or 'missing runtime root'})")
+    path = repo.runtime_root / config.DASHBOARD_START_REQUEST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "preferred_port": None,
+        "requested_by_pid": os.getpid(),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
 def dashboard_endpoint_ready(payload: dict, *, timeout: float = 0.25) -> bool:
     host = payload.get("host")
     port = payload.get("port")
@@ -274,10 +292,10 @@ def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     orch_alive = pid_alive(orch_pid)
     dashboard_alive = pid_alive(dashboard_pid)
 
-    if session_alive and orch_alive and dashboard_alive:
-        status = "running"
-    elif session_alive and orch_alive:
+    if orch_alive and not dashboard_alive:
         status = "no-dashboard"
+    elif session_alive and orch_alive and dashboard_alive:
+        status = "running"
     elif session_alive:
         status = "session-only"
     elif orch_alive:
@@ -411,7 +429,11 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
         if repo.root is None:
             die(f"{repo.label}: invalid config ({repo.error or 'missing git root'})")
         status, orch_pid, _, session = repo_process_state(repo)
-        if status in {"running", "no-dashboard", "running-external"}:
+        if status == "no-dashboard":
+            request_dashboard_start(repo)
+            print(f"{repo.label}: dashboard start requested (orchestrator {orch_pid})")
+            continue
+        if status in {"running", "running-external"}:
             print(f"{repo.label}: already running (orchestrator {orch_pid})")
             continue
         if status == "session-only":
@@ -445,7 +467,7 @@ def stop(repos: list[FleetRepo]) -> None:
             print(f"{repo.label}: stopped tmux session")
         else:
             status, orch_pid, _, _ = repo_process_state(repo)
-            if status == "running-external":
+            if orch_pid != "-":
                 print(f"{repo.label}: running outside fleet tmux session (orchestrator {orch_pid}); left alone")
             else:
                 print(f"{repo.label}: not running")

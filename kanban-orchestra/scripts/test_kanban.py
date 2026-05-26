@@ -3670,7 +3670,6 @@ class TestSingletonLock(unittest.TestCase):
         orchestrator.release_singleton_lock()
         orchestrator._dashboard_process = None
         orchestrator._dashboard_metadata_path_for_process = None
-        orchestrator._dashboard_restart_after = None
         self.tmpdir.cleanup()
 
     def _run_lock_probe(self):
@@ -3717,16 +3716,34 @@ class TestSingletonLock(unittest.TestCase):
         probe = self._run_lock_probe()
         self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
 
-    def test_main_exits_early_when_lock_is_unavailable(self):
+    def test_main_requests_dashboard_start_when_lock_is_unavailable(self):
         with patch.object(orchestrator, "acquire_singleton_lock", side_effect=orchestrator.SingletonLockError("busy")), \
              patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "request_dashboard_start", return_value=Path("/tmp/dashboard-start-request.json")) as request_start, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
              patch.object(orchestrator.os, "setpgrp"), \
              patch.object(orchestrator.signal, "signal"):
             exit_code = orchestrator.main()
 
+        self.assertEqual(exit_code, 0)
+        request_start.assert_called_once()
+        mock_connect.assert_not_called()
+        mock_log.assert_any_call("busy")
+        mock_log.assert_any_call("Requested dashboard start via /tmp/dashboard-start-request.json")
+
+    def test_main_no_dashboard_does_not_request_dashboard_when_lock_is_unavailable(self):
+        with patch.object(orchestrator, "acquire_singleton_lock", side_effect=orchestrator.SingletonLockError("busy")), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "request_dashboard_start") as request_start, \
+             patch.object(orchestrator, "log") as mock_log, \
+             patch.object(orchestrator.db, "connect") as mock_connect, \
+             patch.object(orchestrator.os, "setpgrp"), \
+             patch.object(orchestrator.signal, "signal"):
+            exit_code = orchestrator.main(["--no-dashboard"])
+
         self.assertEqual(exit_code, 1)
+        request_start.assert_not_called()
         mock_connect.assert_not_called()
         mock_log.assert_any_call("busy")
 
@@ -3740,7 +3757,7 @@ class TestSingletonLock(unittest.TestCase):
             exit_code = orchestrator.main()
 
         self.assertEqual(exit_code, 2)
-        mock_lock.assert_not_called()
+        mock_lock.assert_called_once()
         mock_connect.assert_not_called()
         self.assertTrue(any("dirty" in str(c).lower() for c in mock_log.call_args_list))
 
@@ -3821,7 +3838,7 @@ class TestSingletonLock(unittest.TestCase):
 
         mock_remove.assert_not_called()
 
-    def test_check_dashboard_process_schedules_restart_after_exit(self):
+    def test_check_dashboard_process_logs_exit_without_restart(self):
         fake_process = MagicMock()
         fake_process.poll.return_value = 7
         orchestrator._dashboard_process = fake_process
@@ -3831,55 +3848,66 @@ class TestSingletonLock(unittest.TestCase):
 
         with patch.object(orchestrator.db, "update_runtime") as mock_update, \
              patch.object(orchestrator, "_remove_dashboard_metadata") as mock_remove, \
-             patch.object(orchestrator.time, "monotonic", return_value=100.0), \
              patch.object(orchestrator, "log") as mock_log:
-            orchestrator.check_dashboard_process(conn, restart_cooldown_seconds=3.0)
+            orchestrator.check_dashboard_process(conn)
 
         mock_update.assert_called_once()
-        self.assertIn("restart scheduled", mock_update.call_args.kwargs["status_message"])
+        self.assertIn("dashboard stopped", mock_update.call_args.kwargs["status_message"])
         mock_log.assert_called_once()
         mock_remove.assert_called_once_with(metadata_path)
         self.assertIsNone(orchestrator._dashboard_process)
         self.assertIsNone(orchestrator._dashboard_metadata_path_for_process)
-        self.assertEqual(orchestrator._dashboard_restart_after, 103.0)
 
-    def test_check_dashboard_process_restarts_after_cooldown(self):
+    def test_check_dashboard_process_does_not_start_when_no_process_is_tracked(self):
         conn = MagicMock()
-        restarted_process = MagicMock()
-        restarted_process.pid = 4321
         orchestrator._dashboard_process = None
-        orchestrator._dashboard_restart_after = 100.0
 
-        with patch.object(orchestrator, "start_dashboard", return_value=restarted_process) as start_dashboard, \
+        with patch.object(orchestrator, "start_dashboard") as start_dashboard, \
              patch.object(orchestrator.db, "update_runtime") as mock_update, \
-             patch.object(orchestrator, "log") as mock_log, \
-             patch.object(orchestrator.time, "monotonic", return_value=99.9):
+             patch.object(orchestrator, "log") as mock_log:
             orchestrator.check_dashboard_process(conn, "/tmp/kanban.db")
 
         start_dashboard.assert_not_called()
         mock_update.assert_not_called()
         mock_log.assert_not_called()
 
-        with patch.object(orchestrator, "start_dashboard", return_value=restarted_process) as start_dashboard, \
-             patch.object(orchestrator.db, "update_runtime") as mock_update, \
-             patch.object(orchestrator, "log") as mock_log, \
-             patch.object(orchestrator.time, "monotonic", return_value=100.0):
-            orchestrator.check_dashboard_process(conn, "/tmp/kanban.db")
-
-        start_dashboard.assert_called_once_with("/tmp/kanban.db")
-        mock_update.assert_called_once()
-        self.assertIn("Dashboard restarted", mock_update.call_args.kwargs["status_message"])
-        mock_log.assert_called_once_with("Dashboard restarted with PID 4321")
-
-    def test_check_dashboard_process_respects_no_dashboard(self):
+    def test_handle_dashboard_start_request_starts_dashboard(self):
         conn = MagicMock()
+        restarted_process = MagicMock()
+        restarted_process.pid = 4321
+        request = {"preferred_port": 8765}
         orchestrator._dashboard_process = None
-        orchestrator._dashboard_restart_after = 1.0
 
-        with patch.object(orchestrator, "start_dashboard") as start_dashboard:
-            orchestrator.check_dashboard_process(conn, "/tmp/kanban.db", dashboard_enabled=False)
+        with patch.object(orchestrator, "_read_dashboard_start_request", return_value=request), \
+             patch.object(orchestrator, "_clear_dashboard_start_request") as clear_request, \
+             patch.object(orchestrator, "start_dashboard", return_value=restarted_process) as start_dashboard, \
+             patch.object(orchestrator.db, "update_runtime") as mock_update, \
+             patch.object(orchestrator, "log") as mock_log:
+            orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
+        clear_request.assert_called_once_with("/tmp/kanban.db")
+        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=8765)
+        mock_update.assert_called_once()
+        self.assertIn("explicit request", mock_update.call_args.kwargs["status_message"])
+        mock_log.assert_called_once_with("Dashboard started with PID 4321 by explicit request")
+
+    def test_handle_dashboard_start_request_noops_when_dashboard_is_running(self):
+        conn = MagicMock()
+        fake_process = MagicMock()
+        fake_process.poll.return_value = None
+        orchestrator._dashboard_process = fake_process
+
+        with patch.object(orchestrator, "_read_dashboard_start_request", return_value={}), \
+             patch.object(orchestrator, "_clear_dashboard_start_request") as clear_request, \
+             patch.object(orchestrator, "start_dashboard") as start_dashboard, \
+             patch.object(orchestrator.db, "update_runtime") as mock_update, \
+             patch.object(orchestrator, "log") as mock_log:
+            orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
+
+        clear_request.assert_called_once_with("/tmp/kanban.db")
         start_dashboard.assert_not_called()
+        mock_update.assert_not_called()
+        mock_log.assert_called_once_with("Dashboard start requested; dashboard is already running")
 
 
 class TestOrchestratorControlIdentity(unittest.TestCase):
@@ -4045,6 +4073,24 @@ class TestFleetConfig(unittest.TestCase):
             self.assertEqual(dashboard_pid, str(os.getpid()))
             self.assertEqual(session, "orch-repo")
 
+    def test_process_state_reports_no_dashboard_for_external_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            lock_path = root / "kanban-orchestra.lock"
+            lock_path.write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+
+            with patch.object(fleet, "tmux_has_session", return_value=False):
+                state, orch_pid, dashboard_pid, session = fleet.repo_process_state(repo)
+
+            self.assertEqual(state, "no-dashboard")
+            self.assertEqual(orch_pid, str(os.getpid()))
+            self.assertEqual(dashboard_pid, "-")
+            self.assertEqual(session, "-")
+
     def test_open_dashboard_refuses_dead_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
@@ -4145,6 +4191,25 @@ class TestFleetConfig(unittest.TestCase):
              patch.object(fleet, "orchestra_bin", return_value=Path("/tmp/ko-orchestrator")), \
              self.assertRaises(SystemExit):
             fleet.start([repo], precheck=False)
+
+    def test_start_requests_dashboard_for_no_dashboard_repo(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+        out = io.StringIO()
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "require_startable"), \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/tmp/ko-orchestrator")), \
+             patch.object(fleet, "repo_process_state", return_value=("no-dashboard", "123", "-", "orch-repo")), \
+             patch.object(fleet, "request_dashboard_start") as request_start, \
+             patch.object(fleet.subprocess, "run") as run, \
+             patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "print_status"), \
+             redirect_stdout(out):
+            fleet.start([repo])
+
+        request_start.assert_called_once_with(repo)
+        run.assert_not_called()
+        self.assertIn("dashboard start requested", out.getvalue())
 
     def test_restart_waits_for_shutdown_before_starting(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))

@@ -100,6 +100,23 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertEqual(columns[-2], "-")
             self.assertEqual(columns[-1], str(root))
 
+    def test_process_state_reports_no_dashboard_for_external_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+
+            with patch.object(fleet, "tmux_has_session", return_value=False):
+                state, orch_pid, dashboard_pid, session = fleet.repo_process_state(repo)
+
+            self.assertEqual(state, "no-dashboard")
+            self.assertEqual(orch_pid, str(os.getpid()))
+            self.assertEqual(dashboard_pid, "-")
+            self.assertEqual(session, "-")
+
     def test_status_abbreviates_home_repo_root(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir).resolve()
@@ -144,6 +161,25 @@ class TestFleetOperatorFlows(unittest.TestCase):
             ],
             check=True,
         )
+
+    def test_start_requests_dashboard_for_no_dashboard_repo(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+        out = io.StringIO()
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "require_startable"), \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
+             patch.object(fleet, "repo_process_state", return_value=("no-dashboard", "123", "-", "orch-repo")), \
+             patch.object(fleet, "request_dashboard_start") as request_start, \
+             patch.object(fleet.subprocess, "run") as run, \
+             patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "print_status"), \
+             redirect_stdout(out):
+            fleet.start([repo])
+
+        request_start.assert_called_once_with(repo)
+        run.assert_not_called()
+        self.assertIn("dashboard start requested", out.getvalue())
 
     def test_stop_stops_fleet_owned_session(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
