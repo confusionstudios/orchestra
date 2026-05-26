@@ -236,13 +236,8 @@ def request_dashboard_start(repo: FleetRepo) -> Path:
         die(f"{repo.label}: invalid config ({repo.error or 'missing runtime root'})")
     path = repo.runtime_root / config.DASHBOARD_START_REQUEST_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "preferred_port": None,
-        "requested_by_pid": os.getpid(),
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text("start\n", encoding="utf-8")
     tmp.replace(path)
     return path
 

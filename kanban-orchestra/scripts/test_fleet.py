@@ -100,6 +100,16 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertEqual(columns[-2], "-")
             self.assertEqual(columns[-1], str(root))
 
+    def test_request_dashboard_start_creates_presence_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            repo = fleet.FleetRepo("repo", root, root)
+
+            request_path = fleet.request_dashboard_start(repo)
+
+            self.assertEqual(request_path.name, "dashboard-start-request")
+            self.assertEqual(request_path.read_text(encoding="utf-8"), "start\n")
+
     def test_process_state_reports_no_dashboard_for_external_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()

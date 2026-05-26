@@ -3719,7 +3719,7 @@ class TestSingletonLock(unittest.TestCase):
     def test_main_requests_dashboard_start_when_lock_is_unavailable(self):
         with patch.object(orchestrator, "acquire_singleton_lock", side_effect=orchestrator.SingletonLockError("busy")), \
              patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
-             patch.object(orchestrator, "request_dashboard_start", return_value=Path("/tmp/dashboard-start-request.json")) as request_start, \
+             patch.object(orchestrator, "request_dashboard_start", return_value=Path("/tmp/dashboard-start-request")) as request_start, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
              patch.object(orchestrator.os, "setpgrp"), \
@@ -3730,7 +3730,7 @@ class TestSingletonLock(unittest.TestCase):
         request_start.assert_called_once()
         mock_connect.assert_not_called()
         mock_log.assert_any_call("busy")
-        mock_log.assert_any_call("Requested dashboard start via /tmp/dashboard-start-request.json")
+        mock_log.assert_any_call("Requested dashboard start via /tmp/dashboard-start-request")
 
     def test_main_no_dashboard_does_not_request_dashboard_when_lock_is_unavailable(self):
         with patch.object(orchestrator, "acquire_singleton_lock", side_effect=orchestrator.SingletonLockError("busy")), \
@@ -3746,6 +3746,15 @@ class TestSingletonLock(unittest.TestCase):
         request_start.assert_not_called()
         mock_connect.assert_not_called()
         mock_log.assert_any_call("busy")
+
+    def test_request_dashboard_start_creates_presence_file(self):
+        db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+
+        request_path = orchestrator.request_dashboard_start(db_path)
+
+        self.assertEqual(request_path.name, "dashboard-start-request")
+        self.assertEqual(request_path.read_text(encoding="utf-8"), "start\n")
+        self.assertTrue(orchestrator._read_dashboard_start_request(db_path))
 
     def test_main_refuses_to_start_on_dirty_worktree(self):
         with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
@@ -3875,10 +3884,9 @@ class TestSingletonLock(unittest.TestCase):
         conn = MagicMock()
         restarted_process = MagicMock()
         restarted_process.pid = 4321
-        request = {"preferred_port": 8765}
         orchestrator._dashboard_process = None
 
-        with patch.object(orchestrator, "_read_dashboard_start_request", return_value=request), \
+        with patch.object(orchestrator, "_read_dashboard_start_request", return_value=True), \
              patch.object(orchestrator, "_clear_dashboard_start_request") as clear_request, \
              patch.object(orchestrator, "start_dashboard", return_value=restarted_process) as start_dashboard, \
              patch.object(orchestrator.db, "update_runtime") as mock_update, \
@@ -3886,7 +3894,7 @@ class TestSingletonLock(unittest.TestCase):
             orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
         clear_request.assert_called_once_with("/tmp/kanban.db")
-        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=8765)
+        start_dashboard.assert_called_once_with("/tmp/kanban.db")
         mock_update.assert_called_once()
         self.assertIn("explicit request", mock_update.call_args.kwargs["status_message"])
         mock_log.assert_called_once_with("Dashboard started with PID 4321 by explicit request")
@@ -3897,7 +3905,7 @@ class TestSingletonLock(unittest.TestCase):
         fake_process.poll.return_value = None
         orchestrator._dashboard_process = fake_process
 
-        with patch.object(orchestrator, "_read_dashboard_start_request", return_value={}), \
+        with patch.object(orchestrator, "_read_dashboard_start_request", return_value=True), \
              patch.object(orchestrator, "_clear_dashboard_start_request") as clear_request, \
              patch.object(orchestrator, "start_dashboard") as start_dashboard, \
              patch.object(orchestrator.db, "update_runtime") as mock_update, \

@@ -9,7 +9,6 @@ Sequential: one task at a time, exclusive repo access assumed.
 """
 
 import os
-import json
 import re
 import select
 import signal
@@ -216,17 +215,12 @@ def _dashboard_start_request_path(db_path=None):
     return db.get_runtime_root(db_path) / DASHBOARD_START_REQUEST_FILE
 
 
-def request_dashboard_start(db_path=None, *, preferred_port=None):
+def request_dashboard_start(db_path=None):
     """Ask the running repo orchestrator to start its dashboard."""
     path = _dashboard_start_request_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "preferred_port": preferred_port,
-        "requested_by_pid": os.getpid(),
-        "created_at": datetime.now().isoformat(),
-    }
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text("start\n", encoding="utf-8")
     tmp.replace(path)
     return path
 
@@ -234,12 +228,13 @@ def request_dashboard_start(db_path=None, *, preferred_port=None):
 def _read_dashboard_start_request(db_path=None):
     path = _dashboard_start_request_path(db_path)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        path.stat()
+        return True
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         log(f"Could not read dashboard start request: {exc}")
-        return {}
+        return False
 
 
 def _clear_dashboard_start_request(db_path=None):
@@ -344,7 +339,7 @@ def check_dashboard_process(conn, db_path=None):
 def handle_dashboard_start_request(conn, db_path=None):
     """Consume an explicit dashboard-start request, if one exists."""
     request = _read_dashboard_start_request(db_path)
-    if request is None:
+    if not request:
         return
 
     _clear_dashboard_start_request(db_path)
@@ -352,8 +347,7 @@ def handle_dashboard_start_request(conn, db_path=None):
         log("Dashboard start requested; dashboard is already running")
         return
 
-    preferred_port = request.get("preferred_port") if isinstance(request, dict) else None
-    process = start_dashboard(db_path, preferred_port=preferred_port)
+    process = start_dashboard(db_path)
     db.update_runtime(
         conn,
         status_message=f"Dashboard started with PID {process.pid} by explicit request",
@@ -2514,7 +2508,7 @@ def main(argv=None):
     except SingletonLockError as e:
         log(str(e))
         if not args.no_dashboard:
-            request_path = request_dashboard_start(db_path, preferred_port=args.dashboard_port)
+            request_path = request_dashboard_start(db_path)
             log(f"Requested dashboard start via {request_path}")
             return 0
         return 1
