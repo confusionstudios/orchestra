@@ -297,7 +297,6 @@ def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     orch_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
     dashboard_pid = metadata_pid(repo.dashboard_metadata_path, "dashboard", repo)
     orch_alive = pid_alive(orch_pid)
-    dashboard_alive = pid_alive(dashboard_pid)
 
     if orch_alive:
         status = "running"
