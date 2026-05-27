@@ -2,7 +2,10 @@ import os
 import sys
 from pathlib import Path
 
-AGENTS = ["haiku", "sonnet", "opus", "claude", "codex", "gemini", "kilo"]
+_shared = Path(__file__).resolve().parent.parent.parent / "shared_scripts"
+if str(_shared) not in sys.path:
+    sys.path.insert(0, str(_shared))
+from agent_registry import AGENTS, AGENT_CMD, AGENT_DISPLAY_LABELS  # type: ignore  # noqa: E402
 
 
 def _agent_default(env_key: str, fallback: str) -> str:
@@ -21,20 +24,13 @@ def get_agent_display_label(agent: str) -> str:
     This keeps commit attribution tied to orchestration config rather than
     agent self-reporting.
     """
-    try:
-        _shared = Path(__file__).resolve().parent.parent.parent / "shared_scripts"
-        if str(_shared) not in sys.path:
-            sys.path.insert(0, str(_shared))
-        from shared_config import AGENT_CMD, AGENT_DISPLAY_LABELS  # type: ignore
-        if agent in AGENT_DISPLAY_LABELS:
-            return AGENT_DISPLAY_LABELS[agent]
+    if agent in AGENT_DISPLAY_LABELS:
+        return AGENT_DISPLAY_LABELS[agent]
 
-        cmd = AGENT_CMD.get(agent, [])
-        for i, part in enumerate(cmd):
-            if part == "--model" and i + 1 < len(cmd):
-                return cmd[i + 1]
-    except Exception:
-        pass
+    cmd = AGENT_CMD.get(agent, [])
+    for i, part in enumerate(cmd):
+        if part == "--model" and i + 1 < len(cmd):
+            return cmd[i + 1]
     return agent
 
 

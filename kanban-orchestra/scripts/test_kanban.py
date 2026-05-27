@@ -49,6 +49,7 @@ orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
 config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
 fleet = _load_local_module("kanban_test_fleet", "fleet.py")
+import agent_registry
 import shared_config
 skill_wrappers = _load_local_module("kanban_test_skill_wrappers", str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_ai_skill_wrappers.py"))
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
@@ -6704,6 +6705,17 @@ class TestDeferredBuildPolicy(unittest.TestCase):
 class TestCommitFooter(unittest.TestCase):
     """Tests for get_agent_display_name() and task get-commit-footer subcommand."""
 
+    NEW_AGENT_KEYS = (
+        "kilo-opus-4.6",
+        "kilo-opus-4.7",
+        "kilo-sonnet-4.6",
+        "cursor-auto",
+        "cursor-composer-2.5",
+        "cursor-opus-4.6",
+        "cursor-opus-4.7",
+        "cursor-sonnet-4.6",
+    )
+
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
@@ -6737,6 +6749,43 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(shared_config.AGENT_DISPLAY_LABELS["codex"], "GPT-5.5 medium")
         result = config.get_agent_display_name("codex")
         self.assertEqual(result, "GPT-5.5 medium")
+
+    def test_existing_registry_labels_preserve_previous_fallbacks(self):
+        self.assertEqual(config.get_agent_display_name("gemini"), "gemini")
+        self.assertEqual(config.get_agent_display_name("kilo"), "kilo/kilo-auto/free")
+
+    def test_agent_registry_keys_are_unique(self):
+        self.assertEqual(len(agent_registry.AGENTS), len(set(agent_registry.AGENTS)))
+
+    def test_agent_registry_commands_have_one_prompt_placeholder(self):
+        for key, command in agent_registry.AGENT_CMD.items():
+            with self.subTest(key=key):
+                prompt_count = sum(part.count("{prompt}") for part in command)
+                self.assertEqual(prompt_count, 1)
+
+    def test_shared_config_uses_agent_registry_exports(self):
+        self.assertIs(shared_config.AGENT_CMD, agent_registry.AGENT_CMD)
+        self.assertIs(shared_config.AGENT_DISPLAY_LABELS, agent_registry.AGENT_DISPLAY_LABELS)
+
+    def test_new_agent_keys_are_allowed(self):
+        for key in self.NEW_AGENT_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, config.AGENTS)
+
+    def test_display_names_for_new_agent_keys(self):
+        expected = {
+            "kilo-opus-4.6": "Kilo Claude Opus 4.6",
+            "kilo-opus-4.7": "Kilo Claude Opus 4.7",
+            "kilo-sonnet-4.6": "Kilo Claude Sonnet 4.6",
+            "cursor-auto": "Cursor Auto",
+            "cursor-composer-2.5": "Cursor Composer 2.5",
+            "cursor-opus-4.6": "Cursor Opus 4.6 High",
+            "cursor-opus-4.7": "Cursor Opus 4.7 High",
+            "cursor-sonnet-4.6": "Cursor Sonnet 4.6",
+        }
+        for key, label in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(config.get_agent_display_name(key), label)
 
     def test_display_name_fallback_for_unknown_agent(self):
         result = config.get_agent_display_name("nonexistent-agent")
