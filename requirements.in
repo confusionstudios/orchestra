@@ -3,5 +3,6 @@ httpx
 markdown-it-py
 pytest
 pytest-cov
+PyYAML
 rich
 uvicorn

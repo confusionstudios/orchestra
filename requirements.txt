@@ -3,5 +3,6 @@ httpx==0.28.1
 markdown-it-py==4.2.0
 pytest==9.0.3
 pytest-cov==7.1.0
+PyYAML==6.0.3
 rich==15.0.0
 uvicorn==0.46.0

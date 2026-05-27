@@ -1,0 +1,46 @@
+agents:
+  - key: haiku
+    label: Claude Haiku 4.5
+    command: ["claude", "--model", "Haiku", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+  - key: sonnet
+    label: Claude Sonnet 4.5
+    command: ["claude", "--model", "Sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+  - key: opus
+    label: Claude Opus 4.6
+    command: ["claude", "--model", "claude-opus-4-6", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+  - key: claude
+    label: Claude Sonnet 4.5
+    command: ["claude", "--model", "Sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+  - key: codex
+    label: GPT-5.5 medium
+    command: ["codex", "exec", "--yolo", "{prompt}"]
+  - key: gemini
+    label: gemini
+    command: ["gemini", "-p", "{prompt}", "--yolo", "--output-format", "text"]
+  - key: kilo
+    label: kilo/kilo-auto/free
+    command: ["kilo", "--model", "kilo/kilo-auto/free", "run", "{prompt}"]
+  - key: kilo-opus-4.6
+    label: Kilo Claude Opus 4.6
+    command: ["kilo", "--model", "kilo/anthropic/claude-opus-4.6", "run", "{prompt}"]
+  - key: kilo-opus-4.7
+    label: Kilo Claude Opus 4.7
+    command: ["kilo", "--model", "kilo/anthropic/claude-opus-4.7", "run", "{prompt}"]
+  - key: kilo-sonnet-4.6
+    label: Kilo Claude Sonnet 4.6
+    command: ["kilo", "--model", "kilo/anthropic/claude-sonnet-4.6", "run", "{prompt}"]
+  - key: cursor-auto
+    label: Cursor Auto
+    command: ["cursor", "agent", "-p", "--model", "auto", "--yolo", "--trust", "{prompt}"]
+  - key: cursor-composer-2.5
+    label: Cursor Composer 2.5
+    command: ["cursor", "agent", "-p", "--model", "composer-2.5", "--yolo", "--trust", "{prompt}"]
+  - key: cursor-opus-4.6
+    label: Cursor Opus 4.6 High
+    command: ["cursor", "agent", "-p", "--model", "claude-4.6-opus-high", "--yolo", "--trust", "{prompt}"]
+  - key: cursor-opus-4.7
+    label: Cursor Opus 4.7 High
+    command: ["cursor", "agent", "-p", "--model", "claude-opus-4-7-high", "--yolo", "--trust", "{prompt}"]
+  - key: cursor-sonnet-4.6
+    label: Cursor Sonnet 4.6
+    command: ["cursor", "agent", "-p", "--model", "claude-4.6-sonnet-medium", "--yolo", "--trust", "{prompt}"]

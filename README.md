@@ -52,10 +52,12 @@ Orchestra shells out to local agent CLIs. It ships with built-in support for:
 | `sonnet` / `claude` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
 | `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | Default reviewer, plan reviewer, and supertask reviewer |
 | `gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | |
-| `kilo` | [Kilo Code](https://kilocode.ai) | |
+| `kilo` / `kilo-opus-4.6` / `kilo-opus-4.7` / `kilo-sonnet-4.6` | [Kilo Code](https://kilocode.ai) | `kilo` uses Kilo auto/free; the other keys pin specific Anthropic models |
+| `cursor-auto` / `cursor-composer-2.5` / `cursor-opus-4.6` / `cursor-opus-4.7` / `cursor-sonnet-4.6` | [Cursor Agent](https://cursor.com) | Cursor model availability depends on your Cursor account and installed CLI version |
 
-You can add or change agent commands in
-`shared_scripts/shared_config.py`. Orchestra does not provide API keys,
+Agent keys, command templates, and display labels live in
+`shared_scripts/agent_registry.yaml`. `shared_scripts/shared_config.py` keeps
+compatibility exports for older imports. Orchestra does not provide API keys,
 accounts, or billing — install and authenticate each CLI yourself.
 
 ## Prerequisites
