@@ -433,14 +433,27 @@ def precheck(repos: list[FleetRepo]) -> int:
 
 def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
     require_tool("tmux")
-    if precheck:
-        require_startable(repos)
     orchestrator = orchestra_bin("ko-orchestrator")
-    for index, repo in enumerate(repos):
-        if repo.root is None:
-            die(f"{repo.label}: invalid config ({repo.error or 'missing git root'})")
+    invalid = invalid_repos(repos)
+    states = []
+    repos_to_start = []
+    for repo in repos:
+        if repo.error:
+            continue
+        state = repo_process_state(repo)
+        states.append((repo, state))
+        status, _, _, session = state
+        if status != "running" and session == "-":
+            repos_to_start.append(repo)
+    if precheck:
+        require_startable([*invalid, *repos_to_start])
+    elif invalid:
+        for repo in invalid:
+            print(f"{repo.label}: invalid config ({repo.error})", file=sys.stderr)
+        raise SystemExit(1)
+    for index, (repo, state) in enumerate(states):
         preferred_port = dashboard_port_for_index(index)
-        status, orch_pid, dashboard_pid, session = repo_process_state(repo)
+        status, orch_pid, dashboard_pid, session = state
         if status == "running":
             if dashboard_pid == "-":
                 request_dashboard_start(repo, preferred_port=preferred_port)

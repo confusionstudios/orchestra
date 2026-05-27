@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -236,6 +236,48 @@ class TestFleetOperatorFlows(unittest.TestCase):
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["--dashboard-port", "8427"], [cmd[-2:] for cmd in commands])
         self.assertIn(["--dashboard-port", "8428"], [cmd[-2:] for cmd in commands])
+
+    def test_start_prechecks_only_repos_that_will_launch(self):
+        running = fleet.FleetRepo("running", Path("/tmp/running"), Path("/tmp/running"))
+        stopped = fleet.FleetRepo("stopped", Path("/tmp/stopped"), Path("/tmp/stopped"))
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "require_startable") as require_startable, \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
+             patch.object(
+                 fleet,
+                 "repo_process_state",
+                 side_effect=[
+                     ("running", "123", "456", "orch-running"),
+                     ("stopped", "-", "-", "-"),
+                 ],
+             ), \
+             patch.object(fleet.subprocess, "run") as run, \
+             patch.object(fleet, "wait_dashboard_ready", return_value=True), \
+             patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "print_status"):
+            fleet.start([running, stopped])
+
+        require_startable.assert_called_once_with([stopped])
+        run.assert_called_once()
+
+    def test_start_reports_all_invalid_repos_before_launching(self):
+        repos = [
+            fleet.FleetRepo("missing-one", Path("/tmp/missing-one"), None, "path does not exist"),
+            fleet.FleetRepo("missing-two", Path("/tmp/missing-two"), None, "path is not a directory"),
+        ]
+        err = io.StringIO()
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
+             patch.object(fleet, "repo_process_state") as repo_process_state, \
+             redirect_stderr(err), \
+             self.assertRaises(SystemExit):
+            fleet.start(repos)
+
+        repo_process_state.assert_not_called()
+        self.assertIn("missing-one", err.getvalue())
+        self.assertIn("missing-two", err.getvalue())
 
     def test_start_waits_for_each_dashboard_before_next_repo(self):
         repos = [
