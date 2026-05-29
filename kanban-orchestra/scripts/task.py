@@ -141,8 +141,12 @@ def _resolve_branch_for_ready(conn, task, branch_arg):
         name = input("Enter branch name for this task: ").strip()
         if name:
             return name
-        print("Error: a branch is required to set status to 'ready'.", file=sys.stderr)
-        sys.exit(1)
+    print(
+        "Error: task has no branch and none was provided. "
+        "Agents must specify --branch or operate on a task that already has one.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def _normalize_task_type(kind):
@@ -206,11 +210,6 @@ def _validate_next_step_for_type(task_type, next_step):
             f"Error: next_step '{next_step}' is not valid for {_display_task_type(task_type)} tasks.",
             file=sys.stderr,
         )
-        sys.exit(1)
-    else:
-        print("Error: task has no branch and none was provided. "
-              "Agents must specify --branch or operate on a task that already has one.",
-              file=sys.stderr)
         sys.exit(1)
 
 
