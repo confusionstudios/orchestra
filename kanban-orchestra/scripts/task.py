@@ -3,7 +3,7 @@
 task.py — CLI for creating and managing Kanban Orchestra tasks.
 
 Usage:
-    task add "<title>" [--description "<markdown>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--allow-when-blocked]
+    task add "<title>" [--type <commit|pull_request|supertask|other>] [--description "<markdown>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--allow-when-blocked]
     task set <id> [--title ".."] [--status ..] [--next-step ..] [--branch ..]
                   [--description "<markdown>"] [--stash-ref <ref>] [--allow-when-blocked <bool>] ...
     task list [--status ..] [--next-step ..] [--branch ..] [--page N]
@@ -43,10 +43,26 @@ VALID_SKIPS = {
     "commit-review",
     "commit-review-supertask",
     "pull-request-review",
+    "other-review",
 }
 NORMAL_TASK_SKIPS = {"commit-plan", "commit-plan-review", "commit-review"}
 SUPERTASK_SKIPS = {"commit-review-supertask"}
 PULL_REQUEST_SKIPS = {"pull-request-review"}
+OTHER_SKIPS = {"other-review"}
+COMMIT_TYPES = {"commit", "task"}
+TASK_TYPES = {"commit", "supertask", "pull_request", "other"}
+TASK_TYPE_ALIASES = TASK_TYPES | {"task"}
+COMMIT_STEPS = {"commit-make", "commit-review", "commit-plan", "commit-plan-review"}
+SUPERTASK_STEPS = {"commit-make-supertask", "commit-review-supertask"}
+PULL_REQUEST_STEPS = {"pull-request-make", "pull-request-review"}
+OTHER_STEPS = {"other-make", "other-review"}
+STEP_TYPES = {
+    **{step: "commit" for step in COMMIT_STEPS},
+    **{step: "supertask" for step in SUPERTASK_STEPS},
+    **{step: "pull_request" for step in PULL_REQUEST_STEPS},
+    **{step: "other" for step in OTHER_STEPS},
+    "none": "any",
+}
 BRANCH_NAME_RE = re.compile(r'^[A-Za-z0-9._/][A-Za-z0-9._/ -]*$')
 MASTER_BRANCHES = {"master", "main"}
 MASTER_TASKS_DISABLED_ERROR = (
@@ -127,6 +143,70 @@ def _resolve_branch_for_ready(conn, task, branch_arg):
             return name
         print("Error: a branch is required to set status to 'ready'.", file=sys.stderr)
         sys.exit(1)
+
+
+def _normalize_task_type(kind):
+    return "commit" if kind in COMMIT_TYPES else kind
+
+
+def _resolve_add_task_type(args):
+    kind_arg = args.kind
+    type_arg = args.task_type
+    if kind_arg and type_arg and _normalize_task_type(kind_arg) != _normalize_task_type(type_arg):
+        print("Error: --kind and --type specify different task types.", file=sys.stderr)
+        sys.exit(1)
+    raw = type_arg or kind_arg or "commit"
+    normalized = _normalize_task_type(raw)
+    if normalized not in TASK_TYPES:
+        print(
+            f"Error: unknown task type '{raw}'. Valid: {', '.join(sorted(TASK_TYPES))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return normalized
+
+
+def _skip_set_for_type(task_type):
+    if task_type == "commit":
+        return NORMAL_TASK_SKIPS
+    if task_type == "supertask":
+        return SUPERTASK_SKIPS
+    if task_type == "pull_request":
+        return PULL_REQUEST_SKIPS
+    if task_type == "other":
+        return OTHER_SKIPS
+    return set()
+
+
+def _display_task_type(task_type):
+    return task_type.replace("_", " ")
+
+
+def _validate_skip_for_type(task_type, skip):
+    if skip not in VALID_SKIPS:
+        print(f"Error: unknown skip target '{skip}'. Valid: {', '.join(sorted(VALID_SKIPS))}", file=sys.stderr)
+        sys.exit(1)
+    allowed = _skip_set_for_type(task_type)
+    if skip not in allowed:
+        print(
+            f"Error: skip target '{skip}' is not allowed for {_display_task_type(task_type)} tasks. "
+            f"Valid: {', '.join(sorted(allowed)) if allowed else '(none)'}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _validate_next_step_for_type(task_type, next_step):
+    step_type = STEP_TYPES.get(next_step)
+    if step_type is None:
+        print(f"Error: unknown next_step '{next_step}'.", file=sys.stderr)
+        sys.exit(1)
+    if step_type != "any" and step_type != task_type:
+        print(
+            f"Error: next_step '{next_step}' is not valid for {_display_task_type(task_type)} tasks.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     else:
         print("Error: task has no branch and none was provided. "
               "Agents must specify --branch or operate on a task that already has one.",
@@ -146,37 +226,26 @@ def cmd_add(args, conn):
         print(f"Error: reviewer-agent must be one of {AGENTS}", file=sys.stderr)
         sys.exit(1)
 
-    kind = args.kind or "task"
+    kind = _resolve_add_task_type(args)
     parent_task_id = args.parent
     sequence_index = args.sequence_index
     branch = args.branch
     skips = list(args.skip or [])
 
-    # Normal tasks skip planning by default; plan review is inferred from that
+    # Commit tasks skip planning by default; plan review is inferred from that
     # skip so users and defaults only need to store the root planning skip.
-    if kind == "task":
+    if kind == "commit":
         if "commit-plan" not in skips:
             skips.insert(0, "commit-plan")
 
     # Validate skips
     for s in skips:
-        if s not in VALID_SKIPS:
-            print(f"Error: unknown skip target '{s}'. Valid: {', '.join(sorted(VALID_SKIPS))}", file=sys.stderr)
-            sys.exit(1)
-        if kind == "task" and s not in NORMAL_TASK_SKIPS:
-            print(f"Error: skip target '{s}' is not allowed for normal tasks. Valid: {', '.join(sorted(NORMAL_TASK_SKIPS))}", file=sys.stderr)
-            sys.exit(1)
-        if kind == "supertask" and s not in SUPERTASK_SKIPS:
-            print(f"Error: skip target '{s}' is not allowed for supertasks. Valid: {', '.join(sorted(SUPERTASK_SKIPS))}", file=sys.stderr)
-            sys.exit(1)
-        if kind == "pull_request" and s not in PULL_REQUEST_SKIPS:
-            print(f"Error: skip target '{s}' is not allowed for pull request tasks. Valid: {', '.join(sorted(PULL_REQUEST_SKIPS))}", file=sys.stderr)
-            sys.exit(1)
+        _validate_skip_for_type(kind, s)
 
     if parent_task_id is not None:
-        if kind != "task":
+        if kind != "commit":
             print(
-                f"Error: child tasks must use kind='task'; got kind='{kind}'",
+                f"Error: child tasks must use type='commit'; got type='{kind}'",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -230,11 +299,13 @@ def cmd_set(args, conn):
         sys.exit(1)
 
     fields = {}
+    task_type = _normalize_task_type(task.get("kind", "commit"))
     if args.title is not None:
         fields["title"] = args.title
     if args.description is not None:
         fields["description"] = args.description
     if args.next_step is not None:
+        _validate_next_step_for_type(task_type, args.next_step)
         fields["next_step"] = args.next_step
     if args.branch is not None:
         if task.get("parent_task_id") is not None:
@@ -276,43 +347,23 @@ def cmd_set(args, conn):
 
     if args.add_skip:
         for s in args.add_skip:
-            if s not in VALID_SKIPS:
-                print(f"Error: unknown skip target '{s}'. Valid: {', '.join(sorted(VALID_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
-            if task["kind"] == "task" and s not in NORMAL_TASK_SKIPS:
-                print(f"Error: skip target '{s}' is not allowed for normal tasks. Valid: {', '.join(sorted(NORMAL_TASK_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
-            if task["kind"] == "supertask" and s not in SUPERTASK_SKIPS:
-                print(f"Error: skip target '{s}' is not allowed for supertasks. Valid: {', '.join(sorted(SUPERTASK_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
-            if task["kind"] == "pull_request" and s not in PULL_REQUEST_SKIPS:
-                print(f"Error: skip target '{s}' is not allowed for pull request tasks. Valid: {', '.join(sorted(PULL_REQUEST_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
+            _validate_skip_for_type(task_type, s)
             db.add_task_skip(conn, args.task_id, s)
 
     if args.remove_skip:
         for s in args.remove_skip:
-            if s not in VALID_SKIPS:
-                print(f"Error: unknown skip target '{s}'. Valid: {', '.join(sorted(VALID_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
-            if task["kind"] == "task" and s not in NORMAL_TASK_SKIPS:
-                print(f"Error: skip target '{s}' is not allowed for normal tasks. Valid: {', '.join(sorted(NORMAL_TASK_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
-            if task["kind"] == "supertask" and s not in SUPERTASK_SKIPS:
-                print(f"Error: skip target '{s}' is not allowed for supertasks. Valid: {', '.join(sorted(SUPERTASK_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
-            if task["kind"] == "pull_request" and s not in PULL_REQUEST_SKIPS:
-                print(f"Error: skip target '{s}' is not allowed for pull request tasks. Valid: {', '.join(sorted(PULL_REQUEST_SKIPS))}", file=sys.stderr)
-                sys.exit(1)
+            _validate_skip_for_type(task_type, s)
             db.remove_task_skip(conn, args.task_id, s)
 
     # Handle branch resolution when setting status to ready
     if args.status is not None:
         if args.status == "ready":
-            branch = _resolve_branch_for_ready(conn, task, fields.get("branch"))
-            _validate_branch_name(branch)
-            _reject_master_branch_without_marker(branch)
-            fields["branch"] = branch
+            _validate_next_step_for_type(task_type, fields.get("next_step") or task.get("next_step"))
+            if task_type != "other":
+                branch = _resolve_branch_for_ready(conn, task, fields.get("branch"))
+                _validate_branch_name(branch)
+                _reject_master_branch_without_marker(branch)
+                fields["branch"] = branch
         fields["status"] = args.status
 
     if not fields and not args.add_skip and not args.remove_skip:
@@ -641,7 +692,13 @@ def build_parser():
     p_add.add_argument("--branch", default=None)
     p_add.add_argument("--coder-agent", default=None)
     p_add.add_argument("--reviewer-agent", default=None)
-    p_add.add_argument("--kind", choices=["task", "supertask", "pull_request"], default="task")
+    p_add.add_argument("--type", dest="task_type", choices=sorted(TASK_TYPES), default=None)
+    p_add.add_argument(
+        "--kind",
+        choices=sorted(TASK_TYPE_ALIASES),
+        default=None,
+        help="Legacy alias for --type; --kind task maps to --type commit.",
+    )
     p_add.add_argument("--parent", type=int, default=None)
     p_add.add_argument("--sequence-index", type=int, default=None)
     p_add.add_argument("--skip", action="append", default=None)

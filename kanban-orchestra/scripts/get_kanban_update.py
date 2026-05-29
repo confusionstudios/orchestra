@@ -213,7 +213,7 @@ def build_update(conn) -> str:
             if task and task.get("skips"):
                 lines.append(f"  skips: {_format_skips(task.get('skips'))}")
 
-            if step in ("commit-review", "pull-request-review"):
+            if step in ("commit-review", "pull-request-review", "other-review"):
                 lines.append("  review status: in progress")
         else:
             lines.append("")

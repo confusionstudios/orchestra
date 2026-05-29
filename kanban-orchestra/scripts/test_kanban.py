@@ -101,6 +101,7 @@ class TestDB(unittest.TestCase):
         self.assertEqual(task["description"], "A test")
         self.assertEqual(task["status"], "none")
         self.assertEqual(task["next_step"], "commit-plan")
+        self.assertEqual(task["kind"], "commit")
         self.assertIsNone(task["stash_ref"])
         self.assertEqual(task["reviewer_agent"], "gemini")
         self.assertNotIn("koid", task)
@@ -122,6 +123,24 @@ class TestDB(unittest.TestCase):
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["kind"], "pull_request")
         self.assertEqual(task["next_step"], "pull-request-make")
+        self.assertEqual(task["reviewer_agent"], "gemini")
+
+    def test_legacy_task_kind_aliases_to_commit(self):
+        tid = db.add_task(self.conn, "Legacy task", kind="task", branch="feature-branch")
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["kind"], "commit")
+        self.assertEqual(db.task_type(task), "commit")
+
+    def test_add_other_task_starts_at_other_make(self):
+        tid = db.add_task(
+            self.conn,
+            "External maintenance",
+            kind="other",
+            reviewer_agent="gemini",
+        )
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["kind"], "other")
+        self.assertEqual(task["next_step"], "other-make")
         self.assertEqual(task["reviewer_agent"], "gemini")
 
     def test_list_tasks(self):
@@ -215,6 +234,7 @@ class TestDB(unittest.TestCase):
             branch="feat-default-skip",
             coder_agent=None,
             reviewer_agent=None,
+            task_type=None,
             kind="task",
             parent=None,
             sequence_index=None,
@@ -236,6 +256,7 @@ class TestDB(unittest.TestCase):
             branch="feat-default-and-explicit",
             coder_agent=None,
             reviewer_agent=None,
+            task_type=None,
             kind="task",
             parent=None,
             sequence_index=None,
@@ -611,6 +632,10 @@ class TestDB(unittest.TestCase):
                     PRIMARY KEY (task_id, step)
                 )"""
             )
+            legacy.execute(
+                "INSERT INTO tasks (title, kind, next_step, commit_plan) VALUES (?, ?, ?, ?)",
+                ("Legacy task row", "task", "commit-make", None),
+            )
             legacy.commit()
             legacy.close()
 
@@ -622,6 +647,11 @@ class TestDB(unittest.TestCase):
                 self.assertIn("commit-plan", schema)
                 self.assertIn("pull-request-make", schema)
                 self.assertIn("pull_request", schema)
+                self.assertIn("other-make", schema)
+                self.assertIn("other", schema)
+                task = db.get_task(conn, 1)
+                self.assertEqual(task["kind"], "task")
+                self.assertEqual(db.task_type(task), "commit")
             finally:
                 conn.close()
         finally:
@@ -1248,6 +1278,43 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertIn("Do not perform implementation code review", prompt)
         self.assertIn("--approval --author codex --review-round 0", prompt)
 
+    def test_other_make_prompt_requires_durable_evidence_not_commit_message(self):
+        task = {
+            "id": 32, "title": "External maintenance", "description": None,
+            "branch": None, "status": "running", "next_step": "other-make",
+            "review_round": 0, "last_review_decision": "none",
+            "coder_agent": "claude", "reviewer_agent": "codex",
+        }
+
+        prompt = orchestrator.build_prompt(task, "other-make", "claude", [])
+
+        self.assertIn("durable completion evidence", prompt)
+        self.assertIn("why no commit or PR was expected", prompt)
+        self.assertIn("task comment 32 --message-stdin --comment", prompt)
+        self.assertNotIn("--commit-message", prompt)
+        self.assertNotIn("get-commit-footer", prompt)
+
+    def test_other_review_prompt_reviews_evidence(self):
+        task = {
+            "id": 33, "title": "Review evidence", "description": None,
+            "branch": None, "status": "running", "next_step": "other-review",
+            "review_round": 0, "last_review_decision": "none",
+            "coder_agent": "claude", "reviewer_agent": "codex",
+        }
+        comments = [{
+            "id": 1,
+            "kind": "comment",
+            "review_round": 0,
+            "author": "claude",
+            "message": "Checked external state; no repo change or PR was expected.",
+        }]
+
+        prompt = orchestrator.build_prompt(task, "other-review", "codex", comments)
+
+        self.assertIn("Other Reviewer Handoff", prompt)
+        self.assertIn("Checked external state", prompt)
+        self.assertIn("commit-free and PR-free", prompt)
+        self.assertIn("--approval --author codex --review-round 0", prompt)
 
     def test_reviewer_prior_comments_excludes_commit_message_and_validation(self):
         """commit-review prompt drops commit-message and validation from Prior Comments (already in handoff)."""
@@ -1636,6 +1703,140 @@ class TestStateMachine(unittest.TestCase):
 
         with patch.object(orchestrator, "run_agent", side_effect=fake_pr_maker), \
              patch.object(orchestrator, "ensure_branch", return_value=True):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertIsNone(updated["commit_hash"])
+
+    def test_other_make_requires_fresh_evidence_comment(self):
+        tid = db.add_task(
+            self.conn,
+            "External maintenance",
+            kind="other",
+            coder_agent="claude",
+        )
+        db.update_task(self.conn, tid, status="running", next_step="other-make")
+        task = db.get_task(self.conn, tid)
+
+        with patch.object(orchestrator, "run_agent", return_value=0):
+            success = orchestrator.handle_other_make(task, self.conn)
+
+        self.assertFalse(success)
+        run_log = db.get_run_log(self.conn, tid)
+        self.assertTrue(
+            any("without writing a fresh durable evidence comment" in entry["message"] for entry in run_log)
+        )
+
+    def test_other_make_transitions_to_review_when_evidence_recorded(self):
+        tid = db.add_task(
+            self.conn,
+            "External maintenance",
+            kind="other",
+            coder_agent="claude",
+        )
+        db.update_task(self.conn, tid, status="running", next_step="other-make")
+        task = db.get_task(self.conn, tid)
+
+        def fake_other_maker(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(
+                conn,
+                task_id,
+                "Checked the external queue; no code or PR artifact was expected.",
+                kind="comment",
+                author=name,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_other_maker):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "ready")
+        self.assertEqual(updated["next_step"], "other-review")
+        self.assertIsNone(updated["commit_hash"])
+
+    def test_other_review_approval_marks_done_without_commit(self):
+        tid = db.add_task(
+            self.conn,
+            "Review external evidence",
+            kind="other",
+            coder_agent="claude",
+            reviewer_agent="gemini",
+        )
+        db.add_comment(
+            self.conn,
+            tid,
+            "External work completed; no commit or PR was expected.",
+            kind="comment",
+            author="claude",
+        )
+        db.update_task(self.conn, tid, status="running", next_step="other-review")
+        task = db.get_task(self.conn, tid)
+
+        def fake_other_reviewer(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(conn, task_id, "Evidence is clear", kind="approval", author=name, review_round=0)
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_other_reviewer):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertIsNone(updated["commit_hash"])
+        self.assertEqual(updated["last_review_decision"], "approve")
+
+    def test_other_review_rejection_returns_to_make(self):
+        tid = db.add_task(
+            self.conn,
+            "Review external evidence",
+            kind="other",
+            coder_agent="claude",
+            reviewer_agent="gemini",
+        )
+        db.update_task(self.conn, tid, status="running", next_step="other-review")
+        task = db.get_task(self.conn, tid)
+
+        def fake_other_reviewer(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(conn, task_id, "Evidence is unclear", kind="rejection", author=name, review_round=0)
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_other_reviewer):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "ready")
+        self.assertEqual(updated["next_step"], "other-make")
+        self.assertEqual(updated["review_round"], 1)
+
+    def test_other_review_skip_marks_done_after_make(self):
+        tid = db.add_task(
+            self.conn,
+            "External maintenance",
+            kind="other",
+            coder_agent="claude",
+            skips=["other-review"],
+        )
+        db.update_task(self.conn, tid, status="running", next_step="other-make")
+        task = db.get_task(self.conn, tid)
+
+        def fake_other_maker(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(
+                conn,
+                task_id,
+                "Completed external maintenance; no commit or PR was expected.",
+                kind="comment",
+                author=name,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_other_maker):
             result = orchestrator.advance(task, self.conn)
 
         self.assertTrue(result)
@@ -4373,7 +4574,7 @@ class TestSupertaskDB(unittest.TestCase):
         )
         task = db.get_task(self.conn, child_id)
         self.assertEqual(task["parent_task_id"], parent_id)
-        self.assertEqual(task["kind"], "task")
+        self.assertEqual(task["kind"], "commit")
 
     def test_get_child_tasks(self):
         parent_id = db.add_task(self.conn, "Parent", kind="supertask", branch="feat")
@@ -5149,6 +5350,69 @@ class TestTaskPlanningCLI(unittest.TestCase):
         self.assertEqual(task["kind"], "pull_request")
         self.assertEqual(task["next_step"], "pull-request-make")
         self.assertEqual(task["skips"], ["pull-request-review"])
+
+    def test_add_default_task_is_commit_type(self):
+        r = self._run("add", "Default commit", "--branch", "b")
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        task = json.loads(self._run("show", str(tid)).stdout)
+        self.assertEqual(task["kind"], "commit")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["skips"], ["commit-plan"])
+
+    def test_add_commit_task_with_type(self):
+        r = self._run("add", "Explicit commit", "--type", "commit", "--branch", "b")
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        task = json.loads(self._run("show", str(tid)).stdout)
+        self.assertEqual(task["kind"], "commit")
+        self.assertEqual(task["next_step"], "commit-make")
+
+    def test_add_other_task(self):
+        r = self._run(
+            "add",
+            "External maintenance",
+            "--type",
+            "other",
+            "--skip",
+            "other-review",
+        )
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        task = json.loads(self._run("show", str(tid)).stdout)
+        self.assertEqual(task["kind"], "other")
+        self.assertEqual(task["next_step"], "other-make")
+        self.assertEqual(task["skips"], ["other-review"])
+
+    def test_add_other_rejects_commit_review_skip(self):
+        r = self._run(
+            "add",
+            "External maintenance",
+            "--type",
+            "other",
+            "--skip",
+            "commit-review",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not allowed for other tasks", r.stderr)
+
+    def test_set_rejects_invalid_next_step_for_type(self):
+        r = self._run("add", "External maintenance", "--type", "other")
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        r2 = self._run("set", str(tid), "--next-step", "commit-make")
+        self.assertNotEqual(r2.returncode, 0)
+        self.assertIn("not valid for other tasks", r2.stderr)
+
+    def test_set_ready_allows_other_without_branch(self):
+        r = self._run("add", "External maintenance", "--type", "other")
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        r2 = self._run("set", str(tid), "--status", "ready")
+        self.assertEqual(r2.returncode, 0)
+        task = json.loads(self._run("show", str(tid)).stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertIsNone(task["branch"])
 
     def test_add_pull_request_rejects_commit_review_skip(self):
         r = self._run(

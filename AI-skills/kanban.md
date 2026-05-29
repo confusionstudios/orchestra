@@ -87,7 +87,7 @@ modify under that root.
 
 ## Task lifecycle
 
-A standard task moves through these steps:
+A commit task moves through these steps:
 
 1. `commit-plan` — coder drafts a plan. *Skippable* via `--skip commit-plan`
    on `task add` (or `task set --add-skip`); skipping it also bypasses
@@ -103,12 +103,16 @@ Supertasks substitute `commit-make-supertask` and `commit-review-supertask`
 for steps 3–4; the supertask itself never lands a commit.
 `commit-review-supertask` is *skippable*.
 
+Pull request tasks use `pull-request-make` and `pull-request-review`.
+Other tasks use `other-make` and `other-review`, and must leave durable
+completion evidence in a task comment instead of a commit or PR.
+
 When a prior `commit-make` saved WIP via `git stash`, the orchestrator
 prepends Path C (`commit-make-stash-recovery.md`) to the next `commit-make`
 prompt so the coder restores that work first.
 
 Valid skip values: `commit-plan`, `commit-plan-review`, `commit-review`,
-`commit-review-supertask`.
+`commit-review-supertask`, `pull-request-review`, `other-review`.
 
 ## Queueing semantics
 
@@ -150,7 +154,7 @@ Use a feature branch, or explicitly opt the repo in by adding
 task add "<title>" \
     [--description "<description-as-markdown>"] \
     [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] \
-    [--kind <task|supertask>] [--parent <task-id>] \
+    [--type <commit|pull_request|supertask|other>] [--kind <legacy-kind>] [--parent <task-id>] \
     [--sequence-index <n>] [--skip <step>] [--allow-when-blocked]
 
 task list [--status <status>] [--next-step <step>] [--branch <branch>] [--page <n>]

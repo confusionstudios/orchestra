@@ -198,6 +198,8 @@ def _kind_glyph(task: dict) -> str:
         return "⊕"
     if task.get("kind") == "pull_request":
         return "PR"
+    if task.get("kind") == "other":
+        return "O"
     if task.get("parent_task_id") is not None:
         return "↳"
     return ""
@@ -212,13 +214,16 @@ def _task_ref(task: dict) -> str:
 
 
 def _task_kind_label(task: dict) -> str:
+    task_type = db.task_type(task)
     if task.get("kind") == "supertask":
         return "supertask"
-    if task.get("kind") == "pull_request":
+    if task_type == "pull_request":
         return "pull request"
+    if task_type == "other":
+        return "other"
     if task.get("parent_task_id") is not None:
-        return "child task"
-    return "task"
+        return "child commit task"
+    return "commit"
 
 
 def _format_skips(skips: list[str] | None) -> str:
@@ -540,7 +545,7 @@ def render_health_card(runtime: dict | None) -> str:
             lines.append(f'  <p><strong>Branch:</strong> <code>{_esc(branch)}</code></p>')
         if rround is not None:
             lines.append(f'  <p><strong>Review round:</strong> {_esc(rround + 1)}</p>')
-        if step in ("commit-review", "commit-review-supertask", "commit-plan-review", "pull-request-review"):
+        if step in ("commit-review", "commit-review-supertask", "commit-plan-review", "pull-request-review", "other-review"):
             lines.append('  <p><strong>Review status:</strong> in progress</p>')
 
     lines.append("</div>")
@@ -601,11 +606,11 @@ def render_current_task_card(runtime: dict | None, conn) -> str:
     if conn and task.get("kind") == "supertask":
         progress = _supertask_children_progress(conn, tid)
         if progress["total"] == 0:
-            hierarchy_bits.append("<strong>Kind:</strong> supertask plan in progress")
+            hierarchy_bits.append("<strong>Type:</strong> supertask plan in progress")
             hierarchy_bits.append("<strong>Children:</strong> none yet")
         else:
             hierarchy_bits.append(
-                f"<strong>Kind:</strong> supertask ({progress['done']}/{progress['total']} children done)"
+                f"<strong>Type:</strong> supertask ({progress['done']}/{progress['total']} children done)"
             )
     elif conn and task.get("parent_task_id") is not None:
         parent = db.get_task(conn, task["parent_task_id"])
@@ -617,7 +622,7 @@ def render_current_task_card(runtime: dict | None, conn) -> str:
                 hierarchy_bits.append(f"<strong>Position:</strong> {position} of {len(siblings)}")
         hierarchy_bits.append(f"<strong>Queue state:</strong> {_esc(_child_queue_state_label(conn, task))}")
     else:
-        hierarchy_bits.append(f"<strong>Kind:</strong> {_esc(_task_kind_label(task))}")
+        hierarchy_bits.append(f"<strong>Type:</strong> {_esc(_task_kind_label(task))}")
 
     hierarchy_html = ""
     if hierarchy_bits:
@@ -976,7 +981,7 @@ def render_task_runtime_panel(task: dict, runtime: dict | None) -> str:
     badge_cls = STATUS_BADGE_CLASS.get(health, "badge-running")
 
     review_html = ""
-    if step in ("commit-review", "commit-review-supertask", "commit-plan-review", "pull-request-review"):
+    if step in ("commit-review", "commit-review-supertask", "commit-plan-review", "pull-request-review", "other-review"):
         review_html = '<p><strong>Review status:</strong> in progress</p>'
 
     return f"""

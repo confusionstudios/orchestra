@@ -361,7 +361,7 @@ class TestCurrentTaskCard(unittest.TestCase):
         }
 
         html = dashboard.render_current_task_card(runtime, self.conn)
-        self.assertIn("Kind:</strong> supertask plan in progress", html)
+        self.assertIn("Type:</strong> supertask plan in progress", html)
         self.assertIn("Children:</strong> none yet", html)
         self.assertNotIn("0/0 children done", html)
 

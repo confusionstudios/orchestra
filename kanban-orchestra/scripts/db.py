@@ -11,8 +11,9 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 LOCK_FILE_NAME = "kanban-orchestra.lock"
+COMMIT_TASK_KINDS = {"commit", "task"}
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS tasks (
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS tasks (
                             'commit-make-supertask', 'commit-review-supertask',
                             'commit-plan', 'commit-plan-review',
                             'pull-request-make', 'pull-request-review',
+                            'other-make', 'other-review',
                             'none')),
     branch                  TEXT,
     commit_hash             TEXT,
@@ -38,8 +40,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     ready_at                DATETIME DEFAULT NULL,
     updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-    kind                    TEXT NOT NULL DEFAULT 'task'
-        CHECK(kind IN ('task', 'supertask', 'pull_request')),
+    kind                    TEXT NOT NULL DEFAULT 'commit'
+        CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
     parent_task_id          INTEGER REFERENCES tasks(id),
     sequence_index          INTEGER,
     commit_plan             TEXT,
@@ -52,7 +54,7 @@ CREATE TABLE IF NOT EXISTS task_skips (
     step     TEXT    NOT NULL
                      CHECK(step IN ('commit-plan','commit-plan-review',
                                     'commit-review','commit-review-supertask',
-                                    'pull-request-review')),
+                                    'pull-request-review','other-review')),
     PRIMARY KEY (task_id, step)
 );
 
@@ -93,6 +95,7 @@ CREATE TABLE IF NOT EXISTS orchestrator_runtime (
             'commit-make-supertask', 'commit-review-supertask',
             'commit-plan', 'commit-plan-review',
             'pull-request-make', 'pull-request-review',
+            'other-make', 'other-review',
             'none'
         )),
     current_branch       TEXT,
@@ -319,6 +322,7 @@ def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
                     'commit-make-supertask', 'commit-review-supertask',
                     'commit-plan', 'commit-plan-review',
                     'pull-request-make', 'pull-request-review',
+                    'other-make', 'other-review',
                     'none'
                 )),
             current_branch       TEXT,
@@ -351,6 +355,7 @@ def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
                     'commit-make-supertask', 'commit-review-supertask',
                     'commit-plan', 'commit-plan-review',
                     'pull-request-make', 'pull-request-review',
+                    'other-make', 'other-review',
                     'none'
                 )
                 THEN current_step ELSE 'none'
@@ -385,7 +390,7 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
         "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
-        "kind": "kind" if "kind" in task_cols else "'task'",
+        "kind": "kind" if "kind" in task_cols else "'commit'",
         "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
         "sequence_index": "sequence_index" if "sequence_index" in task_cols else "NULL",
         "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
@@ -411,6 +416,7 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                                         'commit-make-supertask', 'commit-review-supertask',
                                         'commit-plan', 'commit-plan-review',
                                         'pull-request-make', 'pull-request-review',
+                                        'other-make', 'other-review',
                                         'none')),
                 branch                  TEXT,
                 commit_hash             TEXT,
@@ -423,8 +429,8 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 ready_at                DATETIME DEFAULT NULL,
                 updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                kind                    TEXT NOT NULL DEFAULT 'task'
-                    CHECK(kind IN ('task', 'supertask', 'pull_request')),
+                kind                    TEXT NOT NULL DEFAULT 'commit'
+                    CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
                 parent_task_id          INTEGER REFERENCES tasks(id),
                 sequence_index          INTEGER,
                 commit_plan             TEXT,
@@ -441,7 +447,7 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                 step     TEXT    NOT NULL
                                  CHECK(step IN ('commit-plan','commit-plan-review',
                                                 'commit-review','commit-review-supertask',
-                                                'pull-request-review')),
+                                                'pull-request-review','other-review')),
                 PRIMARY KEY (task_id, step)
             );
             INSERT OR IGNORE INTO task_skips (task_id, step)
@@ -475,7 +481,7 @@ def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> 
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
         "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
-        "kind": "kind" if "kind" in task_cols else "'task'",
+        "kind": "kind" if "kind" in task_cols else "'commit'",
         "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
         "sequence_index": "sequence_index" if "sequence_index" in task_cols else "NULL",
         "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
@@ -499,6 +505,7 @@ def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> 
                                         'commit-make-supertask', 'commit-review-supertask',
                                         'commit-plan', 'commit-plan-review',
                                         'pull-request-make', 'pull-request-review',
+                                        'other-make', 'other-review',
                                         'none')),
                 branch                  TEXT,
                 commit_hash             TEXT,
@@ -511,8 +518,8 @@ def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> 
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 ready_at                DATETIME DEFAULT NULL,
                 updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                kind                    TEXT NOT NULL DEFAULT 'task'
-                    CHECK(kind IN ('task', 'supertask', 'pull_request')),
+                kind                    TEXT NOT NULL DEFAULT 'commit'
+                    CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
                 parent_task_id          INTEGER REFERENCES tasks(id),
                 sequence_index          INTEGER,
                 commit_plan             TEXT,
@@ -543,14 +550,14 @@ def _migrate_task_skips_constraints(conn: sqlite3.Connection) -> None:
             step     TEXT    NOT NULL
                              CHECK(step IN ('commit-plan','commit-plan-review',
                                             'commit-review','commit-review-supertask',
-                                            'pull-request-review')),
+                                            'pull-request-review','other-review')),
             PRIMARY KEY (task_id, step)
         );
         INSERT OR IGNORE INTO task_skips_migrated (task_id, step)
             SELECT task_id, step FROM task_skips
             WHERE step IN ('commit-plan','commit-plan-review',
                            'commit-review','commit-review-supertask',
-                           'pull-request-review');
+                           'pull-request-review','other-review');
         DROP TABLE task_skips;
         ALTER TABLE task_skips_migrated RENAME TO task_skips;
         COMMIT;
@@ -675,6 +682,7 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
         "'commit-review'",
         "'commit-review-supertask'",
         "'pull-request-review'",
+        "'other-review'",
     )
     missing_steps = [s for s in valid_steps if s not in skips_schema[0]]
     if missing_steps:
@@ -688,6 +696,8 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
         "'commit-plan'" not in tasks_schema[0]
         or "'pull-request-make'" not in tasks_schema[0]
         or "'pull_request'" not in tasks_schema[0]
+        or "'other-make'" not in tasks_schema[0]
+        or "'other'" not in tasks_schema[0]
     ):
         _migrate_task_constraints(conn, task_cols)
         task_cols = {
@@ -706,6 +716,8 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
             "'commit-make-supertask'",
             "'pull-request-make'",
             "'pull-request-review'",
+            "'other-make'",
+            "'other-review'",
             "'starting'",
             "'hard-break'",
         )
@@ -775,6 +787,12 @@ def _row_to_task(row):
     return dict(row)
 
 
+def task_type(task_or_kind) -> str:
+    """Return the public task type name, mapping legacy kind='task' to commit."""
+    kind = task_or_kind.get("kind") if isinstance(task_or_kind, dict) else task_or_kind
+    return "commit" if kind in COMMIT_TASK_KINDS else kind
+
+
 # ── Task CRUD ──────────────────────────────────────────────────────────
 
 def add_task(
@@ -784,17 +802,22 @@ def add_task(
     branch=None,
     coder_agent=None,
     reviewer_agent=None,
-    kind="task",
+    kind="commit",
     parent_task_id=None,
     sequence_index=None,
     status=None,
     skips=None,
     allow_when_blocked=False,
 ):
+    if kind == "task":
+        kind = "commit"
+
     if kind == "supertask":
         next_step = "commit-make-supertask"
     elif kind == "pull_request":
         next_step = "pull-request-make"
+    elif kind == "other":
+        next_step = "other-make"
     elif skips and "commit-plan" in skips:
         next_step = "commit-make"
     else:
