@@ -49,6 +49,9 @@ Use this structure:
 
 ## Outcome
 OUTCOME: [approved | rejected | blocked]
+
+NON_BLOCKING_REQUESTS:
+- Optional follow-up changes the builder may apply without another approval pass.
 ```
 
 If there are no findings, say:
@@ -61,6 +64,8 @@ If there are no findings, say:
 ## Decision Rules
 
 - Use `approved` only when no actionable defects are found.
+- With `approved`, optionally include `NON_BLOCKING_REQUESTS:` for comments or
+  follow-up changes that are not required for approval.
 - Use `rejected` when the diff has a concrete defect or missing required validation that the builder can fix.
 - Use `blocked` when the diff cannot be reviewed because required context, files, or commands are unavailable.
 - Keep rejection feedback specific enough that the builder can act without another clarification round.
