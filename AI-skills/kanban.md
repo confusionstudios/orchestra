@@ -281,6 +281,8 @@ This queues all three tasks for serialized pickup. Do not use `master` or
   unexpected uncommitted changes appear.
 - A task needs a branch and a meaningful `next_step` before it can be set
   to `ready`.
+- If the orchestrator is idle and the work repo is dirty, `task set --status
+  ready` is rejected. Clean or stash the worktree before queueing more work.
 - Pass `--branch` explicitly when creating tasks; do not rely on prompts.
 - Use feature branches by default. The `ALLOW_TASKS_ON_MASTER` `AGENTS.md`
   marker is an explicit opt-in for repos that intentionally operate on

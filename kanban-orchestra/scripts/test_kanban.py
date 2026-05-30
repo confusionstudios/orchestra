@@ -2464,6 +2464,54 @@ class TestTaskCLI(unittest.TestCase):
     def _opt_in_master_tasks(self):
         self._write_agents_md("ALLOW_TASKS_ON_MASTER\n")
 
+    def _init_temp_git_repo(self):
+        subprocess.run(
+            ["git", "init"],
+            cwd=self.tmpdir.name,
+            capture_output=True, text=True, check=True,
+        )
+        Path(self.tmpdir.name, ".gitignore").write_text(
+            "kanban-orchestra.db*\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", ".gitignore"],
+            cwd=self.tmpdir.name,
+            capture_output=True, text=True, check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-c", "user.name=Test User",
+                "-c", "user.email=test@example.com",
+                "commit",
+                "-m", "Initial test repo",
+            ],
+            cwd=self.tmpdir.name,
+            capture_output=True, text=True, check=True,
+        )
+
+    def _make_temp_repo_dirty(self):
+        self._init_temp_git_repo()
+        Path(self.tmpdir.name, "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    def _make_temp_repo_clean(self):
+        self._init_temp_git_repo()
+
+    def _set_orchestrator_runtime(self, status):
+        conn = db.connect(self.db_path)
+        try:
+            db.upsert_runtime(
+                conn,
+                status=status,
+                pid=123,
+                current_task_id=None,
+                current_step=None,
+                status_message=status,
+            )
+        finally:
+            conn.close()
+
     def test_add_and_show(self):
         r = self._run("add", "My test task", "--description", "Desc here", "--branch", "feat-1")
         self.assertEqual(r.returncode, 0)
@@ -2499,6 +2547,46 @@ class TestTaskCLI(unittest.TestCase):
         self.assertEqual(r2.returncode, 0)
         queued = json.loads(r2.stdout)
         self.assertIsNotNone(queued["ready_at"])
+
+    def test_add_with_branch_creates_none_status_task(self):
+        r = self._run("add", "Branched task", "--branch", "my-branch")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "none")
+
+    def test_set_status_ready_rejects_dirty_worktree_when_orchestrator_idle(self):
+        self._make_temp_repo_dirty()
+        self._set_orchestrator_runtime("idle")
+        r = self._run("add", "Dirty idle task", "--branch", "my-branch")
+        tid = json.loads(r.stdout)["id"]
+
+        r2 = self._run("set", str(tid), "--status", "ready")
+
+        self.assertNotEqual(r2.returncode, 0)
+        self.assertIn("cannot set task status to ready", r2.stderr)
+        self.assertIn("orchestrator is idle", r2.stderr)
+
+    def test_set_status_ready_allows_clean_worktree_when_orchestrator_idle(self):
+        self._make_temp_repo_clean()
+        self._set_orchestrator_runtime("idle")
+        r = self._run("add", "Clean idle task", "--branch", "my-branch")
+        tid = json.loads(r.stdout)["id"]
+
+        r2 = self._run("set", str(tid), "--status", "ready")
+
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["status"], "ready")
+
+    def test_set_status_ready_allows_dirty_worktree_when_orchestrator_running(self):
+        self._make_temp_repo_dirty()
+        self._set_orchestrator_runtime("running")
+        r = self._run("add", "Dirty running task", "--branch", "my-branch")
+        tid = json.loads(r.stdout)["id"]
+
+        r2 = self._run("set", str(tid), "--status", "ready")
+
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["status"], "ready")
 
     def test_set_status_ready_prefers_explicit_branch(self):
         r = self._run("add", "Retarget task", "--branch", "old-branch")

@@ -106,6 +106,33 @@ def _repo_root_for_policy():
     return Path(db.get_db_path()).resolve().parent
 
 
+def _is_worktree_dirty(repo_root):
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _is_orchestrator_idle(conn):
+    runtime = db.get_runtime(conn)
+    return bool(runtime and runtime.get("status") == "idle")
+
+
+def _reject_ready_when_idle_worktree_dirty(conn):
+    repo_root = _repo_root_for_policy()
+    if _is_orchestrator_idle(conn) and _is_worktree_dirty(repo_root):
+        print(
+            "Error: cannot set task status to ready while the orchestrator is idle "
+            "and the worktree is dirty. Resolve or stash the worktree changes first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _is_master_branch(branch):
     return branch in MASTER_BRANCHES
 
@@ -276,12 +303,11 @@ def cmd_add(args, conn):
         _validate_branch_name(branch)
         _reject_master_branch_without_marker(branch)
 
-    child_status = "ready" if parent_task_id is not None else None
     task_id = db.add_task(
         conn, args.title, description=args.description,
         branch=branch, coder_agent=agent, reviewer_agent=reviewer_agent,
         kind=kind, parent_task_id=parent_task_id, sequence_index=sequence_index,
-        status=child_status, skips=skips,
+        status="ready" if parent_task_id is not None else None, skips=skips,
         allow_when_blocked=args.allow_when_blocked,
     )
 
@@ -363,6 +389,7 @@ def cmd_set(args, conn):
                 _validate_branch_name(branch)
                 _reject_master_branch_without_marker(branch)
                 fields["branch"] = branch
+            _reject_ready_when_idle_worktree_dirty(conn)
         fields["status"] = args.status
 
     if not fields and not args.add_skip and not args.remove_skip:

@@ -442,6 +442,8 @@ task restore
 - `master` and `main` branches require `ALLOW_TASKS_ON_MASTER` as a standalone
   line in the work repo `AGENTS.md` before tasks can be added, retargeted, or
   set to `ready` on those branches.
+- `task set --status ready` fails when the orchestrator runtime is `idle` and
+  the work repo is dirty. Clean or stash the worktree before queueing more work.
 - In agent or non-interactive mode, missing branch on `status=ready` is an error.
 - `task comment --message-stdin` reads the full message from stdin and is the preferred form for multi-line or shell-sensitive text.
 - `task delete` only works for tasks still in `status=none`.
