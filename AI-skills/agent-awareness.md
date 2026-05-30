@@ -18,7 +18,7 @@ virtualenv, because the loader depends on the repo's Python dependencies:
 
 ```bash
 orchestra_dir="${ORCHESTRA_DIR:-$(git rev-parse --show-toplevel)}"
-PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/.venv/bin/python" - <<'PY'
+PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/bin/ko-python" - <<'PY'
 from agent_registry import AGENTS, AGENT_CMD, AGENT_DISPLAY_LABELS
 for key in AGENTS:
     print(f"{key}: {AGENT_DISPLAY_LABELS[key]} -> {AGENT_CMD[key]}")
@@ -47,7 +47,7 @@ Resolve defaults from the active environment like this:
 
 ```bash
 orchestra_dir="${ORCHESTRA_DIR:-$(git rev-parse --show-toplevel)}"
-PYTHONPATH="$orchestra_dir/shared_scripts:$orchestra_dir/kanban-orchestra/scripts" "$orchestra_dir/.venv/bin/python" - <<'PY'
+PYTHONPATH="$orchestra_dir/shared_scripts:$orchestra_dir/kanban-orchestra/scripts" "$orchestra_dir/bin/ko-python" - <<'PY'
 import config
 for name in (
     "DEFAULT_SUPER_PLANNER",

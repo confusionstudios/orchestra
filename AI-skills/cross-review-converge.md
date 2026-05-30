@@ -24,12 +24,12 @@ repo_root="$(git rev-parse --show-toplevel)" || exit 1
 orchestra_dir="${ORCHESTRA_DIR:-$repo_root}"
 reviewer="$(
   PYTHONPATH="$orchestra_dir/shared_scripts:$orchestra_dir/kanban-orchestra/scripts" \
-  "$orchestra_dir/.venv/bin/python" - <<'PY'
+  "$orchestra_dir/bin/ko-python" - <<'PY'
 import config
 print(config.DEFAULT_REVIEWER)
 PY
 )"
-PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/.venv/bin/python" - "$reviewer" <<'PY'
+PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/bin/ko-python" - "$reviewer" <<'PY'
 import sys
 from agent_registry import AGENT_CMD
 
@@ -74,7 +74,7 @@ case "$reviewer" in
     trap 'rm -f "$prompt_file"' EXIT
     printf '%s' "<review prompt>" > "$prompt_file"
     PYTHONPATH="$orchestra_dir/shared_scripts" \
-      perl -e 'alarm shift; exec @ARGV' 300 "$orchestra_dir/.venv/bin/python" - "$reviewer" "$prompt_file" <<'PY'
+      perl -e 'alarm shift; exec @ARGV' 300 "$orchestra_dir/bin/ko-python" - "$reviewer" "$prompt_file" <<'PY'
 import os
 import sys
 from pathlib import Path
