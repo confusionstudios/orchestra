@@ -160,8 +160,8 @@ class TestHelpers(unittest.TestCase):
 
     def test_display_review_round_text_converts_round_labels(self):
         self.assertEqual(
-            dashboard._display_review_round_text("Round 0: gemini reviewing; Review round 2 approved."),
-            "Round 1: gemini reviewing; Review round 3 approved.",
+            dashboard._display_review_round_text("Round 0: antigravity reviewing; Review round 2 approved."),
+            "Round 1: antigravity reviewing; Review round 3 approved.",
         )
 
 
@@ -257,7 +257,7 @@ class TestHealthCard(unittest.TestCase):
         runtime = {
             "status": "running",
             "last_heartbeat_at": ts,
-            "status_message": "Round 0: gemini reviewing",
+            "status_message": "Round 0: antigravity reviewing",
             "current_task_id": 3,
             "current_step": "commit-review",
             "current_branch": "feat-z",
@@ -266,8 +266,8 @@ class TestHealthCard(unittest.TestCase):
         html = dashboard.render_health_card(runtime)
         self.assertIn("in progress", html)
         self.assertIn("Review round:</strong> 1", html)
-        self.assertIn("Round 1: gemini reviewing", html)
-        self.assertNotIn("Round 0: gemini reviewing", html)
+        self.assertIn("Round 1: antigravity reviewing", html)
+        self.assertNotIn("Round 0: antigravity reviewing", html)
 
     def test_idle_with_ready_work_blocked_by_blocked_gate_displays_blocked(self):
         conn, db_path = _fresh_conn()
@@ -314,7 +314,7 @@ class TestCurrentTaskCard(unittest.TestCase):
             "Implement feature X",
             branch="feat-x",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
             skips=["commit-plan-review"],
         )
         db.update_task(self.conn, tid, status="running")
@@ -331,7 +331,7 @@ class TestCurrentTaskCard(unittest.TestCase):
         html = dashboard.render_current_task_card(runtime, self.conn)
         self.assertIn("Implement feature X", html)
         self.assertIn("feat-x", html)
-        self.assertIn("Reviewer:</strong> gemini", html)
+        self.assertIn("Reviewer:</strong> antigravity", html)
         self.assertIn("Working on it", html)
         self.assertIn(f"/task/{tid}", html)
         self.assertIn(f"Task {tid}: Implement feature X", html)
@@ -416,7 +416,7 @@ class TestReadyQueue(unittest.TestCase):
             skips=["commit-plan", "commit-review"],
         )
         db.update_task(self.conn, t1, status="ready")
-        t2 = db.add_task(self.conn, "Task Beta", branch="feat-b", coder_agent="gemini")
+        t2 = db.add_task(self.conn, "Task Beta", branch="feat-b", coder_agent="antigravity")
         db.update_task(self.conn, t2, status="ready")
         html = dashboard.render_ready_queue(self.conn)
         self.assertIn("Task Alpha", html)
@@ -608,7 +608,7 @@ class TestIcebox(unittest.TestCase):
 
     def test_none_tasks_listed(self):
         db.add_task(self.conn, "Idea Alpha", branch="feat-a", coder_agent="codex")
-        t2 = db.add_task(self.conn, "Idea Beta", branch="feat-b", coder_agent="gemini")
+        t2 = db.add_task(self.conn, "Idea Beta", branch="feat-b", coder_agent="antigravity")
         db.update_task(self.conn, t2, status="ready")
         html = dashboard.render_icebox(self.conn)
         self.assertIn("Idea Alpha", html)
@@ -725,14 +725,14 @@ class TestRecentlyDone(unittest.TestCase):
             coder_agent="claude",
             reviewer_agent="opus",
         )
-        db.add_comment(self.conn, tid, "LGTM", kind="approval", author="gemini", review_round=0)
+        db.add_comment(self.conn, tid, "LGTM", kind="approval", author="antigravity", review_round=0)
         db.add_comment(self.conn, tid, "Fix this", kind="rejection", author="opus", review_round=0)
         db.add_comment(self.conn, tid, "Still failing", kind="rejection", author="opus", review_round=1)
         html = dashboard.render_recently_done(self.conn)
         self.assertIn("Done task", html)
         self.assertIn("22222222", html)
         self.assertIn("claude", html)
-        self.assertIn("gemini", html)
+        self.assertIn("antigravity", html)
         self.assertIn("<th class='col-agent'>Reviewer</th>", html)
         self.assertIn("<th class='col-count'>Rejections</th>", html)
         self.assertIn("<td>2</td>", html)
@@ -853,7 +853,7 @@ class TestTaskHeader(unittest.TestCase):
             "next_step": "commit-review",
             "branch": "feat-42",
             "coder_agent": "claude",
-            "reviewer_agent": "gemini",
+            "reviewer_agent": "antigravity",
             "review_round": 2,
             "last_review_decision": "reject",
             "commit_hash": None,
@@ -871,7 +871,7 @@ class TestTaskHeader(unittest.TestCase):
         self.assertIn("Description Source (Markdown)", html)
         self.assertIn("feat-42", html)
         self.assertIn("claude", html)
-        self.assertIn("<th>Reviewer</th><td>gemini</td>", html)
+        self.assertIn("<th>Reviewer</th><td>antigravity</td>", html)
         self.assertIn("commit-plan, commit-review", html)
         self.assertIn("<th>Review round</th><td>3</td>", html)
         self.assertIn("badge-running", html)
@@ -1090,7 +1090,7 @@ class TestCommentsPanel(unittest.TestCase):
     def test_comments_rendered_in_order(self):
         tid = db.add_task(self.conn, "Comment order")
         db.add_comment(self.conn, tid, "First note", kind="comment", author="human")
-        db.add_comment(self.conn, tid, "Approve it", kind="approval", author="gemini")
+        db.add_comment(self.conn, tid, "Approve it", kind="approval", author="antigravity")
         db.add_comment(self.conn, tid, "Reject it", kind="rejection", author="codex")
         html = dashboard.render_comments_panel(tid, self.conn)
         idx_first = html.find("First note")
@@ -1122,15 +1122,15 @@ class TestCommentsPanel(unittest.TestCase):
         db.add_comment(
             self.conn,
             tid,
-            "Starting commit-review round 0 with reviewer: gemini.",
+            "Starting commit-review round 0 with reviewer: antigravity.",
             kind="comment",
             author="orchestrator",
             review_round=0,
         )
         html = dashboard.render_comments_panel(tid, self.conn)
         self.assertIn("Round 1", html)
-        self.assertIn("Starting commit-review round 1 with reviewer: gemini.", html)
-        self.assertNotIn("Starting commit-review round 0 with reviewer: gemini.", html)
+        self.assertIn("Starting commit-review round 1 with reviewer: antigravity.", html)
+        self.assertNotIn("Starting commit-review round 0 with reviewer: antigravity.", html)
 
 
 class TestRunLogPanel(unittest.TestCase):

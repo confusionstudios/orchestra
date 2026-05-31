@@ -93,7 +93,7 @@ class TestDB(unittest.TestCase):
         os.unlink(self.tmp.name)
 
     def test_add_and_get_task(self):
-        tid = db.add_task(self.conn, "Test task", description="A test", reviewer_agent="gemini")
+        tid = db.add_task(self.conn, "Test task", description="A test", reviewer_agent="antigravity")
         self.assertIsNotNone(tid)
 
         task = db.get_task(self.conn, tid)
@@ -103,7 +103,7 @@ class TestDB(unittest.TestCase):
         self.assertEqual(task["next_step"], "commit-plan")
         self.assertEqual(task["kind"], "commit")
         self.assertIsNone(task["stash_ref"])
-        self.assertEqual(task["reviewer_agent"], "gemini")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
         self.assertNotIn("koid", task)
         self.assertNotIn("skip_same_branch_koid_check", task)
 
@@ -118,12 +118,12 @@ class TestDB(unittest.TestCase):
             "Open PR",
             kind="pull_request",
             branch="feature-branch",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["kind"], "pull_request")
         self.assertEqual(task["next_step"], "pull-request-make")
-        self.assertEqual(task["reviewer_agent"], "gemini")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
 
     def test_legacy_task_kind_aliases_to_commit(self):
         tid = db.add_task(self.conn, "Legacy task", kind="task", branch="feature-branch")
@@ -136,12 +136,12 @@ class TestDB(unittest.TestCase):
             self.conn,
             "External maintenance",
             kind="other",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["kind"], "other")
         self.assertEqual(task["next_step"], "other-make")
-        self.assertEqual(task["reviewer_agent"], "gemini")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
 
     def test_list_tasks(self):
         db.add_task(self.conn, "Task 1")
@@ -1251,7 +1251,7 @@ class TestPromptAssembly(unittest.TestCase):
         comments = [
             {"kind": "commit-message", "review_round": 0, "author": "claude",
              "message": "Fix login bug\n\nTask 7 (ko-def)"},
-            {"kind": "rejection", "review_round": 0, "author": "gemini",
+            {"kind": "rejection", "review_round": 0, "author": "antigravity",
              "message": "Needs tests"},
             {"kind": "commit-message", "review_round": 1, "author": "claude",
              "message": "Fix login bug with tests\n\nTask 7 (ko-def)"},
@@ -1581,11 +1581,11 @@ class TestReviewAggregation(unittest.TestCase):
             self.conn,
             "Specific reviewer",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-review")
         task = db.get_task(self.conn, tid)
-        db.add_comment(self.conn, tid, "LGTM", kind="approval", author="gemini", review_round=0)
+        db.add_comment(self.conn, tid, "LGTM", kind="approval", author="antigravity", review_round=0)
 
         with patch.object(orchestrator, "ensure_branch", return_value=True), \
              patch.object(orchestrator, "run_agent", return_value=0) as run_agent:
@@ -1593,8 +1593,8 @@ class TestReviewAggregation(unittest.TestCase):
 
         self.assertEqual(outcome, "approve")
         run_agent.assert_called_once()
-        self.assertEqual(run_agent.call_args.args[0], "gemini")
-        self.assertIn("- reviewer_agent: gemini", run_agent.call_args.args[1])
+        self.assertEqual(run_agent.call_args.args[0], "antigravity")
+        self.assertIn("- reviewer_agent: antigravity", run_agent.call_args.args[1])
 
     def test_null_reviewer_falls_back_to_default_reviewer(self):
         tid = db.add_task(self.conn, "Default reviewer", coder_agent="claude")
@@ -1741,7 +1741,7 @@ class TestStateMachine(unittest.TestCase):
             kind="pull_request",
             branch="feat-pr",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         db.update_task(self.conn, tid, status="running", next_step="pull-request-review")
         task = db.get_task(self.conn, tid)
@@ -1768,7 +1768,7 @@ class TestStateMachine(unittest.TestCase):
             kind="pull_request",
             branch="feat-pr",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         db.update_task(self.conn, tid, status="running", next_step="pull-request-review")
         task = db.get_task(self.conn, tid)
@@ -1874,7 +1874,7 @@ class TestStateMachine(unittest.TestCase):
             "Review external evidence",
             kind="other",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         db.add_comment(
             self.conn,
@@ -1906,7 +1906,7 @@ class TestStateMachine(unittest.TestCase):
             "Review external evidence",
             kind="other",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
         )
         db.update_task(self.conn, tid, status="running", next_step="other-review")
         task = db.get_task(self.conn, tid)
@@ -3365,7 +3365,7 @@ class TestCLIReviewerIdentityAndRoundEnforcement(unittest.TestCase):
         tid = json.loads(r.stdout)["id"]
         self._run("set", str(tid), "--status", "running", "--branch", "b", "--next-step", "commit-review")
         # Reviewer approves via CLI
-        self._run("comment", str(tid), "LGTM", "--approval", "--author", "gemini", "--review-round", "0")
+        self._run("comment", str(tid), "LGTM", "--approval", "--author", "antigravity", "--review-round", "0")
 
         # Now check aggregation in orchestrator
         conn = db.connect(self.db_path)
@@ -7680,7 +7680,7 @@ class TestCommitFooter(unittest.TestCase):
         )
         db.add_comment(
             self.conn, tid, "Fix two", kind="rejection",
-            author="gemini", review_round=1,
+            author="antigravity", review_round=1,
         )
         db.add_comment(
             self.conn, tid, "Approved", kind="approval",
@@ -7702,7 +7702,7 @@ class TestCommitFooter(unittest.TestCase):
         db.update_task(self.conn, tid, coder_agent="haiku")
         db.add_comment(
             self.conn, tid, "Earlier approval", kind="approval",
-            author="gemini", review_round=0,
+            author="antigravity", review_round=0,
         )
         db.add_comment(
             self.conn, tid, "Final approval", kind="approval",

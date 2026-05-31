@@ -51,7 +51,7 @@ class TestBuildUpdate(unittest.TestCase):
             "Active task",
             branch="feat-active",
             coder_agent="claude",
-            reviewer_agent="gemini",
+            reviewer_agent="antigravity",
             skips=["commit-plan-review", "commit-review"],
         )
         ready_id = db.add_task(self.conn, "Ready task", branch="feat-ready", coder_agent="sonnet", reviewer_agent="opus", skips=["commit-plan"])
@@ -63,7 +63,7 @@ class TestBuildUpdate(unittest.TestCase):
         db.update_task(self.conn, blocked_id, status="blocked", next_step="commit-review")
         db.update_task(self.conn, done_id, status="done", commit_hash="33333333aaaaaaaa",
                        coder_agent="claude")
-        db.add_comment(self.conn, done_id, "LGTM", kind="approval", author="gemini", review_round=0)
+        db.add_comment(self.conn, done_id, "LGTM", kind="approval", author="antigravity", review_round=0)
         db.add_comment(self.conn, done_id, "Needs work", kind="rejection", author="opus", review_round=0)
         db.add_comment(self.conn, done_id, "Still needs work", kind="rejection", author="opus", review_round=1)
         db.add_comment(self.conn, blocked_id, "Needs human input")
@@ -79,10 +79,10 @@ class TestBuildUpdate(unittest.TestCase):
         update = get_kanban_update.build_update(self.conn)
 
         self.assertIn("  skips: commit-plan-review, commit-review", update)
-        self.assertIn("branch: feat-active  coder: claude  reviewer: gemini", update)
+        self.assertIn("branch: feat-active  coder: claude  reviewer: antigravity", update)
         self.assertIn("#2 [commit-make] Ready task  branch: feat-ready  coder: sonnet  reviewer: opus  skips: commit-plan", update)
         self.assertIn("#3 Blocked task  coder: haiku  reviewer: codex  — Needs human input  skips: commit-review", update)
-        self.assertIn("#4 Done task  commit: 33333333  coder: claude  reviewer: gemini  rejections: 2", update)
+        self.assertIn("#4 Done task  commit: 33333333  coder: claude  reviewer: antigravity  rejections: 2", update)
         self.assertNotIn("configured reviewer:", update)
         self.assertNotIn("approver:", update)
 
