@@ -37,6 +37,7 @@ from markdown_it import MarkdownIt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 import db
+import task as task_cli
 
 
 app = FastAPI(title="Kanban Orchestra Dashboard")
@@ -313,10 +314,135 @@ STATUS_BADGE_CLASS = {
 RUNTIME_STATUSES_WITHOUT_HEARTBEAT_STALE = {"starting", "stopping", "stopped", "hard-break"}
 
 
-def _runtime_display_status(status: str, last_heartbeat: str | None) -> str:
+def _runtime_display_status(status: str, last_heartbeat: str | None, conn=None) -> str:
     if _is_stale(last_heartbeat) and status not in RUNTIME_STATUSES_WITHOUT_HEARTBEAT_STALE:
         return "stale"
+    if status == "idle" and conn is not None and db.list_ready_tasks_blocked_by_blocked_gate(conn):
+        return "blocked"
     return status
+
+
+READY_ACTION_STATUSES = {"none", "blocked"}
+READY_ACTION_DEFAULT_NEXT_STEP = {
+    "commit": "commit-make",
+    "pull_request": "pull-request-make",
+    "other": "other-make",
+    "supertask": "commit-make-supertask",
+}
+
+
+class ReadyActionError(ValueError):
+    """Raised when a dashboard set-ready request cannot be applied safely."""
+
+
+class ReadyActionNeedsConfirmation(ReadyActionError):
+    """Raised when the inferred next_step must be confirmed before queueing."""
+
+
+def _meaningful_next_step(next_step: str | None) -> bool:
+    return bool(next_step and next_step.strip() and next_step.strip() != "none")
+
+
+def _normalize_task_type_for_ready(task: dict) -> str:
+    kind = task.get("kind")
+    task_type = "commit" if kind in (None, "") else task_cli._normalize_task_type(kind)
+    if task_type not in task_cli.TASK_TYPES:
+        raw = "null" if kind is None else kind
+        raise ReadyActionError(
+            f"Task kind '{raw}' is not recognized. Set next_step explicitly before queueing this task."
+        )
+    return task_type
+
+
+def _infer_ready_next_step(task: dict) -> str:
+    task_type = _normalize_task_type_for_ready(task)
+    return READY_ACTION_DEFAULT_NEXT_STEP[task_type]
+
+
+def _validate_next_step_for_ready(task_type: str, next_step: str) -> None:
+    try:
+        task_cli.validate_next_step_for_type(task_type, next_step)
+    except task_cli.TaskValidationError as exc:
+        raise ReadyActionError(str(exc)) from exc
+
+
+def _validate_branch_for_ready(branch: str) -> None:
+    try:
+        task_cli.validate_branch_name(branch)
+        task_cli.validate_master_branch_policy(branch)
+    except task_cli.TaskValidationError as exc:
+        raise ReadyActionError(str(exc)) from exc
+
+
+def _ready_update_fields(
+    conn,
+    task: dict,
+    *,
+    confirmed_next_step: str | None = None,
+) -> dict:
+    """Return safe db.update_task fields for dashboard Set to ready."""
+    status = task.get("status")
+    if status not in READY_ACTION_STATUSES:
+        raise ReadyActionError(f"Only tasks with status none or blocked can be set to ready; got '{status}'.")
+
+    task_type = _normalize_task_type_for_ready(task)
+    fields = {}
+    if _meaningful_next_step(task.get("next_step")):
+        next_step = task["next_step"].strip()
+    else:
+        next_step = _infer_ready_next_step(task)
+        if confirmed_next_step != next_step:
+            raise ReadyActionNeedsConfirmation(
+                f"Confirm setting next_step to '{next_step}' before queueing this task."
+            )
+        fields["next_step"] = next_step
+
+    _validate_next_step_for_ready(task_type, next_step)
+
+    if task_type != "other":
+        branch = task.get("branch")
+        if not branch:
+            raise ReadyActionError(
+                "Task has no branch. Set a branch before queueing this task."
+            )
+        _validate_branch_for_ready(branch)
+        fields["branch"] = branch
+
+    try:
+        task_cli.validate_ready_worktree(conn)
+    except task_cli.TaskValidationError as exc:
+        raise ReadyActionError(str(exc)) from exc
+    fields["status"] = "ready"
+    return fields
+
+
+def _restore_parent_after_child_ready(conn, task: dict) -> None:
+    """Mirror task CLI parent restoration when a blocked child is readied."""
+    parent_id = task.get("parent_task_id")
+    if parent_id is None:
+        return
+    parent = db.get_task(conn, parent_id)
+    if not parent or parent.get("status") != "blocked":
+        return
+    siblings = db.get_child_tasks(conn, parent_id)
+    blocked_siblings = [
+        sibling for sibling in siblings
+        if sibling["status"] == "blocked" and sibling["id"] != task["id"]
+    ]
+    if not blocked_siblings:
+        db.update_task(conn, parent_id, status="pending_subtasks")
+
+
+def _ready_action_state(task: dict) -> dict | None:
+    if task.get("status") not in READY_ACTION_STATUSES:
+        return None
+    try:
+        inferred_next_step = None
+        if not _meaningful_next_step(task.get("next_step")):
+            inferred_next_step = _infer_ready_next_step(task)
+    except ReadyActionError as exc:
+        return {"available": False, "error": str(exc)}
+    return {"available": True, "inferred_next_step": inferred_next_step}
 
 
 COMMENT_KIND_CLASS = {
@@ -507,7 +633,7 @@ def _hierarchy_summary_html(task: dict, conn) -> str:
 # ── Fragment renderers ─────────────────────────────────────────────────
 
 
-def render_health_card(runtime: dict | None) -> str:
+def render_health_card(runtime: dict | None, conn=None) -> str:
     """Render the orchestrator health card fragment."""
     if runtime is None:
         return """
@@ -518,7 +644,7 @@ def render_health_card(runtime: dict | None) -> str:
         </div>"""
 
     status = runtime.get("status") or "unknown"
-    display_status = _runtime_display_status(status, runtime.get("last_heartbeat_at"))
+    display_status = _runtime_display_status(status, runtime.get("last_heartbeat_at"), conn)
     badge_cls = STATUS_BADGE_CLASS.get(display_status, "badge-none")
     hb_age = _live_age(runtime.get("last_heartbeat_at"), css_class="heartbeat-age")
     lines = [
@@ -962,16 +1088,42 @@ def render_task_header(task: dict, conn=None, edit_error: str | None = None, *, 
     </div>"""
 
 
-def render_task_runtime_panel(task: dict, runtime: dict | None) -> str:
+def _set_ready_form_html(task: dict) -> str:
+    state = _ready_action_state(task)
+    if state is None:
+        return ""
+    if not state["available"]:
+        return f'<p class="action-error">{_esc(state["error"])}</p>'
+
+    inferred_next_step = state.get("inferred_next_step")
+    confirm_attrs = ""
+    hidden_value = ""
+    if inferred_next_step:
+        confirm_attrs = (
+            f' data-confirm-inferred-next-step="{_esc(inferred_next_step)}"'
+            f' data-confirm-message="Set next_step to {_esc(inferred_next_step)} and queue this task?"'
+        )
+    return f"""
+      <form class="action-form set-ready-form" action="/task/{_esc(task['id'])}/set-ready" method="post" data-ready-form{confirm_attrs}>
+        <input type="hidden" name="confirmed_next_step" value="{hidden_value}" data-confirmed-next-step>
+        <button type="submit">Set to ready</button>
+      </form>"""
+
+
+def render_task_runtime_panel(task: dict, runtime: dict | None, ready_error: str | None = None) -> str:
     """Render the live runtime panel on the task detail page."""
     tid = task["id"]
     if runtime is None or runtime.get("current_task_id") != tid:
         status = task.get("status", "")
         status_cls = STATUS_BADGE_CLASS.get(status, "badge-none")
+        ready_error_html = f'<p class="action-error">{_esc(ready_error)}</p>' if ready_error else ""
+        ready_action_html = _set_ready_form_html(task)
         return f"""
         <div class="card" id="task-runtime-panel">
           <h2>Current State</h2>
           <p><span class="badge {status_cls}">{_esc(status)}</span> This task is not the active task.</p>
+          {ready_error_html}
+          {ready_action_html}
         </div>"""
 
     step = runtime.get("current_step") or ""
@@ -1299,6 +1451,29 @@ code {
   color: #000000;
 }
 
+.action-form {
+  margin-top: 12px;
+}
+
+.action-form button {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #000000;
+  border-radius: 2px;
+  padding: 8px 14px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  text-transform: uppercase;
+  font-size: 0.82em;
+  letter-spacing: 0.04em;
+}
+
+.action-form button:hover {
+  background: #ffffff;
+  border-color: #ffffff;
+}
+
 .button-secondary {
   background: transparent !important;
   color: var(--muted) !important;
@@ -1343,6 +1518,11 @@ code {
 }
 
 .form-error {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.action-error {
   color: var(--red);
   font-weight: 600;
 }
@@ -1624,6 +1804,19 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
         event.preventDefault();
         window.showMoreRows(button);
       }});
+      document.addEventListener("submit", (event) => {{
+        const form = event.target.closest("[data-ready-form]");
+        if (!form) return;
+        const inferredNextStep = form.dataset.confirmInferredNextStep;
+        if (!inferredNextStep) return;
+        const message = form.dataset.confirmMessage || `Set next_step to ${{inferredNextStep}} and queue this task?`;
+        if (!window.confirm(message)) {{
+          event.preventDefault();
+          return;
+        }}
+        const field = form.querySelector("[data-confirmed-next-step]");
+        if (field) field.value = inferredNextStep;
+      }});
 
       updateRelativeTimes();
       hydrateShowMore();
@@ -1641,6 +1834,7 @@ def _task_detail_response(
     *,
     form_task: dict | None = None,
     edit_error: str | None = None,
+    ready_error: str | None = None,
     status_code: int = 200,
 ):
     task = db.get_task(conn, task_id)
@@ -1651,7 +1845,7 @@ def _task_detail_response(
     runtime = db.get_runtime(conn)
     prev_id, next_id = _get_prev_next_task_ids(conn, task_id)
     header_html = render_task_header(form_task or task, conn, edit_error=edit_error, prev_id=prev_id, next_id=next_id)
-    runtime_html = render_task_runtime_panel(task, runtime)
+    runtime_html = render_task_runtime_panel(task, runtime, ready_error=ready_error)
     comments_html = render_comments_panel(task_id, conn)
     log_html = render_run_log_panel(task_id, conn)
 
@@ -1738,7 +1932,7 @@ def index():
     conn = _open_conn()
     try:
         runtime = db.get_runtime(conn) if conn else None
-        health_html = render_health_card(runtime)
+        health_html = render_health_card(runtime, conn)
         current_html = render_current_task_card(runtime, conn)
         active_supertasks_html = render_active_supertasks(conn)
         ready_html = render_ready_queue(conn, runtime)
@@ -1869,6 +2063,47 @@ async def task_edit(task_id: int, request: Request):
     return RedirectResponse(url=f"/task/{task_id}", status_code=303)
 
 
+@app.post("/task/{task_id}/set-ready")
+async def task_set_ready(task_id: int, request: Request):
+    if not _is_local_origin(request):
+        return HTMLResponse("<p>Forbidden: cross-origin request.</p>", status_code=403)
+
+    conn = _open_conn()
+    if conn is None:
+        body = '<div class="card"><p class="muted">Database not available.</p></div>'
+        return HTMLResponse(_page_shell("Task Not Found", body), status_code=503)
+
+    try:
+        task = db.get_task(conn, task_id)
+        if task is None:
+            body = f'<div class="card"><p class="muted">Task #{task_id} not found.</p></div>'
+            return HTMLResponse(_page_shell("Task Not Found", body), status_code=404)
+
+        form_data = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        confirmed_next_step = form_data.get("confirmed_next_step", [""])[0].strip() or None
+
+        try:
+            fields = _ready_update_fields(
+                conn,
+                task,
+                confirmed_next_step=confirmed_next_step,
+            )
+        except ReadyActionError as exc:
+            return _task_detail_response(
+                task_id,
+                conn,
+                ready_error=str(exc),
+                status_code=400,
+            )
+
+        db.update_task(conn, task_id, **fields)
+        _restore_parent_after_child_ready(conn, task)
+    finally:
+        conn.close()
+
+    return RedirectResponse(url=f"/task/{task_id}", status_code=303)
+
+
 @app.get("/events")
 def events_overview():
     """SSE stream for the overview page. Pushes named events every 5 s."""
@@ -1877,7 +2112,7 @@ def events_overview():
             conn = _open_conn()
             try:
                 runtime = db.get_runtime(conn) if conn else None
-                health = render_health_card(runtime)
+                health = render_health_card(runtime, conn)
                 current = render_current_task_card(runtime, conn)
                 active_supertasks = render_active_supertasks(conn)
                 ready = render_ready_queue(conn, runtime)

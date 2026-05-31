@@ -266,6 +266,29 @@ class TestHealthCard(unittest.TestCase):
         self.assertIn("Round 1: gemini reviewing", html)
         self.assertNotIn("Round 0: gemini reviewing", html)
 
+    def test_idle_with_ready_work_blocked_by_blocked_gate_displays_blocked(self):
+        conn, db_path = _fresh_conn()
+        try:
+            blocked_id = db.add_task(conn, "Blocked task", branch="feat-blocked")
+            ready_id = db.add_task(conn, "Ready task", branch="feat-ready")
+            db.update_task(conn, blocked_id, status="blocked")
+            db.update_task(conn, ready_id, status="ready")
+            runtime = {
+                "status": "idle",
+                "last_heartbeat_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "status_message": "Waiting for ready tasks",
+                "current_task_id": None,
+            }
+
+            html = dashboard.render_health_card(runtime, conn)
+
+            self.assertIn("badge-blocked", html)
+            self.assertIn(">blocked<", html)
+            self.assertIn("Waiting for ready tasks", html)
+        finally:
+            conn.close()
+            os.unlink(db_path)
+
 
 class TestCurrentTaskCard(unittest.TestCase):
     """Tests for render_current_task_card."""
@@ -1221,6 +1244,26 @@ class TestTaskRuntimePanel(unittest.TestCase):
         task = {"id": 5, "status": "none", "next_step": "commit-make"}
         html = dashboard.render_task_runtime_panel(task, None)
         self.assertIn("not the active task", html)
+        self.assertIn("Set to ready", html)
+        self.assertNotIn("data-confirm-inferred-next-step", html)
+
+    def test_blocked_task_shows_set_ready_action(self):
+        task = {"id": 5, "status": "blocked", "next_step": "commit-review", "kind": "commit"}
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn('action="/task/5/set-ready"', html)
+        self.assertIn("Set to ready", html)
+
+    def test_missing_next_step_prompts_for_inferred_default(self):
+        task = {"id": 5, "status": "blocked", "next_step": "none", "kind": "pull_request"}
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn('data-confirm-inferred-next-step="pull-request-make"', html)
+        self.assertIn("Set to ready", html)
+
+    def test_unknown_kind_displays_ready_error_without_action(self):
+        task = {"id": 5, "status": "blocked", "next_step": "none", "kind": "mystery"}
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn("not recognized", html)
+        self.assertNotIn("Set to ready", html)
 
     def test_active_task_details(self):
         utc_dt = datetime.now(timezone.utc)
@@ -1240,6 +1283,109 @@ class TestTaskRuntimePanel(unittest.TestCase):
         self.assertNotIn("Review round 0: reviewing", html)
         self.assertIn('data-relative-time="true"', html)
         self.assertNotIn('data-local-time="true"', html)
+
+
+class TestReadyActionHelpers(unittest.TestCase):
+    """Tests for dashboard Set to ready helper behavior."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+
+    def test_infers_defaults_by_normalized_kind(self):
+        cases = [
+            (None, "commit-make"),
+            ("task", "commit-make"),
+            ("commit", "commit-make"),
+            ("pull_request", "pull-request-make"),
+            ("other", "other-make"),
+            ("supertask", "commit-make-supertask"),
+        ]
+        for kind, expected in cases:
+            with self.subTest(kind=kind):
+                task = {
+                    "id": 1,
+                    "status": "none",
+                    "next_step": "none",
+                    "kind": kind,
+                    "branch": "feat-ready",
+                }
+                self.assertEqual(dashboard._infer_ready_next_step(task), expected)
+
+    def test_unknown_kind_refused(self):
+        task = {
+            "id": 1,
+            "status": "none",
+            "next_step": "none",
+            "kind": "unknown",
+            "branch": "feat-ready",
+        }
+        with self.assertRaisesRegex(dashboard.ReadyActionError, "not recognized"):
+            dashboard._ready_update_fields(self.conn, task, confirmed_next_step="commit-make")
+
+    def test_preserves_existing_meaningful_next_step(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "commit-review",
+            "kind": "commit",
+            "branch": "feat-ready",
+        }
+
+        fields = dashboard._ready_update_fields(self.conn, task)
+
+        self.assertEqual(fields["status"], "ready")
+        self.assertNotIn("next_step", fields)
+
+    def test_missing_next_step_requires_confirmed_default(self):
+        for missing_value in (None, "", "none"):
+            with self.subTest(next_step=missing_value):
+                task = {
+                    "id": 1,
+                    "status": "blocked",
+                    "next_step": missing_value,
+                    "kind": "commit",
+                    "branch": "feat-ready",
+                }
+
+                with self.assertRaisesRegex(dashboard.ReadyActionNeedsConfirmation, "commit-make"):
+                    dashboard._ready_update_fields(self.conn, task)
+
+                fields = dashboard._ready_update_fields(
+                    self.conn,
+                    task,
+                    confirmed_next_step="commit-make",
+                )
+                self.assertEqual(fields["next_step"], "commit-make")
+                self.assertEqual(fields["status"], "ready")
+
+    def test_invalid_existing_next_step_is_refused(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "other-make",
+            "kind": "commit",
+            "branch": "feat-ready",
+        }
+        with self.assertRaisesRegex(dashboard.ReadyActionError, "not valid for commit"):
+            dashboard._ready_update_fields(self.conn, task)
+
+    def test_idle_dirty_worktree_refused(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "commit-make",
+            "kind": "commit",
+            "branch": "feat-ready",
+        }
+        with patch.object(dashboard.task_cli, "_is_orchestrator_idle", return_value=True), \
+             patch.object(dashboard.task_cli, "_is_worktree_dirty", return_value=True), \
+             patch.object(dashboard.task_cli, "_repo_root_for_policy", return_value=Path("/tmp/repo")):
+            with self.assertRaisesRegex(dashboard.ReadyActionError, "worktree is dirty"):
+                dashboard._ready_update_fields(self.conn, task)
 
 
 class TestTaskDetailLiveHeader(unittest.TestCase):
@@ -1387,6 +1533,113 @@ class TestTaskEditingRoutes(unittest.TestCase):
         resp = client.post(
             f"/task/{self.tid}/edit",
             data={"title": "evil", "description": "injected"},
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
+class TestTaskSetReadyRoutes(unittest.TestCase):
+    """Tests for task detail Set to ready flow."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+        os.environ["KANBAN_DB"] = self.db_path
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+        os.environ.pop("KANBAN_DB", None)
+
+    def _post_ready(self, task_id, data=None):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        return client.post(
+            f"/task/{task_id}/set-ready",
+            data=data or {},
+            headers={"origin": "http://127.0.0.1:8427"},
+            follow_redirects=False,
+        )
+
+    def test_set_ready_from_none(self):
+        tid = db.add_task(self.conn, "Parked task", branch="feat-ready")
+        db.update_task(self.conn, tid, next_step="commit-make")
+
+        resp = self._post_ready(tid)
+
+        self.assertEqual(resp.status_code, 303)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertIsNotNone(task["ready_at"])
+
+    def test_set_ready_from_blocked(self):
+        tid = db.add_task(self.conn, "Blocked task", branch="feat-ready")
+        db.update_task(self.conn, tid, status="blocked", next_step="commit-review")
+
+        resp = self._post_ready(tid)
+
+        self.assertEqual(resp.status_code, 303)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-review")
+
+    def test_existing_next_step_does_not_require_confirmation(self):
+        tid = db.add_task(self.conn, "Blocked task", branch="feat-ready")
+        db.update_task(self.conn, tid, status="blocked", next_step="commit-review")
+
+        resp = self._post_ready(tid)
+
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(db.get_task(self.conn, tid)["next_step"], "commit-review")
+
+    def test_missing_next_step_requires_confirmation_then_applies_default(self):
+        tid = db.add_task(self.conn, "Blocked task", branch="feat-ready")
+        db.update_task(self.conn, tid, status="blocked", next_step="none")
+
+        resp = self._post_ready(tid)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Confirm setting next_step to", resp.text)
+        self.assertEqual(db.get_task(self.conn, tid)["status"], "blocked")
+
+        resp2 = self._post_ready(tid, {"confirmed_next_step": "commit-make"})
+        self.assertEqual(resp2.status_code, 303)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+
+    def test_legacy_kind_uses_commit_default(self):
+        tid = db.add_task(self.conn, "Legacy task", branch="feat-ready")
+        self.conn.execute("UPDATE tasks SET kind = 'task' WHERE id = ?", (tid,))
+        self.conn.commit()
+        db.update_task(self.conn, tid, status="blocked", next_step="none")
+
+        resp = self._post_ready(tid, {"confirmed_next_step": "commit-make"})
+
+        self.assertEqual(resp.status_code, 303)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+
+    def test_error_display_for_master_branch_refusal(self):
+        tid = db.add_task(self.conn, "Master task")
+        db.update_task(self.conn, tid, branch="master", next_step="commit-make")
+
+        resp = self._post_ready(tid)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("tasks on master/main are disabled", resp.text)
+        self.assertIn("Set to ready", resp.text)
+        self.assertEqual(db.get_task(self.conn, tid)["status"], "none")
+
+    def test_set_ready_rejects_cross_origin(self):
+        from fastapi.testclient import TestClient
+
+        tid = db.add_task(self.conn, "Parked task", branch="feat-ready")
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{tid}/set-ready",
+            data={},
+            headers={"origin": "http://evil.example.com"},
         )
         self.assertEqual(resp.status_code, 403)
 

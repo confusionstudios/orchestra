@@ -72,6 +72,10 @@ MASTER_TASKS_DISABLED_ERROR = (
 )
 
 
+class TaskValidationError(ValueError):
+    """Raised by reusable task validation helpers."""
+
+
 def _json_out(obj):
     print(json.dumps(obj, indent=2, default=str))
 
@@ -123,11 +127,11 @@ def _is_orchestrator_idle(conn):
 
 
 def _reject_ready_when_idle_worktree_dirty(conn):
-    repo_root = _repo_root_for_policy()
-    if _is_orchestrator_idle(conn) and _is_worktree_dirty(repo_root):
+    try:
+        validate_ready_worktree(conn)
+    except TaskValidationError as exc:
         print(
-            "Error: cannot set task status to ready while the orchestrator is idle "
-            "and the worktree is dirty. Resolve or stash the worktree changes first.",
+            f"Error: {exc}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -142,14 +146,18 @@ def _allow_tasks_on_master():
 
 
 def _validate_branch_name(branch):
-    if not BRANCH_NAME_RE.match(branch):
-        print(f"Error: invalid branch name '{branch}'.", file=sys.stderr)
+    try:
+        validate_branch_name(branch)
+    except TaskValidationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
 def _reject_master_branch_without_marker(branch):
-    if _is_master_branch(branch) and not _allow_tasks_on_master():
-        print(MASTER_TASKS_DISABLED_ERROR, file=sys.stderr)
+    try:
+        validate_master_branch_policy(branch)
+    except TaskValidationError as exc:
+        print(str(exc), file=sys.stderr)
         sys.exit(1)
 
 
@@ -228,16 +236,40 @@ def _validate_skip_for_type(task_type, skip):
 
 
 def _validate_next_step_for_type(task_type, next_step):
+    try:
+        validate_next_step_for_type(task_type, next_step)
+    except TaskValidationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def validate_next_step_for_type(task_type, next_step):
     step_type = STEP_TYPES.get(next_step)
     if step_type is None:
-        print(f"Error: unknown next_step '{next_step}'.", file=sys.stderr)
-        sys.exit(1)
+        raise TaskValidationError(f"unknown next_step '{next_step}'.")
     if step_type != "any" and step_type != task_type:
-        print(
-            f"Error: next_step '{next_step}' is not valid for {_display_task_type(task_type)} tasks.",
-            file=sys.stderr,
+        raise TaskValidationError(
+            f"next_step '{next_step}' is not valid for {_display_task_type(task_type)} tasks.",
         )
-        sys.exit(1)
+
+
+def validate_branch_name(branch):
+    if not BRANCH_NAME_RE.match(branch):
+        raise TaskValidationError(f"invalid branch name '{branch}'.")
+
+
+def validate_master_branch_policy(branch):
+    if _is_master_branch(branch) and not _allow_tasks_on_master():
+        raise TaskValidationError(MASTER_TASKS_DISABLED_ERROR)
+
+
+def validate_ready_worktree(conn):
+    repo_root = _repo_root_for_policy()
+    if _is_orchestrator_idle(conn) and _is_worktree_dirty(repo_root):
+        raise TaskValidationError(
+            "cannot set task status to ready while the orchestrator is idle "
+            "and the worktree is dirty. Resolve or stash the worktree changes first."
+        )
 
 
 # ── Subcommands ────────────────────────────────────────────────────────
