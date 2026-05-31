@@ -28,6 +28,7 @@ class FleetRepo:
     path: Path
     root: Path | None
     error: str | None = None
+    managed: bool = True
 
     @property
     def session(self) -> str:
@@ -149,6 +150,13 @@ def load_repos() -> list[FleetRepo]:
     path = config_path()
     if not path.exists():
         die(f"fleet config not found: {path}\nRun `ko-fleet init` or `ko-fleet add .`.")
+    return [discover_repo(raw) for raw in parse_config_lines(path.read_text(encoding="utf-8"))]
+
+
+def load_status_repos() -> list[FleetRepo]:
+    path = config_path()
+    if not path.exists():
+        return []
     return [discover_repo(raw) for raw in parse_config_lines(path.read_text(encoding="utf-8"))]
 
 
@@ -299,6 +307,122 @@ def tmux_has_session(session: str) -> bool:
     ).returncode == 0
 
 
+def process_table() -> list[tuple[int, str]]:
+    result = run(["ps", "-Ao", "pid=,command="])
+    if result.returncode != 0:
+        return []
+
+    processes = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        processes.append((pid, command.strip()))
+    return processes
+
+
+def is_orchestrator_command(command: str) -> bool:
+    return re.search(r"(^|\s)\S*orchestrator\.py(\s|$)", command) is not None
+
+
+def process_cwd(pid: int) -> Path | None:
+    proc_cwd = Path("/proc") / str(pid) / "cwd"
+    if proc_cwd.exists():
+        try:
+            return proc_cwd.resolve()
+        except OSError:
+            return None
+
+    if shutil.which("lsof") is None:
+        return None
+    result = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            try:
+                return Path(line[1:]).resolve()
+            except OSError:
+                return None
+    return None
+
+
+def repo_root_for_process_cwd(cwd: Path) -> Path | None:
+    result = run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])
+    if result.returncode == 0:
+        return Path(result.stdout.strip()).resolve()
+    fallback = cwd.resolve()
+    if (fallback / "kanban-orchestra.lock").exists():
+        return fallback
+    return None
+
+
+def running_orchestrator_process_roots() -> list[tuple[int, Path]]:
+    roots = []
+    current_pid = os.getpid()
+    for pid, command in process_table():
+        if pid == current_pid or not is_orchestrator_command(command):
+            continue
+        cwd = process_cwd(pid)
+        if cwd is None:
+            continue
+        root = repo_root_for_process_cwd(cwd)
+        if root is not None:
+            roots.append((pid, root))
+    return roots
+
+
+def discover_running_repos() -> list[FleetRepo]:
+    repos = []
+    seen_roots: set[Path] = set()
+    for pid, root in running_orchestrator_process_roots():
+        if root in seen_roots:
+            continue
+        repo = FleetRepo(label_for(root), root, root, managed=False)
+        if metadata_pid(repo.lock_path, "orchestrator", repo) != pid:
+            continue
+        if not pid_alive(pid):
+            continue
+        repos.append(repo)
+        seen_roots.add(root)
+    return repos
+
+
+def status_repos(queries: list[str]) -> list[FleetRepo]:
+    configured = load_status_repos()
+    managed_roots = {repo.root.resolve() for repo in configured if repo.root is not None}
+    unmanaged = [
+        repo
+        for repo in discover_running_repos()
+        if repo.root is not None and repo.root.resolve() not in managed_roots
+    ]
+    repos = [
+        *configured,
+        *unmanaged,
+    ]
+    if not queries:
+        return repos
+
+    selected: list[FleetRepo] = []
+    unmatched: list[str] = []
+    for query in queries:
+        matches = [repo for repo in repos if repo_matches(repo, query)]
+        if not matches:
+            unmatched.append(query)
+            continue
+        for repo in matches:
+            if repo not in selected:
+                selected.append(repo)
+    if unmatched:
+        die(f"unknown repo selector(s): {', '.join(unmatched)}")
+    return selected
+
+
 def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     if repo.error:
         return "invalid", "-", "-", repo.error
@@ -365,7 +489,19 @@ def print_status(repos: list[FleetRepo]) -> None:
     for repo in repos:
         status, orch_pid, dashboard_pid, session = repo_process_state(repo)
         dashboard_url = dashboard_status_url(repo)
-        rows.append((repo.label, status, orch_pid, dashboard_pid, session, dashboard_url, display_path(repo.root or repo.path)))
+        owner = "managed" if repo.managed else "unmanaged"
+        rows.append(
+            (
+                repo.label,
+                status,
+                orch_pid,
+                dashboard_pid,
+                session,
+                dashboard_url,
+                owner,
+                display_path(repo.root or repo.path),
+            )
+        )
 
     widths = [
         max(len("repo"), *(len(row[0]) for row in rows)),
@@ -374,22 +510,23 @@ def print_status(repos: list[FleetRepo]) -> None:
         max(len("dash"), *(len(row[3]) for row in rows)),
         max(len("session"), *(len(row[4]) for row in rows)),
         max(len("dash_url"), *(len(row[5]) for row in rows)),
+        max(len("owner"), *(len(row[6]) for row in rows)),
     ]
     print(
         f"{'repo':<{widths[0]}}  {'status':<{widths[1]}}  "
         f"{'orch':>{widths[2]}}  {'dash':>{widths[3]}}  {'session':<{widths[4]}}  "
-        f"{'dash_url':<{widths[5]}}  root"
+        f"{'dash_url':<{widths[5]}}  {'owner':<{widths[6]}}  root"
     )
     print(
         f"{'-' * widths[0]}  {'-' * widths[1]}  "
         f"{'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  "
-        f"{'-' * widths[5]}  ----"
+        f"{'-' * widths[5]}  {'-' * widths[6]}  ----"
     )
-    for label, status, orch_pid, dashboard_pid, session, dashboard_url, root in rows:
+    for label, status, orch_pid, dashboard_pid, session, dashboard_url, owner, root in rows:
         print(
             f"{label:<{widths[0]}}  {status:<{widths[1]}}  "
             f"{orch_pid:>{widths[2]}}  {dashboard_pid:>{widths[3]}}  {session:<{widths[4]}}  "
-            f"{dashboard_url:<{widths[5]}}  {root}"
+            f"{dashboard_url:<{widths[5]}}  {owner:<{widths[6]}}  {root}"
         )
 
 
@@ -656,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "status":
-        print_status(select_repos(args.repos))
+        print_status(status_repos(args.repos))
     elif args.command == "precheck":
         return precheck(select_repos(args.repos))
     elif args.command == "start":

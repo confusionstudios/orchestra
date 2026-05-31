@@ -127,8 +127,74 @@ class TestFleetOperatorFlows(unittest.TestCase):
             lines = out.getvalue().splitlines()
             self.assertIn("dash_url", lines[0])
             columns = lines[2].split()
-            self.assertEqual(columns[-2], "-")
+            self.assertEqual(columns[-3], "-")
+            self.assertEqual(columns[-2], "managed")
             self.assertEqual(columns[-1], str(root))
+
+    def test_discover_running_repos_marks_live_processes_as_unmanaged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                fleet,
+                "running_orchestrator_process_roots",
+                return_value=[(os.getpid(), root)],
+            ):
+                repos = fleet.discover_running_repos()
+
+            self.assertEqual(len(repos), 1)
+            self.assertEqual(repos[0].root, root)
+            self.assertFalse(repos[0].managed)
+
+    def test_status_repos_adds_unmanaged_running_instances_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+            managed_root = base / "managed"
+            unmanaged_root = base / "unmanaged"
+            managed_root.mkdir()
+            unmanaged_root.mkdir()
+            managed = fleet.FleetRepo("managed", managed_root, managed_root)
+            unmanaged = fleet.FleetRepo(
+                "unmanaged",
+                unmanaged_root,
+                unmanaged_root,
+                managed=False,
+            )
+            duplicate_running = fleet.FleetRepo(
+                "managed",
+                managed_root,
+                managed_root,
+                managed=False,
+            )
+
+            with patch.object(fleet, "load_status_repos", return_value=[managed]), \
+                 patch.object(fleet, "discover_running_repos", return_value=[duplicate_running, unmanaged]):
+                repos = fleet.status_repos([])
+
+            self.assertEqual([repo.root for repo in repos], [managed_root, unmanaged_root])
+            self.assertTrue(repos[0].managed)
+            self.assertFalse(repos[1].managed)
+
+    def test_status_prints_unmanaged_owner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root, managed=False)
+            out = io.StringIO()
+
+            with patch.object(fleet, "tmux_has_session", return_value=False), redirect_stdout(out):
+                fleet.print_status([repo])
+
+            text = out.getvalue()
+            self.assertIn("owner", text.splitlines()[0])
+            self.assertIn("unmanaged", text.splitlines()[2])
 
     def test_request_dashboard_start_creates_presence_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
