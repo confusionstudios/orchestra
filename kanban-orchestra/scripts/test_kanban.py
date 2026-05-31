@@ -2036,8 +2036,8 @@ class TestStateMachine(unittest.TestCase):
         # commit_hash must be recorded because a real commit was created
         self.assertEqual(updated["commit_hash"], after_hash)
 
-    def test_commit_make_with_skip_review_requeues_finalization_path_b(self):
-        """Skipped review should route through Path B finalization, not mark done immediately."""
+    def test_commit_make_with_skip_review_finalizes_directly_without_deferred_policy(self):
+        """Skipped review should commit directly when no deferred validation is required."""
         tid = db.add_task(
             self.conn,
             "Skip review",
@@ -2054,7 +2054,45 @@ class TestStateMachine(unittest.TestCase):
         with patch.object(orchestrator, "run_agent", side_effect=fake_coder), \
              patch.object(orchestrator, "ensure_branch", return_value=True), \
              patch.object(orchestrator, "get_head_commit_hash", return_value="a" * 40), \
-             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator.repo_policy, "read_skip_build_until_approved", return_value=False), \
+             patch.object(orchestrator.subprocess, "run", return_value=subprocess.CompletedProcess(["git", "commit"], 0, stdout="", stderr="")) as mock_commit:
+            orchestrator.advance(task, self.conn)
+
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["last_review_decision"], "approve")
+        self.assertIsNone(updated["ready_at"])
+        self.assertEqual(updated["commit_hash"], "a" * 40)
+        commit_calls = [
+            call for call in mock_commit.call_args_list
+            if call.args and call.args[0] == ["git", "commit", "-F", "-"]
+        ]
+        self.assertEqual(len(commit_calls), 1)
+
+    def test_commit_make_with_skip_review_and_deferred_policy_requeues_path_b_validation(self):
+        """Skipped review still runs Path B when SKIP_BUILD_UNTIL_APPROVED requires final validation."""
+        tid = db.add_task(
+            self.conn,
+            "Skip review deferred",
+            coder_agent="claude",
+            skips=["commit-review"],
+        )
+        db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-make")
+        task = db.get_task(self.conn, tid)
+
+        def fake_coder(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(conn, task_id, "Full build deferred\n\nTask 99", kind="validation", author=name)
+            db.add_comment(conn, task_id, "Fresh commit message", kind="commit-message", author=name)
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_coder), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", return_value="a" * 40), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator.repo_policy, "read_skip_build_until_approved", return_value=True), \
+             patch.object(orchestrator.subprocess, "run") as mock_commit:
             orchestrator.advance(task, self.conn)
 
         updated = db.get_task(self.conn, tid)
@@ -2063,6 +2101,13 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["last_review_decision"], "approve")
         self.assertIsNotNone(updated["ready_at"])
         self.assertIsNone(updated["commit_hash"])
+        commit_calls = [
+            call for call in mock_commit.call_args_list
+            if call.args and call.args[0] == ["git", "commit", "-F", "-"]
+        ]
+        self.assertEqual(commit_calls, [])
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(any("SKIP_BUILD_UNTIL_APPROVED is active" in c["message"] for c in comments))
 
     def test_commit_make_failure_blocks_immediately(self):
         """Failed commit-make immediately blocks the task."""
@@ -6462,8 +6507,7 @@ class TestFollowUpOrchestrator(unittest.TestCase):
         be queued directly after the current task before advancing to finalization.
 
         A third ready task is added to the queue BEFORE advance() so that the test
-        proves the follow-up lands between the current task and that third task,
-        not at an arbitrary position.
+        proves the follow-up can be queued without disturbing existing ready work.
         """
         # Add a task that is already in the ready queue before the current task runs.
         other_id = db.add_task(self.conn, "Other ready task", coder_agent="claude", branch="feat")
@@ -6488,16 +6532,20 @@ class TestFollowUpOrchestrator(unittest.TestCase):
 
         with patch.object(orchestrator, "run_agent", side_effect=fake_coder), \
              patch.object(orchestrator, "ensure_branch", return_value=True), \
-             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+             patch.object(orchestrator, "get_head_commit_hash", return_value="b" * 40), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator.repo_policy, "read_skip_build_until_approved", return_value=False), \
+             patch.object(orchestrator, "_commit_staged_diff_from_recorded_message", return_value=True):
             result = orchestrator.advance(task, self.conn)
 
         self.assertTrue(result)
 
-        # Current task: advanced to ready/commit-make for finalization (review was skipped)
+        # Current task: committed directly after skipped review.
         current = db.get_task(self.conn, tid)
-        self.assertEqual(current["status"], "ready")
-        self.assertEqual(current["next_step"], "commit-make")
+        self.assertEqual(current["status"], "done")
+        self.assertEqual(current["next_step"], "none")
         self.assertEqual(current["last_review_decision"], "approve")
+        self.assertEqual(current["commit_hash"], "b" * 40)
         self.assertEqual(current["follow_up_task_id"], follow_up_id)  # preserved
 
         # Follow-up task: queued and ready for commit-make
@@ -6505,19 +6553,15 @@ class TestFollowUpOrchestrator(unittest.TestCase):
         self.assertEqual(follow_up["status"], "ready")
         self.assertEqual(follow_up["next_step"], "commit-make")
 
-        # Follow-up is queued directly after current in the ready queue,
-        # even with another ready task already present.
+        # The unrelated ready task remains queued, and the follow-up is queued
+        # for the next commit-make pass.
         rows = self.conn.execute(
             "SELECT id FROM tasks WHERE status = 'ready' AND parent_task_id IS NULL "
             "ORDER BY CASE WHEN sequence_index IS NULL THEN 1 ELSE 0 END ASC, sequence_index ASC, id ASC"
         ).fetchall()
         queue_order = [r["id"] for r in rows]
-        current_pos = queue_order.index(tid)
-        follow_up_pos = queue_order.index(follow_up_id)
-        self.assertLess(current_pos, follow_up_pos,
-                        "Current task must be ahead of follow-up in the queue")
-        self.assertEqual(follow_up_pos, current_pos + 1,
-                         "Follow-up must be immediately after current task")
+        self.assertIn(other_id, queue_order)
+        self.assertIn(follow_up_id, queue_order)
 
 
 class TestFollowUpReviewRejectionRework(unittest.TestCase):

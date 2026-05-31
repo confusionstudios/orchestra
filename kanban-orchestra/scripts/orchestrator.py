@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db
 import config
 import repo_policy
+import task as task_cli
 import orchestrator_control
 import active_agent_processes
 
@@ -394,6 +395,13 @@ def _repo_root_for_subprocess():
 def _master_tasks_allowed():
     try:
         return repo_policy.read_allow_tasks_on_master(_repo_root())
+    except Exception:
+        return False
+
+
+def _skip_build_until_approved_active():
+    try:
+        return repo_policy.read_skip_build_until_approved(_repo_root())
     except Exception:
         return False
 
@@ -1119,10 +1127,7 @@ def handle_commit_make(task, conn):
     ensure_agent_acked(agent, task["id"], conn)
 
     # Read repo policy once; drives Path A validation enforcement and Path B gating.
-    try:
-        skip_build_policy = repo_policy.read_skip_build_until_approved(_repo_root())
-    except Exception:
-        skip_build_policy = False
+    skip_build_policy = _skip_build_until_approved_active()
 
     comments = db.get_comments(conn, task["id"])
     prompt = build_prompt(task, "commit-make", agent, comments)
@@ -1824,6 +1829,76 @@ def _finalize_commit(task, conn, done_without_commit=False):
     _check_parent_completion(task_id, conn)
 
 
+def _commit_staged_diff_from_recorded_message(task, conn):
+    """Commit the staged diff using the latest recorded commit-message comment."""
+    task_id = task["id"]
+    commit_messages = [
+        c for c in db.get_comments(conn, task_id)
+        if c.get("kind") == "commit-message"
+    ]
+    if not commit_messages:
+        log("Skipped commit-review finalization failed: no commit-message comment recorded", task_id)
+        db.add_run_log(
+            conn,
+            task_id,
+            "Skipped commit-review finalization found no commit-message comment",
+            verb="commit-make",
+            author="orchestrator",
+        )
+        return False
+
+    message = task_cli.normalize_commit_message_footer(
+        commit_messages[-1]["message"],
+        task_id,
+        conn,
+    )
+    result = subprocess.run(
+        ["git", "commit", "-F", "-"],
+        input=message,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "git commit produced no output").strip()
+        log(
+            f"Skipped commit-review finalization failed: git commit exited {result.returncode}",
+            task_id,
+        )
+        db.add_comment(
+            conn,
+            task_id,
+            "Commit review was skipped, but direct finalization failed while committing "
+            f"the staged diff from the recorded commit message:\n\n{detail}",
+            kind="comment",
+            author="orchestrator",
+        )
+        return False
+
+    db.add_comment(
+        conn,
+        task_id,
+        "Commit review skipped; orchestrator finalized directly from the staged diff "
+        "and recorded commit message.",
+        kind="comment",
+        author="orchestrator",
+    )
+    return True
+
+
+def _queue_deferred_validation_after_skipped_review(task, conn):
+    """Route skipped review through Path B only when deferred validation is required."""
+    _approve_commit(task, conn)
+    db.add_comment(
+        conn,
+        task["id"],
+        "Commit review skipped, but SKIP_BUILD_UNTIL_APPROVED is active; queued "
+        "commit-make Path B so the deferred full-build validation still runs before "
+        "finalization.",
+        kind="comment",
+        author="orchestrator",
+    )
+
+
 def _finalize_pull_request(task, conn):
     """Mark a pull request task done after metadata review approval or skip."""
     task_id = task["id"]
@@ -2392,11 +2467,31 @@ def advance(task, conn):
             else:
                 _finalize_commit(task, conn, done_without_commit=done_without_commit)
         elif db.should_skip_step(conn, task_id, "commit-review"):
-            # Advance first so the current task has status=ready, which
-            # db.reposition_task requires for the anchor argument.
-            _approve_commit(task, conn)
-            # Queue the follow-up (if any) directly after the now-ready task.
-            _queue_follow_up_if_needed(task, conn)
+            if _skip_build_until_approved_active():
+                # A skipped review counts as approval, but the deferred-build policy
+                # still requires Path B validation before the commit can land.
+                _queue_deferred_validation_after_skipped_review(task, conn)
+                # Queue the follow-up (if any) directly after the now-ready task.
+                _queue_follow_up_if_needed(task, conn)
+            else:
+                if not _commit_staged_diff_from_recorded_message(task, conn):
+                    mark_blocked(
+                        task_id,
+                        conn,
+                        "commit-review was skipped, but direct finalization from the staged diff failed.",
+                        f"Blocked: skipped-review direct finalization failed for task {task_id}",
+                        log_message="Blocked: skipped-review direct finalization failed",
+                        preserve_wip=True,
+                    )
+                    return False
+                db.update_task(conn, task_id,
+                               status="ready", next_step="commit-make",
+                               last_review_decision="approve")
+                queued_id = _queue_follow_up_if_needed(task, conn)
+                task = db.get_task(conn, task_id)
+                _finalize_commit(task, conn)
+                if queued_id:
+                    db.update_runtime(conn, status_message=f"Task {task_id} committed directly after skipped review; follow-up {queued_id} queued")
         else:
             # Path A: code built, move to review
             db.update_task(conn, task_id,
