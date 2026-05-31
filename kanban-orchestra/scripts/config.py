@@ -5,13 +5,21 @@ from pathlib import Path
 _shared = Path(__file__).resolve().parent.parent.parent / "shared_scripts"
 if str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
-from agent_registry import AGENTS, AGENT_CMD, AGENT_DISPLAY_LABELS  # type: ignore  # noqa: E402
+from agent_registry import (  # type: ignore  # noqa: E402
+    AGENTS,
+    AGENT_CMD,
+    AGENT_DISPLAY_LABELS,
+    AGENT_PROVIDERS,
+    is_valid_agent_spec,
+    resolve_agent_command,
+    resolve_agent_label,
+)
 
 
 def _agent_default(env_key: str, fallback: str) -> str:
     """Return the value of env_key if set to a known agent, else fallback."""
     val = os.environ.get(env_key, "").strip()
-    if val and val in AGENTS:
+    if val and is_valid_agent_spec(val):
         return val
     return fallback
 
@@ -24,14 +32,19 @@ def get_agent_display_label(agent: str) -> str:
     This keeps commit attribution tied to orchestration config rather than
     agent self-reporting.
     """
-    if agent in AGENT_DISPLAY_LABELS:
-        return AGENT_DISPLAY_LABELS[agent]
+    label = resolve_agent_label(agent)
+    if label is not None:
+        return label
 
-    cmd = AGENT_CMD.get(agent, [])
+    cmd = resolve_agent_command(agent) or []
     for i, part in enumerate(cmd):
         if part == "--model" and i + 1 < len(cmd):
             return cmd[i + 1]
     return agent
+
+
+def is_valid_agent(agent: str) -> bool:
+    return is_valid_agent_spec(agent)
 
 
 def get_agent_display_name(agent: str) -> str:

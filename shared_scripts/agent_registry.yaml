@@ -1,3 +1,11 @@
+providers:
+  cursor:
+    label: Cursor {model}
+    command: ["cursor", "agent", "-p", "--model", "{model}", "--yolo", "--trust", "{prompt}"]
+  kilo:
+    label: Kilo {model}
+    command: ["kilo", "--model", "{model}", "run", "{prompt}"]
+
 agents:
   - key: haiku
     label: Claude Haiku 4.5
