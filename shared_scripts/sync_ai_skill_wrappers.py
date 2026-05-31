@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -35,6 +36,9 @@ AGENTS = ("claude", "agents")
 OBSOLETE_AGENTS = ("gemini", "codex", "kilo")
 KNOWN_AGENTS = (*AGENTS, *OBSOLETE_AGENTS)
 WRAPPER_PREFIX = "ko-"
+GENERATED_WRAPPER_GITIGNORE_ENTRIES = tuple(
+    f".{agent}/skills/{WRAPPER_PREFIX}*/" for agent in KNOWN_AGENTS
+)
 
 _FRONT_MATTER_RE = re.compile(
     r"\A---\nname: (?P<name>[^\n]+)\ndescription: (?P<description>[^\n]+)\n---\n\n(?P<body>.*)\Z",
@@ -181,14 +185,136 @@ def _remove_wrapper_dir(wrapper_path: Path) -> None:
             break
 
 
+def _ensure_generated_wrapper_gitignore(target: Path) -> list[str]:
+    gitignore = target / ".gitignore"
+    original = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    lines = original.splitlines()
+    missing = [entry for entry in GENERATED_WRAPPER_GITIGNORE_ENTRIES if entry not in lines]
+    if not missing:
+        return []
+
+    existing_entry_indices = [
+        index
+        for index, line in enumerate(lines)
+        if line in GENERATED_WRAPPER_GITIGNORE_ENTRIES
+    ]
+    if existing_entry_indices:
+        insert_at = max(existing_entry_indices) + 1
+    else:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append("# Generated Orchestra skill wrappers. Canonical source lives in AI-skills/.")
+        insert_at = len(lines)
+
+    for entry in missing:
+        lines.insert(insert_at, entry)
+        insert_at += 1
+
+    gitignore.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return missing
+
+
+def _git_repo_root(path: Path) -> Path | None:
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def _git_relative_path(path: Path, repo_root: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return None
+
+
+def _target_relative_path(path: Path, target: Path) -> str:
+    try:
+        return path.resolve().relative_to(target).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _remove_git_index_paths(target: Path, paths: list[Path]) -> list[str]:
+    if not paths:
+        return []
+
+    repo_root = _git_repo_root(target)
+    if repo_root is None:
+        return []
+
+    git_paths = sorted(
+        {
+            git_path
+            for path in paths
+            if (git_path := _git_relative_path(path, repo_root)) is not None
+        }
+    )
+    if not git_paths:
+        return []
+
+    tracked: list[str] = []
+    for git_path in git_paths:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--", git_path],
+            capture_output=True,
+            check=True,
+        )
+        tracked.extend(
+            path.decode("utf-8")
+            for path in result.stdout.split(b"\0")
+            if path
+        )
+
+    if not tracked:
+        return []
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "rm",
+            "-r",
+            "-f",
+            "--cached",
+            "--ignore-unmatch",
+            "--",
+            *git_paths,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+    return sorted(
+        {
+            _target_relative_path(repo_root / tracked_path, target)
+            for tracked_path in tracked
+        }
+    )
+
+
 def fix_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str]]:
     target = target.resolve()
     orchestra_dir = orchestra_dir.resolve()
-    summary = {"removed": [], "ignored": [], "skipped": []}
+    summary = {
+        "removed": [],
+        "ignored": [],
+        "skipped": [],
+        "gitignore_added": [],
+        "git_index_removed": [],
+    }
     canonical_paths = {
         canonical_path.stem: canonical_path
         for canonical_path in _canonical_skill_files(orchestra_dir)
     }
+    git_index_candidates: list[Path] = []
+
+    summary["gitignore_added"] = _ensure_generated_wrapper_gitignore(target)
 
     for agent in KNOWN_AGENTS:
         skills_root = target / f".{agent}" / "skills"
@@ -204,9 +330,15 @@ def fix_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str]
             wrapper_name = wrapper_dir.name
             skill_name = _unwrap_wrapper_skill_name(wrapper_name)
             canonical_path = canonical_paths.get(skill_name)
+            current_text = wrapper_path.read_text(encoding="utf-8")
+            is_generated = _is_generated_wrapper(current_text, skill_name, canonical_path)
 
             if wrapper_name.startswith(WRAPPER_PREFIX) and agent in AGENTS:
-                summary["ignored"].append(relative_path)
+                if is_generated:
+                    git_index_candidates.append(wrapper_dir)
+                    summary["ignored"].append(relative_path)
+                else:
+                    summary["skipped"].append(relative_path)
                 continue
 
             if wrapper_name.startswith(WRAPPER_PREFIX):
@@ -218,14 +350,15 @@ def fix_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str]
                 summary["ignored"].append(relative_path)
                 continue
 
-            current_text = wrapper_path.read_text(encoding="utf-8")
-            if _is_generated_wrapper(current_text, skill_name, canonical_path):
+            if is_generated:
+                git_index_candidates.append(wrapper_dir)
                 _remove_wrapper_dir(wrapper_path)
                 summary["removed"].append(relative_path)
                 continue
 
             summary["skipped"].append(relative_path)
 
+    summary["git_index_removed"] = _remove_git_index_paths(target, git_index_candidates)
     return summary
 
 
@@ -311,9 +444,13 @@ def main() -> int:
             "AI skill wrappers fixed:"
             f" removed={len(summary['removed'])}"
             f" ignored={len(summary['ignored'])}"
+            f" gitignore_added={len(summary['gitignore_added'])}"
+            f" git_index_removed={len(summary['git_index_removed'])}"
             f" skipped={len(summary['skipped'])}"
         )
         for key, label in (
+            ("gitignore_added", "Gitignore added"),
+            ("git_index_removed", "Git index removed"),
             ("removed", "Removed"),
             ("ignored", "Ignored"),
             ("skipped", "Skipped"),

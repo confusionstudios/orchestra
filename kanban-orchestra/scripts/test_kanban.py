@@ -3469,6 +3469,7 @@ class TestKanbanCLI(unittest.TestCase):
             ".claude/skills/ko-*/",
             ".gemini/skills/ko-*/",
             ".agents/skills/ko-*/",
+            ".codex/skills/ko-*/",
             ".kilo/skills/ko-*/",
         ]:
             self.assertIn(entry, gitignore)
@@ -3476,6 +3477,7 @@ class TestKanbanCLI(unittest.TestCase):
         self.assertNotIn(".claude/", gitignore_lines)
         self.assertNotIn(".gemini/", gitignore_lines)
         self.assertNotIn(".agents/", gitignore_lines)
+        self.assertNotIn(".codex/", gitignore_lines)
         self.assertNotIn(".kilo/", gitignore_lines)
 
 
@@ -3651,6 +3653,38 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                 orchestra_dir=orchestra_dir,
             )
             self.assertEqual(second_summary["removed"], [])
+            self.assertEqual(second_summary["gitignore_added"], [])
+
+    def test_fix_skill_wrappers_repairs_generated_wrapper_gitignore_entries(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            _write_test_ai_skills(orchestra_dir)
+            (target / ".gitignore").write_text(
+                "# Existing policy\n.claude/skills/ko-*/\n",
+                encoding="utf-8",
+            )
+
+            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
+
+            self.assertEqual(
+                summary["gitignore_added"],
+                [
+                    ".agents/skills/ko-*/",
+                    ".gemini/skills/ko-*/",
+                    ".codex/skills/ko-*/",
+                    ".kilo/skills/ko-*/",
+                ],
+            )
+            gitignore_lines = (target / ".gitignore").read_text(encoding="utf-8").splitlines()
+            for entry in skill_wrappers.GENERATED_WRAPPER_GITIGNORE_ENTRIES:
+                self.assertEqual(gitignore_lines.count(entry), 1)
+
+            second_summary = skill_wrappers.fix_skill_wrappers(
+                target=target,
+                orchestra_dir=orchestra_dir,
+            )
+            self.assertEqual(second_summary["gitignore_added"], [])
 
     def test_fix_skill_wrappers_removes_generated_ko_wrappers_from_obsolete_agents(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
@@ -3672,14 +3706,66 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                     skill_wrappers.render_wrapper(skill_name, description, canonical_path),
                     encoding="utf-8",
                 )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "."], cwd=target, check=True)
 
             summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
 
             self.assertIn(".gemini/skills/ko-kanban/SKILL.md", summary["removed"])
             self.assertIn(".codex/skills/ko-kanban/SKILL.md", summary["removed"])
             self.assertIn(".kilo/skills/ko-kanban/SKILL.md", summary["removed"])
+            self.assertEqual(
+                sorted(summary["git_index_removed"]),
+                [
+                    ".codex/skills/ko-kanban/SKILL.md",
+                    ".gemini/skills/ko-kanban/SKILL.md",
+                    ".kilo/skills/ko-kanban/SKILL.md",
+                ],
+            )
             for stale_wrapper in stale_wrappers:
                 self.assertFalse(stale_wrapper.exists())
+            tracked = subprocess.run(
+                ["git", "ls-files"],
+                cwd=target,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertNotIn(".gemini/skills/ko-kanban/SKILL.md", tracked)
+            self.assertNotIn(".codex/skills/ko-kanban/SKILL.md", tracked)
+            self.assertNotIn(".kilo/skills/ko-kanban/SKILL.md", tracked)
+
+    def test_fix_skill_wrappers_untracks_current_generated_wrappers_without_deleting(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            _write_test_ai_skills(orchestra_dir)
+
+            skill_name = "kanban"
+            canonical_path = orchestra_dir / "AI-skills" / f"{skill_name}.md"
+            description = skill_wrappers._skill_description(canonical_path)
+            wrapper = target / ".agents" / "skills" / "ko-kanban" / "SKILL.md"
+            wrapper.parent.mkdir(parents=True, exist_ok=True)
+            wrapper.write_text(
+                skill_wrappers.render_wrapper(skill_name, description, canonical_path),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "."], cwd=target, check=True)
+
+            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
+
+            self.assertIn(".agents/skills/ko-kanban/SKILL.md", summary["ignored"])
+            self.assertEqual(summary["git_index_removed"], [".agents/skills/ko-kanban/SKILL.md"])
+            self.assertTrue(wrapper.exists())
+            tracked = subprocess.run(
+                ["git", "ls-files", "--", ".agents/skills/ko-kanban/SKILL.md"],
+                cwd=target,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(tracked, "")
 
     def test_fix_skill_wrappers_removes_old_gemini_generated_copies(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
@@ -3747,6 +3833,39 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
             self.assertIn(".agents/skills/kanban/SKILL.md", summary["skipped"])
             self.assertEqual(custom_wrapper.read_text(encoding="utf-8"), custom_content)
             self.assertFalse((target / ".agents" / "skills" / "ko-kanban" / "SKILL.md").exists())
+
+    def test_fix_skill_wrappers_skips_tracked_custom_ko_wrapper_files(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            _write_test_ai_skills(orchestra_dir)
+
+            custom_wrapper = target / ".agents" / "skills" / "ko-kanban" / "SKILL.md"
+            custom_wrapper.parent.mkdir(parents=True, exist_ok=True)
+            custom_content = (
+                "---\n"
+                "name: ko-kanban\n"
+                "description: Custom local instructions.\n"
+                "---\n\n"
+                "Use the local team-specific kanban workflow instead of the shared one.\n"
+            )
+            custom_wrapper.write_text(custom_content, encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            subprocess.run(["git", "add", "."], cwd=target, check=True)
+
+            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
+
+            self.assertIn(".agents/skills/ko-kanban/SKILL.md", summary["skipped"])
+            self.assertEqual(summary["git_index_removed"], [])
+            self.assertEqual(custom_wrapper.read_text(encoding="utf-8"), custom_content)
+            tracked = subprocess.run(
+                ["git", "ls-files", "--", ".agents/skills/ko-kanban/SKILL.md"],
+                cwd=target,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertEqual(tracked, [".agents/skills/ko-kanban/SKILL.md"])
 
     def test_fix_mode_prints_warning_for_skipped_ambiguous_skills(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:

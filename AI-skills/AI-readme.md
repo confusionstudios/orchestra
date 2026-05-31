@@ -34,16 +34,21 @@ This creates or refreshes:
 - `.claude/skills/ko-{skill-name}/SKILL.md`
 - `.agents/skills/ko-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Gemini-, and Kilo-compatible agents)
 
-To explicitly clean generated wrappers from obsolete output paths, run:
+To explicitly repair generated wrapper policy and clean generated wrappers from
+obsolete output paths, run:
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-sync-skills" --fix
 ```
 
-Fix mode removes generated wrappers from paths such as
+Fix mode ensures narrow `.gitignore` entries exist for generated `ko-*` wrapper
+directories, removes generated wrappers from paths such as
 `.gemini/skills/{skill-name}/SKILL.md`, `.gemini/skills/ko-{skill-name}/SKILL.md`,
-`.codex/skills/{skill-name}/SKILL.md`, and `.kilo/skills/{skill-name}/SKILL.md`.
-Hand-edited or unknown files are left untouched.
+`.codex/skills/{skill-name}/SKILL.md`, and `.kilo/skills/{skill-name}/SKILL.md`,
+and removes generated wrappers from git tracking when run in a git repo.
+Current generated wrappers under `.claude/skills/ko-*` and `.agents/skills/ko-*`
+remain on disk as ignored local generated files. Hand-edited or unknown files
+are left untouched.
 
 Each wrapper uses the same thin shared format:
 

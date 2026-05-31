@@ -43,6 +43,7 @@ GITIGNORE_ENTRIES = [
     ".claude/skills/ko-*/",
     ".gemini/skills/ko-*/",
     ".agents/skills/ko-*/",
+    ".codex/skills/ko-*/",
     ".kilo/skills/ko-*/",
     "kanban-orchestra.db-shm",
     "kanban-orchestra.db-wal",

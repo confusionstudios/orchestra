@@ -29,6 +29,7 @@ test_workspace/
 .claude/skills/ko-*/
 .gemini/skills/ko-*/
 .agents/skills/ko-*/
+.codex/skills/ko-*/
 .kilo/skills/ko-*/
 
 # Local Claude settings
