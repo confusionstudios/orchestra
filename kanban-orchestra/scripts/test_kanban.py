@@ -1077,8 +1077,11 @@ class TestPromptAssembly(unittest.TestCase):
             "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
         }
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
-        self.assertIn("Always write a fresh `--commit-message` comment during the current run", prompt)
-        self.assertIn("valid on Path B only", prompt)
+        verb_prompt = prompt[prompt.index("# commit-make"):]
+        self.assertIn("## Path A", verb_prompt)
+        self.assertNotIn("## Path B", verb_prompt)
+        self.assertIn("Always write a fresh `--commit-message` comment during the current run", verb_prompt)
+        self.assertNotIn("valid on Path B only", verb_prompt)
 
     def test_build_prompt_path_b_requires_reading_approval_notes(self):
         task = {
@@ -1094,11 +1097,14 @@ class TestPromptAssembly(unittest.TestCase):
              "message": "Same-round note: no broader refactor needed."},
         ]
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", comments)
-        self.assertIn("Read same-round review guidance before committing", prompt)
-        self.assertIn("Approval means the task may land", prompt)
-        self.assertIn("small, directly reviewer-requested edits", prompt)
-        self.assertIn("Do not make broader improvements", prompt)
-        self.assertIn("durable `task comment ... --comment`", prompt)
+        verb_prompt = prompt[prompt.index("# commit-make"):]
+        self.assertIn("## Path B", verb_prompt)
+        self.assertNotIn("## Path A", verb_prompt)
+        self.assertIn("Read same-round review guidance before committing", verb_prompt)
+        self.assertIn("Approval means the task may land", verb_prompt)
+        self.assertIn("small, directly reviewer-requested edits", verb_prompt)
+        self.assertIn("Do not make broader improvements", verb_prompt)
+        self.assertIn("durable `task comment ... --comment`", verb_prompt)
         self.assertIn("Approved; please fix the typo before landing.", prompt)
         self.assertIn("Same-round note: no broader refactor needed.", prompt)
 
@@ -1346,8 +1352,8 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertNotIn("Fix bug", prior_comments_block)
         self.assertNotIn("pytest: 15 passed", prior_comments_block)
 
-    def test_coder_prior_comments_includes_all_kinds(self):
-        """commit-make prompt shows all comment kinds (no filtering by kind)."""
+    def test_coder_prior_comments_excludes_commit_message_and_validation(self):
+        """commit-make prompt drops bulky handoff artifacts from Prior Comments."""
         task = {
             "id": 21, "title": "T", "description": None,
             "branch": "b", "status": "running", "next_step": "commit-make",
@@ -1363,8 +1369,11 @@ class TestPromptAssembly(unittest.TestCase):
              "message": "Wrong approach"},
         ]
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", comments)
-        self.assertIn("pytest: 5 passed", prompt)
-        self.assertIn("Fix\n\nTask 21 (ko-bbb)", prompt)
+        prior_start = prompt.index("## Prior Comments")
+        cli_start = prompt.rindex("## CLI Commands Available")
+        prior_block = prompt[prior_start:cli_start]
+        self.assertNotIn("pytest: 5 passed", prior_block)
+        self.assertNotIn("Fix\n\nTask 21 (ko-bbb)", prior_block)
         self.assertIn("Wrong approach", prompt)
 
     def test_prior_comments_hard_capped_keeps_most_recent(self):
@@ -1413,15 +1422,18 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertIn("comment", kinds)
         self.assertEqual(total, 2)  # two non-excluded comments
 
-    def test_filter_comments_for_prompt_coder_keeps_all_kinds(self):
-        """_filter_comments_for_prompt keeps all kinds for coder verbs."""
+    def test_filter_comments_for_prompt_commit_make_excludes_bulk_artifacts(self):
+        """_filter_comments_for_prompt keeps commit-make comments focused on actionable history."""
         comments = [
             {"kind": "commit-message", "review_round": 0, "author": "claude", "message": "Msg"},
             {"kind": "validation", "review_round": 0, "author": "claude", "message": "ok"},
+            {"kind": "rejection", "review_round": 0, "author": "codex", "message": "Fix this"},
         ]
         filtered, total = orchestrator._filter_comments_for_prompt(comments, "commit-make")
-        self.assertEqual(len(filtered), 2)
-        self.assertEqual(total, 2)
+        self.assertEqual(filtered, [
+            {"kind": "rejection", "review_round": 0, "author": "codex", "message": "Fix this"},
+        ])
+        self.assertEqual(total, 1)
 
     def test_filter_comments_for_prompt_caps_at_max(self):
         """_filter_comments_for_prompt caps result at MAX_PRIOR_COMMENTS."""

@@ -540,7 +540,7 @@ actionable, and appropriate for a commit-free and PR-free task.
 """
 
 
-def _filter_comments_for_prompt(comments, verb):
+def _filter_comments_for_prompt(comments, verb, task=None):
     """
     Return a filtered, capped list of comments for the ## Prior Comments block.
 
@@ -548,13 +548,17 @@ def _filter_comments_for_prompt(comments, verb):
     - For reviewer verbs (commit-review, commit-review-supertask): exclude
       commit-message and validation kinds — both are already surfaced in the
       ## Reviewer Handoff section, so including them again would be redundant.
+    - For commit-make: exclude commit-message and validation kinds. Path A must
+      create fresh versions, and Path B explicitly reads the canonical
+      commit-message from `task show-comments`, so inlining prior bodies only
+      bloats small-task prompts.
     - For all verbs: cap at MAX_PRIOR_COMMENTS, keeping the most recent entries.
 
     Returns (filtered_comments, total_before_cap) so callers can render a
     truncation note when comments were dropped.
     """
     is_reviewer = verb in ("commit-review", "commit-review-supertask", "commit-plan-review")
-    if is_reviewer:
+    if is_reviewer or verb == "commit-make":
         filtered = [c for c in comments if c.get("kind") not in ("commit-message", "validation")]
     else:
         filtered = list(comments)
@@ -570,6 +574,26 @@ def _filter_comments_for_prompt(comments, verb):
     return filtered, total
 
 
+def _trim_commit_make_prompt_to_active_path(verb_text, task):
+    """Keep only the active commit-make path for the task's review state."""
+    path_a_marker = "## Path A"
+    path_b_marker = "## Path B"
+    path_a_start = verb_text.find(path_a_marker)
+    path_b_start = verb_text.find(path_b_marker)
+    if path_a_start == -1 or path_b_start == -1 or path_b_start <= path_a_start:
+        return verb_text
+
+    intro = verb_text[:path_a_start].rstrip()
+    if task.get("last_review_decision") == "approve":
+        active_path = verb_text[path_b_start:].strip()
+    else:
+        active_path = verb_text[path_a_start:path_b_start].strip()
+        if active_path.endswith("---"):
+            active_path = active_path[:-3].rstrip()
+
+    return f"{intro}\n\n{active_path}\n"
+
+
 def build_prompt(task, verb, agent_name, comments):
     """Assemble the full prompt from shared context + verb-specific prompt."""
     shared_path = _prompts_dir() / "shared-task-context.md"
@@ -577,6 +601,8 @@ def build_prompt(task, verb, agent_name, comments):
 
     shared_text = shared_path.read_text() if shared_path.exists() else ""
     verb_text = verb_path.read_text() if verb_path.exists() else ""
+    if verb == "commit-make":
+        verb_text = _trim_commit_make_prompt_to_active_path(verb_text, task)
 
     # Conditionally prepend Path C (stash recovery) for commit-make
     if verb == "commit-make" and task.get("stash_ref"):
@@ -585,7 +611,7 @@ def build_prompt(task, verb, agent_name, comments):
             verb_text = path_c_path.read_text() + "\n\n" + verb_text
 
     # Filter and cap comments for injection
-    filtered_comments, total_comments = _filter_comments_for_prompt(comments, verb)
+    filtered_comments, total_comments = _filter_comments_for_prompt(comments, verb, task)
     comments_text = ""
     if filtered_comments:
         lines = []
