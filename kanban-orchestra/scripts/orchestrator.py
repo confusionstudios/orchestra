@@ -33,10 +33,10 @@ import task as task_cli
 import orchestrator_control
 import active_agent_processes
 
-# Import shared agent config from the orchestra repo
+# Import shared agent registry from the orchestra repo
 ORCHESTRA_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ORCHESTRA_ROOT / "shared_scripts"))
-from shared_config import AGENT_CMD as AGENT_CMD
+from agent_registry import AGENT_CMD as AGENT_CMD
 
 # Re-export for backwards compatibility
 DEFAULT_CODER = config.DEFAULT_CODER

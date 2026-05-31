@@ -50,7 +50,6 @@ config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
 fleet = _load_local_module("kanban_test_fleet", "fleet.py")
 import agent_registry
-import shared_config
 skill_wrappers = _load_local_module("kanban_test_skill_wrappers", str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_ai_skill_wrappers.py"))
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
 
@@ -7528,7 +7527,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(config.get_agent_display_name("claude"), "Claude Sonnet 4.5")
 
     def test_display_name_fallback_for_codex(self):
-        self.assertEqual(shared_config.AGENT_DISPLAY_LABELS["codex"], "GPT-5.5 medium")
+        self.assertEqual(agent_registry.AGENT_DISPLAY_LABELS["codex"], "GPT-5.5 medium")
         result = config.get_agent_display_name("codex")
         self.assertEqual(result, "GPT-5.5 medium")
 
@@ -7545,9 +7544,9 @@ class TestCommitFooter(unittest.TestCase):
                 prompt_count = sum(part.count("{prompt}") for part in command)
                 self.assertEqual(prompt_count, 1)
 
-    def test_shared_config_uses_agent_registry_exports(self):
-        self.assertIs(shared_config.AGENT_CMD, agent_registry.AGENT_CMD)
-        self.assertIs(shared_config.AGENT_DISPLAY_LABELS, agent_registry.AGENT_DISPLAY_LABELS)
+    def test_agent_registry_provider_specs_are_loaded(self):
+        self.assertIn("cursor", agent_registry.AGENT_PROVIDERS)
+        self.assertIn("kilo", agent_registry.AGENT_PROVIDERS)
 
     def test_new_agent_keys_are_allowed(self):
         for key in self.NEW_AGENT_KEYS:
@@ -7578,7 +7577,7 @@ class TestCommitFooter(unittest.TestCase):
 
     def test_provider_model_command_resolution(self):
         self.assertEqual(
-            shared_config.resolve_agent_command("cursor:claude-opus-4-8-high"),
+            agent_registry.resolve_agent_command("cursor:claude-opus-4-8-high"),
             [
                 "cursor",
                 "agent",

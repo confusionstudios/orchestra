@@ -57,8 +57,7 @@ Orchestra shells out to local agent CLIs. It ships with built-in support for:
 | `cursor:<model>` / `kilo:<model>` | Provider/model specs | Resolve dynamically through the registry, for example `cursor:claude-opus-4-8-high` |
 
 Agent keys, command templates, and display labels live in
-`shared_scripts/agent_registry.yaml`. `shared_scripts/shared_config.py` keeps
-compatibility exports for older imports. Orchestra does not provide API keys,
+`shared_scripts/agent_registry.yaml`. Orchestra does not provide API keys,
 accounts, or billing — install and authenticate each CLI yourself.
 
 ## Prerequisites
@@ -229,7 +228,7 @@ account, an OrbStack/Docker container, or a `sandbox-exec` profile. See
 ## Agent Configuration
 
 Default agent roles can be overridden with environment variables. Set each one
-to a key from `shared_scripts/shared_config.py`:
+to a key from `shared_scripts/agent_registry.yaml`:
 
 ```bash
 export ORCHESTRA_DEFAULT_CODER=sonnet
