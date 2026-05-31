@@ -1,4 +1,4 @@
-# Optional zsh helpers for running Orchestra from a work repository.
+# Optional zsh helpers for running Kanban Orchestra from a work repository.
 #
 # Source this file from ~/.zshrc after ORCHESTRA_DIR is set:
 #
@@ -57,15 +57,15 @@ _orchestra_run_from_git_root() {
   "$ORCHESTRA_DIR/bin/$command_name" "$@"
 }
 
-orchestra() {
+ko-start() {
   _orchestra_run_from_git_root ko-orchestrator "$@"
 }
 
-orchestra-dashboard() {
+ko-dashboard() {
   _orchestra_run_from_git_root ko-dashboard "$@"
 }
 
-orchestra-fleet() {
+ko-fleet() {
   if [[ -z "${ORCHESTRA_DIR:-}" ]]; then
     print -u2 "orchestra: ORCHESTRA_DIR is not set"
     return 2
@@ -73,20 +73,11 @@ orchestra-fleet() {
   "$ORCHESTRA_DIR/bin/ko-fleet" "$@"
 }
 
-orchestra-status() {
+ko-status() {
   _orchestra_run_from_git_root ko-get-update "$@"
 }
 
-orchestra-start() {
-  print -u2 "orchestra-start is deprecated; use 'orchestra' from the repo root."
-  _orchestra_run_from_git_root ko-orchestrator "$@"
+ko-current-repo() {
+  _orchestra_require_git_root || return
+  command git rev-parse --show-toplevel
 }
-
-orchestra-stop() {
-  print -u2 "orchestra-stop is deprecated; stop the foreground orchestrator with Ctrl-C, touch KANBAN_ORCHESTRATOR_STOP_AFTER_TASK in the repo, or use 'orchestra-fleet stop <repo>'."
-  return 2
-}
-
-alias odash='orchestra-dashboard'
-alias ofleet='orchestra-fleet'
-alias ostatus='orchestra-status'

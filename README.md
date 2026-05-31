@@ -122,8 +122,9 @@ accounts, or billing — install and authenticate each CLI yourself.
    ```
 
    The dashboard is attached to that same repo instance. If you loaded the zsh
-   helpers, `orchestra` starts the orchestrator/dashboard pair from the current
-   repo root, and `orchestra-dashboard` / `odash` opens that repo dashboard.
+   helpers, `ko-start` starts the orchestrator/dashboard pair from the current
+   repo root, `ko-status` prints the current repo status, and `ko-dashboard`
+   opens that repo dashboard.
 
    For multiple repos, create a private fleet list:
 
