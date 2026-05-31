@@ -19,6 +19,7 @@ import threading
 import time
 import fcntl
 import argparse
+import hashlib
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -880,6 +881,21 @@ def _summarize_transcript_tail(lines, max_chars=240):
     return summary
 
 
+def _format_agent_command_for_transcript(cmd, prompt):
+    """Render the launched command without replaying the full prompt body."""
+    if not prompt:
+        return shlex.join(cmd)
+    prompt_summary = (
+        f"<prompt: {len(prompt)} chars; "
+        f"sha256={hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:12]}>"
+    )
+    redacted_cmd = [
+        part.replace(prompt, prompt_summary) if prompt in part else part
+        for part in cmd
+    ]
+    return shlex.join(redacted_cmd)
+
+
 def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_registry=None):
     """
     Launch an agent subprocess, capture full output to a transcript, return exit code.
@@ -942,7 +958,7 @@ def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_r
         with transcript_path.open("w", encoding="utf-8") as transcript:
             transcript.write(f"# agent: {agent_name}\n")
             transcript.write(f"# verb: {verb}\n")
-            transcript.write(f"# command: {shlex.join(cmd)}\n")
+            transcript.write(f"# command: {_format_agent_command_for_transcript(cmd, prompt)}\n")
             if proc_cwd:
                 transcript.write(f"# cwd: {proc_cwd}\n")
             transcript.write("\n")

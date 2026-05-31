@@ -1083,6 +1083,20 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertIn("Always write a fresh `--commit-message` comment during the current run", verb_prompt)
         self.assertNotIn("valid on Path B only", verb_prompt)
 
+    def test_build_prompt_commit_make_guides_compact_shell_output(self):
+        task = {
+            "id": 1, "title": "T", "description": None,
+            "branch": "b", "status": "running", "next_step": "commit-make",
+            "review_round": 0, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
+        }
+        prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
+        verb_prompt = prompt[prompt.index("# commit-make"):]
+        self.assertIn("## Keep Shell Output Compact", verb_prompt)
+        self.assertIn("git status --short", verb_prompt)
+        self.assertIn("git diff --name-only", verb_prompt)
+        self.assertIn("wc -l", verb_prompt)
+
     def test_build_prompt_path_b_requires_reading_approval_notes(self):
         task = {
             "id": 1, "title": "T", "description": None,
@@ -3013,7 +3027,22 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         transcript_text = transcript_files[0].read_text(encoding="utf-8")
         self.assertIn("python3 -m pytest -q", transcript_text)
         self.assertIn("2 passed in 0.05s", transcript_text)
+        self.assertIn("# command: codex '<prompt: 11 chars; sha256=", transcript_text)
+        self.assertNotIn("prompt body", transcript_text)
         self.assertIn(str(transcript_files[0]), run_log[0]["message"])
+
+    def test_run_agent_transcript_command_redacts_prompt_when_embedded(self):
+        rendered = orchestrator._format_agent_command_for_transcript(
+            ["agent", "--payload=before prompt body after"],
+            "prompt body",
+        )
+        self.assertIn("--payload=before <prompt: 11 chars; sha256=", rendered)
+        self.assertIn("after", rendered)
+        self.assertNotIn("prompt body", rendered)
+
+    def test_run_agent_transcript_command_handles_empty_prompt(self):
+        rendered = orchestrator._format_agent_command_for_transcript(["agent", "--flag"], "")
+        self.assertEqual(rendered, "agent --flag")
 
     def test_run_agent_launches_from_repo_root(self):
         tid = db.add_task(self.conn, "Transcript cwd", coder_agent="codex")

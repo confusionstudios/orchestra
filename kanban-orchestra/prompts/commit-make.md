@@ -4,6 +4,21 @@ You are the **sticky coder** for this task. Your first action is to read
 `last_review_decision` in the task context above — it determines which path
 you follow.
 
+## Keep Shell Output Compact
+
+Large task diffs can make transcripts expensive. Prefer compact checks unless
+the task requires detail:
+
+- Use counts and summaries first, such as `git diff --cached --name-only |
+  wc -l`, `rg --files | wc -l`, or targeted `sed -n '1,40p'`.
+- Use `git status --short`, `git diff --name-only`, and
+  `git diff --name-status` before full `git status`, full `git diff --stat`,
+  or long file listings.
+- Sample large sets with `head`, `tail`, or a small `sed -n` range, then state
+  the summary in your update instead of printing every path.
+- Only print full listings, full stats, or full diffs when the task needs that
+  detail for correctness or review.
+
 ## Path A — `last_review_decision` is not `approve`
 
 You are building (or reworking) the commit.
