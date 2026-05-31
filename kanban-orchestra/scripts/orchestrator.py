@@ -36,7 +36,7 @@ import active_agent_processes
 # Import shared agent config from the orchestra repo
 ORCHESTRA_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ORCHESTRA_ROOT / "shared_scripts"))
-from shared_config import AGENT_CMD
+from shared_config import AGENT_CMD as AGENT_CMD
 
 # Re-export for backwards compatibility
 DEFAULT_CODER = config.DEFAULT_CODER
@@ -771,11 +771,11 @@ PING_RETRY_INTERVAL = 60  # seconds between retries when agent does not respond
 
 def ping_agent(agent_name, task_id):
     """Send a lightweight ping prompt. Returns True if any text response received."""
-    if agent_name not in AGENT_CMD:
+    cmd_template = config.resolve_agent_command(agent_name)
+    if cmd_template is None:
         log(f"Unknown agent '{agent_name}', cannot ping", task_id)
         return False
 
-    cmd_template = AGENT_CMD[agent_name]
     cmd = [part.replace("{prompt}", PING_PROMPT) for part in cmd_template]
 
     log(f"Pre-flight ping: checking {agent_name} is responsive (task {task_id})", task_id)
@@ -904,11 +904,11 @@ def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_r
     proc_registry: dict — if provided, register the Popen object under agent_name
                    so the caller can kill it on interrupt.
     """
-    if agent_name not in AGENT_CMD:
+    cmd_template = config.resolve_agent_command(agent_name)
+    if cmd_template is None:
         log(f"Unknown agent '{agent_name}', skipping", task_id)
         return 1
 
-    cmd_template = AGENT_CMD[agent_name]
     cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
     transcript_path = None
     proc_cwd = _repo_root_for_subprocess()

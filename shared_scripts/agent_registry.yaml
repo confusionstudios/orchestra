@@ -22,9 +22,9 @@ agents:
   - key: codex
     label: GPT-5.5 medium
     command: ["codex", "exec", "--yolo", "{prompt}"]
-  - key: gemini
-    label: gemini
-    command: ["gemini", "-p", "{prompt}", "--yolo", "--output-format", "text"]
+  - key: antigravity
+    label: Antigravity
+    command: ["agy", "--print", "{prompt}", "--dangerously-skip-permissions"]
   - key: kilo
     label: kilo/kilo-auto/free
     command: ["kilo", "--model", "kilo/kilo-auto/free", "run", "{prompt}"]

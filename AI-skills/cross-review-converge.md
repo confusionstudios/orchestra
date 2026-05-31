@@ -11,9 +11,10 @@ assistant's model family.
 
 Priority:
 
-1. If the user specifies a reviewer agent key, use that key.
+1. If the user specifies a reviewer agent alias or provider/model spec, use it.
 2. Otherwise use the configured commit-review agent from
-   `ORCHESTRA_DEFAULT_REVIEWER` when it names a valid registry key.
+   `ORCHESTRA_DEFAULT_REVIEWER` when it names a valid fixed alias or
+   provider/model spec such as `cursor:<model>`.
 3. If the env var is unset or invalid, use the repo fallback exposed as
    `config.DEFAULT_REVIEWER`.
 
@@ -31,11 +32,11 @@ PY
 )"
 PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/bin/ko-python" - "$reviewer" <<'PY'
 import sys
-from agent_registry import AGENT_CMD
+from agent_registry import is_valid_agent_spec
 
 reviewer = sys.argv[1]
-if reviewer not in AGENT_CMD:
-    raise SystemExit(f"unknown reviewer agent key: {reviewer}")
+if not is_valid_agent_spec(reviewer):
+    raise SystemExit(f"unknown reviewer agent alias or provider/model spec: {reviewer}")
 PY
 ```
 
@@ -43,8 +44,8 @@ Run only the command for the selected `$reviewer`.
 
 For reviewers other than Codex, find the command template in
 `$ORCHESTRA_DIR/shared_scripts/agent_registry.yaml` or through
-`agent_registry.AGENT_CMD`, then replace the single `{prompt}` placeholder with
-the review prompt.
+`agent_registry.resolve_agent_command(reviewer)`, then replace the single
+`{prompt}` placeholder with the review prompt.
 
 Use the repo's configured non-interactive CLI form when available. Codex is the
 only special case because `codex exec review --uncommitted` gathers the
@@ -78,11 +79,14 @@ case "$reviewer" in
 import os
 import sys
 from pathlib import Path
-from agent_registry import AGENT_CMD
+from agent_registry import resolve_agent_command
 
 reviewer = sys.argv[1]
 prompt = Path(sys.argv[2]).read_text(encoding="utf-8")
-cmd = [part.replace("{prompt}", prompt) for part in AGENT_CMD[reviewer]]
+cmd_template = resolve_agent_command(reviewer)
+if cmd_template is None:
+    raise SystemExit(f"unknown reviewer agent alias or provider/model spec: {reviewer}")
+cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
 os.execvp(cmd[0], cmd)
 PY
     ;;
@@ -97,7 +101,7 @@ substitute a different reviewer unless the user explicitly approves.
 The command examples assume a macOS/Linux shell with `perl` and `rg`. If those tools are unavailable, use an equivalent shell-level timeout and help-output check. Use a longer timeout when the diff is broad, schema-sensitive, or otherwise likely to require deeper context.
 
 The Codex review subcommand gathers staged, unstaged, and untracked changes.
-Neither Codex, Claude, Cursor, Kilo, nor Gemini is mechanically prevented from
+Neither Codex, Claude, Cursor, Kilo, nor Antigravity is mechanically prevented from
 editing files in every environment, so the prompt must explicitly say `Do not
 edit files`. Prefer read/review-specific CLI modes and deny edit tools where
 the reviewer CLI supports it.

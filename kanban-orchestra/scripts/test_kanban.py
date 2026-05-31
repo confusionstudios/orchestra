@@ -2978,10 +2978,24 @@ class TestTaskCLI(unittest.TestCase):
         self.assertEqual(task["reviewer_agent"], DEFAULT_REVIEWER)
 
     def test_reviewer_agent_explicit(self):
-        r = self._run("add", "Explicit reviewer", "--reviewer-agent", "gemini")
+        r = self._run("add", "Explicit reviewer", "--reviewer-agent", "antigravity")
         self.assertEqual(r.returncode, 0, r.stderr)
         task = json.loads(r.stdout)
-        self.assertEqual(task["reviewer_agent"], "gemini")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
+
+    def test_coder_agent_accepts_provider_model_spec(self):
+        spec = "cursor:claude-opus-4-8-high"
+        r = self._run("add", "Dynamic coder", "--branch", "feature-dynamic", "--coder-agent", spec)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["coder_agent"], spec)
+
+    def test_set_reviewer_agent_accepts_provider_model_spec(self):
+        spec = "cursor:claude-opus-4-8-high"
+        r = self._run("add", "Dynamic reviewer")
+        tid = json.loads(r.stdout)["id"]
+        r2 = self._run("set", str(tid), "--reviewer-agent", spec)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["reviewer_agent"], spec)
 
     def test_set_reviewer_agent(self):
         r = self._run("add", "Change reviewer")
@@ -2993,13 +3007,21 @@ class TestTaskCLI(unittest.TestCase):
     def test_reviewer_agent_rejects_invalid_agent(self):
         r = self._run("add", "Bad reviewer", "--reviewer-agent", "nope")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("reviewer-agent must be one of", r.stderr)
+        self.assertIn("reviewer-agent must be a fixed alias", r.stderr)
+        self.assertIn("cursor:<model>", r.stderr)
 
         ok = self._run("add", "Good reviewer")
         tid = json.loads(ok.stdout)["id"]
         r2 = self._run("set", str(tid), "--reviewer-agent", "nope")
         self.assertNotEqual(r2.returncode, 0)
-        self.assertIn("reviewer-agent must be one of", r2.stderr)
+        self.assertIn("reviewer-agent must be a fixed alias", r2.stderr)
+
+    def test_provider_model_agent_rejects_invalid_specs(self):
+        for spec in ("unknown:model", "cursor:", "cursor:{prompt}", "cursor:{model}"):
+            with self.subTest(spec=spec):
+                r = self._run("add", "Bad dynamic agent", "--coder-agent", spec)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("coder-agent must be a fixed alias", r.stderr)
 
     def test_coder_agent_supports_claude_family_aliases(self):
         for agent in ("haiku", "sonnet", "opus", "claude"):
@@ -3150,6 +3172,36 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(len(transcript_files), 1)
         transcript_text = transcript_files[0].read_text(encoding="utf-8")
         self.assertIn("# cwd: /tmp/work-repo", transcript_text)
+
+    def test_run_agent_resolves_provider_model_spec(self):
+        spec = "cursor:claude-opus-4-8-high"
+        tid = db.add_task(self.conn, "Dynamic provider", coder_agent=spec)
+        fake_proc = self._fake_proc(["done\n"], 0)
+
+        with patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc) as mock_popen, \
+             patch.object(orchestrator.db, "get_db_path", return_value=self.db_path):
+            exit_code = orchestrator.run_agent(
+                spec,
+                "prompt body",
+                tid,
+                self.conn,
+                "commit-make",
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            mock_popen.call_args.args[0],
+            [
+                "cursor",
+                "agent",
+                "-p",
+                "--model",
+                "claude-opus-4-8-high",
+                "--yolo",
+                "--trust",
+                "prompt body",
+            ],
+        )
 
     def test_run_agent_registers_and_clears_active_process_metadata(self):
         tid = db.add_task(self.conn, "Active process metadata", coder_agent="codex")
@@ -6656,14 +6708,14 @@ class TestFollowUpCLI(unittest.TestCase):
 
     def test_follow_up_inherits_branch_and_coder_agent(self):
         """Follow-up task inherits branch, coder_agent, and reviewer_agent from current task."""
-        tid = self._add_task("Feature A", branch="feat-a", coder_agent="sonnet", reviewer_agent="gemini")
+        tid = self._add_task("Feature A", branch="feat-a", coder_agent="sonnet", reviewer_agent="antigravity")
         self._set_running(tid)
         r = self._run("follow-up", str(tid), "--description", "Part 2")
         self.assertEqual(r.returncode, 0, r.stderr)
         follow_up = json.loads(r.stdout)
         self.assertEqual(follow_up["branch"], "feat-a")
         self.assertEqual(follow_up["coder_agent"], "sonnet")
-        self.assertEqual(follow_up["reviewer_agent"], "gemini")
+        self.assertEqual(follow_up["reviewer_agent"], "antigravity")
 
     def test_follow_up_sets_follow_up_task_id_on_current(self):
         """follow_up_task_id is set on the current task after calling follow-up."""
@@ -7013,15 +7065,24 @@ class TestConfigEnvOverrides(unittest.TestCase):
     def test_valid_env_override_applies(self):
         """Each ORCHESTRA_DEFAULT_* env var overrides the corresponding constant."""
         # Use one valid override value for every role.
-        env = {env_key: "gemini" for env_key, _, _ in self._CASES}
+        env = {env_key: "antigravity" for env_key, _, _ in self._CASES}
         # Remove any pre-existing overrides so only our patch is active.
         with patch.dict(os.environ, env, clear=False):
             cfg = self._load_config()
             for _, attr, _ in self._CASES:
                 self.assertEqual(
-                    getattr(cfg, attr), "gemini",
-                    msg=f"{attr} should be 'gemini' when env var is set",
+                    getattr(cfg, attr), "antigravity",
+                    msg=f"{attr} should be 'antigravity' when env var is set",
                 )
+
+    def test_provider_model_env_override_applies(self):
+        """Provider/model specs are valid role defaults."""
+        spec = "cursor:claude-opus-4-8-high"
+        env = {env_key: spec for env_key, _, _ in self._CASES}
+        with patch.dict(os.environ, env, clear=False):
+            cfg = self._load_config()
+            for _, attr, _ in self._CASES:
+                self.assertEqual(getattr(cfg, attr), spec)
 
     def test_fallback_when_env_var_empty(self):
         """Empty string env vars fall back to the hard-coded defaults."""
@@ -7489,6 +7550,7 @@ class TestCommitFooter(unittest.TestCase):
     """Tests for get_agent_display_name() and task get-commit-footer subcommand."""
 
     NEW_AGENT_KEYS = (
+        "antigravity",
         "kilo-opus-4.6",
         "kilo-opus-4.7",
         "kilo-sonnet-4.6",
@@ -7534,7 +7596,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(result, "GPT-5.5 medium")
 
     def test_existing_registry_labels_preserve_previous_fallbacks(self):
-        self.assertEqual(config.get_agent_display_name("gemini"), "gemini")
+        self.assertEqual(config.get_agent_display_name("antigravity"), "Antigravity")
         self.assertEqual(config.get_agent_display_name("kilo"), "kilo/kilo-auto/free")
 
     def test_agent_registry_keys_are_unique(self):
@@ -7557,6 +7619,7 @@ class TestCommitFooter(unittest.TestCase):
 
     def test_display_names_for_new_agent_keys(self):
         expected = {
+            "antigravity": "Antigravity",
             "kilo-opus-4.6": "Kilo Claude Opus 4.6",
             "kilo-opus-4.7": "Kilo Claude Opus 4.7",
             "kilo-sonnet-4.6": "Kilo Claude Sonnet 4.6",
@@ -7569,6 +7632,27 @@ class TestCommitFooter(unittest.TestCase):
         for key, label in expected.items():
             with self.subTest(key=key):
                 self.assertEqual(config.get_agent_display_name(key), label)
+
+    def test_provider_model_display_name(self):
+        self.assertEqual(
+            config.get_agent_display_name("cursor:claude-opus-4-8-high"),
+            "Cursor claude-opus-4-8-high",
+        )
+
+    def test_provider_model_command_resolution(self):
+        self.assertEqual(
+            shared_config.resolve_agent_command("cursor:claude-opus-4-8-high"),
+            [
+                "cursor",
+                "agent",
+                "-p",
+                "--model",
+                "claude-opus-4-8-high",
+                "--yolo",
+                "--trust",
+                "{prompt}",
+            ],
+        )
 
     def test_display_name_fallback_for_unknown_agent(self):
         result = config.get_agent_display_name("nonexistent-agent")
@@ -7622,6 +7706,21 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             r2.stdout.strip(),
             f"Task {tid} (coder: GPT-5.5 medium; reviewer: pending; review rejections: 0)",
+        )
+
+    def test_get_commit_footer_provider_model_agent(self):
+        """get-commit-footer resolves labels for provider/model specs."""
+        spec = "cursor:claude-opus-4-8-high"
+        r = self._run("add", "Dynamic footer task", "--branch", "test", "--coder-agent", spec)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tid = json.loads(r.stdout)["id"]
+        db.add_comment(self.conn, tid, "Looks good", kind="approval", author=spec, review_round=0)
+
+        r2 = self._run("get-commit-footer", str(tid))
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(
+            r2.stdout.strip(),
+            f"Task {tid} (coder: Cursor claude-opus-4-8-high; reviewer: Cursor claude-opus-4-8-high; review rejections: 0)",
         )
 
     def test_get_commit_footer_counts_only_code_review_rejections(self):
@@ -7835,6 +7934,30 @@ class TestAgentPingACKGate(unittest.TestCase):
 
         failure_logs = [m for m in log_messages if "no output" in m or "unavailable" in m]
         self.assertTrue(failure_logs, f"Expected a 'no output / unavailable' log; got: {log_messages}")
+
+    def test_ping_agent_resolves_provider_model_spec(self):
+        spec = "cursor:claude-opus-4-8-high"
+        mock_proc = MagicMock()
+        mock_proc.stdout = None
+        mock_proc.pid = 1234
+
+        with patch.object(orchestrator.subprocess, "Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(orchestrator.db, "get_db_path", return_value=self.tmp.name):
+            orchestrator.ping_agent(spec, 42)
+
+        self.assertEqual(
+            mock_popen.call_args.args[0],
+            [
+                "cursor",
+                "agent",
+                "-p",
+                "--model",
+                "claude-opus-4-8-high",
+                "--yolo",
+                "--trust",
+                orchestrator.PING_PROMPT,
+            ],
+        )
 
     # ── one-ACK-per-(task, agent) caching ────────────────────────────
 

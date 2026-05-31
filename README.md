@@ -3,7 +3,7 @@
 Orchestra coordinates the AI coding CLIs you already have installed —
 [Claude Code](https://claude.ai/code),
 [OpenAI Codex CLI](https://github.com/openai/codex),
-[Gemini CLI](https://github.com/google-gemini/gemini-cli) —
+Antigravity through the `agy` CLI —
 into an autonomous development team. You describe tasks in plain language;
 Orchestra queues them, assigns one CLI to code and another to review, runs
 rejection cycles on the staged diffs, and lands approved commits — while you
@@ -51,9 +51,10 @@ Orchestra shells out to local agent CLIs. It ships with built-in support for:
 |-----|-----------|-------|
 | `sonnet` / `claude` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
 | `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | Default reviewer, plan reviewer, and supertask reviewer |
-| `gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | |
+| `antigravity` | Antigravity (`agy`) | Uses `agy --print` with tool permission auto-approval |
 | `kilo` / `kilo-opus-4.6` / `kilo-opus-4.7` / `kilo-sonnet-4.6` | [Kilo Code](https://kilocode.ai) | `kilo` uses Kilo auto/free; the other keys pin specific Anthropic models |
 | `cursor-auto` / `cursor-composer-2.5` / `cursor-opus-4.6` / `cursor-opus-4.7` / `cursor-sonnet-4.6` | [Cursor Agent](https://cursor.com) | Cursor model availability depends on your Cursor account and installed CLI version |
+| `cursor:<model>` / `kilo:<model>` | Provider/model specs | Resolve dynamically through the registry, for example `cursor:claude-opus-4-8-high` |
 
 Agent keys, command templates, and display labels live in
 `shared_scripts/agent_registry.yaml`. `shared_scripts/shared_config.py` keeps

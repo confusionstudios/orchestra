@@ -6,10 +6,10 @@ _shared = Path(__file__).resolve().parent.parent.parent / "shared_scripts"
 if str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
 from agent_registry import (  # type: ignore  # noqa: E402
-    AGENTS,
-    AGENT_CMD,
-    AGENT_DISPLAY_LABELS,
-    AGENT_PROVIDERS,
+    AGENTS as AGENTS,
+    AGENT_CMD as AGENT_CMD,
+    AGENT_DISPLAY_LABELS as AGENT_DISPLAY_LABELS,
+    AGENT_PROVIDERS as AGENT_PROVIDERS,
     is_valid_agent_spec,
     resolve_agent_command,
     resolve_agent_label,

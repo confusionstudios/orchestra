@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Create or refresh thin AI skill wrappers for Claude and the Open Agent
-Standard path supported by Codex, Gemini, and Kilo.
+Standard path supported by Codex, Antigravity, Kilo, and other compatible agents.
 
 Intended invocation:
 
@@ -402,7 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create or refresh thin AI skill wrappers for Claude and the "
-            "Open Agent Standard path supported by Codex, Gemini, and Kilo. "
+            "Open Agent Standard path supported by Codex, Antigravity, Kilo, and other compatible agents. "
             "Normally run this as "
             '`ko-sync-skills`.'
         )

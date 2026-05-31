@@ -37,6 +37,7 @@ import repo_policy
 
 
 AGENTS = config.AGENTS
+AGENT_PROVIDERS = config.AGENT_PROVIDERS
 VALID_SKIPS = {
     "commit-plan",
     "commit-plan-review",
@@ -243,6 +244,24 @@ def _validate_next_step_for_type(task_type, next_step):
         sys.exit(1)
 
 
+def _agent_error(role):
+    aliases = ", ".join(AGENTS)
+    providers = ", ".join(AGENT_PROVIDERS)
+    provider_text = f" (providers: {providers})" if providers else ""
+    return (
+        f"Error: {role} must be a fixed alias (one of: {aliases}) "
+        f"or a provider:model spec such as cursor:<model>"
+        f"{provider_text}."
+    )
+
+
+def _validate_agent_arg(role, agent):
+    if config.is_valid_agent(agent):
+        return
+    print(_agent_error(role), file=sys.stderr)
+    sys.exit(1)
+
+
 def validate_next_step_for_type(task_type, next_step):
     step_type = STEP_TYPES.get(next_step)
     if step_type is None:
@@ -276,13 +295,9 @@ def validate_ready_worktree(conn):
 
 def cmd_add(args, conn):
     agent = args.coder_agent or config.DEFAULT_CODER
-    if agent not in AGENTS:
-        print(f"Error: coder-agent must be one of {AGENTS}", file=sys.stderr)
-        sys.exit(1)
+    _validate_agent_arg("coder-agent", agent)
     reviewer_agent = args.reviewer_agent or config.DEFAULT_REVIEWER
-    if reviewer_agent not in AGENTS:
-        print(f"Error: reviewer-agent must be one of {AGENTS}", file=sys.stderr)
-        sys.exit(1)
+    _validate_agent_arg("reviewer-agent", reviewer_agent)
 
     kind = _resolve_add_task_type(args)
     parent_task_id = args.parent
@@ -379,14 +394,10 @@ def cmd_set(args, conn):
     if args.stash_ref is not None:
         fields["stash_ref"] = args.stash_ref or None
     if args.coder_agent is not None:
-        if args.coder_agent not in AGENTS:
-            print(f"Error: coder-agent must be one of {AGENTS}", file=sys.stderr)
-            sys.exit(1)
+        _validate_agent_arg("coder-agent", args.coder_agent)
         fields["coder_agent"] = args.coder_agent
     if args.reviewer_agent is not None:
-        if args.reviewer_agent not in AGENTS:
-            print(f"Error: reviewer-agent must be one of {AGENTS}", file=sys.stderr)
-            sys.exit(1)
+        _validate_agent_arg("reviewer-agent", args.reviewer_agent)
         fields["reviewer_agent"] = args.reviewer_agent
     if args.review_round is not None:
         fields["review_round"] = args.review_round

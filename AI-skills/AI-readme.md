@@ -3,7 +3,7 @@
 How each agent discovers and loads custom commands and skills:
 
 - **Claude**: https://code.claude.com/docs/en/slash-commands
-- **Gemini CLI**: https://geminicli.com/docs/cli/gemini-md/
+- **Antigravity**: use the Open Agent Standard skill path through `agy`
 - **Codex / Open Agent Standard skills**: https://developers.openai.com/codex/skills
 - **Codex (AGENTS.md)**: https://developers.openai.com/codex/guides/agents-md
 
@@ -32,7 +32,7 @@ From the repo that should receive the wrappers:
 This creates or refreshes:
 
 - `.claude/skills/ko-{skill-name}/SKILL.md`
-- `.agents/skills/ko-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Gemini-, and Kilo-compatible agents)
+- `.agents/skills/ko-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Antigravity-, Kilo-, and other compatible agents)
 
 To explicitly repair generated wrapper policy and clean generated wrappers from
 obsolete output paths, run:

@@ -1,8 +1,8 @@
-Understand Orchestra agent keys, labels, commands, and default role env vars.
+Understand Orchestra agent aliases/specs, labels, commands, and default role env vars.
 
 Use this skill when you need to identify available Orchestra agents, choose an
-agent key for a role, explain which model/tool a key invokes, or call another
-agent from this repo.
+agent alias or provider/model spec for a role, explain which model/tool it
+invokes, or call another agent from this repo.
 
 ## Source Of Truth
 
@@ -19,9 +19,10 @@ virtualenv, because the loader depends on the repo's Python dependencies:
 ```bash
 orchestra_dir="${ORCHESTRA_DIR:-$(git rev-parse --show-toplevel)}"
 PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/bin/ko-python" - <<'PY'
-from agent_registry import AGENTS, AGENT_CMD, AGENT_DISPLAY_LABELS
+from agent_registry import AGENTS, AGENT_PROVIDERS, resolve_agent_command, resolve_agent_label
 for key in AGENTS:
-    print(f"{key}: {AGENT_DISPLAY_LABELS[key]} -> {AGENT_CMD[key]}")
+    print(f"{key}: {resolve_agent_label(key)} -> {resolve_agent_command(key)}")
+print("Dynamic providers:", ", ".join(AGENT_PROVIDERS))
 PY
 ```
 
@@ -40,8 +41,8 @@ ORCHESTRA_DEFAULT_REVIEWER
 
 `ORCHESTRA_DEFAULT_REVIEWER` is the default commit-review agent. If the user
 asks for the configured commit-review reviewer, use that value when it names a
-valid registry key. If it is unset or invalid, use the repo fallback from
-`kanban-orchestra/scripts/config.py`.
+valid fixed alias or provider/model spec such as `cursor:<model>`. If it is
+unset or invalid, use the repo fallback from `kanban-orchestra/scripts/config.py`.
 
 Resolve defaults from the active environment like this:
 
@@ -64,8 +65,10 @@ PY
 
 ## Calling An Agent
 
-When you need to call an agent, use the command template from the registry and
-replace the single `{prompt}` placeholder with the prompt text. Keep the call
+When you need to call an agent, resolve the command through
+`agent_registry.resolve_agent_command(agent_spec)`, then replace the single
+`{prompt}` placeholder with the prompt text. This supports fixed aliases and
+provider/model specs such as `cursor:claude-opus-4-8-high`. Keep the call
 non-interactive, run it from the repo root, and include task-specific context
 in the prompt.
 
@@ -84,9 +87,9 @@ If an approval includes non-blocking requested changes, the reviewer should add
 `NON_BLOCKING_REQUESTS:` after `OUTCOME: approved`. Mandatory changes require
 `OUTCOME: rejected`.
 
-If the user names a specific agent key, use that key. Otherwise use the role
-default that matches the work, especially `ORCHESTRA_DEFAULT_REVIEWER` for
-commit-review or convergence review.
+If the user names a specific agent alias or provider/model spec, use that
+value. Otherwise use the role default that matches the work, especially
+`ORCHESTRA_DEFAULT_REVIEWER` for commit-review or convergence review.
 
 ## Common Local Keys
 
@@ -95,9 +98,12 @@ At the time this skill was written, useful keys included:
 
 - `codex`
 - `opus`
+- `antigravity`
 - `cursor-composer-2.5`
 - `cursor-opus-4.6`
 - `cursor-opus-4.7`
 - `kilo-opus-4.6`
 - `kilo-opus-4.7`
 - `kilo-sonnet-4.6`
+- `cursor:<model>` for dynamic Cursor Agent model specs
+- `kilo:<model>` for dynamic Kilo model specs
