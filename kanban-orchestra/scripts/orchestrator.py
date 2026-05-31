@@ -30,7 +30,7 @@ import db
 import config
 import repo_policy
 import task as task_cli
-import orchestrator_control
+import orchestrator_lock
 import active_agent_processes
 
 # Import shared agent registry from the orchestra repo
@@ -127,7 +127,7 @@ def acquire_singleton_lock(db_path=None, lock_path=None):
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
-        metadata = orchestrator_control.read_singleton_lock_metadata(lock_path=path)
+        metadata = orchestrator_lock.read_singleton_lock_metadata(lock_path=path)
         repo_root = metadata.get("repo_root") or str(path.parent)
         pid = metadata.get("pid")
         pid_detail = f" (PID {pid})" if pid else ""

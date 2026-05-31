@@ -214,7 +214,7 @@ class TestHealthCard(unittest.TestCase):
         html = dashboard.render_health_card(runtime)
         self.assertIn("stale", html)
 
-    def test_operator_control_states_are_not_mislabeled_stale(self):
+    def test_runtime_lifecycle_states_are_not_mislabeled_stale(self):
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
         for status in ("starting", "stopped", "hard-break"):
             with self.subTest(status=status):

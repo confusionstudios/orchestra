@@ -44,7 +44,7 @@ active_agent_processes = _load_local_module(
     "active_agent_processes.py",
     canonical_name="active_agent_processes",
 )
-orchestrator_control = _load_local_module("kanban_test_orchestrator_control", "orchestrator_control.py", canonical_name="orchestrator_control")
+orchestrator_lock = _load_local_module("kanban_test_orchestrator_lock", "orchestrator_lock.py", canonical_name="orchestrator_lock")
 orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
 config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
@@ -4043,7 +4043,7 @@ class TestOrchestratorRuntime(unittest.TestCase):
                               current_step="none", active_agents=0,
                               status_message="bad")
 
-    def test_runtime_status_accepts_operator_control_states(self):
+    def test_runtime_status_accepts_lifecycle_states(self):
         db.upsert_runtime(self.conn, status="starting", pid=1,
                           started_at="CURRENT_TIMESTAMP",
                           last_heartbeat_at="CURRENT_TIMESTAMP",
@@ -4665,8 +4665,8 @@ class TestSingletonLock(unittest.TestCase):
         mock_log.assert_called_once_with("Dashboard start requested; dashboard is already running")
 
 
-class TestOrchestratorControlIdentity(unittest.TestCase):
-    """Test repo identity metadata in filesystem-backed control helpers."""
+class TestOrchestratorLockMetadata(unittest.TestCase):
+    """Test repo identity metadata in the singleton lock helpers."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -4675,34 +4675,28 @@ class TestOrchestratorControlIdentity(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def test_write_supervisor_heartbeat_includes_instance_identity(self):
-        orchestrator_control.write_supervisor_heartbeat(db_path=self.db_path)
+    def test_read_singleton_lock_metadata_parses_identity_file(self):
+        lock_path = Path(self.tmpdir.name) / "kanban-orchestra.lock"
+        identity = db.get_instance_identity(self.db_path, lock_path=lock_path)
+        lock_path.write_text(
+            "".join(f"{key}={value}\n" for key, value in identity.items()),
+            encoding="utf-8",
+        )
 
-        heartbeat_path = db.get_runtime_root(self.db_path) / orchestrator_control.SUPERVISOR_HEARTBEAT_FILE
-        payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        metadata = orchestrator_lock.read_singleton_lock_metadata(lock_path=lock_path)
 
-        self.assertEqual(payload["repo_root"], str(Path(self.tmpdir.name).resolve()))
-        self.assertEqual(payload["repo_label"], Path(self.tmpdir.name).name)
-        self.assertEqual(payload["db_path"], str(Path(self.db_path).resolve()))
-        self.assertEqual(payload["runtime_root"], str((Path(self.tmpdir.name) / ".kanban-orchestra").resolve()))
-        self.assertEqual(payload["lock_path"], str((Path(self.tmpdir.name) / "kanban-orchestra.lock").resolve()))
+        self.assertEqual(metadata["repo_root"], str(Path(self.tmpdir.name).resolve()))
+        self.assertEqual(metadata["repo_label"], Path(self.tmpdir.name).name)
+        self.assertEqual(metadata["db_path"], str(Path(self.db_path).resolve()))
+        self.assertEqual(metadata["runtime_root"], str((Path(self.tmpdir.name) / ".kanban-orchestra").resolve()))
+        self.assertEqual(metadata["lock_path"], str(lock_path.resolve()))
 
-    def test_supervisor_status_rejects_heartbeat_for_other_repo(self):
-        heartbeat_path = db.get_runtime_root(self.db_path) / orchestrator_control.SUPERVISOR_HEARTBEAT_FILE
-        heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            **db.get_instance_identity(self.db_path),
-            "repo_root": str((Path(self.tmpdir.name) / "other-repo").resolve()),
-            "pid": os.getpid(),
-            "updated_at": "2026-05-24T00:00:00+00:00",
-        }
-        heartbeat_path.write_text(json.dumps(payload), encoding="utf-8")
+    def test_read_singleton_lock_metadata_missing_file_returns_empty_dict(self):
+        missing_path = Path(self.tmpdir.name) / "missing.lock"
 
-        live, reason, read_payload = orchestrator_control.supervisor_status(self.db_path)
+        metadata = orchestrator_lock.read_singleton_lock_metadata(lock_path=missing_path)
 
-        self.assertFalse(live)
-        self.assertIn("different repo", reason)
-        self.assertEqual(read_payload["repo_root"], payload["repo_root"])
+        self.assertEqual(metadata, {})
 
 
 class TestActiveAgentProcesses(unittest.TestCase):

@@ -86,7 +86,7 @@ class TestBuildUpdate(unittest.TestCase):
         self.assertNotIn("configured reviewer:", update)
         self.assertNotIn("approver:", update)
 
-    def test_operator_control_statuses_render_distinctly(self):
+    def test_runtime_lifecycle_statuses_render_distinctly(self):
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
         for status, attention in (
             ("starting", "orchestrator is starting"),
