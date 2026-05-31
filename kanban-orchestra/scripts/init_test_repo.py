@@ -117,10 +117,7 @@ print("Wrote README.md")
     "kanban-orchestra.lock\n"
     ".kanban-orchestra/\n"
     ".claude/skills/ko-*/\n"
-    ".gemini/skills/ko-*/\n"
-    ".agents/skills/ko-*/\n"
-    ".codex/skills/ko-*/\n"
-    ".kilo/skills/ko-*/\n",
+    ".agents/skills/ko-*/\n",
     encoding="utf-8",
 )
 print("Wrote .gitignore")

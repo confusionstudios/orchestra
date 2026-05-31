@@ -33,11 +33,9 @@ from pathlib import Path
 
 
 AGENTS = ("claude", "agents")
-OBSOLETE_AGENTS = ("gemini", "codex", "kilo")
-KNOWN_AGENTS = (*AGENTS, *OBSOLETE_AGENTS)
 WRAPPER_PREFIX = "ko-"
 GENERATED_WRAPPER_GITIGNORE_ENTRIES = tuple(
-    f".{agent}/skills/{WRAPPER_PREFIX}*/" for agent in KNOWN_AGENTS
+    f".{agent}/skills/{WRAPPER_PREFIX}*/" for agent in AGENTS
 )
 
 _FRONT_MATTER_RE = re.compile(
@@ -316,7 +314,7 @@ def fix_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str]
 
     summary["gitignore_added"] = _ensure_generated_wrapper_gitignore(target)
 
-    for agent in KNOWN_AGENTS:
+    for agent in AGENTS:
         skills_root = target / f".{agent}" / "skills"
         if not skills_root.is_dir():
             continue
@@ -339,15 +337,6 @@ def fix_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str]
                     summary["ignored"].append(relative_path)
                 else:
                     summary["skipped"].append(relative_path)
-                continue
-
-            if wrapper_name.startswith(WRAPPER_PREFIX):
-                should_consider = agent in OBSOLETE_AGENTS
-            else:
-                should_consider = True
-
-            if not should_consider:
-                summary["ignored"].append(relative_path)
                 continue
 
             if is_generated:
