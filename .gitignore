@@ -30,3 +30,6 @@ test_workspace/
 .gemini/skills/ko-*/
 .agents/skills/ko-*/
 .kilo/skills/ko-*/
+
+# Local Claude settings
+.claude/settings.local.json
