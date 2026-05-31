@@ -233,10 +233,9 @@ Notes:
   open verb; it is an alias for `dashboard`.
 - The dashboard chooses a free port at runtime and records it in
   `.kanban-orchestra/dashboard.json`.
-- The dashboard is the repo-scoped read-only status surface. The old
-  process-manager UI and its `BREAK` command have been removed; stop or
-  interrupt the repo instance, inspect with `ko-get-update`, use `ko-task` to
-  record or unblock the affected task, and restart explicitly.
+- The dashboard is the repo-scoped read-only status surface. For intervention,
+  stop or interrupt the repo instance, inspect with `ko-get-update`, use
+  `ko-task` to record or unblock the affected task, and restart explicitly.
 
 ## Default operating pattern
 

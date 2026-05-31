@@ -87,11 +87,6 @@ orchestra-stop() {
   return 2
 }
 
-orchestra-break() {
-  print -u2 "orchestra-break was removed with the process-manager UI; inspect the blocked task and use ko-task directly."
-  return 2
-}
-
 alias odash='orchestra-dashboard'
 alias ofleet='orchestra-fleet'
 alias ostatus='orchestra-status'

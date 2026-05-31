@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-
-set -euo pipefail
-
-echo "ko-ui has been removed. Use ko-orchestrator for this repo, ko-fleet for multiple repos, or ko-get-update for status." >&2
-exit 2
