@@ -24,6 +24,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
             "precheck",
             "start",
             "stop",
+            "stop-all",
             "restart",
             "attach",
             "logs",
@@ -415,6 +416,92 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         run.assert_not_called()
         self.assertIn("running outside fleet tmux session", out.getvalue())
+
+    def test_stop_reports_stale_lock_pid_as_not_running(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+        out = io.StringIO()
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "tmux_has_session", return_value=False), \
+             patch.object(fleet, "repo_process_state", return_value=("stopped", "123", "-", "-")), \
+             patch.object(fleet.subprocess, "run") as run, \
+             redirect_stdout(out):
+            fleet.stop([repo])
+
+        run.assert_not_called()
+        self.assertIn("repo: not running", out.getvalue())
+        self.assertNotIn("running outside fleet tmux session", out.getvalue())
+
+    def test_stop_all_stops_managed_fleet_session(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+        out = io.StringIO()
+
+        with patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
+             patch.object(fleet.subprocess, "run") as run, \
+             redirect_stdout(out):
+            fleet.stop_all([repo])
+
+        run.assert_called_once_with(["tmux", "send-keys", "-t", "orch-repo", "C-c"], check=False)
+        self.assertIn("repo [managed]: stopped fleet tmux session", out.getvalue())
+
+    def test_stop_all_stops_unmanaged_running_instance(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"), managed=False)
+        out = io.StringIO()
+
+        with patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "-")), \
+             patch.object(fleet, "validated_orchestrator_pid", return_value=123), \
+             patch.object(fleet, "stop_pid", return_value=True) as stop_pid, \
+             redirect_stdout(out):
+            fleet.stop_all([repo])
+
+        stop_pid.assert_called_once_with(123)
+        self.assertIn("repo [unmanaged]: stopped orchestrator 123", out.getvalue())
+
+    def test_stop_all_handles_mixed_managed_and_unmanaged_repos(self):
+        managed = fleet.FleetRepo("managed", Path("/tmp/managed"), Path("/tmp/managed"))
+        unmanaged = fleet.FleetRepo(
+            "unmanaged",
+            Path("/tmp/unmanaged"),
+            Path("/tmp/unmanaged"),
+            managed=False,
+        )
+        out = io.StringIO()
+
+        with patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
+             patch.object(fleet, "repo_process_state", return_value=("running", "234", "-", "-")), \
+             patch.object(fleet, "validated_orchestrator_pid", return_value=234), \
+             patch.object(fleet, "stop_pid", return_value=True), \
+             patch.object(fleet.subprocess, "run"), \
+             redirect_stdout(out):
+            fleet.stop_all([managed, unmanaged])
+
+        text = out.getvalue()
+        self.assertIn("managed [managed]: stopped fleet tmux session", text)
+        self.assertIn("unmanaged [unmanaged]: stopped orchestrator 234", text)
+
+    def test_stop_all_leaves_unvalidated_running_pid_alone(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"), managed=False)
+        out = io.StringIO()
+
+        with patch.object(fleet, "repo_process_state", return_value=("running", "999", "-", "-")), \
+             patch.object(fleet, "validated_orchestrator_pid", return_value=None), \
+             patch.object(fleet, "stop_pid") as stop_pid, \
+             redirect_stdout(out):
+            fleet.stop_all([repo])
+
+        stop_pid.assert_not_called()
+        self.assertIn("repo [unmanaged]: running orchestrator 999 could not be validated; left alone", out.getvalue())
+
+    def test_stop_all_dispatches_to_status_repos(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"), managed=False)
+
+        with patch.object(fleet, "status_repos", return_value=[repo]) as status_repos, \
+             patch.object(fleet, "stop_all") as stop_all:
+            exit_code = fleet.main(["stop-all"])
+
+        self.assertEqual(exit_code, 0)
+        status_repos.assert_called_once_with([])
+        stop_all.assert_called_once_with([repo])
 
     def test_attach_uses_selected_repo_session(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))

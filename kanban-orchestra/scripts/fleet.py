@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -300,6 +301,8 @@ def wait_dashboard_ready(repo: FleetRepo, *, timeout: float = 12.0) -> bool:
 
 
 def tmux_has_session(session: str) -> bool:
+    if shutil.which("tmux") is None:
+        return False
     return subprocess.run(
         ["tmux", "has-session", "-t", session],
         stdout=subprocess.DEVNULL,
@@ -391,6 +394,19 @@ def discover_running_repos() -> list[FleetRepo]:
         repos.append(repo)
         seen_roots.add(root)
     return repos
+
+
+def validated_orchestrator_pid(repo: FleetRepo) -> int | None:
+    """Return a live repo-owned orchestrator PID only after process validation."""
+    if repo.root is None:
+        return None
+    lock_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
+    if not pid_alive(lock_pid):
+        return None
+    for pid, root in running_orchestrator_process_roots():
+        if pid == lock_pid and root.resolve() == repo.root.resolve() and pid_alive(pid):
+            return pid
+    return None
 
 
 def status_repos(queries: list[str]) -> list[FleetRepo]:
@@ -638,10 +654,73 @@ def stop(repos: list[FleetRepo]) -> None:
             print(f"{repo.label}: stopped tmux session")
         else:
             status, orch_pid, _, _ = repo_process_state(repo)
-            if orch_pid != "-":
+            if status == "running":
                 print(f"{repo.label}: running outside fleet tmux session (orchestrator {orch_pid}); left alone")
             else:
                 print(f"{repo.label}: not running")
+
+
+def stop_pid(pid: int, *, timeout: float = 2.0) -> bool:
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not pid_alive(pid)
+
+
+def stop_all(repos: list[FleetRepo]) -> None:
+    for repo in repos:
+        owner = "managed" if repo.managed else "unmanaged"
+        prefix = f"{repo.label} [{owner}]"
+        if repo.error:
+            print(f"{prefix}: invalid config ({repo.error})")
+            continue
+
+        if repo.managed and tmux_has_session(repo.session):
+            subprocess.run(["tmux", "send-keys", "-t", repo.session, "C-c"], check=False)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and tmux_has_session(repo.session):
+                time.sleep(0.1)
+            if tmux_has_session(repo.session):
+                subprocess.run(["tmux", "kill-session", "-t", repo.session], check=False)
+            print(f"{prefix}: stopped fleet tmux session")
+            continue
+
+        status, orch_pid, _, _ = repo_process_state(repo)
+        if status != "running":
+            print(f"{prefix}: not running")
+            continue
+
+        pid = validated_orchestrator_pid(repo)
+        if pid is None:
+            print(f"{prefix}: running orchestrator {orch_pid} could not be validated; left alone")
+            continue
+
+        if stop_pid(pid):
+            print(f"{prefix}: stopped orchestrator {pid}")
+        else:
+            print(f"{prefix}: could not stop orchestrator {pid}")
 
 
 def wait_stopped(repos: list[FleetRepo], *, timeout: float = 12.0) -> None:
@@ -767,7 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
 
-    for name in ("status", "precheck", "start", "stop", "restart"):
+    for name in ("status", "precheck", "start", "stop", "stop-all", "restart"):
         p = sub.add_parser(name)
         p.add_argument("repos", nargs="*", help="optional repo labels or paths")
 
@@ -800,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
         start(select_repos(args.repos))
     elif args.command == "stop":
         stop(select_repos(args.repos))
+    elif args.command == "stop-all":
+        stop_all(status_repos(args.repos))
     elif args.command == "restart":
         repos = select_repos(args.repos)
         require_startable(repos)
