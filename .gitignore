@@ -24,9 +24,9 @@ eraseme/
 orchestra
 test_workspace/
 
-# Generated agent-local folders. Canonical source lives in AI-skills/.
+# Generated Orchestra skill wrappers. Canonical source lives in AI-skills/.
 .kanban-orchestra/
-.claude/
-.gemini/
-.agents/
-.kilo/
+.claude/skills/ko-*/
+.gemini/skills/ko-*/
+.agents/skills/ko-*/
+.kilo/skills/ko-*/

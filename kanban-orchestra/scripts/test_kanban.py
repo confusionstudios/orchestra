@@ -3383,11 +3383,17 @@ class TestKanbanCLI(unittest.TestCase):
             "kanban-orchestra.db-wal",
             "kanban-orchestra.lock",
             ".kanban-orchestra/",
-            ".claude/",
-            ".gemini/",
-            ".agents/",
+            ".claude/skills/ko-*/",
+            ".gemini/skills/ko-*/",
+            ".agents/skills/ko-*/",
+            ".kilo/skills/ko-*/",
         ]:
             self.assertIn(entry, gitignore)
+        gitignore_lines = gitignore.splitlines()
+        self.assertNotIn(".claude/", gitignore_lines)
+        self.assertNotIn(".gemini/", gitignore_lines)
+        self.assertNotIn(".agents/", gitignore_lines)
+        self.assertNotIn(".kilo/", gitignore_lines)
 
 
 class TestInitTestRepo(unittest.TestCase):
@@ -3499,13 +3505,14 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                 orchestra_dir / "AI-skills" / "review-build.md",
             )
             for agent in skill_wrappers.AGENTS:
-                wrapper_path = target / f".{agent}" / "skills" / "review-build" / "SKILL.md"
+                wrapper_path = target / f".{agent}" / "skills" / "ko-review-build" / "SKILL.md"
                 self.assertEqual(wrapper_path.read_text(encoding="utf-8"), expected)
             self.assertTrue(
-                (target / ".agents" / "skills" / "review-build" / "SKILL.md").exists()
+                (target / ".agents" / "skills" / "ko-review-build" / "SKILL.md").exists()
             )
+            self.assertFalse((target / ".gemini" / "skills" / "ko-review-build").exists())
 
-    def test_sync_skill_wrappers_updates_legacy_generated_wrappers(self):
+    def test_sync_skill_wrappers_removes_legacy_generated_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
             orchestra_dir = Path(orchestra_tmp)
             target = Path(repo_tmp)
@@ -3523,6 +3530,12 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                     f"---\nname: {skill_name}\ndescription: {description}\n---\n\n"
                     f"Read and follow the instructions in `{canonical_path.resolve()}`.\n"
                 ),
+                ".agents/skills/kanban/SKILL.md": (
+                    f"---\nname: {skill_name}\ndescription: {json.dumps(description)}\n---\n\n"
+                    "Follow the shared skill:\n\n"
+                    f"- Location: $ORCHESTRA_DIR/AI-skills/{skill_name}.md\n"
+                    f"- Least Seen at: {canonical_path.resolve()}\n"
+                ),
             }
             for relative_path, content in legacy_files.items():
                 wrapper_path = target / relative_path
@@ -3532,12 +3545,14 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
             summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
 
             self.assertEqual(
-                sorted(summary["updated"]),
+                sorted(summary["removed"]),
                 sorted(legacy_files),
             )
             expected = skill_wrappers.render_wrapper(skill_name, description, canonical_path)
             for relative_path in legacy_files:
-                wrapper_path = target / relative_path
+                self.assertFalse((target / relative_path).exists())
+            for agent in skill_wrappers.AGENTS:
+                wrapper_path = target / f".{agent}" / "skills" / "ko-kanban" / "SKILL.md"
                 self.assertEqual(wrapper_path.read_text(encoding="utf-8"), expected)
 
     def test_sync_skill_wrappers_removes_generated_obsolete_codex_wrappers(self):
@@ -3549,17 +3564,25 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
             skill_name = "kanban"
             canonical_path = orchestra_dir / "AI-skills" / f"{skill_name}.md"
             description = skill_wrappers._skill_description(canonical_path)
-            stale_wrapper = target / ".codex" / "skills" / skill_name / "SKILL.md"
-            stale_wrapper.parent.mkdir(parents=True, exist_ok=True)
-            stale_wrapper.write_text(
-                skill_wrappers.render_wrapper(skill_name, description, canonical_path),
-                encoding="utf-8",
-            )
+            stale_wrappers = [
+                target / ".codex" / "skills" / skill_name / "SKILL.md",
+                target / ".gemini" / "skills" / "ko-kanban" / "SKILL.md",
+                target / ".kilo" / "skills" / skill_name / "SKILL.md",
+            ]
+            for stale_wrapper in stale_wrappers:
+                stale_wrapper.parent.mkdir(parents=True, exist_ok=True)
+                stale_wrapper.write_text(
+                    skill_wrappers.render_wrapper(skill_name, description, canonical_path),
+                    encoding="utf-8",
+                )
 
             summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
 
             self.assertIn(".codex/skills/kanban/SKILL.md", summary["removed"])
-            self.assertFalse(stale_wrapper.exists())
+            self.assertIn(".gemini/skills/ko-kanban/SKILL.md", summary["removed"])
+            self.assertIn(".kilo/skills/kanban/SKILL.md", summary["removed"])
+            for stale_wrapper in stale_wrappers:
+                self.assertFalse(stale_wrapper.exists())
 
     def test_sync_skill_wrappers_keeps_custom_obsolete_codex_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
@@ -3604,6 +3627,7 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
 
             self.assertIn(".agents/skills/kanban/SKILL.md", summary["skipped"])
             self.assertEqual(custom_wrapper.read_text(encoding="utf-8"), custom_content)
+            self.assertTrue((target / ".agents" / "skills" / "ko-kanban" / "SKILL.md").exists())
 
     def test_sync_skill_wrappers_picks_up_new_skill_file_automatically(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
@@ -3618,7 +3642,7 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
             summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
 
             for agent in skill_wrappers.AGENTS:
-                relative_path = f".{agent}/skills/new-skill/SKILL.md"
+                relative_path = f".{agent}/skills/ko-new-skill/SKILL.md"
                 self.assertIn(relative_path, summary["created"])
                 wrapper_path = target / relative_path
                 self.assertIn(
@@ -3638,8 +3662,8 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
 
             summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
 
-            self.assertIn(".agents/skills/prep-for-review/SKILL.md", summary["created"])
-            wrapper_path = target / ".agents" / "skills" / "prep-for-review" / "SKILL.md"
+            self.assertIn(".agents/skills/ko-prep-for-review/SKILL.md", summary["created"])
+            wrapper_path = target / ".agents" / "skills" / "ko-prep-for-review" / "SKILL.md"
             self.assertIn(
                 'description: "**Note**: This is the ad-hoc manual workflow."',
                 wrapper_path.read_text(encoding="utf-8"),

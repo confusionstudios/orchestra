@@ -9,9 +9,9 @@ How each agent discovers and loads custom commands and skills:
 
 ---
 
-## Adding a Skill to All Three Agents
+## Adding a Shared Orchestra Skill
 
-All skills live in `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` as the canonical source. Each agent gets a thin wrapper in its own skills directory that points to the canonical file.
+All shared Orchestra skills live in `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` as the canonical source. Agents get a thin `ko-{skill-name}` wrapper that points to the canonical file.
 
 ### 1. Write the canonical skill
 
@@ -31,19 +31,19 @@ From the repo that should receive the wrappers:
 
 This creates or refreshes:
 
-- `.claude/skills/{skill-name}/SKILL.md`
-- `.gemini/skills/{skill-name}/SKILL.md`
-- `.agents/skills/{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-compatible agents)
+- `.claude/skills/ko-{skill-name}/SKILL.md`
+- `.agents/skills/ko-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Gemini-, and Kilo-compatible agents)
 
 It also removes generated wrappers from obsolete output paths such as
-`.codex/skills/{skill-name}/SKILL.md`. Hand-edited or unknown files are left
-untouched.
+`.gemini/skills/{skill-name}/SKILL.md`, `.gemini/skills/ko-{skill-name}/SKILL.md`,
+`.codex/skills/{skill-name}/SKILL.md`, and `.kilo/skills/{skill-name}/SKILL.md`.
+Hand-edited or unknown files are left untouched.
 
 Each wrapper uses the same thin shared format:
 
 ```markdown
 ---
-name: {skill-name}
+name: ko-{skill-name}
 description: {one-line description}
 ---
 

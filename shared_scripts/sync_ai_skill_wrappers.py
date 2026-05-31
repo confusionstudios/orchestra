@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Create or refresh thin AI skill wrappers for Claude, Gemini, and
-the Open Agent Standard path supported by Codex and Kilo.
+Create or refresh thin AI skill wrappers for Claude and the Open Agent
+Standard path supported by Codex, Gemini, and Kilo.
 
 Intended invocation:
 
@@ -14,9 +14,8 @@ This script is meant to be run from the Orchestra checkout referenced by
 Wrappers are generated from the canonical skill docs in AI-skills/*.md and
 written into a target repo under:
 
-  .claude/skills/<skill>/SKILL.md
-  .gemini/skills/<skill>/SKILL.md
-  .agents/skills/<skill>/SKILL.md
+  .claude/skills/ko-<skill>/SKILL.md
+  .agents/skills/ko-<skill>/SKILL.md
 
 The script only overwrites wrappers it can confidently identify as previously
 generated wrappers. Unknown or hand-edited files are left untouched. It also
@@ -31,8 +30,9 @@ import re
 from pathlib import Path
 
 
-AGENTS = ("claude", "gemini", "agents")
-OBSOLETE_AGENTS = ("codex",)
+AGENTS = ("claude", "agents")
+OBSOLETE_AGENTS = ("gemini", "codex", "kilo")
+WRAPPER_PREFIX = "ko-"
 
 _FRONT_MATTER_RE = re.compile(
     r"\A---\nname: (?P<name>[^\n]+)\ndescription: (?P<description>[^\n]+)\n---\n\n(?P<body>.*)\Z",
@@ -59,10 +59,15 @@ def _skill_description(canonical_path: Path) -> str:
     raise ValueError(f"skill file is empty: {canonical_path}")
 
 
+def _wrapper_skill_name(skill_name: str) -> str:
+    return f"{WRAPPER_PREFIX}{skill_name}"
+
+
 def render_wrapper(skill_name: str, description: str, canonical_path: Path) -> str:
+    wrapper_name = _wrapper_skill_name(skill_name)
     return (
         f"---\n"
-        f"name: {skill_name}\n"
+        f"name: {wrapper_name}\n"
         f"description: {json.dumps(description)}\n"
         f"---\n\n"
         f"Follow the shared skill:\n\n"
@@ -112,7 +117,7 @@ def _is_current_generated_body(body: str, skill_name: str) -> bool:
 
 def is_generated_wrapper(content: str, skill_name: str, canonical_path: Path) -> bool:
     match = _FRONT_MATTER_RE.match(content)
-    if not match or match.group("name") != skill_name:
+    if not match or match.group("name") not in {skill_name, _wrapper_skill_name(skill_name)}:
         return False
     body = match.group("body").strip()
     if _is_current_generated_body(body, skill_name):
@@ -127,11 +132,12 @@ def sync_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str
 
     for canonical_path in _canonical_skill_files(orchestra_dir):
         skill_name = canonical_path.stem
+        wrapper_name = _wrapper_skill_name(skill_name)
         description = _skill_description(canonical_path)
         wrapper_text = render_wrapper(skill_name, description, canonical_path)
 
         for agent in AGENTS:
-            wrapper_path = target / f".{agent}" / "skills" / skill_name / "SKILL.md"
+            wrapper_path = target / f".{agent}" / "skills" / wrapper_name / "SKILL.md"
             wrapper_path.parent.mkdir(parents=True, exist_ok=True)
             relative_path = str(wrapper_path.relative_to(target))
 
@@ -152,22 +158,31 @@ def sync_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str
 
             summary["skipped"].append(relative_path)
 
-        for agent in OBSOLETE_AGENTS:
-            wrapper_path = target / f".{agent}" / "skills" / skill_name / "SKILL.md"
-            if not wrapper_path.exists():
-                continue
-            relative_path = str(wrapper_path.relative_to(target))
-            current_text = wrapper_path.read_text(encoding="utf-8")
-            if not is_generated_wrapper(current_text, skill_name, canonical_path):
-                summary["skipped"].append(relative_path)
-                continue
-            wrapper_path.unlink()
-            summary["removed"].append(relative_path)
-            for parent in (wrapper_path.parent, wrapper_path.parent.parent, wrapper_path.parent.parent.parent):
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
+        obsolete_wrapper_names = {
+            agent: [skill_name, wrapper_name] if agent in OBSOLETE_AGENTS else [skill_name]
+            for agent in (*AGENTS, *OBSOLETE_AGENTS)
+        }
+        for agent, obsolete_names in obsolete_wrapper_names.items():
+            for obsolete_name in obsolete_names:
+                wrapper_path = target / f".{agent}" / "skills" / obsolete_name / "SKILL.md"
+                if not wrapper_path.exists():
+                    continue
+                relative_path = str(wrapper_path.relative_to(target))
+                current_text = wrapper_path.read_text(encoding="utf-8")
+                if not is_generated_wrapper(current_text, skill_name, canonical_path):
+                    summary["skipped"].append(relative_path)
+                    continue
+                wrapper_path.unlink()
+                summary["removed"].append(relative_path)
+                for parent in (
+                    wrapper_path.parent,
+                    wrapper_path.parent.parent,
+                    wrapper_path.parent.parent.parent,
+                ):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
 
     return summary
 
@@ -175,8 +190,8 @@ def sync_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create or refresh thin AI skill wrappers for Claude, Gemini, "
-            "and the Open Agent Standard path supported by Codex and Kilo. "
+            "Create or refresh thin AI skill wrappers for Claude and the "
+            "Open Agent Standard path supported by Codex, Gemini, and Kilo. "
             "Normally run this as "
             '`ko-sync-skills`.'
         )

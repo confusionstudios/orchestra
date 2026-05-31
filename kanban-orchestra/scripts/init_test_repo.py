@@ -116,9 +116,10 @@ print("Wrote README.md")
     "kanban-orchestra.db-wal\n"
     "kanban-orchestra.lock\n"
     ".kanban-orchestra/\n"
-    ".claude/\n"
-    ".gemini/\n"
-    ".agents/\n",
+    ".claude/skills/ko-*/\n"
+    ".gemini/skills/ko-*/\n"
+    ".agents/skills/ko-*/\n"
+    ".kilo/skills/ko-*/\n",
     encoding="utf-8",
 )
 print("Wrote .gitignore")
@@ -179,7 +180,7 @@ run("git", "commit", "-m", "Initial commit: counter module with off-by-one bug")
 print("Initialised git repo with one commit")
 
 # ---------------------------------------------------------------------------
-# AI skills (claude / gemini / codex → shared skills in orchestra checkout)
+# AI skills (Claude and generic agent wrappers → shared skills in orchestra checkout)
 # ---------------------------------------------------------------------------
 
 _scripts_dir = Path(__file__).parent
