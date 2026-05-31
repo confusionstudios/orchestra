@@ -171,6 +171,8 @@ Important columns:
 - `review_round`
 - `last_review_decision`
 - `ready_at`
+- `last_ready_at`
+- `done_at`
 - `kind`
 - `parent_task_id`
 - `sequence_index`

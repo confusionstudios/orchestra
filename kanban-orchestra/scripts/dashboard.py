@@ -108,6 +108,25 @@ def _age(dt_str: str | None) -> str:
         return dt_str
 
 
+def _format_duration_hhmmss(seconds: int) -> str:
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _done_elapsed_runtime(task: dict) -> str:
+    """Return done-task runtime from latest ready time to done, or a placeholder."""
+    ready_dt = _parse_utc_datetime(task.get("last_ready_at") or task.get("ready_at"))
+    done_dt = _parse_utc_datetime(task.get("done_at"))
+    if ready_dt is None or done_dt is None:
+        return "unknown"
+    elapsed = int((done_dt - ready_dt).total_seconds())
+    if elapsed < 0:
+        return "unknown"
+    return _format_duration_hhmmss(elapsed)
+
+
 def _parse_utc_datetime(dt_str: str | None) -> datetime | None:
     """Parse a timestamp and normalize it to a UTC-aware datetime."""
     if not dt_str:
@@ -954,7 +973,8 @@ def render_recently_done(conn) -> str:
     if conn is None:
         return '<div class="card" id="recently-done"><h2>Recently Done</h2><p class="muted">Database not available.</p></div>'
     rows_raw = [dict(r) for r in conn.execute(
-        "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent FROM tasks "
+        "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent, "
+        "ready_at, last_ready_at, done_at FROM tasks "
         "WHERE status = 'done' ORDER BY updated_at DESC, id DESC"
     ).fetchall()]
     for row in rows_raw:
@@ -974,6 +994,7 @@ def render_recently_done(conn) -> str:
           <td>{_esc(r.get('coder_agent') or '') or '<span class="muted">-</span>'}</td>
           <td>{_esc(_task_done_reviewer(r))}</td>
           <td>{_esc(r.get('rejection_count', 0))}</td>
+          <td>{_esc(_done_elapsed_runtime(r))}</td>
         </tr>"""
         for idx, r in enumerate(rows_raw)
     )
@@ -993,7 +1014,7 @@ def render_recently_done(conn) -> str:
     <div class="card" id="recently-done" data-show-more-root data-initial-visible="{initial_visible}" data-visible-count="{initial_visible}" data-increment="{increment}" data-total-rows="{total_rows}">
       <h2>Recently Done</h2>
       <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-commit'>Commit</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-count'>Rejections</th></tr></thead>
+        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-commit'>Commit</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-count'>Rejections</th><th class='col-duration'>Runtime</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
       {controls_html}
@@ -1574,6 +1595,7 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .col-skips  { width: 72px; }
 .col-count  { width: 82px; }
 .col-state  { width: 114px; }
+.col-duration { width: 86px; }
 
 .muted { color: var(--muted); font-size: 0.88em; }
 .task-ref  { font-family: monospace; font-size: 0.82em; }

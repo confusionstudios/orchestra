@@ -194,6 +194,7 @@ class TestDB(unittest.TestCase):
         self.assertEqual(task["branch"], "feat-1")
         self.assertEqual(task["stash_ref"], "stash@{0}")
         self.assertIsNotNone(task["ready_at"])
+        self.assertEqual(task["last_ready_at"], task["ready_at"])
 
     def test_update_task_status_transitions_manage_ready_at(self):
         tid = db.add_task(self.conn, "Queue transitions", branch="feat-q")
@@ -212,11 +213,20 @@ class TestDB(unittest.TestCase):
         db.update_task(self.conn, tid, status="running")
         running = db.get_task(self.conn, tid)
         self.assertIsNone(running["ready_at"])
+        self.assertEqual(running["last_ready_at"], still_ready["last_ready_at"])
+        self.assertIsNone(running["done_at"])
 
         db.update_task(self.conn, tid, status="ready")
         requeued = db.get_task(self.conn, tid)
         self.assertIsNotNone(requeued["ready_at"])
         self.assertNotEqual(requeued["ready_at"], "2000-01-01 00:00:00")
+        self.assertEqual(requeued["last_ready_at"], requeued["ready_at"])
+
+        db.update_task(self.conn, tid, status="done")
+        done = db.get_task(self.conn, tid)
+        self.assertIsNone(done["ready_at"])
+        self.assertEqual(done["last_ready_at"], requeued["last_ready_at"])
+        self.assertIsNotNone(done["done_at"])
 
     def test_orchestrator_log_path_lives_under_repo_runtime_dir(self):
         log_path = db.get_orchestrator_log_path(self.tmp.name)
@@ -416,6 +426,79 @@ class TestDB(unittest.TestCase):
                 self.assertEqual(db.get_task(conn, tid)["reviewer_agent"], DEFAULT_REVIEWER)
             finally:
                 conn.close()
+        finally:
+            for suffix in ("", "-shm", "-wal"):
+                path = tmp.name + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_missing_done_runtime_columns_are_migrated(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            legacy = sqlite3.connect(tmp.name)
+            legacy.execute(
+                """CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT NOT NULL DEFAULT 'none'
+                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
+                    next_step TEXT NOT NULL DEFAULT 'commit-make'
+                        CHECK(next_step IN ('commit-make', 'commit-review',
+                                            'commit-make-supertask', 'commit-review-supertask',
+                                            'commit-plan', 'commit-plan-review',
+                                            'pull-request-make', 'pull-request-review',
+                                            'other-make', 'other-review', 'none')),
+                    branch TEXT,
+                    commit_hash TEXT,
+                    stash_ref TEXT,
+                    coder_agent TEXT,
+                    reviewer_agent TEXT,
+                    review_round INTEGER DEFAULT 0,
+                    last_review_decision TEXT DEFAULT 'none',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ready_at DATETIME DEFAULT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL DEFAULT 'commit'
+                        CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
+                    parent_task_id INTEGER REFERENCES tasks(id),
+                    sequence_index INTEGER,
+                    commit_plan TEXT,
+                    follow_up_task_id INTEGER REFERENCES tasks(id),
+                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE task_skips (
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    step TEXT NOT NULL
+                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
+                                       'commit-review-supertask','pull-request-review','other-review')),
+                    PRIMARY KEY (task_id, step)
+                )"""
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, ready_at, updated_at) "
+                "VALUES ('queued', 'ready', 'commit-make', '2026-05-31 10:00:00', '2026-05-31 10:01:00')"
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, updated_at) "
+                "VALUES ('complete', 'done', 'none', '2026-05-31 11:00:00')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            migrated = db.connect(tmp.name)
+            try:
+                queued = db.get_task(migrated, 1)
+                complete = db.get_task(migrated, 2)
+                self.assertEqual(queued["last_ready_at"], "2026-05-31 10:00:00")
+                self.assertIsNone(queued["done_at"])
+                self.assertIsNone(complete["last_ready_at"])
+                self.assertEqual(complete["done_at"], "2026-05-31 11:00:00")
+            finally:
+                migrated.close()
         finally:
             for suffix in ("", "-shm", "-wal"):
                 path = tmp.name + suffix

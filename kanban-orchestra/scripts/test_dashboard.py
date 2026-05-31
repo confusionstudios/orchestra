@@ -51,6 +51,9 @@ class TestHelpers(unittest.TestCase):
     def test_age_none(self):
         self.assertEqual(dashboard._age(None), "unknown")
 
+    def test_format_duration_hhmmss(self):
+        self.assertEqual(dashboard._format_duration_hhmmss(3661), "01:01:01")
+
     def test_client_timestamp_is_utc_iso(self):
         self.assertEqual(
             dashboard._client_timestamp("2026-03-30 12:34:56"),
@@ -735,6 +738,60 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("<td>2</td>", html)
         self.assertNotIn("Configured Reviewer", html)
         self.assertNotIn("Approver", html)
+
+    def test_recently_done_shows_elapsed_runtime(self):
+        tid = db.add_task(self.conn, "Runtime task", branch="feat-runtime")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET last_ready_at = ?, done_at = ? WHERE id = ?",
+            ("2026-05-31 10:00:00", "2026-05-31 12:03:04", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("<th class='col-duration'>Runtime</th>", html)
+        self.assertIn("<td>02:03:04</td>", html)
+
+    def test_recently_done_elapsed_runtime_uses_latest_ready_time(self):
+        tid = db.add_task(self.conn, "Requeued runtime task", branch="feat-runtime")
+        db.update_task(self.conn, tid, status="ready")
+        self.conn.execute(
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
+            ("2026-05-31 08:00:00", "2026-05-31 08:00:00", tid),
+        )
+        self.conn.commit()
+        db.update_task(self.conn, tid, status="running")
+        db.update_task(self.conn, tid, status="ready")
+        self.conn.execute(
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
+            ("2026-05-31 10:00:00", "2026-05-31 10:00:00", tid),
+        )
+        self.conn.commit()
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET done_at = ? WHERE id = ?",
+            ("2026-05-31 10:10:05", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("<td>00:10:05</td>", html)
+        self.assertNotIn("<td>02:10:05</td>", html)
+
+    def test_recently_done_elapsed_runtime_missing_timestamp_fallback(self):
+        tid = db.add_task(self.conn, "Missing runtime task", branch="feat-runtime")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET last_ready_at = NULL WHERE id = ?",
+            (tid,),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("<td>unknown</td>", html)
 
     def test_recently_done_reviewer_falls_back_to_configured_reviewer(self):
         tid = db.add_task(self.conn, "Done task", branch="feat-done", reviewer_agent="opus")

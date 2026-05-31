@@ -11,7 +11,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 LOCK_FILE_NAME = "kanban-orchestra.lock"
 COMMIT_TASK_KINDS = {"commit", "task"}
 
@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS tasks (
         CHECK(last_review_decision IN ('none', 'approve', 'reject')),
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     ready_at                DATETIME DEFAULT NULL,
+    last_ready_at           DATETIME DEFAULT NULL,
+    done_at                 DATETIME DEFAULT NULL,
     updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     kind                    TEXT NOT NULL DEFAULT 'commit'
         CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
@@ -389,6 +391,8 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
         "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
+        "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
+        "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
         "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
         "kind": "kind" if "kind" in task_cols else "'commit'",
         "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
@@ -428,6 +432,8 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                     CHECK(last_review_decision IN ('none', 'approve', 'reject')),
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 ready_at                DATETIME DEFAULT NULL,
+                last_ready_at           DATETIME DEFAULT NULL,
+                done_at                 DATETIME DEFAULT NULL,
                 updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 kind                    TEXT NOT NULL DEFAULT 'commit'
                     CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
@@ -480,6 +486,8 @@ def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> 
         "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
+        "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
+        "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
         "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
         "kind": "kind" if "kind" in task_cols else "'commit'",
         "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
@@ -517,6 +525,8 @@ def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> 
                     CHECK(last_review_decision IN ('none', 'approve', 'reject')),
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 ready_at                DATETIME DEFAULT NULL,
+                last_ready_at           DATETIME DEFAULT NULL,
+                done_at                 DATETIME DEFAULT NULL,
                 updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 kind                    TEXT NOT NULL DEFAULT 'commit'
                     CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
@@ -664,6 +674,14 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
         conn.commit()
     if "reviewer_agent" not in task_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN reviewer_agent TEXT")
+        conn.commit()
+    if "last_ready_at" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_ready_at DATETIME DEFAULT NULL")
+        conn.execute("UPDATE tasks SET last_ready_at = ready_at WHERE ready_at IS NOT NULL")
+        conn.commit()
+    if "done_at" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN done_at DATETIME DEFAULT NULL")
+        conn.execute("UPDATE tasks SET done_at = updated_at WHERE status = 'done'")
         conn.commit()
 
     # The task_skips table must exist and its step CHECK constraint must be current.
@@ -918,7 +936,7 @@ READY_TASK_ORDER_BY = (
 def list_tasks(conn, status=None, next_step=None, branch=None, page=1, page_size=20):
     query = (
         "SELECT id, title, status, next_step, branch, coder_agent, reviewer_agent, "
-        "review_round, created_at, ready_at, updated_at, "
+        "review_round, created_at, ready_at, last_ready_at, done_at, updated_at, "
         "kind, parent_task_id, sequence_index, allow_when_blocked "
         "FROM tasks WHERE 1=1"
     )
@@ -949,13 +967,14 @@ def list_tasks(conn, status=None, next_step=None, branch=None, page=1, page_size
 
 
 def update_task(conn, task_id, **fields):
-    """Update arbitrary fields on a task. Automatically sets updated_at and manages ready_at."""
+    """Update task fields and maintain queue/completion timestamps."""
     if not fields:
         return
     allowed = {
         "title", "description", "status", "next_step", "branch",
         "commit_hash", "stash_ref", "coder_agent", "reviewer_agent",
         "review_round", "last_review_decision", "ready_at",
+        "last_ready_at", "done_at",
         "sequence_index", "commit_plan", "follow_up_task_id",
         "allow_when_blocked",
     }
@@ -964,7 +983,7 @@ def update_task(conn, task_id, **fields):
         raise ValueError(f"Cannot update fields: {bad}")
     if "status" in fields:
         current = conn.execute(
-            "SELECT status, ready_at FROM tasks WHERE id = ?",
+            "SELECT status, ready_at, done_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if current:
@@ -972,8 +991,15 @@ def update_task(conn, task_id, **fields):
             if new_status == "ready":
                 if current["status"] != "ready" or current["ready_at"] is None:
                     fields["ready_at"] = "CURRENT_TIMESTAMP"
+                    fields["last_ready_at"] = "CURRENT_TIMESTAMP"
+                fields["done_at"] = None
             else:
                 fields["ready_at"] = None
+                if new_status == "done":
+                    if current["status"] != "done" or current["done_at"] is None:
+                        fields["done_at"] = "CURRENT_TIMESTAMP"
+                else:
+                    fields["done_at"] = None
     fields["updated_at"] = "CURRENT_TIMESTAMP"
     sets = []
     params = []
