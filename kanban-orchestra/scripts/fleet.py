@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -240,6 +241,57 @@ def metadata_pid(path: Path | None, role: str, repo: FleetRepo | None = None) ->
         return None
 
 
+def repo_runtime_status(repo: FleetRepo) -> dict | None:
+    """Read the repo runtime row without creating or migrating its database."""
+    if repo.root is None:
+        return None
+    db_path = repo.root / "kanban-orchestra.db"
+    if not db_path.exists():
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM orchestrator_runtime WHERE singleton = 1").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    return dict(row) if row else None
+
+
+def runtime_activity(runtime: dict | None) -> str | None:
+    if not runtime:
+        return None
+
+    current_step = runtime.get("current_step")
+    try:
+        active_agents = int(runtime.get("active_agents") or 0)
+    except (TypeError, ValueError):
+        active_agents = 0
+
+    if runtime.get("current_task_id") or (current_step and current_step != "none") or active_agents > 0:
+        return "busy"
+
+    status = runtime.get("status")
+    if status == "idle":
+        return "idle"
+    if status == "running":
+        return "busy"
+    if status in {"starting", "stopping", "hard-break", "error"}:
+        return str(status)
+    return None
+
+
+def running_status(activity: str | None) -> str:
+    return f"running/{activity}" if activity else "running"
+
+
+def status_is_running(status: str) -> bool:
+    return status == "running" or status.startswith("running/")
+
+
 def dashboard_port_for_index(index: int) -> int:
     """Return Fleet's preferred dashboard port for a repo position."""
     return config.DASHBOARD_PORT_BASE + index
@@ -441,7 +493,7 @@ def status_repos(queries: list[str]) -> list[FleetRepo]:
 
 def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     if repo.error:
-        return "invalid", "-", "-", repo.error
+        return "invalid", "-", "-", "-"
 
     session_alive = tmux_has_session(repo.session)
     orch_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
@@ -449,7 +501,7 @@ def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     orch_alive = pid_alive(orch_pid)
 
     if orch_alive:
-        status = "running"
+        status = running_status(runtime_activity(repo_runtime_status(repo)))
     else:
         status = "stopped"
         dashboard_pid = None
@@ -503,46 +555,47 @@ def require_startable(repos: list[FleetRepo]) -> None:
 def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
-        status, orch_pid, dashboard_pid, session = repo_process_state(repo)
-        dashboard_url = dashboard_status_url(repo)
+        status, orch_pid, dashboard_pid, tmux = repo_process_state(repo)
+        dashboard_url = "-" if repo.error else dashboard_status_url(repo)
         owner = "managed" if repo.managed else "unmanaged"
+        root_display = display_path(repo.root or repo.path)
+        if repo.error:
+            root_display = f"{root_display} ({repo.error})"
         rows.append(
             (
                 repo.label,
                 status,
-                orch_pid,
-                dashboard_pid,
-                session,
+                f"{orch_pid}/{dashboard_pid}",
+                tmux,
                 dashboard_url,
                 owner,
-                display_path(repo.root or repo.path),
+                root_display,
             )
         )
 
     widths = [
         max(len("repo"), *(len(row[0]) for row in rows)),
         max(len("status"), *(len(row[1]) for row in rows)),
-        max(len("orch"), *(len(row[2]) for row in rows)),
-        max(len("dash"), *(len(row[3]) for row in rows)),
-        max(len("session"), *(len(row[4]) for row in rows)),
-        max(len("dash_url"), *(len(row[5]) for row in rows)),
-        max(len("owner"), *(len(row[6]) for row in rows)),
+        max(len("orch/dash"), *(len(row[2]) for row in rows)),
+        max(len("tmux"), *(len(row[3]) for row in rows)),
+        max(len("dash_url"), *(len(row[4]) for row in rows)),
+        max(len("owner"), *(len(row[5]) for row in rows)),
     ]
     print(
         f"{'repo':<{widths[0]}}  {'status':<{widths[1]}}  "
-        f"{'orch':>{widths[2]}}  {'dash':>{widths[3]}}  {'session':<{widths[4]}}  "
-        f"{'dash_url':<{widths[5]}}  {'owner':<{widths[6]}}  root"
+        f"{'orch/dash':>{widths[2]}}  {'tmux':<{widths[3]}}  "
+        f"{'dash_url':<{widths[4]}}  {'owner':<{widths[5]}}  root"
     )
     print(
         f"{'-' * widths[0]}  {'-' * widths[1]}  "
-        f"{'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  "
-        f"{'-' * widths[5]}  {'-' * widths[6]}  ----"
+        f"{'-' * widths[2]}  {'-' * widths[3]}  "
+        f"{'-' * widths[4]}  {'-' * widths[5]}  ----"
     )
-    for label, status, orch_pid, dashboard_pid, session, dashboard_url, owner, root in rows:
+    for label, status, process_pids, tmux, dashboard_url, owner, root in rows:
         print(
             f"{label:<{widths[0]}}  {status:<{widths[1]}}  "
-            f"{orch_pid:>{widths[2]}}  {dashboard_pid:>{widths[3]}}  {session:<{widths[4]}}  "
-            f"{dashboard_url:<{widths[5]}}  {owner:<{widths[6]}}  {root}"
+            f"{process_pids:>{widths[2]}}  {tmux:<{widths[3]}}  "
+            f"{dashboard_url:<{widths[4]}}  {owner:<{widths[5]}}  {root}"
         )
 
 
@@ -596,7 +649,7 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
         state = repo_process_state(repo)
         states.append((repo, state))
         status, _, _, session = state
-        if status != "running" and session == "-":
+        if not status_is_running(status) and session == "-":
             repos_to_start.append(repo)
     if precheck:
         require_startable([*invalid, *repos_to_start])
@@ -607,7 +660,7 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
     for index, (repo, state) in enumerate(states):
         preferred_port = dashboard_port_for_index(index)
         status, orch_pid, dashboard_pid, session = state
-        if status == "running":
+        if status_is_running(status):
             if dashboard_pid == "-":
                 request_dashboard_start(repo, preferred_port=preferred_port)
                 if wait_dashboard_ready(repo):
@@ -654,7 +707,7 @@ def stop(repos: list[FleetRepo]) -> None:
             print(f"{repo.label}: stopped tmux session")
         else:
             status, orch_pid, _, _ = repo_process_state(repo)
-            if status == "running":
+            if status_is_running(status):
                 print(f"{repo.label}: running outside fleet tmux session (orchestrator {orch_pid}); left alone")
             else:
                 print(f"{repo.label}: not running")
@@ -708,7 +761,7 @@ def stop_all(repos: list[FleetRepo]) -> None:
             continue
 
         status, orch_pid, _, _ = repo_process_state(repo)
-        if status != "running":
+        if not status_is_running(status):
             print(f"{prefix}: not running")
             continue
 

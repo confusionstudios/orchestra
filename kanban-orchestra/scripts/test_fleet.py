@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,42 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet
+
+
+def write_runtime(root, **overrides):
+    fields = {
+        "singleton": 1,
+        "status": "idle",
+        "current_task_id": None,
+        "current_step": "none",
+        "active_agents": 0,
+    }
+    fields.update(overrides)
+    conn = sqlite3.connect(root / "kanban-orchestra.db")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE orchestrator_runtime (
+                singleton INTEGER PRIMARY KEY,
+                status TEXT,
+                current_task_id INTEGER,
+                current_step TEXT,
+                active_agents INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO orchestrator_runtime
+                (singleton, status, current_task_id, current_step, active_agents)
+            VALUES
+                (:singleton, :status, :current_task_id, :current_step, :active_agents)
+            """,
+            fields,
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class TestFleetOperatorFlows(unittest.TestCase):
@@ -80,6 +117,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            write_runtime(root, status="idle", current_step="none", active_agents=0)
             repo = fleet.FleetRepo("repo", root, root)
             out = io.StringIO()
 
@@ -87,8 +125,36 @@ class TestFleetOperatorFlows(unittest.TestCase):
                 fleet.print_status([repo])
 
             text = out.getvalue()
+            self.assertIn("orch/dash", text.splitlines()[0])
+            self.assertIn("tmux", text.splitlines()[0])
+            self.assertIn(f"{os.getpid()}/{os.getpid()}", text)
+            self.assertIn("running/idle", text)
             self.assertIn("dash_url", text)
             self.assertIn("http://127.0.0.1:8427", text)
+
+    def test_process_state_reports_running_busy_from_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            write_runtime(
+                root,
+                status="running",
+                current_task_id=7,
+                current_step="commit-make",
+                active_agents=1,
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+
+            with patch.object(fleet, "tmux_has_session", return_value=False):
+                state, orch_pid, dashboard_pid, session = fleet.repo_process_state(repo)
+
+            self.assertEqual(state, "running/busy")
+            self.assertEqual(orch_pid, str(os.getpid()))
+            self.assertEqual(dashboard_pid, "-")
+            self.assertEqual(session, "-")
 
     def test_status_hides_dashboard_url_when_orchestrator_is_stopped(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,9 +182,14 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertIn("stopped", line)
             self.assertNotIn("http://127.0.0.1:8427", line)
 
-    def test_status_prints_dash_without_dashboard_metadata(self):
+    def test_status_prints_missing_dashboard_in_combined_process_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            write_runtime(root, status="idle", current_step="none", active_agents=0)
             repo = fleet.FleetRepo("repo", root, root)
             out = io.StringIO()
 
@@ -126,11 +197,30 @@ class TestFleetOperatorFlows(unittest.TestCase):
                 fleet.print_status([repo])
 
             lines = out.getvalue().splitlines()
+            self.assertIn("orch/dash", lines[0])
             self.assertIn("dash_url", lines[0])
+            self.assertIn("running/idle", lines[2])
+            self.assertIn(f"{os.getpid()}/-", lines[2])
             columns = lines[2].split()
             self.assertEqual(columns[-3], "-")
             self.assertEqual(columns[-2], "managed")
             self.assertEqual(columns[-1], str(root))
+
+    def test_status_prints_invalid_repo_error_outside_tmux_column(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir).resolve() / "missing"
+            repo = fleet.FleetRepo("missing", path, None, "path does not exist")
+            out = io.StringIO()
+
+            with redirect_stdout(out):
+                fleet.print_status([repo])
+
+            lines = out.getvalue().splitlines()
+            self.assertIn("tmux", lines[0])
+            self.assertIn("invalid", lines[2])
+            self.assertIn("-/-", lines[2])
+            self.assertIn("path does not exist", lines[2])
+            self.assertNotIn("path does not exist", lines[2].split()[3])
 
     def test_discover_running_repos_marks_live_processes_as_unmanaged(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -315,7 +405,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
                  fleet,
                  "repo_process_state",
                  side_effect=[
-                     ("running", "123", "456", "orch-running"),
+                     ("running/idle", "123", "456", "orch-running"),
                      ("stopped", "-", "-", "-"),
                  ],
              ), \
@@ -379,7 +469,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         with patch.object(fleet, "require_tool"), \
              patch.object(fleet, "require_startable"), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
-             patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "orch-repo")), \
+             patch.object(fleet, "repo_process_state", return_value=("running/idle", "123", "-", "orch-repo")), \
              patch.object(fleet, "request_dashboard_start") as request_start, \
              patch.object(fleet, "wait_dashboard_ready", return_value=True) as wait_dashboard, \
              patch.object(fleet.subprocess, "run") as run, \
@@ -409,7 +499,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         with patch.object(fleet, "require_tool"), \
              patch.object(fleet, "tmux_has_session", return_value=False), \
-             patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "-")), \
+             patch.object(fleet, "repo_process_state", return_value=("running/busy", "123", "-", "-")), \
              patch.object(fleet.subprocess, "run") as run, \
              redirect_stdout(out):
             fleet.stop([repo])
@@ -448,7 +538,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"), managed=False)
         out = io.StringIO()
 
-        with patch.object(fleet, "repo_process_state", return_value=("running", "123", "-", "-")), \
+        with patch.object(fleet, "repo_process_state", return_value=("running/busy", "123", "-", "-")), \
              patch.object(fleet, "validated_orchestrator_pid", return_value=123), \
              patch.object(fleet, "stop_pid", return_value=True) as stop_pid, \
              redirect_stdout(out):
@@ -468,7 +558,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         out = io.StringIO()
 
         with patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
-             patch.object(fleet, "repo_process_state", return_value=("running", "234", "-", "-")), \
+             patch.object(fleet, "repo_process_state", return_value=("running/busy", "234", "-", "-")), \
              patch.object(fleet, "validated_orchestrator_pid", return_value=234), \
              patch.object(fleet, "stop_pid", return_value=True), \
              patch.object(fleet.subprocess, "run"), \
@@ -483,7 +573,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"), managed=False)
         out = io.StringIO()
 
-        with patch.object(fleet, "repo_process_state", return_value=("running", "999", "-", "-")), \
+        with patch.object(fleet, "repo_process_state", return_value=("running/busy", "999", "-", "-")), \
              patch.object(fleet, "validated_orchestrator_pid", return_value=None), \
              patch.object(fleet, "stop_pid") as stop_pid, \
              redirect_stdout(out):
