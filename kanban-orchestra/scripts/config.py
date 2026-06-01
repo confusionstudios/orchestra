@@ -10,9 +10,11 @@ from agent_registry import (  # type: ignore  # noqa: E402
     AGENT_CMD as AGENT_CMD,
     AGENT_DISPLAY_LABELS as AGENT_DISPLAY_LABELS,
     AGENT_PROVIDERS as AGENT_PROVIDERS,
+    has_review_agent_command as has_review_agent_command,
     is_valid_agent_spec,
     resolve_agent_command,
     resolve_agent_label,
+    resolve_review_agent_command as resolve_review_agent_command,
 )
 
 

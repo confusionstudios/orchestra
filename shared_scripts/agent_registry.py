@@ -27,31 +27,53 @@ def _load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:
     return raw
 
 
-def _validate_agent(entry: Any, seen: set[str]) -> tuple[str, list[str], str]:
+def _validate_command(command: Any, *, subject: str, require_model: bool = False) -> list[str]:
+    if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
+        raise ValueError(f"{subject} has invalid command")
+
+    prompt_count = sum(part.count("{prompt}") for part in command)
+    if prompt_count != 1:
+        raise ValueError(f"{subject} command must contain exactly one {{prompt}} placeholder")
+    model_count = sum(part.count("{model}") for part in command)
+    if require_model and model_count < 1:
+        raise ValueError(f"{subject} command must contain a {{model}} placeholder")
+    if not require_model and model_count:
+        raise ValueError(f"{subject} command must not contain a {{model}} placeholder")
+
+    return command
+
+
+def _validate_optional_review_command(command: Any, *, subject: str, require_model: bool = False) -> list[str] | None:
+    if command is None:
+        return None
+    return _validate_command(command, subject=subject, require_model=require_model)
+
+
+def _validate_agent(entry: Any, seen: set[str]) -> tuple[str, list[str], str, list[str] | None]:
     if not isinstance(entry, dict):
         raise ValueError("agent registry entries must be mappings")
 
     key = entry.get("key")
     label = entry.get("label")
     command = entry.get("command")
+    review_command = entry.get("review_command")
     if not isinstance(key, str) or not key.strip():
         raise ValueError("agent registry entry has missing key")
     if key in seen:
         raise ValueError(f"duplicate agent key in registry: {key}")
     if not isinstance(label, str) or not label.strip():
         raise ValueError(f"agent registry entry has missing label: {key}")
-    if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
-        raise ValueError(f"agent registry entry has invalid command: {key}")
-
-    prompt_count = sum(part.count("{prompt}") for part in command)
-    if prompt_count != 1:
-        raise ValueError(f"agent command must contain exactly one {{prompt}} placeholder: {key}")
+    command = _validate_command(command, subject=f"agent registry entry {key}")
+    review_command = _validate_optional_review_command(
+        review_command,
+        subject=f"agent registry entry {key} review_command",
+    )
 
     seen.add(key)
-    return key, command, label
+    return key, command, label, review_command
 
 
-def _validate_provider(name: Any, entry: Any) -> tuple[str, list[str], str]:
+def _validate_provider(name: Any, entry: Any) -> tuple[str, list[str], str, list[str] | None]:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("agent provider has missing name")
     if not _PROVIDER_RE.fullmatch(name):
@@ -61,21 +83,19 @@ def _validate_provider(name: Any, entry: Any) -> tuple[str, list[str], str]:
 
     label = entry.get("label")
     command = entry.get("command")
+    review_command = entry.get("review_command")
     if not isinstance(label, str) or not label.strip():
         raise ValueError(f"agent provider has missing label: {name}")
     if "{model}" not in label:
         raise ValueError(f"agent provider label must contain {{model}}: {name}")
-    if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
-        raise ValueError(f"agent provider has invalid command: {name}")
+    command = _validate_command(command, subject=f"agent provider {name}", require_model=True)
+    review_command = _validate_optional_review_command(
+        review_command,
+        subject=f"agent provider {name} review_command",
+        require_model=True,
+    )
 
-    prompt_count = sum(part.count("{prompt}") for part in command)
-    if prompt_count != 1:
-        raise ValueError(f"agent provider command must contain exactly one {{prompt}} placeholder: {name}")
-    model_count = sum(part.count("{model}") for part in command)
-    if model_count < 1:
-        raise ValueError(f"agent provider command must contain a {{model}} placeholder: {name}")
-
-    return name, command, label
+    return name, command, label, review_command
 
 
 def load_agent_registry(path: Path = REGISTRY_PATH) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
@@ -90,12 +110,27 @@ def load_agent_registry(path: Path = REGISTRY_PATH) -> tuple[list[str], dict[str
     seen: set[str] = set()
 
     for entry in agents_raw:
-        key, command, label = _validate_agent(entry, seen)
+        key, command, label, _review_command = _validate_agent(entry, seen)
         agents.append(key)
         commands[key] = command
         labels[key] = label
 
     return agents, commands, labels
+
+
+def load_agent_review_commands(path: Path = REGISTRY_PATH) -> dict[str, list[str]]:
+    raw = _load_registry(path)
+    agents_raw = raw.get("agents")
+    if not isinstance(agents_raw, list):
+        raise ValueError(f"agent registry must contain an agents list: {path}")
+
+    commands: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for entry in agents_raw:
+        key, _command, _label, review_command = _validate_agent(entry, seen)
+        if review_command is not None:
+            commands[key] = review_command
+    return commands
 
 
 def load_agent_providers(path: Path = REGISTRY_PATH) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
@@ -110,11 +145,27 @@ def load_agent_providers(path: Path = REGISTRY_PATH) -> tuple[list[str], dict[st
     commands: dict[str, list[str]] = {}
     labels: dict[str, str] = {}
     for name, entry in providers_raw.items():
-        provider, command, label = _validate_provider(name, entry)
+        provider, command, label, _review_command = _validate_provider(name, entry)
         providers.append(provider)
         commands[provider] = command
         labels[provider] = label
     return providers, commands, labels
+
+
+def load_provider_review_commands(path: Path = REGISTRY_PATH) -> dict[str, list[str]]:
+    raw = _load_registry(path)
+    providers_raw = raw.get("providers", {})
+    if providers_raw is None:
+        providers_raw = {}
+    if not isinstance(providers_raw, dict):
+        raise ValueError(f"agent registry providers must be a mapping: {path}")
+
+    commands: dict[str, list[str]] = {}
+    for name, entry in providers_raw.items():
+        provider, _command, _label, review_command = _validate_provider(name, entry)
+        if review_command is not None:
+            commands[provider] = review_command
+    return commands
 
 
 def _split_provider_model(spec: str) -> tuple[str, str] | None:
@@ -147,6 +198,35 @@ def resolve_agent_command(spec: str) -> list[str] | None:
     return [part.replace("{model}", model) for part in command]
 
 
+def has_review_agent_command(spec: str) -> bool:
+    """Return True when an alias/provider:model spec has an explicit review command."""
+    if spec in AGENT_REVIEW_CMD:
+        return True
+
+    parsed = _split_provider_model(spec)
+    if parsed is None:
+        return False
+    provider, _model = parsed
+    return provider in PROVIDER_REVIEW_CMD
+
+
+def resolve_review_agent_command(spec: str) -> list[str] | None:
+    """Return the review command for an agent spec, falling back to the normal command."""
+    if spec in AGENT_REVIEW_CMD:
+        return list(AGENT_REVIEW_CMD[spec])
+    if spec in AGENT_CMD:
+        return list(AGENT_CMD[spec])
+
+    parsed = _split_provider_model(spec)
+    if parsed is None:
+        return None
+    provider, model = parsed
+    command = PROVIDER_REVIEW_CMD.get(provider) or PROVIDER_CMD.get(provider)
+    if command is None:
+        return None
+    return [part.replace("{model}", model) for part in command]
+
+
 def resolve_agent_label(spec: str) -> str | None:
     """Return a display label for an alias or provider:model agent spec."""
     if spec in AGENT_DISPLAY_LABELS:
@@ -168,3 +248,5 @@ def is_valid_agent_spec(spec: str) -> bool:
 
 AGENTS, AGENT_CMD, AGENT_DISPLAY_LABELS = load_agent_registry()
 AGENT_PROVIDERS, PROVIDER_CMD, PROVIDER_DISPLAY_LABELS = load_agent_providers()
+AGENT_REVIEW_CMD = load_agent_review_commands()
+PROVIDER_REVIEW_CMD = load_provider_review_commands()

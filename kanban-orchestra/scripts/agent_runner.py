@@ -71,9 +71,15 @@ PING_PROMPT = "This is a ping. Respond with ACK."
 PING_RETRY_INTERVAL = 60  # seconds between retries when agent does not respond
 
 
-def ping_agent(agent_name, task_id):
+def _resolve_command_template(agent_name, *, use_review_command=False):
+    if use_review_command:
+        return config.resolve_review_agent_command(agent_name)
+    return config.resolve_agent_command(agent_name)
+
+
+def ping_agent(agent_name, task_id, *, use_review_command=False):
     """Send a lightweight ping prompt. Returns True if any text response received."""
-    cmd_template = config.resolve_agent_command(agent_name)
+    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command)
     if cmd_template is None:
         log(f"Unknown agent '{agent_name}', cannot ping", task_id)
         return False
@@ -136,7 +142,7 @@ def ping_agent(agent_name, task_id):
     return acked
 
 
-def ensure_agent_acked(agent_name, task_id, conn):
+def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False):
     """
     Ensure the agent has ACKed for this task before running a real step.
 
@@ -145,12 +151,16 @@ def ensure_agent_acked(agent_name, task_id, conn):
     The task stays pinned and running throughout the retry loop. Do not call
     for steps that will be skipped.
     """
-    cache_key = (task_id, agent_name)
+    cache_key = (task_id, agent_name, "review") if use_review_command else (task_id, agent_name)
     if cache_key in _agent_ack_cache:
         return
 
     while True:
-        if ping_agent(agent_name, task_id):
+        if use_review_command:
+            acked = ping_agent(agent_name, task_id, use_review_command=True)
+        else:
+            acked = ping_agent(agent_name, task_id)
+        if acked:
             _agent_ack_cache.add(cache_key)
             return
 
@@ -196,7 +206,17 @@ def _format_agent_command_for_transcript(cmd, prompt):
     return shlex.join(redacted_cmd)
 
 
-def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_registry=None):
+def run_agent(
+    agent_name,
+    prompt,
+    task_id,
+    conn,
+    verb,
+    cancel_event=None,
+    proc_registry=None,
+    *,
+    use_review_command=False,
+):
     """
     Launch an agent subprocess, capture full output to a transcript, return exit code.
 
@@ -204,7 +224,7 @@ def run_agent(agent_name, prompt, task_id, conn, verb, cancel_event=None, proc_r
     proc_registry: dict — if provided, register the Popen object under agent_name
                    so the caller can kill it on interrupt.
     """
-    cmd_template = config.resolve_agent_command(agent_name)
+    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command)
     if cmd_template is None:
         log(f"Unknown agent '{agent_name}', skipping", task_id)
         return 1

@@ -40,65 +40,44 @@ if not is_valid_agent_spec(reviewer):
 PY
 ```
 
-Run only the command for the selected `$reviewer`.
+Run only the review command for the selected `$reviewer`.
 
-For reviewers other than Codex, find the command template in
-`$ORCHESTRA_DIR/shared_scripts/agent_registry.yaml` or through
-`agent_registry.resolve_agent_command(reviewer)`, then replace the single
-`{prompt}` placeholder with the review prompt.
-
-Use the repo's configured non-interactive CLI form when available. Codex is the
-only special case because `codex exec review --uncommitted` gathers the
-uncommitted diff for review. All other reviewers must use the exact command
-template for the selected key.
+Resolve the command through
+`agent_registry.resolve_review_agent_command(reviewer)`, then replace the
+single `{prompt}` placeholder with the review prompt. The shared resolver uses
+review-specific forms when configured, such as Codex `exec review --uncommitted`
+and Cursor `agent --mode ask`, and falls back to the normal agent command for
+providers without a review-specific template.
 
 ```bash
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
 orchestra_dir="${ORCHESTRA_DIR:-$repo_root}"
 cd "$repo_root" || exit 1
 
-case "$reviewer" in
-  codex)
-    codex_review_help="$(codex exec review --help)"
-    printf '%s\n' "$codex_review_help" | rg -- "--uncommitted" >/dev/null &&
-      printf '%s\n' "$codex_review_help" | rg -- "-o, --output-last-message" >/dev/null || {
-      echo "Codex review CLI is unavailable or missing required flags."
-      exit 1
-    }
-    review_out="$(mktemp -t cross-review-codex.XXXXXX)"
-    trap 'rm -f "$review_out"' EXIT
-    perl -e 'alarm shift; exec @ARGV' 300 codex exec review --uncommitted -o "$review_out" "<review prompt>" || echo "Codex reviewer failed or timed out."
-    cat "$review_out"
-    ;;
-  *)
-    prompt_file="$(mktemp -t cross-review-prompt.XXXXXX)"
-    trap 'rm -f "$prompt_file"' EXIT
-    printf '%s' "<review prompt>" > "$prompt_file"
-    PYTHONPATH="$orchestra_dir/shared_scripts" \
-      perl -e 'alarm shift; exec @ARGV' 300 "$orchestra_dir/bin/ko-python" - "$reviewer" "$prompt_file" <<'PY'
+prompt_file="$(mktemp -t cross-review-prompt.XXXXXX)"
+trap 'rm -f "$prompt_file"' EXIT
+printf '%s' "<review prompt>" > "$prompt_file"
+PYTHONPATH="$orchestra_dir/shared_scripts" \
+  perl -e 'alarm shift; exec @ARGV' 300 "$orchestra_dir/bin/ko-python" - "$reviewer" "$prompt_file" <<'PY'
 import os
 import sys
 from pathlib import Path
-from agent_registry import resolve_agent_command
+from agent_registry import resolve_review_agent_command
 
 reviewer = sys.argv[1]
 prompt = Path(sys.argv[2]).read_text(encoding="utf-8")
-cmd_template = resolve_agent_command(reviewer)
+cmd_template = resolve_review_agent_command(reviewer)
 if cmd_template is None:
     raise SystemExit(f"unknown reviewer agent alias or provider/model spec: {reviewer}")
 cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
 os.execvp(cmd[0], cmd)
 PY
-    ;;
-esac
 ```
-
-The `codex exec review --uncommitted -o` form is supported by the repo's installed Codex CLI. If `codex exec review --help` does not show both `--uncommitted` and `-o, --output-last-message`, stop and report the Codex review CLI as unavailable.
 
 If the configured reviewer CLI is unavailable, report the blocker and do not
 substitute a different reviewer unless the user explicitly approves.
 
-The command examples assume a macOS/Linux shell with `perl` and `rg`. If those tools are unavailable, use an equivalent shell-level timeout and help-output check. Use a longer timeout when the diff is broad, schema-sensitive, or otherwise likely to require deeper context.
+The command example assumes a macOS/Linux shell with `perl`. If it is unavailable, use an equivalent shell-level timeout. Use a longer timeout when the diff is broad, schema-sensitive, or otherwise likely to require deeper context.
 
 The Codex review subcommand gathers staged, unstaged, and untracked changes.
 Neither Codex, Claude, Cursor, Kilo, nor Antigravity is mechanically prevented from

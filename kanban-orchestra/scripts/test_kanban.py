@@ -1595,6 +1595,7 @@ class TestReviewAggregation(unittest.TestCase):
         run_agent.assert_called_once()
         self.assertEqual(run_agent.call_args.args[0], "antigravity")
         self.assertIn("- reviewer_agent: antigravity", run_agent.call_args.args[1])
+        self.assertTrue(run_agent.call_args.kwargs["use_review_command"])
 
     def test_null_reviewer_falls_back_to_default_reviewer(self):
         tid = db.add_task(self.conn, "Default reviewer", coder_agent="claude")
@@ -1608,6 +1609,7 @@ class TestReviewAggregation(unittest.TestCase):
 
         self.assertEqual(outcome, "approve")
         self.assertEqual(run_agent.call_args.args[0], DEFAULT_REVIEWER)
+        self.assertTrue(run_agent.call_args.kwargs["use_review_command"])
 
     def test_reviewer_rejection_returns_reject(self):
         tid = db.add_task(self.conn, "Review reject", coder_agent="claude")
@@ -1984,6 +1986,7 @@ class TestStateMachine(unittest.TestCase):
         task = db.get_task(self.conn, tid)
 
         def fake_coder(name, prompt, task_id, conn, verb, **kw):
+            self.assertFalse(kw.get("use_review_command", False))
             db.add_comment(conn, task_id, "Fresh commit message", kind="commit-message", author=name)
             return 0
 
@@ -3198,6 +3201,37 @@ class TestAgentTranscriptCapture(unittest.TestCase):
                 "--model",
                 "claude-opus-4-8-high",
                 "--yolo",
+                "--trust",
+                "prompt body",
+            ],
+        )
+
+    def test_run_agent_uses_review_command_when_requested(self):
+        tid = db.add_task(self.conn, "Review command", reviewer_agent="cursor-composer-2.5")
+        fake_proc = self._fake_proc(["done\n"], 0)
+
+        with patch.object(agent_runner.subprocess, "Popen", return_value=fake_proc) as mock_popen, \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.db_path):
+            exit_code = agent_runner.run_agent(
+                "cursor-composer-2.5",
+                "prompt body",
+                tid,
+                self.conn,
+                "commit-review",
+                use_review_command=True,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            mock_popen.call_args.args[0],
+            [
+                "cursor",
+                "agent",
+                "-p",
+                "--mode",
+                "ask",
+                "--model",
+                "composer-2.5",
                 "--trust",
                 "prompt body",
             ],
@@ -7583,6 +7617,52 @@ class TestCommitFooter(unittest.TestCase):
                 "--trust",
                 "{prompt}",
             ],
+        )
+
+    def test_cursor_alias_review_command_uses_read_only_mode(self):
+        self.assertEqual(
+            agent_registry.resolve_review_agent_command("cursor-composer-2.5"),
+            [
+                "cursor",
+                "agent",
+                "-p",
+                "--mode",
+                "ask",
+                "--model",
+                "composer-2.5",
+                "--trust",
+                "{prompt}",
+            ],
+        )
+        self.assertNotIn("--yolo", agent_registry.resolve_review_agent_command("cursor-composer-2.5"))
+
+    def test_cursor_provider_review_command_substitutes_model(self):
+        self.assertEqual(
+            agent_registry.resolve_review_agent_command("cursor:claude-opus-4-8-high"),
+            [
+                "cursor",
+                "agent",
+                "-p",
+                "--mode",
+                "ask",
+                "--model",
+                "claude-opus-4-8-high",
+                "--trust",
+                "{prompt}",
+            ],
+        )
+
+    def test_codex_review_command_uses_review_subcommand(self):
+        self.assertEqual(
+            agent_registry.resolve_review_agent_command("codex"),
+            ["codex", "exec", "review", "--uncommitted", "{prompt}"],
+        )
+
+    def test_review_command_falls_back_to_normal_command(self):
+        self.assertFalse(agent_registry.has_review_agent_command("antigravity"))
+        self.assertEqual(
+            agent_registry.resolve_review_agent_command("antigravity"),
+            agent_registry.resolve_agent_command("antigravity"),
         )
 
     def test_display_name_fallback_for_unknown_agent(self):
