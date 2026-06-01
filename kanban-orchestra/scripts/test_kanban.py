@@ -46,6 +46,7 @@ active_agent_processes = _load_local_module(
 )
 orchestrator_lock = _load_local_module("kanban_test_orchestrator_lock", "orchestrator_lock.py", canonical_name="orchestrator_lock")
 orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
+agent_runner = orchestrator.agent_runner
 config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
 fleet = _load_local_module("kanban_test_fleet", "fleet.py")
@@ -3109,9 +3110,9 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         )
 
         with patch.dict(orchestrator.AGENT_CMD, {"codex": ["codex", "{prompt}"]}, clear=False), \
-             patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc), \
-             patch.object(orchestrator.db, "get_db_path", return_value=self.db_path):
-            exit_code = orchestrator.run_agent(
+             patch.object(agent_runner.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.db_path):
+            exit_code = agent_runner.run_agent(
                 "codex",
                 "prompt body",
                 tid,
@@ -3136,7 +3137,7 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertIn(str(transcript_files[0]), run_log[0]["message"])
 
     def test_run_agent_transcript_command_redacts_prompt_when_embedded(self):
-        rendered = orchestrator._format_agent_command_for_transcript(
+        rendered = agent_runner._format_agent_command_for_transcript(
             ["agent", "--payload=before prompt body after"],
             "prompt body",
         )
@@ -3145,7 +3146,7 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertNotIn("prompt body", rendered)
 
     def test_run_agent_transcript_command_handles_empty_prompt(self):
-        rendered = orchestrator._format_agent_command_for_transcript(["agent", "--flag"], "")
+        rendered = agent_runner._format_agent_command_for_transcript(["agent", "--flag"], "")
         self.assertEqual(rendered, "agent --flag")
 
     def test_run_agent_launches_from_repo_root(self):
@@ -3154,9 +3155,9 @@ class TestAgentTranscriptCapture(unittest.TestCase):
 
         with patch.dict(orchestrator.AGENT_CMD, {"codex": ["codex", "{prompt}"]}, clear=False), \
              patch.object(orchestrator, "_repo_root", return_value="/tmp/work-repo"), \
-             patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc) as mock_popen, \
-             patch.object(orchestrator.db, "get_db_path", return_value=self.db_path):
-            exit_code = orchestrator.run_agent(
+             patch.object(agent_runner.subprocess, "Popen", return_value=fake_proc) as mock_popen, \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.db_path):
+            exit_code = agent_runner.run_agent(
                 "codex",
                 "prompt body",
                 tid,
@@ -3177,9 +3178,9 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         tid = db.add_task(self.conn, "Dynamic provider", coder_agent=spec)
         fake_proc = self._fake_proc(["done\n"], 0)
 
-        with patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc) as mock_popen, \
-             patch.object(orchestrator.db, "get_db_path", return_value=self.db_path):
-            exit_code = orchestrator.run_agent(
+        with patch.object(agent_runner.subprocess, "Popen", return_value=fake_proc) as mock_popen, \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.db_path):
+            exit_code = agent_runner.run_agent(
                 spec,
                 "prompt body",
                 tid,
@@ -3207,11 +3208,11 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         fake_proc = self._fake_proc(["done\n"], 0)
 
         with patch.dict(orchestrator.AGENT_CMD, {"codex": ["codex", "{prompt}"]}, clear=False), \
-             patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc), \
-             patch.object(orchestrator.db, "get_db_path", return_value=self.db_path), \
-             patch.object(orchestrator.active_agent_processes, "register_active_agent", return_value="rec-1") as mock_register, \
-             patch.object(orchestrator.active_agent_processes, "clear_active_agent") as mock_clear:
-            exit_code = orchestrator.run_agent(
+             patch.object(agent_runner.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.db_path), \
+             patch.object(agent_runner.active_agent_processes, "register_active_agent", return_value="rec-1") as mock_register, \
+             patch.object(agent_runner.active_agent_processes, "clear_active_agent") as mock_clear:
+            exit_code = agent_runner.run_agent(
                 "codex",
                 "prompt body",
                 tid,
@@ -3241,9 +3242,9 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         )
 
         with patch.dict(orchestrator.AGENT_CMD, {"codex": ["codex", "{prompt}"]}, clear=False), \
-             patch.object(orchestrator.subprocess, "Popen", return_value=fake_proc), \
-             patch.object(orchestrator.db, "get_db_path", return_value=self.db_path):
-            exit_code = orchestrator.run_agent(
+             patch.object(agent_runner.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.db_path):
+            exit_code = agent_runner.run_agent(
                 "codex",
                 "prompt body",
                 tid,
@@ -7823,13 +7824,13 @@ class TestAgentPingACKGate(unittest.TestCase):
 
     def setUp(self):
         # Each test gets a fresh ACK cache so tests don't bleed into each other.
-        orchestrator._agent_ack_cache.clear()
+        agent_runner._agent_ack_cache.clear()
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.conn = db.connect(self.tmp.name)
 
     def tearDown(self):
-        orchestrator._agent_ack_cache.clear()
+        agent_runner._agent_ack_cache.clear()
         self.conn.close()
         os.unlink(self.tmp.name)
 
@@ -7837,8 +7838,8 @@ class TestAgentPingACKGate(unittest.TestCase):
 
     def test_ping_log_on_success_mentions_responsive(self):
         """Successful ping log says the agent responded, not just 'ACKed'."""
-        with patch.object(orchestrator, "ping_agent", return_value=True) as mock_ping:
-            orchestrator.ensure_agent_acked("sonnet", 1, self.conn)
+        with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
+            agent_runner.ensure_agent_acked("sonnet", 1, self.conn)
         # ensure_agent_acked delegates to ping_agent; verify it was called
         mock_ping.assert_called_once_with("sonnet", 1)
 
@@ -7851,8 +7852,8 @@ class TestAgentPingACKGate(unittest.TestCase):
             log_messages.append(msg)
 
         with (
-            patch.object(orchestrator, "log", side_effect=capture_log),
-            patch.object(orchestrator, "subprocess") as mock_sub,
+            patch.object(agent_runner, "log", side_effect=capture_log),
+            patch.object(agent_runner, "subprocess") as mock_sub,
         ):
             # Simulate a process that closes stdout immediately (no output).
             mock_proc = MagicMock()
@@ -7860,7 +7861,7 @@ class TestAgentPingACKGate(unittest.TestCase):
             mock_sub.Popen.return_value = mock_proc
             # AGENT_CMD needs a known agent; patch it so ping_agent doesn't bail early.
             with patch.dict(orchestrator.AGENT_CMD, {"sonnet": ["echo", "{prompt}"]}):
-                orchestrator.ping_agent("sonnet", 42)
+                agent_runner.ping_agent("sonnet", 42)
 
         failure_logs = [m for m in log_messages if "no output" in m or "unavailable" in m]
         self.assertTrue(failure_logs, f"Expected a 'no output / unavailable' log; got: {log_messages}")
@@ -7871,9 +7872,9 @@ class TestAgentPingACKGate(unittest.TestCase):
         mock_proc.stdout = None
         mock_proc.pid = 1234
 
-        with patch.object(orchestrator.subprocess, "Popen", return_value=mock_proc) as mock_popen, \
-             patch.object(orchestrator.db, "get_db_path", return_value=self.tmp.name):
-            orchestrator.ping_agent(spec, 42)
+        with patch.object(agent_runner.subprocess, "Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.tmp.name):
+            agent_runner.ping_agent(spec, 42)
 
         self.assertEqual(
             mock_popen.call_args.args[0],
@@ -7885,7 +7886,7 @@ class TestAgentPingACKGate(unittest.TestCase):
                 "claude-opus-4-8-high",
                 "--yolo",
                 "--trust",
-                orchestrator.PING_PROMPT,
+                agent_runner.PING_PROMPT,
             ],
         )
 
@@ -7893,31 +7894,31 @@ class TestAgentPingACKGate(unittest.TestCase):
 
     def test_second_call_skips_ping(self):
         """ensure_agent_acked with same (task_id, agent) calls ping only once."""
-        with patch.object(orchestrator, "ping_agent", return_value=True) as mock_ping:
-            orchestrator.ensure_agent_acked("sonnet", 10, self.conn)
-            orchestrator.ensure_agent_acked("sonnet", 10, self.conn)
+        with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
+            agent_runner.ensure_agent_acked("sonnet", 10, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 10, self.conn)
         mock_ping.assert_called_once()
 
     def test_different_task_ids_each_get_a_ping(self):
         """ACK cache is keyed on (task_id, agent) — two tasks trigger two pings."""
-        with patch.object(orchestrator, "ping_agent", return_value=True) as mock_ping:
-            orchestrator.ensure_agent_acked("sonnet", 11, self.conn)
-            orchestrator.ensure_agent_acked("sonnet", 12, self.conn)
+        with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
+            agent_runner.ensure_agent_acked("sonnet", 11, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 12, self.conn)
         self.assertEqual(mock_ping.call_count, 2)
 
     def test_different_agents_same_task_each_get_a_ping(self):
         """Different agents for the same task_id both need to ping."""
-        with patch.object(orchestrator, "ping_agent", return_value=True) as mock_ping:
-            orchestrator.ensure_agent_acked("sonnet", 20, self.conn)
-            orchestrator.ensure_agent_acked("haiku", 20, self.conn)
+        with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
+            agent_runner.ensure_agent_acked("sonnet", 20, self.conn)
+            agent_runner.ensure_agent_acked("haiku", 20, self.conn)
         self.assertEqual(mock_ping.call_count, 2)
 
     def test_ack_cache_populated_after_success(self):
         """Cache key is present after a successful ping so subsequent calls hit it."""
-        with patch.object(orchestrator, "ping_agent", return_value=True):
-            orchestrator.ensure_agent_acked("sonnet", 30, self.conn)
+        with patch.object(agent_runner, "ping_agent", return_value=True):
+            agent_runner.ensure_agent_acked("sonnet", 30, self.conn)
         self.assertIn(("sonnet", 30) if False else (30, "sonnet"),
-                      orchestrator._agent_ack_cache)
+                      agent_runner._agent_ack_cache)
 
     # ── retry loop ───────────────────────────────────────────────────
 
@@ -7931,11 +7932,11 @@ class TestAgentPingACKGate(unittest.TestCase):
             return ping_results.pop(0)
 
         with (
-            patch.object(orchestrator, "ping_agent", side_effect=fake_ping),
-            patch.object(orchestrator, "time") as mock_time,
-            patch.object(db, "update_runtime"),
+            patch.object(agent_runner, "ping_agent", side_effect=fake_ping),
+            patch.object(agent_runner, "time") as mock_time,
+            patch.object(agent_runner.db, "update_runtime"),
         ):
-            orchestrator.ensure_agent_acked("sonnet", 40, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 40, self.conn)
 
         self.assertEqual(len(call_count), 3, "Should have pinged 3 times before success")
         self.assertEqual(mock_time.sleep.call_count, 2, "Should have slept twice (once per failure)")
@@ -7945,13 +7946,13 @@ class TestAgentPingACKGate(unittest.TestCase):
         ping_results = [False, True]
 
         with (
-            patch.object(orchestrator, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
-            patch.object(orchestrator, "time") as mock_time,
-            patch.object(db, "update_runtime"),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "time") as mock_time,
+            patch.object(agent_runner.db, "update_runtime"),
         ):
-            orchestrator.ensure_agent_acked("sonnet", 41, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 41, self.conn)
 
-        mock_time.sleep.assert_called_with(orchestrator.PING_RETRY_INTERVAL)
+        mock_time.sleep.assert_called_with(agent_runner.PING_RETRY_INTERVAL)
 
     # ── runtime status messaging ─────────────────────────────────────
 
@@ -7965,11 +7966,11 @@ class TestAgentPingACKGate(unittest.TestCase):
                 captured_messages.append(kwargs["status_message"])
 
         with (
-            patch.object(orchestrator, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
-            patch.object(orchestrator, "time"),
-            patch.object(db, "update_runtime", side_effect=fake_update_runtime),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "time"),
+            patch.object(agent_runner.db, "update_runtime", side_effect=fake_update_runtime),
         ):
-            orchestrator.ensure_agent_acked("haiku", 50, self.conn)
+            agent_runner.ensure_agent_acked("haiku", 50, self.conn)
 
         self.assertTrue(captured_messages, "Expected at least one status_message update")
         msg = captured_messages[0]
@@ -7986,11 +7987,11 @@ class TestAgentPingACKGate(unittest.TestCase):
                 captured.append(kwargs["status_message"])
 
         with (
-            patch.object(orchestrator, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
-            patch.object(orchestrator, "time"),
-            patch.object(db, "update_runtime", side_effect=fake_update_runtime),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "time"),
+            patch.object(agent_runner.db, "update_runtime", side_effect=fake_update_runtime),
         ):
-            orchestrator.ensure_agent_acked("haiku", 51, self.conn)
+            agent_runner.ensure_agent_acked("haiku", 51, self.conn)
 
         self.assertTrue(captured)
         self.assertIn("STALLED", captured[0])
@@ -8005,11 +8006,11 @@ class TestAgentPingACKGate(unittest.TestCase):
                 captured.append(kwargs["status_message"])
 
         with (
-            patch.object(orchestrator, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
-            patch.object(orchestrator, "time"),
-            patch.object(db, "update_runtime", side_effect=fake_update_runtime),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "time"),
+            patch.object(agent_runner.db, "update_runtime", side_effect=fake_update_runtime),
         ):
-            orchestrator.ensure_agent_acked("haiku", 52, self.conn)
+            agent_runner.ensure_agent_acked("haiku", 52, self.conn)
 
         self.assertTrue(captured)
         self.assertTrue(
@@ -8026,22 +8027,22 @@ class TestAgentPingACKGate(unittest.TestCase):
             log_messages.append(msg)
 
         with (
-            patch.object(orchestrator, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
-            patch.object(orchestrator, "log", side_effect=capture_log),
-            patch.object(orchestrator, "time"),
-            patch.object(db, "update_runtime"),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "log", side_effect=capture_log),
+            patch.object(agent_runner, "time"),
+            patch.object(agent_runner.db, "update_runtime"),
         ):
-            orchestrator.ensure_agent_acked("sonnet", 60, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 60, self.conn)
 
         stall_logs = [m for m in log_messages if "STALLED" in m or "no other" in m.lower()]
         self.assertTrue(stall_logs, f"Expected a stall log mentioning blocking; got: {log_messages}")
 
     def test_no_status_update_when_cache_hit(self):
         """Cache hit path never calls update_runtime (no unnecessary DB writes)."""
-        orchestrator._agent_ack_cache.add((60, "sonnet"))
+        agent_runner._agent_ack_cache.add((60, "sonnet"))
 
-        with patch.object(db, "update_runtime") as mock_update:
-            orchestrator.ensure_agent_acked("sonnet", 60, self.conn)
+        with patch.object(agent_runner.db, "update_runtime") as mock_update:
+            agent_runner.ensure_agent_acked("sonnet", 60, self.conn)
 
         mock_update.assert_not_called()
 
