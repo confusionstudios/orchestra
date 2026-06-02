@@ -1596,7 +1596,7 @@ class TestReviewAggregation(unittest.TestCase):
         run_agent.assert_called_once()
         self.assertEqual(run_agent.call_args.args[0], "antigravity")
         self.assertIn("- reviewer_agent: antigravity", run_agent.call_args.args[1])
-        self.assertTrue(run_agent.call_args.kwargs["use_review_command"])
+        self.assertFalse(run_agent.call_args.kwargs.get("use_review_command", False))
 
     def test_null_reviewer_falls_back_to_default_reviewer(self):
         tid = db.add_task(self.conn, "Default reviewer", coder_agent="claude")
@@ -1610,7 +1610,7 @@ class TestReviewAggregation(unittest.TestCase):
 
         self.assertEqual(outcome, "approve")
         self.assertEqual(run_agent.call_args.args[0], DEFAULT_REVIEWER)
-        self.assertTrue(run_agent.call_args.kwargs["use_review_command"])
+        self.assertFalse(run_agent.call_args.kwargs.get("use_review_command", False))
 
     def test_reviewer_rejection_returns_reject(self):
         tid = db.add_task(self.conn, "Review reject", coder_agent="claude")
