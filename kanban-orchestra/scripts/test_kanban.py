@@ -51,6 +51,7 @@ config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
 fleet = _load_local_module("kanban_test_fleet", "fleet.py")
 import agent_registry
+import agent_smoke
 skill_wrappers = _load_local_module("kanban_test_skill_wrappers", str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_ai_skill_wrappers.py"))
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
 
@@ -7789,6 +7790,63 @@ class TestCommitFooter(unittest.TestCase):
             r2.stdout.strip(),
             f"Task {tid} (coder: Claude Haiku 4.5; reviewer: GPT-5.5 medium; review rejections: 0)",
         )
+
+
+class TestAgentSmoke(unittest.TestCase):
+    def test_default_matrix_contains_replacement_agents(self):
+        matrix = {agent.name: agent.spec for agent in agent_smoke.AGENT_MATRIX}
+        self.assertEqual(matrix["antigravity"], "antigravity")
+        self.assertEqual(matrix["cursor-composer-2.5"], "cursor-composer-2.5")
+        self.assertEqual(matrix["kilo-opus-4.8"], "kilo:kilo/anthropic/claude-opus-4.8")
+
+    def test_selected_agents_can_skip_by_name_or_spec(self):
+        selected = agent_smoke.selected_agents(
+            ["extra=cursor:auto"],
+            {"antigravity", "cursor:auto"},
+        )
+        self.assertEqual(
+            [(agent.name, agent.spec) for agent in selected],
+            [
+                ("cursor-composer-2.5", "cursor-composer-2.5"),
+                ("kilo-opus-4.8", "kilo:kilo/anthropic/claude-opus-4.8"),
+            ],
+        )
+
+    def test_default_output_dir_is_repo_local_runtime_path(self):
+        self.assertEqual(
+            agent_smoke.default_output_dir(),
+            Path.cwd() / ".kanban-orchestra" / "agent-smoke",
+        )
+
+    def test_run_one_writes_stdout_stderr_and_requires_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            writer = (
+                "import re, sys; "
+                "prompt=sys.argv[1]; "
+                "path=re.search(r'Create or overwrite this exact UTF-8 text file:\\n   (.+)', prompt).group(1); "
+                "open(path, 'w', encoding='utf-8').write('fake report\\n'); "
+                "print('fake model v1 / effort low')"
+            )
+
+            with patch.object(
+                agent_smoke,
+                "resolve_agent_command",
+                return_value=[sys.executable, "-c", writer, "{prompt}"],
+            ), patch.object(agent_smoke, "resolve_agent_label", return_value="Fake Agent"):
+                result = agent_smoke.run_one(
+                    agent_smoke.SmokeAgent("fake", "fake"),
+                    output_dir,
+                    timeout=10,
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual((output_dir / "agent-smoke-fake.txt").read_text(encoding="utf-8"), "fake report\n")
+            self.assertIn(
+                "fake model v1",
+                (output_dir / "agent-smoke-fake.stdout.txt").read_text(encoding="utf-8"),
+            )
+            self.assertTrue((output_dir / "agent-smoke-fake.stderr.txt").exists())
 
 
 class TestFinalizationFooter(unittest.TestCase):
