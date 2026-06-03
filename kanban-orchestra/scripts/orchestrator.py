@@ -431,14 +431,29 @@ def get_head_commit_hash():
         return None
 
 
+_OWN_ARTIFACTS = {
+    ".kanban-orchestra/",
+    "kanban-orchestra.lock",
+    "kanban-orchestra.db",
+    "kanban-orchestra.db-journal",
+    "kanban-orchestra.db-shm",
+    "kanban-orchestra.db-wal",
+}
+
+
 def is_worktree_dirty():
-    """Return True if the worktree has any uncommitted changes (staged, unstaged, or untracked)."""
+    """Return True if the worktree has uncommitted changes beyond orchestrator artifacts."""
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, check=True,
         )
-        return bool(result.stdout.strip())
+        for line in result.stdout.splitlines():
+            # porcelain format: XY <path> or XY <path> -> <path>
+            path = line[3:].split(" -> ")[0]
+            if not any(path == art.rstrip("/") or path.startswith(art) for art in _OWN_ARTIFACTS):
+                return True
+        return False
     except subprocess.CalledProcessError:
         return False
 
