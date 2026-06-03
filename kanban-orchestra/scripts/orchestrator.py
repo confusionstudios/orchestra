@@ -2296,6 +2296,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     db_path = db.get_db_path()
+
+    # Check worktree cleanliness BEFORE creating any files (log dir, lock
+    # file) that would themselves dirty the worktree and cause a false
+    # positive on the very check we're about to run.
+    if is_worktree_dirty():
+        print("[orchestrator] Refusing to start: git worktree is dirty. "
+              "Commit, stash, or clean it before starting the orchestrator.",
+              file=sys.stderr)
+        return 2
+
     log_path = db.get_orchestrator_log_path(db_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _log_fh = log_path.open("a", encoding="utf-8", buffering=1)
@@ -2319,9 +2329,6 @@ def main(argv=None):
         log(f"Logging to {log_path}")
         lock_path = acquire_singleton_lock(db_path=db_path)
         log(f"Acquired singleton lock: {lock_path}")
-        if is_worktree_dirty():
-            log("Refusing to start: git worktree is dirty. Commit, stash, or clean it before starting the orchestrator.")
-            return 2
         if not args.no_dashboard:
             start_dashboard(db_path, preferred_port=args.dashboard_port)
 
