@@ -197,9 +197,9 @@ For several repo instances, use the fleet command:
 ```
 
 `ko-fleet` reads `~/.config/orchestra/fleet.repos`, a private flat list with
-one repo root per line. It derives display names from each path. `start` is
-all-or-nothing for selected repos: if any selected repo is dirty or invalid,
-nothing launches.
+one repo root per line. It derives display names from each path. `start`
+skips dirty stopped repos and keeps launching clean stopped repos; invalid
+repo config remains a hard failure.
 
 ### YOLO Mode and Hardening
 
@@ -217,8 +217,8 @@ account, an OrbStack/Docker container, or a `sandbox-exec` profile. See
 
 ### Tips
 
-* Orchestra will not launch against a dirty worktree. Commit or stash before
-  starting.
+* A single Orchestra instance will not launch against a dirty worktree. Commit
+  or stash before starting that repo.
 * The agent running the Kanban skill should not modify the worktree itself —
   queued runs block if uncommitted changes appear between tasks.
 * Set a task to `none` status while you're still editing it. Change it to
