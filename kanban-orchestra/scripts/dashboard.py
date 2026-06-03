@@ -1399,7 +1399,11 @@ nav {
   gap: 16px;
 }
 
-nav > a:first-child::before {
+.nav-title {
+  flex: 0 0 auto;
+}
+
+.nav-title::before {
   content: "$ ";
   color: var(--muted);
 }
@@ -1412,6 +1416,18 @@ nav a {
 }
 
 nav a:hover { color: #ffffff; text-decoration: none; }
+
+.nav-repo-path {
+  color: var(--muted);
+  font-size: 0.82rem;
+  margin-left: auto;
+  max-width: min(64vw, 760px);
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 h1 { margin: 0 0 8px; font-size: 1.6rem; color: var(--accent); text-shadow: 0 0 18px rgba(0,204,68,0.28); }
 h2 { margin: 0 0 12px; font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; color: var(--accent); }
@@ -1703,6 +1719,11 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
     flex-wrap: wrap;
   }
 
+  .nav-repo-path {
+    flex-basis: 100%;
+    max-width: 100%;
+  }
+
   .card {
     padding: 14px 12px;
   }
@@ -1821,6 +1842,7 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 
 
 def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
+    running_directory = _running_directory_display()
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1832,8 +1854,9 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
 </head>
 <body>
   <nav>
-    <a href="/">Kanban Orchestra</a>
+    <a class="nav-title" href="/">Kanban Orchestra</a>
     {nav_extra}
+    <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
   </nav>
   <main>
     {body}
@@ -2065,7 +2088,6 @@ def index():
 
     body = f"""
     <h1>Kanban Orchestra</h1>
-    <p class="lede">Running against <code>{_esc(_running_directory_display())}</code></p>
     <div id="health-wrap">{health_html}</div>
     <div id="current-task-wrap">{current_html}</div>
     <div id="agent-output-wrap">{agent_output_html}</div>

@@ -178,6 +178,14 @@ class TestPageShell(unittest.TestCase):
         self.assertNotIn("Intl.DateTimeFormat", html)
         self.assertNotIn("timeZoneName", html)
 
+    def test_page_shell_shows_running_directory_in_nav(self):
+        with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
+            html = dashboard._page_shell("Title", "<p>Body</p>")
+
+        self.assertIn('<a class="nav-title" href="/">Kanban Orchestra</a>', html)
+        self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', html)
+        self.assertNotIn("Running against", html)
+
 
 class TestHealthCard(unittest.TestCase):
     """Tests for render_health_card."""
@@ -1828,15 +1836,27 @@ class TestOverviewPage(unittest.TestCase):
         os.unlink(self.db_path)
         os.environ.pop("KANBAN_DB", None)
 
-    def test_overview_shows_running_directory(self):
+    def test_overview_shows_running_directory_in_header_only(self):
         from fastapi.testclient import TestClient
 
         client = TestClient(dashboard.app)
         with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
             resp = client.get("/")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("Running against <code>~/work-repo</code>", resp.text)
+        self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
+        self.assertNotIn("Running against", resp.text)
         self.assertNotIn("Overview is read-only", resp.text)
+
+    def test_task_detail_shows_running_directory_in_header(self):
+        from fastapi.testclient import TestClient
+
+        tid = db.add_task(self.conn, "Task detail path", branch="feat-path")
+        client = TestClient(dashboard.app)
+        with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
+            resp = client.get(f"/task/{tid}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
+        self.assertNotIn("Running against", resp.text)
 
     def test_overview_timezone_note_moves_to_bottom(self):
         from fastapi.testclient import TestClient
