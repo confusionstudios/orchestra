@@ -708,7 +708,7 @@ def handle_commit_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn, use_review_command=True)
+    ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -724,7 +724,7 @@ def handle_commit_review(task, conn):
                    kind="comment", author="orchestrator")
 
     prompt = prompt_builder.build_prompt(task, "commit-review", reviewer, comments)
-    exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-review", use_review_command=True)
+    exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-review")
 
     if exit_code != 0:
         db.add_comment(conn, task["id"],
@@ -820,7 +820,7 @@ def handle_pull_request_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn, use_review_command=True)
+    ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -840,7 +840,7 @@ def handle_pull_request_review(task, conn):
     )
 
     prompt = prompt_builder.build_prompt(task, "pull-request-review", reviewer, comments)
-    exit_code = run_agent(reviewer, prompt, task["id"], conn, "pull-request-review", use_review_command=True)
+    exit_code = run_agent(reviewer, prompt, task["id"], conn, "pull-request-review")
 
     if exit_code != 0:
         db.add_comment(
@@ -944,7 +944,7 @@ def handle_other_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn, use_review_command=True)
+    ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -964,7 +964,7 @@ def handle_other_review(task, conn):
     )
 
     prompt = prompt_builder.build_prompt(task, "other-review", reviewer, comments)
-    exit_code = run_agent(reviewer, prompt, task["id"], conn, "other-review", use_review_command=True)
+    exit_code = run_agent(reviewer, prompt, task["id"], conn, "other-review")
 
     if exit_code != 0:
         db.add_comment(
@@ -1056,7 +1056,7 @@ def handle_commit_review_supertask(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = DEFAULT_SUPER_REVIEWER
-    ensure_agent_acked(reviewer, task["id"], conn, use_review_command=True)
+    ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1072,7 +1072,7 @@ def handle_commit_review_supertask(task, conn):
                    kind="comment", author="orchestrator")
 
     prompt = prompt_builder.build_prompt(task, "commit-review-supertask", reviewer, comments)
-    exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-review-supertask", use_review_command=True)
+    exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-review-supertask")
 
     if exit_code != 0:
         db.add_comment(conn, task["id"],
@@ -1172,7 +1172,7 @@ def handle_commit_plan_review(task, conn):
     is not incremented for planning rejections.
     """
     reviewer = DEFAULT_PLAN_REVIEWER
-    ensure_agent_acked(reviewer, task["id"], conn, use_review_command=True)
+    ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1193,7 +1193,7 @@ def handle_commit_plan_review(task, conn):
     start_comment_id = all_comments_before[-1]["id"] if all_comments_before else 0
 
     prompt = prompt_builder.build_prompt(task, "commit-plan-review", reviewer, comments)
-    exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-plan-review", use_review_command=True)
+    exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-plan-review")
 
     if exit_code != 0:
         db.add_comment(conn, task["id"],

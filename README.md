@@ -240,6 +240,18 @@ export ORCHESTRA_DEFAULT_SUPER_PLANNER=opus
 export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
 ```
 
+To smoke-test the configured replacement agents, run:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-agent-smoke"
+```
+
+It uses `shared_scripts/agent_registry.yaml`, asks each enabled matrix entry
+to write a short report, and stores local output under
+`.kanban-orchestra/agent-smoke/`. Edit `AGENT_MATRIX` in
+`shared_scripts/agent_smoke.py` to change the default agent/model set, or use
+`--skip` for a one-off run.
+
 ## Source Layout
 
 | Path | Contents |
