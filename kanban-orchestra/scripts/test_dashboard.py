@@ -178,6 +178,14 @@ class TestPageShell(unittest.TestCase):
         self.assertNotIn("Intl.DateTimeFormat", html)
         self.assertNotIn("timeZoneName", html)
 
+    def test_page_shell_shows_running_directory_in_nav(self):
+        with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
+            html = dashboard._page_shell("Title", "<p>Body</p>")
+
+        self.assertIn('<a class="nav-title" href="/">Kanban Orchestra</a>', html)
+        self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', html)
+        self.assertNotIn("Running against", html)
+
 
 class TestHealthCard(unittest.TestCase):
     """Tests for render_health_card."""
@@ -1225,6 +1233,121 @@ class TestCurrentTaskCardRunLog(unittest.TestCase):
         self.assertIn('class="log-row log-row-picked-up"', html)
 
 
+class TestCurrentAgentOutputPanel(unittest.TestCase):
+    """Tests for current agent output selection and rendering."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+
+    def tearDown(self):
+        artifacts = db.get_artifacts_root(self.db_path)
+        if artifacts.exists():
+            for path in sorted(artifacts.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            artifacts.rmdir()
+        self.conn.close()
+        os.unlink(self.db_path)
+
+    def _write_transcript(self, task_id, name, text, mtime):
+        task_dir = db.get_artifacts_root(self.db_path) / f"task-{task_id}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        path = task_dir / name
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_idle_state_has_clear_empty_message(self):
+        state = dashboard.current_agent_output_state(None, self.conn)
+
+        self.assertEqual(state["state"], "idle")
+        self.assertIn("no active task", state["message"])
+
+    def test_pending_state_when_active_phase_has_no_transcript(self):
+        tid = db.add_task(self.conn, "Active output", coder_agent="codex")
+        runtime = {"current_task_id": tid, "current_step": "commit-make"}
+
+        state = dashboard.current_agent_output_state(runtime, self.conn)
+
+        self.assertEqual(state["state"], "pending")
+        self.assertEqual(state["task_id"], tid)
+        self.assertEqual(state["step"], "commit-make")
+        self.assertIn("No agent output file", state["message"])
+
+    def test_selects_latest_transcript_for_current_step_only(self):
+        tid = db.add_task(self.conn, "Active output", coder_agent="codex")
+        older = self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "older coder output\n",
+            100,
+        )
+        latest = self._write_transcript(
+            tid,
+            "20260603-010001-000000-commit-make-codex.log",
+            "latest coder output\n",
+            200,
+        )
+        self._write_transcript(
+            tid,
+            "20260603-010002-000000-commit-review-cursor-composer-2.5.log",
+            "review output\n",
+            300,
+        )
+        runtime = {"current_task_id": tid, "current_step": "commit-make"}
+
+        state = dashboard.current_agent_output_state(runtime, self.conn)
+
+        self.assertEqual(state["state"], "ready")
+        self.assertEqual(state["path"], latest)
+        self.assertNotEqual(state["path"], older)
+        self.assertEqual(state["lines"], ["latest coder output"])
+
+    def test_follows_phase_when_current_step_changes(self):
+        tid = db.add_task(self.conn, "Active output", coder_agent="codex")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "coder output\n",
+            100,
+        )
+        review = self._write_transcript(
+            tid,
+            "20260603-010001-000000-commit-review-cursor-composer-2.5.log",
+            "review output\n",
+            200,
+        )
+        runtime = {"current_task_id": tid, "current_step": "commit-review"}
+
+        state = dashboard.current_agent_output_state(runtime, self.conn)
+
+        self.assertEqual(state["path"], review)
+        self.assertEqual(state["step"], "commit-review")
+        self.assertEqual(state["lines"], ["review output"])
+
+    def test_render_includes_metadata_and_tail(self):
+        tid = db.add_task(self.conn, "Active output", coder_agent="codex")
+        path = self._write_transcript(
+            tid,
+            "20260603-010000-000000-other-make-codex.log",
+            "first\nsecond\n",
+            100,
+        )
+        runtime = {"current_task_id": tid, "current_step": "other-make"}
+
+        html = dashboard.render_current_agent_output_panel(runtime, self.conn)
+
+        self.assertIn("Agent Output", html)
+        self.assertIn(f">#{tid}</a>", html)
+        self.assertIn("other-make", html)
+        self.assertIn(path.name, html)
+        self.assertIn("first", html)
+        self.assertIn("second", html)
+        self.assertIn('data-stick-to-bottom="true"', html)
+
+
 class TestGlobalRunLogPanel(unittest.TestCase):
     """Tests for render_global_run_log_panel."""
 
@@ -1713,15 +1836,27 @@ class TestOverviewPage(unittest.TestCase):
         os.unlink(self.db_path)
         os.environ.pop("KANBAN_DB", None)
 
-    def test_overview_shows_running_directory(self):
+    def test_overview_shows_running_directory_in_header_only(self):
         from fastapi.testclient import TestClient
 
         client = TestClient(dashboard.app)
         with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
             resp = client.get("/")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("Running against <code>~/work-repo</code>", resp.text)
+        self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
+        self.assertNotIn("Running against", resp.text)
         self.assertNotIn("Overview is read-only", resp.text)
+
+    def test_task_detail_shows_running_directory_in_header(self):
+        from fastapi.testclient import TestClient
+
+        tid = db.add_task(self.conn, "Task detail path", branch="feat-path")
+        client = TestClient(dashboard.app)
+        with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
+            resp = client.get(f"/task/{tid}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
+        self.assertNotIn("Running against", resp.text)
 
     def test_overview_timezone_note_moves_to_bottom(self):
         from fastapi.testclient import TestClient

@@ -197,9 +197,9 @@ For several repo instances, use the fleet command:
 ```
 
 `ko-fleet` reads `~/.config/orchestra/fleet.repos`, a private flat list with
-one repo root per line. It derives display names from each path. `start` is
-all-or-nothing for selected repos: if any selected repo is dirty or invalid,
-nothing launches.
+one repo root per line. It derives display names from each path. `start`
+skips dirty stopped repos and keeps launching clean stopped repos; invalid
+repo config remains a hard failure.
 
 ### YOLO Mode and Hardening
 
@@ -217,8 +217,8 @@ account, an OrbStack/Docker container, or a `sandbox-exec` profile. See
 
 ### Tips
 
-* Orchestra will not launch against a dirty worktree. Commit or stash before
-  starting.
+* A single Orchestra instance will not launch against a dirty worktree. Commit
+  or stash before starting that repo.
 * The agent running the Kanban skill should not modify the worktree itself —
   queued runs block if uncommitted changes appear between tasks.
 * Set a task to `none` status while you're still editing it. Change it to
@@ -239,6 +239,18 @@ export ORCHESTRA_DEFAULT_PLAN_REVIEWER=codex
 export ORCHESTRA_DEFAULT_SUPER_PLANNER=opus
 export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
 ```
+
+To smoke-test the configured replacement agents, run:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-agent-smoke"
+```
+
+It uses `shared_scripts/agent_registry.yaml`, asks each enabled matrix entry
+to write a short report, and stores local output under
+`.kanban-orchestra/agent-smoke/`. Edit `AGENT_MATRIX` in
+`shared_scripts/agent_smoke.py` to change the default agent/model set, or use
+`--skip` for a one-off run.
 
 ## Source Layout
 

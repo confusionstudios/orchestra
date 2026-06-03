@@ -172,3 +172,90 @@ class TestBuildUpdate(unittest.TestCase):
         update = get_kanban_update.build_update(self.conn)
 
         self.assertIn("processes: none found", update)
+        self.assertIn("dashboard: not running", update)
+
+    def test_running_dashboard_url_is_shown(self):
+        identity = db.get_instance_identity(self.db_path)
+        dashboard_path = Path(identity["runtime_root"]) / "dashboard.json"
+        dashboard_path.parent.mkdir(parents=True, exist_ok=True)
+        dashboard_path.write_text(
+            json.dumps(
+                {
+                    "role": "dashboard",
+                    "pid": os.getpid(),
+                    "repo_root": identity["repo_root"],
+                    "db_path": identity["db_path"],
+                    "runtime_root": identity["runtime_root"],
+                    "lock_path": identity["lock_path"],
+                    "url": "http://127.0.0.1:8432",
+                }
+            ),
+            encoding="utf-8",
+        )
+        db.upsert_runtime(
+            self.conn,
+            status="idle",
+            pid=os.getpid(),
+            started_at=None,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            current_task_id=None,
+            current_step="none",
+            active_agents=0,
+            status_message="idle",
+        )
+
+        update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn("dashboard: http://127.0.0.1:8432", update)
+
+    def test_missing_dashboard_metadata_reports_not_running(self):
+        db.upsert_runtime(
+            self.conn,
+            status="idle",
+            pid=os.getpid(),
+            started_at=None,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            current_task_id=None,
+            current_step="none",
+            active_agents=0,
+            status_message="idle",
+        )
+
+        update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn("dashboard: not running", update)
+
+    def test_stale_dashboard_metadata_reports_not_running(self):
+        identity = db.get_instance_identity(self.db_path)
+        dashboard_path = Path(identity["runtime_root"]) / "dashboard.json"
+        dashboard_path.parent.mkdir(parents=True, exist_ok=True)
+        dashboard_path.write_text(
+            json.dumps(
+                {
+                    "role": "dashboard",
+                    "pid": 999999999,
+                    "repo_root": identity["repo_root"],
+                    "db_path": identity["db_path"],
+                    "runtime_root": identity["runtime_root"],
+                    "lock_path": identity["lock_path"],
+                    "url": "http://127.0.0.1:8432",
+                }
+            ),
+            encoding="utf-8",
+        )
+        db.upsert_runtime(
+            self.conn,
+            status="idle",
+            pid=os.getpid(),
+            started_at=None,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            current_task_id=None,
+            current_step="none",
+            active_agents=0,
+            status_message="idle",
+        )
+
+        update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn("dashboard: not running", update)
+        self.assertNotIn("dashboard: http://127.0.0.1:8432", update)

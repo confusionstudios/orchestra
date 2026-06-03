@@ -347,7 +347,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
 
         with patch.object(fleet, "require_tool") as require_tool, \
-             patch.object(fleet, "require_startable") as require_startable, \
+             patch.object(fleet, "dirty_lines", return_value=[]), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
              patch.object(fleet.subprocess, "run") as run, \
@@ -357,7 +357,6 @@ class TestFleetOperatorFlows(unittest.TestCase):
             fleet.start([repo])
 
         require_tool.assert_called_once_with("tmux")
-        require_startable.assert_called_once_with([repo])
         run.assert_called_once_with(
             [
                 "tmux",
@@ -381,7 +380,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         ]
 
         with patch.object(fleet, "require_tool"), \
-             patch.object(fleet, "require_startable"), \
+             patch.object(fleet, "dirty_lines", return_value=[]), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
              patch.object(fleet.subprocess, "run") as run, \
@@ -399,7 +398,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         stopped = fleet.FleetRepo("stopped", Path("/tmp/stopped"), Path("/tmp/stopped"))
 
         with patch.object(fleet, "require_tool"), \
-             patch.object(fleet, "require_startable") as require_startable, \
+             patch.object(fleet, "dirty_lines", return_value=[]) as dirty_lines, \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(
                  fleet,
@@ -415,8 +414,34 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet, "print_status"):
             fleet.start([running, stopped])
 
-        require_startable.assert_called_once_with([stopped])
+        dirty_lines.assert_called_once_with(stopped)
         run.assert_called_once()
+
+    def test_start_skips_dirty_stopped_repos_and_launches_clean_ones(self):
+        dirty = fleet.FleetRepo("dirty", Path("/tmp/dirty"), Path("/tmp/dirty"))
+        clean = fleet.FleetRepo("clean", Path("/tmp/clean"), Path("/tmp/clean"))
+        err = io.StringIO()
+
+        def fake_dirty_lines(repo):
+            return [" M file.txt"] if repo.label == "dirty" else []
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "dirty_lines", side_effect=fake_dirty_lines), \
+             patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
+             patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
+             patch.object(fleet.subprocess, "run") as run, \
+             patch.object(fleet, "wait_dashboard_ready", return_value=True), \
+             patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "print_status"), \
+             redirect_stderr(err):
+            fleet.start([dirty, clean])
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("-c") + 1], "/tmp/clean")
+        self.assertIn("skipped dirty repo", err.getvalue())
+        self.assertIn("dirty", err.getvalue())
+        self.assertIn("M file.txt", err.getvalue())
 
     def test_start_reports_all_invalid_repos_before_launching(self):
         repos = [
@@ -451,7 +476,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
             return True
 
         with patch.object(fleet, "require_tool"), \
-             patch.object(fleet, "require_startable"), \
+             patch.object(fleet, "dirty_lines", return_value=[]), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
              patch.object(fleet.subprocess, "run", side_effect=fake_run), \
@@ -467,7 +492,6 @@ class TestFleetOperatorFlows(unittest.TestCase):
         out = io.StringIO()
 
         with patch.object(fleet, "require_tool"), \
-             patch.object(fleet, "require_startable"), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("running/idle", "123", "-", "orch-repo")), \
              patch.object(fleet, "request_dashboard_start") as request_start, \

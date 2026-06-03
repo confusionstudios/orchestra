@@ -157,6 +157,19 @@ def _kanban_pids(identity: dict) -> list[tuple[int, str]]:
     return results
 
 
+def _dashboard_status_url(identity: dict) -> str | None:
+    """Return the repo-local dashboard URL when metadata and process are live."""
+    dashboard_path = Path(identity["runtime_root"]) / "dashboard.json"
+    payload = _read_key_value_or_json(dashboard_path)
+    url = payload.get("url")
+    if not url or not _metadata_matches_identity(payload, identity):
+        return None
+    pid = _metadata_pid(dashboard_path, "dashboard", identity)
+    if not _pid_alive(pid):
+        return None
+    return str(url)
+
+
 def _format_skips(skips: list[str] | None) -> str:
     if not skips:
         return ""
@@ -195,6 +208,11 @@ def build_update(conn) -> str:
             lines.append(f"  processes: {', '.join(pid_parts)}")
         else:
             lines.append("  processes: none found")
+        dashboard_url = _dashboard_status_url(identity)
+        if dashboard_url:
+            lines.append(f"  dashboard: {dashboard_url}")
+        else:
+            lines.append("  dashboard: not running")
 
         # ── Active task ──────────────────────────────────────────────────
         tid = runtime.get("current_task_id")

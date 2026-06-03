@@ -552,6 +552,28 @@ def require_startable(repos: list[FleetRepo]) -> None:
     raise SystemExit(1)
 
 
+def clean_start_repos(repos: list[FleetRepo]) -> list[FleetRepo]:
+    """Return stopped repos that can be launched, reporting dirty skips."""
+    clean = []
+    dirty = []
+    for repo in repos:
+        lines = dirty_lines(repo)
+        if lines:
+            dirty.append((repo, lines))
+        else:
+            clean.append(repo)
+
+    if dirty:
+        print("Fleet start skipped dirty repo(s); clean repos will still start.", file=sys.stderr)
+        for repo, lines in dirty:
+            print(f"\n{repo.label}: {display_path(repo.root)}", file=sys.stderr)
+            for line in lines[:12]:
+                print(f"  {line}", file=sys.stderr)
+            if len(lines) > 12:
+                print(f"  ... {len(lines) - 12} more", file=sys.stderr)
+    return clean
+
+
 def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
@@ -652,11 +674,14 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
         if not status_is_running(status) and session == "-":
             repos_to_start.append(repo)
     if precheck:
-        require_startable([*invalid, *repos_to_start])
+        if invalid:
+            require_startable(invalid)
+        repos_to_start = clean_start_repos(repos_to_start)
     elif invalid:
         for repo in invalid:
             print(f"{repo.label}: invalid config ({repo.error})", file=sys.stderr)
         raise SystemExit(1)
+    startable_roots = {repo.root for repo in repos_to_start}
     for index, (repo, state) in enumerate(states):
         preferred_port = dashboard_port_for_index(index)
         status, orch_pid, dashboard_pid, session = state
@@ -672,6 +697,8 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
             continue
         if session != "-":
             print(f"{repo.label}: tmux session already exists without a live orchestrator ({session})")
+            continue
+        if repo.root not in startable_roots:
             continue
         subprocess.run(
             [
