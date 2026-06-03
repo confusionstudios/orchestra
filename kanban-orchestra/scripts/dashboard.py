@@ -1237,6 +1237,99 @@ def _tail_text_file(path: Path, limit: int = 200) -> list[str]:
         return list(deque((line.rstrip("\n") for line in handle), maxlen=limit))
 
 
+def _latest_agent_transcript_for_step(
+    task_id: int,
+    step: str | None,
+    *,
+    db_path: str | None = None,
+) -> Path | None:
+    """Return the newest transcript matching one task's active step."""
+    if not step or step == "none":
+        return None
+    task_dir = db.get_artifacts_root(db_path) / f"task-{task_id}"
+    if not task_dir.exists():
+        return None
+    candidates = [path for path in task_dir.glob(f"*-{step}-*.log") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def current_agent_output_state(runtime: dict | None, conn) -> dict:
+    """Return dashboard data for the current phase's latest agent transcript."""
+    if runtime is None or not runtime.get("current_task_id"):
+        return {"state": "idle", "message": "Orchestrator is idle — no active task."}
+    if conn is None:
+        return {"state": "unavailable", "message": "Database not available."}
+
+    task_id = runtime["current_task_id"]
+    task = db.get_task(conn, task_id)
+    if task is None:
+        return {
+            "state": "missing-task",
+            "task_id": task_id,
+            "message": f"Task #{task_id} not found in database.",
+        }
+
+    step = runtime.get("current_step") or task.get("next_step") or ""
+    db_path = _connection_db_path(conn)
+    transcript_path = _latest_agent_transcript_for_step(task_id, step, db_path=db_path)
+    if transcript_path is None:
+        return {
+            "state": "pending",
+            "task_id": task_id,
+            "step": step,
+            "message": "No agent output file for this phase yet.",
+        }
+
+    stat = transcript_path.stat()
+    updated = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "state": "ready",
+        "task_id": task_id,
+        "step": step,
+        "path": transcript_path,
+        "basename": transcript_path.name,
+        "updated_at": updated,
+        "lines": _tail_text_file(transcript_path, limit=240),
+    }
+
+
+def render_current_agent_output_panel(runtime: dict | None, conn) -> str:
+    """Render the active phase's live agent transcript tail."""
+    state = current_agent_output_state(runtime, conn)
+    if state.get("state") != "ready":
+        task_meta = ""
+        if state.get("task_id"):
+            task_meta = f'<p><strong>Task:</strong> <a href="/task/{_esc(state["task_id"])}">#{_esc(state["task_id"])}</a></p>'
+        if state.get("step"):
+            task_meta += f'<p><strong>Step:</strong> {_esc(state["step"])}</p>'
+        return f"""
+        <div class="card" id="current-agent-output-panel">
+          <h2>Agent Output</h2>
+          {task_meta}
+          <p class="muted">{_esc(state.get("message") or "No agent output available.")}</p>
+        </div>"""
+
+    lines = state.get("lines") or []
+    entries = "\n".join(f'<div class="log-output-line">{_esc(line)}</div>' for line in lines)
+    output_html = (
+        f'<div class="run-log agent-output-log" data-stick-to-bottom="true">{entries}</div>'
+        if entries
+        else '<p class="muted">Agent output file exists but is empty.</p>'
+    )
+    path_display = _abbreviate_home(Path(state["path"]).resolve())
+    return f"""
+    <div class="card" id="current-agent-output-panel">
+      <h2>Agent Output</h2>
+      <p><strong>Task:</strong> <a href="/task/{_esc(state['task_id'])}">#{_esc(state['task_id'])}</a> &nbsp;
+         <strong>Step:</strong> {_esc(state.get('step') or '')}</p>
+      <p><strong>File:</strong> <code>{_esc(state.get('basename') or '')}</code></p>
+      <p class="muted"><strong>Path:</strong> {_esc(path_display)} &nbsp; <strong>Updated:</strong> {_live_age(state.get('updated_at'))}</p>
+      {output_html}
+    </div>"""
+
+
 def _slice_from_last_orchestrator_start(lines: list[str]) -> list[str]:
     """Return only the most recent orchestrator run from a tailed log."""
     start_marker = "Kanban Orchestra started. Polling for ready tasks..."
@@ -1869,12 +1962,14 @@ def _task_detail_response(
     header_html = render_task_header(form_task or task, conn, edit_error=edit_error, prev_id=prev_id, next_id=next_id)
     runtime_html = render_task_runtime_panel(task, runtime, ready_error=ready_error)
     comments_html = render_comments_panel(task_id, conn)
+    agent_output_html = render_current_agent_output_panel(runtime, conn)
     log_html = render_run_log_panel(task_id, conn)
 
     body = f"""
     <div id="task-header-wrap">{header_html}</div>
     <div id="task-runtime-wrap">{runtime_html}</div>
     <div id="task-comments-wrap">{comments_html}</div>
+    <div id="task-agent-output-wrap">{agent_output_html}</div>
     <div id="task-log-wrap">{log_html}</div>
     <p class="muted tz-note">Times shown in server local time ({_server_tz_label()}).</p>
     <script>
@@ -1930,6 +2025,7 @@ def _task_detail_response(
       }});
       source.addEventListener("task_runtime",  e => swap("task-runtime-wrap",  JSON.parse(e.data)));
       source.addEventListener("task_comments", e => swap("task-comments-wrap", JSON.parse(e.data)));
+      source.addEventListener("task_agent_output", e => swap("task-agent-output-wrap", JSON.parse(e.data)));
       source.addEventListener("task_log",      e => swap("task-log-wrap",      JSON.parse(e.data)));
 
       source.onerror = () => console.log("SSE connection interrupted");
@@ -1956,6 +2052,7 @@ def index():
         runtime = db.get_runtime(conn) if conn else None
         health_html = render_health_card(runtime, conn)
         current_html = render_current_task_card(runtime, conn)
+        agent_output_html = render_current_agent_output_panel(runtime, conn)
         active_supertasks_html = render_active_supertasks(conn)
         ready_html = render_ready_queue(conn, runtime)
         icebox_html = render_icebox(conn)
@@ -1971,6 +2068,7 @@ def index():
     <p class="lede">Running against <code>{_esc(_running_directory_display())}</code></p>
     <div id="health-wrap">{health_html}</div>
     <div id="current-task-wrap">{current_html}</div>
+    <div id="agent-output-wrap">{agent_output_html}</div>
     <div id="active-supertasks-wrap">{active_supertasks_html}</div>
     <div id="ready-queue-wrap">{ready_html}</div>
     <div id="icebox-wrap">{icebox_html}</div>
@@ -2003,6 +2101,7 @@ def index():
 
       source.addEventListener("health",       e => swap("health-wrap",       JSON.parse(e.data)));
       source.addEventListener("current_task", e => swap("current-task-wrap", JSON.parse(e.data)));
+      source.addEventListener("agent_output", e => swap("agent-output-wrap", JSON.parse(e.data)));
       source.addEventListener("active_supertasks", e => swap("active-supertasks-wrap", JSON.parse(e.data)));
       source.addEventListener("ready_queue",  e => swap("ready-queue-wrap",  JSON.parse(e.data)));
       source.addEventListener("icebox",       e => swap("icebox-wrap",       JSON.parse(e.data)));
@@ -2136,6 +2235,7 @@ def events_overview():
                 runtime = db.get_runtime(conn) if conn else None
                 health = render_health_card(runtime, conn)
                 current = render_current_task_card(runtime, conn)
+                agent_output = render_current_agent_output_panel(runtime, conn)
                 active_supertasks = render_active_supertasks(conn)
                 ready = render_ready_queue(conn, runtime)
                 icebox = render_icebox(conn)
@@ -2148,6 +2248,7 @@ def events_overview():
 
             yield f"event: health\ndata: {json.dumps(health)}\n\n"
             yield f"event: current_task\ndata: {json.dumps(current)}\n\n"
+            yield f"event: agent_output\ndata: {json.dumps(agent_output)}\n\n"
             yield f"event: active_supertasks\ndata: {json.dumps(active_supertasks)}\n\n"
             yield f"event: ready_queue\ndata: {json.dumps(ready)}\n\n"
             yield f"event: icebox\ndata: {json.dumps(icebox)}\n\n"
@@ -2173,11 +2274,13 @@ def events_task(task_id: int):
                     header_html = render_task_header(task, conn, prev_id=prev_id, next_id=next_id)
                     runtime_html = render_task_runtime_panel(task, runtime)
                     comments_html = render_comments_panel(task_id, conn)
+                    agent_output_html = render_current_agent_output_panel(runtime, conn)
                     log_html = render_run_log_panel(task_id, conn)
                 else:
                     header_html = '<div class="card" id="task-header"><p class="muted">Task not found.</p></div>'
                     runtime_html = '<div class="card" id="task-runtime-panel"><p class="muted">Task not found.</p></div>'
                     comments_html = '<div class="card" id="comments-panel"><p class="muted">Task not found.</p></div>'
+                    agent_output_html = '<div class="card" id="current-agent-output-panel"><p class="muted">Task not found.</p></div>'
                     log_html = '<div class="card" id="run-log-panel"><p class="muted">Task not found.</p></div>'
             finally:
                 if conn:
@@ -2186,6 +2289,7 @@ def events_task(task_id: int):
             yield f"event: task_header\ndata: {json.dumps(header_html)}\n\n"
             yield f"event: task_runtime\ndata: {json.dumps(runtime_html)}\n\n"
             yield f"event: task_comments\ndata: {json.dumps(comments_html)}\n\n"
+            yield f"event: task_agent_output\ndata: {json.dumps(agent_output_html)}\n\n"
             yield f"event: task_log\ndata: {json.dumps(log_html)}\n\n"
             time.sleep(5)
 
