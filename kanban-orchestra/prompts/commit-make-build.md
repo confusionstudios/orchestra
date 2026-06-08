@@ -81,4 +81,13 @@ the task requires detail:
    ```
    That returns `Task <id> (<attribution>)` — use the exact string as the
    last line.
-8. Stop here. The orchestrator routes the task to review next.
+8. **Pre-exit checklist.** Before your final response, run `task
+   show-comments <id>` and confirm both fresh records from this run exist:
+   - a `validation` comment for step 5
+   - a `commit-message` comment for step 7
+
+   An ordinary `--comment` is useful for blockers or extra notes, but it does
+   not satisfy the commit-message requirement. If the latest commit message
+   was recorded with `--comment`, immediately write the same message again
+   with `--commit-message` before exiting.
+9. Stop here. The orchestrator routes the task to review next.

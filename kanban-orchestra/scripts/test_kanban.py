@@ -1165,7 +1165,22 @@ class TestPromptAssembly(unittest.TestCase):
         self.assertIn("## Build Or Rework The Commit", verb_prompt)
         self.assertNotIn("# commit-make-finalize", verb_prompt)
         self.assertIn("Always write a fresh `--commit-message` comment during the current run", verb_prompt)
+        self.assertIn("Pre-exit checklist", verb_prompt)
+        self.assertIn("ordinary `--comment`", verb_prompt)
+        self.assertIn("commit-message requirement", verb_prompt)
+        self.assertIn("with `--commit-message` before exiting", verb_prompt)
         self.assertNotIn("valid during finalization only", verb_prompt)
+
+    def test_build_prompt_commit_make_lists_validation_command(self):
+        task = {
+            "id": 1, "title": "T", "description": None,
+            "branch": "b", "status": "running", "next_step": "commit-make",
+            "review_round": 0, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
+        }
+        prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
+        self.assertIn("task comment 1 --message-stdin --validation", prompt)
+        self.assertIn("task comment 1 --message-stdin --commit-message", prompt)
 
     def test_build_prompt_commit_make_guides_compact_shell_output(self):
         task = {

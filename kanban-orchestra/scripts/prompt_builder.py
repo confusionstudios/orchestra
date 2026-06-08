@@ -334,6 +334,7 @@ def build_prompt(task, verb, agent_name, comments):
             f"- {_t} set {task['id']} --stash-ref <stash-ref>",
             f"- {_t} set {task['id']} --commit-plan \"<plan text>\"",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --comment",
+            f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --validation",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --commit-message",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --done-without-commit",
             f"- {_t} get-commit-footer {task['id']}",
