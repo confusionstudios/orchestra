@@ -34,8 +34,8 @@ you intend to modify so the task trail is auditable.
 
 ## Operating Rules
 
-- One commit task maps to one commit. During Path A `commit-make`, stage the
-  complete candidate diff with `git add .` before stopping for review.
+- One commit task maps to one commit. During `commit-make` build/rework, stage
+  the complete candidate diff with `git add .` before stopping for review.
 - Pull request and other tasks do not create commits unless their step prompt
   explicitly says otherwise.
 - Use only the task fields and comment commands listed in

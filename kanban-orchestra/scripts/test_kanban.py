@@ -1161,11 +1161,11 @@ class TestPromptAssembly(unittest.TestCase):
             "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
         }
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
-        verb_prompt = prompt[prompt.index("# commit-make"):]
-        self.assertIn("## Path A", verb_prompt)
-        self.assertNotIn("## Path B", verb_prompt)
+        verb_prompt = prompt[prompt.index("# commit-make-build"):]
+        self.assertIn("## Build Or Rework The Commit", verb_prompt)
+        self.assertNotIn("# commit-make-finalize", verb_prompt)
         self.assertIn("Always write a fresh `--commit-message` comment during the current run", verb_prompt)
-        self.assertNotIn("valid on Path B only", verb_prompt)
+        self.assertNotIn("valid during finalization only", verb_prompt)
 
     def test_build_prompt_commit_make_guides_compact_shell_output(self):
         task = {
@@ -1175,7 +1175,7 @@ class TestPromptAssembly(unittest.TestCase):
             "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
         }
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
-        verb_prompt = prompt[prompt.index("# commit-make"):]
+        verb_prompt = prompt[prompt.index("# commit-make-build"):]
         self.assertIn("## Keep Shell Output Compact", verb_prompt)
         self.assertIn("git status --short", verb_prompt)
         self.assertIn("git diff --name-only", verb_prompt)
@@ -1195,9 +1195,9 @@ class TestPromptAssembly(unittest.TestCase):
              "message": "Same-round note: no broader refactor needed."},
         ]
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", comments)
-        verb_prompt = prompt[prompt.index("# commit-make"):]
-        self.assertIn("## Path B", verb_prompt)
-        self.assertNotIn("## Path A", verb_prompt)
+        verb_prompt = prompt[prompt.index("# commit-make-finalize"):]
+        self.assertIn("## Finalize The Approved Commit", verb_prompt)
+        self.assertNotIn("# commit-make-build", verb_prompt)
         self.assertIn("Read same-round review guidance before committing", verb_prompt)
         self.assertIn("Approval means the task may land", verb_prompt)
         self.assertIn("small, directly reviewer-requested edits", verb_prompt)
@@ -6377,8 +6377,8 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertNotIn("commit_plan", prompt)
         self.assertNotIn("Step 1: Add tests", prompt)
 
-    def test_build_prompt_omits_path_c_when_no_stash(self):
-        """build_prompt omits Path C (stash recovery) text when stash_ref is null."""
+    def test_build_prompt_omits_stash_recovery_when_no_stash(self):
+        """build_prompt omits stash recovery text when stash_ref is null."""
         task = {
             "id": 99, "title": "No stash prompt", "description": None,
             "branch": "b", "status": "running", "next_step": "commit-make",
@@ -6386,8 +6386,21 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
             "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
         }
         prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
-        self.assertNotIn("Path C: `stash_ref` is set", prompt)
+        self.assertNotIn("stash recovery: `stash_ref` is set", prompt)
         self.assertNotIn("git stash pop", prompt)
+
+    def test_build_prompt_prepends_stash_recovery_when_stash_is_set(self):
+        """build_prompt prepends stash recovery before the active commit-make prompt."""
+        task = {
+            "id": 99, "title": "Stash prompt", "description": None,
+            "branch": "b", "status": "running", "next_step": "commit-make",
+            "review_round": 0, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": "stash@{0}", "coder_agent": "claude",
+        }
+        prompt = orchestrator.build_prompt(task, "commit-make", "claude", [])
+        self.assertIn("stash recovery: `stash_ref` is set", prompt)
+        self.assertIn("git stash pop <stash_ref>", prompt)
+        self.assertLess(prompt.index("stash recovery: `stash_ref` is set"), prompt.index("# commit-make-build"))
 
     def test_build_prompt_omits_fields_for_supertasks(self):
         """build_prompt omits stash_ref and commit_hash from Task Context for supertask steps."""
@@ -7949,13 +7962,12 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(result.endswith(expected_footer), repr(result))
 
-    def test_path_b_prompt_references_get_commit_footer(self):
-        """The commit-make.md Path B section instructs agents to run get-commit-footer."""
-        prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "commit-make.md"
+    def test_finalize_prompt_references_get_commit_footer(self):
+        """The commit-make finalization prompt instructs agents to run get-commit-footer."""
+        prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "commit-make-finalize.md"
         content = prompt_path.read_text()
-        path_b_section = content[content.index("## Path B"):]
-        self.assertIn("get-commit-footer", path_b_section)
-        self.assertIn("Task <id> (<attribution>)", path_b_section)
+        self.assertIn("get-commit-footer", content)
+        self.assertIn("Task <id> (<attribution>)", content)
 
 
 class TestAgentPingACKGate(unittest.TestCase):

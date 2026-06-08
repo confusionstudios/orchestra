@@ -94,9 +94,9 @@ A commit task moves through these steps:
    `commit-plan-review`.
 2. `commit-plan-review` — reviewer assesses the plan. *Skippable when a plan
    exists.*
-3. `commit-make` (Path A) — coder builds and stages the change. Always runs.
+3. `commit-make` build/rework — coder builds and stages the change. Always runs.
 4. `commit-review` — reviewer inspects `git diff --cached`. *Skippable.*
-5. `commit-make` (Path B) — same coder considers approval notes and finalizes the commit after approval.
+5. `commit-make` finalization — same coder considers approval notes and finalizes the commit after approval.
    Always runs.
 
 Supertasks substitute `commit-make-supertask` and `commit-review-supertask`
@@ -108,8 +108,8 @@ Other tasks use `other-make` and `other-review`, and must leave durable
 completion evidence in a task comment instead of a commit or PR.
 
 When a prior `commit-make` saved WIP via `git stash`, the orchestrator
-prepends Path C (`commit-make-stash-recovery.md`) to the next `commit-make`
-prompt so the coder restores that work first.
+prepends stash recovery (`commit-make-stash-recovery.md`) to the next
+`commit-make` prompt so the coder restores that work first.
 
 Valid skip values: `commit-plan`, `commit-plan-review`, `commit-review`,
 `commit-review-supertask`, `pull-request-review`, `other-review`.

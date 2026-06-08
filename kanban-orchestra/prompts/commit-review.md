@@ -49,8 +49,9 @@ there instead of rebuilding context from scratch.
   diff or reported results give a specific reason to verify something.
   Prefer targeted checks (`grep`, reading one file) over full reruns.
 - If the task context shows `skip_build_until_approved: yes`, the maker's
-  validation comment may say the full build is deferred to Path B. That is
-  correct repo policy — evaluate the diff, not the absence of build output.
+  validation comment may say the full build is deferred to `commit-make`
+  finalization. That is correct repo policy — evaluate the diff, not the
+  absence of build output.
 - Approval rationale should be brief; rejection feedback must be specific
   enough that the coder can act on it.
 - The task's configured reviewer is shown as `reviewer_agent` in the task

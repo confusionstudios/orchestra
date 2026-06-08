@@ -1,12 +1,13 @@
-# Path C: `stash_ref` is set
+# stash recovery: `stash_ref` is set
 
-This path runs before Path A or Path B. A prior `commit-make` run blocked
-after saving WIP with `git stash`. Restore that work first.
+This section runs before the normal `commit-make` build or finalization prompt.
+A prior `commit-make` run blocked after saving WIP with `git stash`. Restore
+that work first.
 
 1. **Try to restore the stash.** Run `git stash pop <stash_ref>`.
 
 2. **If the pop is clean** — clear the recorded stash ref and continue with
-   Path A or Path B on the restored worktree:
+   the normal prompt on the restored worktree:
    ```
    task set <id> --stash-ref ""
    ```
