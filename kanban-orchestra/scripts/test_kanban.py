@@ -4464,7 +4464,7 @@ class TestSingletonLock(unittest.TestCase):
 
     def test_main_requests_dashboard_start_when_lock_is_unavailable(self):
         with patch.object(orchestrator, "acquire_singleton_lock", side_effect=orchestrator.SingletonLockError("busy")), \
-             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=True) as dirty_check, \
              patch.object(orchestrator, "request_dashboard_start", return_value=Path("/tmp/dashboard-start-request")) as request_start, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
@@ -4473,6 +4473,7 @@ class TestSingletonLock(unittest.TestCase):
             exit_code = orchestrator.main()
 
         self.assertEqual(exit_code, 0)
+        dirty_check.assert_not_called()
         request_start.assert_called_once()
         mock_connect.assert_not_called()
         mock_log.assert_any_call("busy")
@@ -4480,7 +4481,7 @@ class TestSingletonLock(unittest.TestCase):
 
     def test_main_no_dashboard_does_not_request_dashboard_when_lock_is_unavailable(self):
         with patch.object(orchestrator, "acquire_singleton_lock", side_effect=orchestrator.SingletonLockError("busy")), \
-             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=True) as dirty_check, \
              patch.object(orchestrator, "request_dashboard_start") as request_start, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
@@ -4489,6 +4490,7 @@ class TestSingletonLock(unittest.TestCase):
             exit_code = orchestrator.main(["--no-dashboard"])
 
         self.assertEqual(exit_code, 1)
+        dirty_check.assert_not_called()
         request_start.assert_not_called()
         mock_connect.assert_not_called()
         mock_log.assert_any_call("busy")

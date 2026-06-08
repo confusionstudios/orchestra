@@ -431,14 +431,29 @@ def get_head_commit_hash():
         return None
 
 
+_OWN_ARTIFACTS = {
+    ".kanban-orchestra/",
+    "kanban-orchestra.lock",
+    "kanban-orchestra.db",
+    "kanban-orchestra.db-journal",
+    "kanban-orchestra.db-shm",
+    "kanban-orchestra.db-wal",
+}
+
+
 def is_worktree_dirty():
-    """Return True if the worktree has any uncommitted changes (staged, unstaged, or untracked)."""
+    """Return True if the worktree has uncommitted changes (staged, unstaged, or untracked) beyond orchestrator artifacts."""
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, check=True,
         )
-        return bool(result.stdout.strip())
+        for line in result.stdout.splitlines():
+            # porcelain format: XY <path> or XY <path> -> <path>
+            path = line[3:].split(" -> ")[0]
+            if not any(path == art.rstrip("/") or path.startswith(art) for art in _OWN_ARTIFACTS):
+                return True
+        return False
     except subprocess.CalledProcessError:
         return False
 
@@ -2296,32 +2311,35 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     db_path = db.get_db_path()
-    log_path = db.get_orchestrator_log_path(db_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    _log_fh = log_path.open("a", encoding="utf-8", buffering=1)
-
-    def handle_sigint(signum, frame):
-        global _shutting_down
-        if _shutting_down:
-            # Second Ctrl-C: hard kill process group
-            log("Force shutdown.")
-            os.killpg(os.getpgrp(), signal.SIGKILL)
-        else:
-            _shutting_down = True
-            log("Ctrl-C received. Press again to force quit.")
-            raise KeyboardInterrupt
-
-    os.setpgrp()
-    signal.signal(signal.SIGINT, handle_sigint)
 
     conn = None
     try:
-        log(f"Logging to {log_path}")
         lock_path = acquire_singleton_lock(db_path=db_path)
-        log(f"Acquired singleton lock: {lock_path}")
+
         if is_worktree_dirty():
             log("Refusing to start: git worktree is dirty. Commit, stash, or clean it before starting the orchestrator.")
             return 2
+
+        log_path = db.get_orchestrator_log_path(db_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _log_fh = log_path.open("a", encoding="utf-8", buffering=1)
+
+        def handle_sigint(signum, frame):
+            global _shutting_down
+            if _shutting_down:
+                # Second Ctrl-C: hard kill process group
+                log("Force shutdown.")
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            else:
+                _shutting_down = True
+                log("Ctrl-C received. Press again to force quit.")
+                raise KeyboardInterrupt
+
+        os.setpgrp()
+        signal.signal(signal.SIGINT, handle_sigint)
+
+        log(f"Logging to {log_path}")
+        log(f"Acquired singleton lock: {lock_path}")
         if not args.no_dashboard:
             start_dashboard(db_path, preferred_port=args.dashboard_port)
 
