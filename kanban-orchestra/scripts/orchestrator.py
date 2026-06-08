@@ -442,7 +442,7 @@ _OWN_ARTIFACTS = {
 
 
 def is_worktree_dirty():
-    """Return True if the worktree has uncommitted changes beyond orchestrator artifacts."""
+    """Return True if the worktree has uncommitted changes (staged, unstaged, or untracked) beyond orchestrator artifacts."""
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
