@@ -72,8 +72,8 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
     elif skip_build_policy:
         validation_summary = (
             "*(no full-build validation recorded — this repo has `SKIP_BUILD_UNTIL_APPROVED: true` "
-            "in `AGENTS.md`, so the full build is intentionally deferred to Path B "
-            "(post-approval finalization). The missing full-build result (e.g. test suite output) "
+            "in `AGENTS.md`, so the full build is intentionally deferred to "
+            "`commit-make` finalization. The missing full-build result (e.g. test suite output) "
             "is expected here. The maker is still required to have recorded a deferred-validation "
             "comment explicitly stating that the full build was intentionally skipped — if that "
             "comment is present, the absence of a full-build result is correct and not a problem.)*"
@@ -83,7 +83,7 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
 
     policy_note = (
         "\n> **Repo policy:** `SKIP_BUILD_UNTIL_APPROVED: true` — full-build validation is "
-        "deferred to post-approval finalization (Path B). You are reviewing the diff without "
+        "deferred to post-approval `commit-make` finalization. You are reviewing the diff without "
         "a full-build result. If the maker recorded a deferred-validation comment, that is "
         "expected and correct per repo policy.\n"
         if skip_build_policy else ""
@@ -173,10 +173,10 @@ def _filter_comments_for_prompt(comments, verb, task=None):
     - For reviewer verbs (commit-review, commit-review-supertask): exclude
       commit-message and validation kinds — both are already surfaced in the
       ## Reviewer Handoff section, so including them again would be redundant.
-    - For commit-make: exclude commit-message and validation kinds. Path A must
-      create fresh versions, and Path B explicitly reads the canonical
-      commit-message from `task show-comments`, so inlining prior bodies only
-      bloats small-task prompts.
+    - For commit-make: exclude commit-message and validation kinds. The build
+      prompt must create fresh versions, and the finalization prompt explicitly
+      reads the canonical commit-message from `task show-comments`, so inlining
+      prior bodies only bloats small-task prompts.
     - For all verbs: cap at MAX_PRIOR_COMMENTS, keeping the most recent entries.
 
     Returns (filtered_comments, total_before_cap) so callers can render a
@@ -199,35 +199,25 @@ def _filter_comments_for_prompt(comments, verb, task=None):
     return filtered, total
 
 
-def _trim_commit_make_prompt_to_active_path(verb_text, task):
-    """Keep only the active commit-make path for the task's review state."""
-    path_a_marker = "## Path A"
-    path_b_marker = "## Path B"
-    path_a_start = verb_text.find(path_a_marker)
-    path_b_start = verb_text.find(path_b_marker)
-    if path_a_start == -1 or path_b_start == -1 or path_b_start <= path_a_start:
-        return verb_text
+def _prompt_path_for_verb(verb, task):
+    """Return the concrete prompt file for a lifecycle verb."""
+    prompt_name = verb
+    if verb == "commit-make":
+        if task.get("last_review_decision") == "approve":
+            prompt_name = "commit-make-finalize"
+        else:
+            prompt_name = "commit-make-build"
 
-    intro = verb_text[:path_a_start].rstrip()
-    if task.get("last_review_decision") == "approve":
-        active_path = verb_text[path_b_start:].strip()
-    else:
-        active_path = verb_text[path_a_start:path_b_start].strip()
-        if active_path.endswith("---"):
-            active_path = active_path[:-3].rstrip()
-
-    return f"{intro}\n\n{active_path}\n"
+    return _prompts_dir() / f"{prompt_name}.md"
 
 
 def build_prompt(task, verb, agent_name, comments):
     """Assemble the full prompt from shared context + verb-specific prompt."""
     shared_path = _prompts_dir() / "shared-task-context.md"
-    verb_path = _prompts_dir() / f"{verb}.md"
+    verb_path = _prompt_path_for_verb(verb, task)
 
     shared_text = shared_path.read_text() if shared_path.exists() else ""
     verb_text = verb_path.read_text() if verb_path.exists() else ""
-    if verb == "commit-make":
-        verb_text = _trim_commit_make_prompt_to_active_path(verb_text, task)
 
     # Conditionally prepend Path C (stash recovery) for commit-make
     if verb == "commit-make" and task.get("stash_ref"):
@@ -303,7 +293,7 @@ def build_prompt(task, verb, agent_name, comments):
         context_lines.append(
             "- skip_build_until_approved: yes "
             "(SKIP_BUILD_UNTIL_APPROVED marker detected in repo AGENTS.md — "
-            "see Path A / Path B guidance below)"
+            "see the commit-make build/finalization guidance below)"
         )
 
     try:
@@ -344,6 +334,7 @@ def build_prompt(task, verb, agent_name, comments):
             f"- {_t} set {task['id']} --stash-ref <stash-ref>",
             f"- {_t} set {task['id']} --commit-plan \"<plan text>\"",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --comment",
+            f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --validation",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --commit-message",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --done-without-commit",
             f"- {_t} get-commit-footer {task['id']}",
