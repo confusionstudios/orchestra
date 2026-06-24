@@ -45,9 +45,10 @@ Run only the review command for the selected `$reviewer`.
 Resolve the command through
 `agent_registry.resolve_review_agent_command(reviewer)`, then replace the
 single `{prompt}` placeholder with the review prompt. The shared resolver uses
-review-specific forms when configured, such as Codex `exec review --uncommitted`
-and Cursor `agent --mode ask`, and falls back to the normal agent command for
-providers without a review-specific template.
+review-specific forms only when they are known to be sufficiently permissive,
+such as Codex `exec review --uncommitted`, and falls back to the normal agent
+command for providers without a review-specific template. Do not use restrictive
+ASK/read-only modes for agent CLIs; they tend to block necessary tool access.
 
 ```bash
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
@@ -82,8 +83,9 @@ The command example assumes a macOS/Linux shell with `perl`. If it is unavailabl
 The Codex review subcommand gathers staged, unstaged, and untracked changes.
 Neither Codex, Claude, Cursor, Kilo, nor Antigravity is mechanically prevented from
 editing files in every environment, so the prompt must explicitly say `Do not
-edit files`. Prefer read/review-specific CLI modes and deny edit tools where
-the reviewer CLI supports it.
+edit files`. Do not compensate with restrictive ASK/read-only modes for agent
+CLIs; use normal permissive agent commands and rely on explicit review
+instructions.
 
 ## Review Prompt
 

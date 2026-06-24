@@ -3222,7 +3222,7 @@ class TestAgentTranscriptCapture(unittest.TestCase):
             ],
         )
 
-    def test_run_agent_uses_review_command_when_requested(self):
+    def test_run_agent_falls_back_to_normal_command_when_no_review_command_exists(self):
         tid = db.add_task(self.conn, "Review command", reviewer_agent="cursor-composer-2.5")
         fake_proc = self._fake_proc(["done\n"], 0)
 
@@ -3244,10 +3244,9 @@ class TestAgentTranscriptCapture(unittest.TestCase):
                 "cursor",
                 "agent",
                 "-p",
-                "--mode",
-                "ask",
                 "--model",
                 "composer-2.5",
+                "--yolo",
                 "--trust",
                 "prompt body",
             ],
@@ -7650,34 +7649,33 @@ class TestCommitFooter(unittest.TestCase):
             ],
         )
 
-    def test_cursor_alias_review_command_uses_read_only_mode(self):
+    def test_cursor_alias_review_command_uses_normal_permissive_mode(self):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor-composer-2.5"),
             [
                 "cursor",
                 "agent",
                 "-p",
-                "--mode",
-                "ask",
                 "--model",
                 "composer-2.5",
+                "--yolo",
                 "--trust",
                 "{prompt}",
             ],
         )
-        self.assertNotIn("--yolo", agent_registry.resolve_review_agent_command("cursor-composer-2.5"))
+        self.assertNotIn("--mode", agent_registry.resolve_review_agent_command("cursor-composer-2.5"))
+        self.assertIn("--yolo", agent_registry.resolve_review_agent_command("cursor-composer-2.5"))
 
-    def test_cursor_provider_review_command_substitutes_model(self):
+    def test_cursor_provider_review_command_falls_back_to_normal_command(self):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor:claude-opus-4-8-high"),
             [
                 "cursor",
                 "agent",
                 "-p",
-                "--mode",
-                "ask",
                 "--model",
                 "claude-opus-4-8-high",
+                "--yolo",
                 "--trust",
                 "{prompt}",
             ],

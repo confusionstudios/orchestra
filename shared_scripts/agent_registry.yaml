@@ -2,7 +2,6 @@ providers:
   cursor:
     label: Cursor {model}
     command: ["cursor", "agent", "-p", "--model", "{model}", "--yolo", "--trust", "{prompt}"]
-    review_command: ["cursor", "agent", "-p", "--mode", "ask", "--model", "{model}", "--trust", "{prompt}"]
   kilo:
     label: Kilo {model}
     command: ["kilo", "--model", "{model}", "run", "{prompt}"]
@@ -42,20 +41,15 @@ agents:
   - key: cursor-auto
     label: Cursor Auto
     command: ["cursor", "agent", "-p", "--model", "auto", "--yolo", "--trust", "{prompt}"]
-    review_command: ["cursor", "agent", "-p", "--mode", "ask", "--model", "auto", "--trust", "{prompt}"]
   - key: cursor-composer-2.5
     label: Cursor Composer 2.5
     command: ["cursor", "agent", "-p", "--model", "composer-2.5", "--yolo", "--trust", "{prompt}"]
-    review_command: ["cursor", "agent", "-p", "--mode", "ask", "--model", "composer-2.5", "--trust", "{prompt}"]
   - key: cursor-opus-4.6
     label: Cursor Opus 4.6 High
     command: ["cursor", "agent", "-p", "--model", "claude-4.6-opus-high", "--yolo", "--trust", "{prompt}"]
-    review_command: ["cursor", "agent", "-p", "--mode", "ask", "--model", "claude-4.6-opus-high", "--trust", "{prompt}"]
   - key: cursor-opus-4.7
     label: Cursor Opus 4.7 High
     command: ["cursor", "agent", "-p", "--model", "claude-opus-4-7-high", "--yolo", "--trust", "{prompt}"]
-    review_command: ["cursor", "agent", "-p", "--mode", "ask", "--model", "claude-opus-4-7-high", "--trust", "{prompt}"]
   - key: cursor-sonnet-4.6
     label: Cursor Sonnet 4.6
     command: ["cursor", "agent", "-p", "--model", "claude-4.6-sonnet-medium", "--yolo", "--trust", "{prompt}"]
-    review_command: ["cursor", "agent", "-p", "--mode", "ask", "--model", "claude-4.6-sonnet-medium", "--trust", "{prompt}"]
