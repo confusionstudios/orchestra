@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db
@@ -30,6 +31,10 @@ class TestBuildUpdate(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
         os.unlink(self.db_path)
+
+    def _fleet_repo(self):
+        root = Path(self.db_path).resolve().parent
+        return get_kanban_update.fleet.FleetRepo("short-name", root, root)
 
     def test_recently_done_shows_commit_hash(self):
         tid = db.add_task(self.conn, "Done task", branch="feat-done")
@@ -259,3 +264,44 @@ class TestBuildUpdate(unittest.TestCase):
 
         self.assertIn("dashboard: not running", update)
         self.assertNotIn("dashboard: http://127.0.0.1:8432", update)
+
+    def test_fleet_configured_running_repo_appends_dashboard_summary(self):
+        repo = self._fleet_repo()
+
+        with patch.object(get_kanban_update.fleet, "load_status_repos", return_value=[repo]), \
+             patch.object(get_kanban_update.fleet, "repo_process_state", return_value=("running/busy", "123", "456", "-")), \
+             patch.object(get_kanban_update.fleet, "dashboard_status_url", return_value="http://127.0.0.1:8427"):
+            update = get_kanban_update.build_update(self.conn)
+
+        self.assertTrue(
+            update.endswith(
+                "ATTENTION: start the orchestrator — no runtime row found\n\n"
+                "This repo (short-name) is running. Dash: http://127.0.0.1:8427"
+            )
+        )
+
+    def test_fleet_configured_stopped_repo_reports_dashboard_not_running(self):
+        repo = self._fleet_repo()
+
+        with patch.object(get_kanban_update.fleet, "load_status_repos", return_value=[repo]), \
+             patch.object(get_kanban_update.fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
+             patch.object(get_kanban_update.fleet, "dashboard_status_url", return_value="-"):
+            update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn(
+            "\n\nThis repo (short-name) is stopped. Dash: dashboard not running",
+            update,
+        )
+
+    def test_repo_not_in_fleet_keeps_existing_concise_output(self):
+        other_root = Path(self.db_path).resolve().parent / "other"
+        repo = get_kanban_update.fleet.FleetRepo("other", other_root, other_root)
+
+        with patch.object(get_kanban_update.fleet, "load_status_repos", return_value=[repo]), \
+             patch.object(get_kanban_update.fleet, "repo_process_state") as repo_process_state, \
+             patch.object(get_kanban_update.fleet, "dashboard_status_url") as dashboard_status_url:
+            update = get_kanban_update.build_update(self.conn)
+
+        self.assertNotIn("This repo (", update)
+        repo_process_state.assert_not_called()
+        dashboard_status_url.assert_not_called()
