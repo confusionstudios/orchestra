@@ -57,6 +57,38 @@ repo. Current generated wrappers under `.claude/skills/orch-*` and
 `.agents/skills/orch-*` remain on disk as ignored local generated files.
 Hand-edited or unknown non-`ko-*` files are left untouched.
 
+### 4. Register repos for ad-hoc sync
+
+To opt a repo into future bulk syncs from the Orchestra checkout:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/client-repo
+```
+
+Registration writes two things:
+
+- A repo-local `.orchestra-skill-sync` marker. This is safe to commit and says
+  the repo accepts shared Orchestra skill sync.
+- A private machine-local path entry in
+  `~/.config/orchestra/skill-sync.repos`, or in the path named by
+  `$ORCHESTRA_SKILL_SYNC_REPOS`.
+
+From the Orchestra checkout, sync every registered repo:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-sync-skills" --registered
+```
+
+Registered sync runs fix mode and then normal sync for each repo whose path is
+still valid and whose repo root still contains `.orchestra-skill-sync`. Missing
+paths or repos without the marker are skipped rather than guessed.
+
+To opt out:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-sync-skills" --unregister /path/to/client-repo
+```
+
 Each wrapper uses the same thin shared format:
 
 ```markdown

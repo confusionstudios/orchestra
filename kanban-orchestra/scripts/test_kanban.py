@@ -4027,6 +4027,75 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                 wrapper_path.read_text(encoding="utf-8"),
             )
 
+    def test_register_repo_for_skill_sync_writes_marker_and_private_registry(self):
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+
+            result = skill_wrappers.register_repo_for_skill_sync(target, registry)
+            second_result = skill_wrappers.register_repo_for_skill_sync(target, registry)
+
+            marker = target / skill_wrappers.SKILL_SYNC_MARKER
+            self.assertTrue(marker.exists())
+            self.assertIn("skills = true", marker.read_text(encoding="utf-8"))
+            self.assertEqual(result["repo"], str(target.resolve()))
+            self.assertFalse(second_result["registry_added"])
+            registry_lines = [
+                line for line in registry.read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            ]
+            self.assertEqual(registry_lines, [str(target.resolve())])
+
+    def test_sync_registered_repos_runs_fix_then_sync_for_opted_in_repo(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            _write_test_ai_skills(orchestra_dir)
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            skill_wrappers.register_repo_for_skill_sync(target, registry)
+
+            legacy = target / ".agents" / "skills" / "ko-kanban" / "SKILL.md"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                "---\nname: ko-kanban\ndescription: old\n---\n\nCustom old wrapper.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=target, check=True)
+
+            summary = skill_wrappers.sync_registered_repos(orchestra_dir, registry)
+
+            self.assertEqual(summary["synced"], [str(target.resolve())])
+            self.assertEqual(summary["skipped"], [])
+            self.assertEqual(summary["failed"], [])
+            self.assertFalse(legacy.exists())
+            self.assertTrue((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
+            tracked = subprocess.run(
+                ["git", "ls-files", "--", ".agents/skills/ko-kanban/SKILL.md"],
+                cwd=target,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(tracked, "")
+
+    def test_sync_registered_repos_skips_repo_without_opt_in_marker(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            _write_test_ai_skills(orchestra_dir)
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            skill_wrappers._write_registered_repo_paths(registry, [target])
+
+            summary = skill_wrappers.sync_registered_repos(orchestra_dir, registry)
+
+            self.assertEqual(summary["synced"], [])
+            self.assertEqual(summary["failed"], [])
+            self.assertEqual(summary["skipped"], [f"{target.resolve()}: missing {skill_wrappers.SKILL_SYNC_MARKER}"])
+            self.assertFalse((target / ".agents" / "skills" / "orch-kb-kanban").exists())
+
 
 class TestDevlogSkillHelper(unittest.TestCase):
     """Test the bundled devlog helper used by the shared devlog skill."""
