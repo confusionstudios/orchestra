@@ -26,6 +26,10 @@ test_workspace/
 
 # Generated Orchestra skill wrappers. Canonical source lives in AI-skills/.
 .kanban-orchestra/
+.claude/skills/orch-kb-*/
+.claude/skills/orch-adhoc-*/
+.agents/skills/orch-kb-*/
+.agents/skills/orch-adhoc-*/
 .claude/skills/ko-*/
 .gemini/skills/ko-*/
 .agents/skills/ko-*/

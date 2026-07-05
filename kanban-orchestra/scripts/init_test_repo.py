@@ -116,8 +116,10 @@ print("Wrote README.md")
     "kanban-orchestra.db-wal\n"
     "kanban-orchestra.lock\n"
     ".kanban-orchestra/\n"
-    ".claude/skills/ko-*/\n"
-    ".agents/skills/ko-*/\n",
+    ".claude/skills/orch-kb-*/\n"
+    ".claude/skills/orch-adhoc-*/\n"
+    ".agents/skills/orch-kb-*/\n"
+    ".agents/skills/orch-adhoc-*/\n",
     encoding="utf-8",
 )
 print("Wrote .gitignore")

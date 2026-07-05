@@ -256,7 +256,7 @@ to write a short report, and stores local output under
 
 | Path | Contents |
 |------|----------|
-| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` copies these into each agent's config directory |
+| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` copies Kanban wrappers as `orch-kb-*` and general workflow wrappers as `orch-adhoc-*` |
 | `kanban-orchestra/scripts/` | Task queue, dashboard, orchestrator, and CLI |
 | `kanban-orchestra/prompts/` | Prompts injected into task agents |
 | `bin/` | Thin wrappers that run through the checkout-local venv |

@@ -12,10 +12,12 @@ This script is meant to be run from the Orchestra checkout referenced by
 `$ORCHESTRA_DIR/AI-skills/*.md` unless `--orchestra-dir` is overridden.
 
 Wrappers are generated from the canonical skill docs in AI-skills/*.md and
-written into a target repo under:
+written into a target repo under category-specific names:
 
-  .claude/skills/ko-<skill>/SKILL.md
-  .agents/skills/ko-<skill>/SKILL.md
+  .claude/skills/orch-kb-<skill>/SKILL.md
+  .agents/skills/orch-kb-<skill>/SKILL.md
+  .claude/skills/orch-adhoc-<skill>/SKILL.md
+  .agents/skills/orch-adhoc-<skill>/SKILL.md
 
 The script only overwrites wrappers it can confidently identify as previously
 generated wrappers. Unknown or hand-edited files are left untouched. Pass
@@ -33,9 +35,23 @@ from pathlib import Path
 
 
 AGENTS = ("claude", "agents")
-WRAPPER_PREFIX = "ko-"
+KANBAN_SKILLS = frozenset(
+    {
+        "get-kanban-update",
+        "kanban",
+        "plan-to-tasks",
+        "review-recent-kanban-tasks",
+    }
+)
+KANBAN_WRAPPER_PREFIX = "orch-kb-"
+ADHOC_WRAPPER_PREFIX = "orch-adhoc-"
+LEGACY_WRAPPER_PREFIX = "ko-"
+CURRENT_WRAPPER_PREFIXES = (KANBAN_WRAPPER_PREFIX, ADHOC_WRAPPER_PREFIX)
+GENERATED_WRAPPER_PREFIXES = (*CURRENT_WRAPPER_PREFIXES, LEGACY_WRAPPER_PREFIX)
 GENERATED_WRAPPER_GITIGNORE_ENTRIES = tuple(
-    f".{agent}/skills/{WRAPPER_PREFIX}*/" for agent in AGENTS
+    f".{agent}/skills/{prefix}*/"
+    for agent in AGENTS
+    for prefix in CURRENT_WRAPPER_PREFIXES
 )
 
 _FRONT_MATTER_RE = re.compile(
@@ -63,14 +79,27 @@ def _skill_description(canonical_path: Path) -> str:
     raise ValueError(f"skill file is empty: {canonical_path}")
 
 
+def _wrapper_prefix(skill_name: str) -> str:
+    return KANBAN_WRAPPER_PREFIX if skill_name in KANBAN_SKILLS else ADHOC_WRAPPER_PREFIX
+
+
 def _wrapper_skill_name(skill_name: str) -> str:
-    return f"{WRAPPER_PREFIX}{skill_name}"
+    return f"{_wrapper_prefix(skill_name)}{skill_name}"
 
 
 def _unwrap_wrapper_skill_name(wrapper_name: str) -> str:
-    if wrapper_name.startswith(WRAPPER_PREFIX):
-        return wrapper_name[len(WRAPPER_PREFIX) :]
+    for prefix in GENERATED_WRAPPER_PREFIXES:
+        if wrapper_name.startswith(prefix):
+            return wrapper_name[len(prefix) :]
     return wrapper_name
+
+
+def _is_expected_current_wrapper_name(wrapper_name: str, skill_name: str) -> bool:
+    return wrapper_name == _wrapper_skill_name(skill_name)
+
+
+def _has_generated_wrapper_prefix(wrapper_name: str) -> bool:
+    return any(wrapper_name.startswith(prefix) for prefix in GENERATED_WRAPPER_PREFIXES)
 
 
 def render_wrapper(skill_name: str, description: str, canonical_path: Path) -> str:
@@ -326,15 +355,25 @@ def fix_skill_wrappers(target: Path, orchestra_dir: Path) -> dict[str, list[str]
 
             relative_path = str(wrapper_path.relative_to(target))
             wrapper_name = wrapper_dir.name
+            if wrapper_name.startswith(LEGACY_WRAPPER_PREFIX):
+                git_index_candidates.append(wrapper_dir)
+                _remove_wrapper_dir(wrapper_path)
+                summary["removed"].append(relative_path)
+                continue
+
             skill_name = _unwrap_wrapper_skill_name(wrapper_name)
             canonical_path = canonical_paths.get(skill_name)
             current_text = wrapper_path.read_text(encoding="utf-8")
             is_generated = _is_generated_wrapper(current_text, skill_name, canonical_path)
 
-            if wrapper_name.startswith(WRAPPER_PREFIX) and agent in AGENTS:
-                if is_generated:
+            if _has_generated_wrapper_prefix(wrapper_name) and agent in AGENTS:
+                if is_generated and _is_expected_current_wrapper_name(wrapper_name, skill_name):
                     git_index_candidates.append(wrapper_dir)
                     summary["ignored"].append(relative_path)
+                elif is_generated:
+                    git_index_candidates.append(wrapper_dir)
+                    _remove_wrapper_dir(wrapper_path)
+                    summary["removed"].append(relative_path)
                 else:
                     summary["skipped"].append(relative_path)
                 continue

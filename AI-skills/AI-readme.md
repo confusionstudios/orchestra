@@ -11,7 +11,14 @@ How each agent discovers and loads custom commands and skills:
 
 ## Adding a Shared Orchestra Skill
 
-All shared Orchestra skills live in `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` as the canonical source. Agents get a thin `ko-{skill-name}` wrapper that points to the canonical file.
+All shared Orchestra skills live in `$ORCHESTRA_DIR/AI-skills/{skill-name}.md`
+as the canonical source. Agents get a thin wrapper that points to the canonical
+file.
+
+Wrappers use two prefixes:
+
+- `orch-kb-{skill-name}` for Kanban Orchestra skills.
+- `orch-adhoc-{skill-name}` for general shared workflow skills.
 
 ### 1. Write the canonical skill
 
@@ -31,8 +38,8 @@ From the repo that should receive the wrappers:
 
 This creates or refreshes:
 
-- `.claude/skills/ko-{skill-name}/SKILL.md`
-- `.agents/skills/ko-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Antigravity-, Kilo-, and other compatible agents)
+- `.claude/skills/orch-kb-{skill-name}/SKILL.md` or `.claude/skills/orch-adhoc-{skill-name}/SKILL.md`
+- `.agents/skills/orch-kb-{skill-name}/SKILL.md` or `.agents/skills/orch-adhoc-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Antigravity-, Kilo-, and other compatible agents)
 
 To explicitly repair generated wrapper policy and clean old generated wrappers
 from current output paths, run:
@@ -41,18 +48,20 @@ from current output paths, run:
 "$ORCHESTRA_DIR/bin/ko-sync-skills" --fix
 ```
 
-Fix mode ensures narrow `.gitignore` entries exist for generated `ko-*` wrapper
-directories, removes generated unprefixed wrappers from current `.claude/skills`
-and `.agents/skills` paths, and removes current generated `ko-*` wrappers from
-git tracking when run in a git repo. Current generated wrappers under
-`.claude/skills/ko-*` and `.agents/skills/ko-*` remain on disk as ignored local
-generated files. Hand-edited or unknown files are left untouched.
+Fix mode ensures narrow `.gitignore` entries exist for generated
+`orch-kb-*` and `orch-adhoc-*` wrapper directories, removes generated
+unprefixed wrappers from current `.claude/skills` and `.agents/skills` paths,
+removes all legacy `ko-*` wrapper directories from those same current paths,
+and removes current generated wrappers from git tracking when run in a git
+repo. Current generated wrappers under `.claude/skills/orch-*` and
+`.agents/skills/orch-*` remain on disk as ignored local generated files.
+Hand-edited or unknown non-`ko-*` files are left untouched.
 
 Each wrapper uses the same thin shared format:
 
 ```markdown
 ---
-name: ko-{skill-name}
+name: orch-kb-{skill-name}
 description: {one-line description}
 ---
 
