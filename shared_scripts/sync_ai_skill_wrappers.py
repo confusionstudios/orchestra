@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
 
@@ -279,6 +280,22 @@ def _skill_sync_marker_path(repo_root: Path) -> Path:
     return repo_root / SKILL_SYNC_MARKER
 
 
+def _read_marker_data(marker: Path) -> dict[str, object]:
+    if not marker.is_file():
+        return {}
+    try:
+        return tomllib.loads(marker.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
+def _marker_text(project_name: str | None = None) -> str:
+    text = MARKER_TEXT
+    if project_name:
+        text += f"devlog_project = {json.dumps(project_name)}\n"
+    return text
+
+
 def _read_registered_repo_paths(registry_path: Path) -> list[Path]:
     if not registry_path.exists():
         return []
@@ -315,11 +332,19 @@ def _write_registered_repo_paths(registry_path: Path, repo_roots: list[Path]) ->
     registry_path.write_text("".join(lines), encoding="utf-8")
 
 
-def register_repo_for_skill_sync(repo: Path, registry_path: Path) -> dict[str, str | bool]:
+def register_repo_for_skill_sync(
+    repo: Path,
+    registry_path: Path,
+    project_name: str | None = None,
+) -> dict[str, str | bool]:
     repo_root = _require_git_repo_root(repo)
     marker = _skill_sync_marker_path(repo_root)
     marker_created = not marker.exists()
-    marker.write_text(MARKER_TEXT, encoding="utf-8")
+    if project_name is None:
+        raw_project = _read_marker_data(marker).get("devlog_project")
+        if isinstance(raw_project, str) and raw_project.strip():
+            project_name = raw_project.strip()
+    marker.write_text(_marker_text(project_name), encoding="utf-8")
 
     registered: list[Path] = []
     for path in _read_registered_repo_paths(registry_path):
@@ -619,6 +644,13 @@ def parse_args() -> argparse.Namespace:
         help="Opt a git repo into registered shared skill sync.",
     )
     parser.add_argument(
+        "--project-name",
+        help=(
+            "Human project name to store as devlog_project while registering, "
+            "for example 'MIDI Designer'."
+        ),
+    )
+    parser.add_argument(
         "--unregister",
         nargs="?",
         const=".",
@@ -638,6 +670,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--register, --unregister, and --registered are mutually exclusive")
     if mode_count and args.fix:
         parser.error("--fix cannot be combined with --register, --unregister, or --registered")
+    if args.project_name and not args.register:
+        parser.error("--project-name can only be used with --register")
     if args.registered and args.target != ".":
         parser.error("--registered does not accept a target repo argument")
     return args
@@ -648,7 +682,11 @@ def main() -> int:
     registry_path = Path(args.registry).expanduser() if args.registry else _default_registry_path()
 
     if args.register:
-        result = register_repo_for_skill_sync(Path(args.register), registry_path)
+        result = register_repo_for_skill_sync(
+            Path(args.register),
+            registry_path,
+            project_name=args.project_name,
+        )
         print(f"Registered for skill sync: {result['repo']}")
         print(f"Marker: {result['marker']}")
         print(f"Registry: {result['registry']}")

@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import tomllib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
 DEVLOG_ENV = "ORCH_DEVLOG_DIR"
+PROJECT_ENV = "ORCH_DEVLOG_PROJECT"
+PROJECT_CONFIG = ".orchestra-skill-sync"
 
 
 def default_journal_dir() -> Path:
@@ -18,6 +22,54 @@ def default_journal_dir() -> Path:
     if not raw:
         raise ValueError(f"{DEVLOG_ENV} is not set")
     return Path(raw).expanduser()
+
+
+def git_repo_root(path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return Path(result.stdout.strip())
+
+
+def project_from_config(path: Path) -> str | None:
+    config_path = path / PROJECT_CONFIG
+    if not config_path.is_file():
+        return None
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid {PROJECT_CONFIG}: {exc}") from exc
+    raw = data.get("devlog_project")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{PROJECT_CONFIG} devlog_project must be a non-empty string")
+    return raw.strip()
+
+
+def default_project(cwd: Path | None = None) -> str:
+    raw = os.environ.get(PROJECT_ENV, "").strip()
+    if raw:
+        return raw
+
+    start = (cwd or Path.cwd()).resolve()
+    repo_root = git_repo_root(start)
+    if repo_root is not None:
+        configured = project_from_config(repo_root)
+        if configured:
+            return configured
+
+    raise ValueError(
+        f"project is required; pass --project, set {PROJECT_ENV}, "
+        f"or set devlog_project in {PROJECT_CONFIG}"
+    )
 
 
 def sunday_for(day: date) -> date:
@@ -149,8 +201,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("entry", nargs="*", help="Entry text. Ignored when --stdin is used.")
     parser.add_argument(
         "--project",
-        required=True,
-        help="Project label to place first in the bullet, for example `orchestra`.",
+        help=(
+            "Project label to place first in the bullet. Defaults to "
+            f"${PROJECT_ENV} or devlog_project in {PROJECT_CONFIG}."
+        ),
     )
     parser.add_argument(
         "--stdin",
@@ -182,7 +236,7 @@ def main() -> int:
         note_path = append_entry(
             journal_dir=journal_dir,
             day=parse_day(args.date),
-            project=args.project,
+            project=args.project or default_project(),
             entry=entry,
         )
     except (FileNotFoundError, ValueError) as exc:

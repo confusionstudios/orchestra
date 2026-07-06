@@ -62,13 +62,14 @@ Hand-edited or unknown non-`ko-*` files are left untouched.
 To opt a repo into future bulk syncs from the Orchestra checkout:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/client-repo
+"$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/client-repo --project-name "MIDI Designer"
 ```
 
 Registration writes two things:
 
 - A repo-local `.orchestra-skill-sync` marker. This is safe to commit and says
-  the repo accepts shared Orchestra skill sync.
+  the repo accepts shared Orchestra skill sync. When `--project-name` is passed,
+  the marker also stores the human display name used by the devlog skill.
 - A private machine-local path entry in
   `~/.config/orchestra/skill-sync.repos`, or in the path named by
   `$ORCHESTRA_SKILL_SYNC_REPOS`.

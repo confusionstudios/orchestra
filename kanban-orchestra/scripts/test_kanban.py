@@ -4033,12 +4033,18 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
             registry = Path(config_tmp) / "skill-sync.repos"
             subprocess.run(["git", "init", "-q"], cwd=target, check=True)
 
-            result = skill_wrappers.register_repo_for_skill_sync(target, registry)
+            result = skill_wrappers.register_repo_for_skill_sync(
+                target,
+                registry,
+                project_name="MIDI Designer",
+            )
             second_result = skill_wrappers.register_repo_for_skill_sync(target, registry)
 
             marker = target / skill_wrappers.SKILL_SYNC_MARKER
             self.assertTrue(marker.exists())
-            self.assertIn("skills = true", marker.read_text(encoding="utf-8"))
+            marker_text = marker.read_text(encoding="utf-8")
+            self.assertIn("skills = true", marker_text)
+            self.assertIn('devlog_project = "MIDI Designer"', marker_text)
             self.assertEqual(result["repo"], str(target.resolve()))
             self.assertFalse(second_result["registry_added"])
             registry_lines = [
@@ -4046,6 +4052,23 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                 if line and not line.startswith("#")
             ]
             self.assertEqual(registry_lines, [str(target.resolve())])
+
+    def test_register_repo_for_skill_sync_preserves_existing_project_name(self):
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            (target / skill_wrappers.SKILL_SYNC_MARKER).write_text(
+                "skills = true\ndevlog_project = \"Orchestra\"\n",
+                encoding="utf-8",
+            )
+
+            skill_wrappers.register_repo_for_skill_sync(target, registry)
+
+            self.assertIn(
+                'devlog_project = "Orchestra"',
+                (target / skill_wrappers.SKILL_SYNC_MARKER).read_text(encoding="utf-8"),
+            )
 
     def test_sync_registered_repos_runs_fix_then_sync_for_opted_in_repo(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
@@ -4132,6 +4155,27 @@ class TestDevlogSkillHelper(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "ORCH_DEVLOG_DIR is not set"):
                 devlog_helper.default_journal_dir()
+
+    def test_default_project_uses_repo_skill_sync_marker(self):
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            target = Path(repo_tmp)
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            (target / devlog_helper.PROJECT_CONFIG).write_text(
+                "skills = true\ndevlog_project = \"MIDI Designer\"\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(devlog_helper.default_project(target), "MIDI Designer")
+
+    def test_default_project_requires_configured_project(self):
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            target = Path(repo_tmp)
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "project is required"):
+                    devlog_helper.default_project(target)
 
 
 class TestOrchestratorRuntime(unittest.TestCase):

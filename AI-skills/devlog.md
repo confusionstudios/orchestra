@@ -19,6 +19,17 @@ not log elsewhere unless the user explicitly asks.
 The journal uses Sunday-start weekly Markdown notes named `YYYY-MM-DD - Week.md`,
 with daily headings named `# YYYY-MM-DD - Weekday`.
 
+## Project Name
+
+Use the human project name configured for the repo. The helper resolves it from:
+
+1. `--project`, when explicitly passed.
+2. `$ORCH_DEVLOG_PROJECT`.
+3. `devlog_project` in the repo root `.orchestra-skill-sync` file.
+
+Prefer normal display names such as `Orchestra` or `MIDI Designer`, not repo
+directory names such as `orchestra` or `midi-designer3`.
+
 ## Workflow
 
 1. Identify the work to log from the current conversation and tool results.
@@ -63,20 +74,22 @@ with daily headings named `# YYYY-MM-DD - Weekday`.
 Use the bundled helper from the Orchestra checkout:
 
 ```bash
-"$ORCHESTRA_DIR/AI-skills/devlog/scripts/log_work.py" --project orchestra "Moved non-Kanban shared skills into Orchestra."
+"$ORCHESTRA_DIR/AI-skills/devlog/scripts/log_work.py" "Moved non-Kanban shared skills into Orchestra."
 ```
 
 For multi-line entries:
 
 ```bash
 printf '%s\n' "Moved non-Kanban shared skills into Orchestra." "Kept private Obsidian paths in local environment." |
-  "$ORCHESTRA_DIR/AI-skills/devlog/scripts/log_work.py" --project orchestra --stdin
+  "$ORCHESTRA_DIR/AI-skills/devlog/scripts/log_work.py" --stdin
 ```
 
 If the helper is not available, implement the same behavior directly:
 
 - Compute the current local date.
 - Compute the Sunday that starts that week.
+- Resolve the project label from `--project`, `$ORCH_DEVLOG_PROJECT`, or
+  `.orchestra-skill-sync` `devlog_project`.
 - Open `$ORCH_DEVLOG_DIR/<sunday> - Week.md`.
 - Ensure a daily heading exists.
 - Append a project-first bullet:
