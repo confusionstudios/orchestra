@@ -105,6 +105,30 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-sync-skills"
    ```
 
+   To sync a specific repo from anywhere:
+
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-sync-skills" /path/to/work-repo
+   ```
+
+   To register a repo for future bulk skill sync:
+
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/work-repo --project-name "Project Name"
+   ```
+
+   To inspect every registered repo without changing anything:
+
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
+   ```
+
+   To update every registered repo:
+
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-sync-registered-skills" --apply
+   ```
+
 5. **Start the repo instance** from the work repo root and keep it running:
 
    ```bash
@@ -256,7 +280,7 @@ to write a short report, and stores local output under
 
 | Path | Contents |
 |------|----------|
-| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` copies these into each agent's config directory |
+| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` syncs one repo, and `bin/ko-sync-registered-skills --apply` syncs repos registered with `.orchestra-skill-sync` |
 | `kanban-orchestra/scripts/` | Task queue, dashboard, orchestrator, and CLI |
 | `kanban-orchestra/prompts/` | Prompts injected into task agents |
 | `bin/` | Thin wrappers that run through the checkout-local venv |

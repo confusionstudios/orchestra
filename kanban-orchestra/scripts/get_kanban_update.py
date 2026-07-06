@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 import db
+import fleet
 
 
 STALE_SECONDS = 60
@@ -170,6 +171,37 @@ def _dashboard_status_url(identity: dict) -> str | None:
     return str(url)
 
 
+def _fleet_repo_for_identity(identity: dict) -> fleet.FleetRepo | None:
+    """Return the configured fleet repo for this instance, if any."""
+    try:
+        repo_root = Path(identity["repo_root"]).expanduser().resolve()
+        repos = fleet.load_status_repos()
+    except (KeyError, OSError):
+        return None
+
+    for repo in repos:
+        if repo.root is None:
+            continue
+        try:
+            if repo.root.expanduser().resolve() == repo_root:
+                return repo
+        except OSError:
+            continue
+    return None
+
+
+def _fleet_status_line(identity: dict) -> str | None:
+    repo = _fleet_repo_for_identity(identity)
+    if repo is None:
+        return None
+
+    fleet_status, _, _, _ = fleet.repo_process_state(repo)
+    running_status = "running" if fleet.status_is_running(fleet_status) else "stopped"
+    dashboard_url = fleet.dashboard_status_url(repo)
+    dashboard = dashboard_url if dashboard_url != "-" else "dashboard not running"
+    return f"This repo ({repo.label}) is {running_status}. Dash: {dashboard}"
+
+
 def _format_skips(skips: list[str] | None) -> str:
     if not skips:
         return ""
@@ -296,6 +328,11 @@ def build_update(conn) -> str:
     # ── What likely needs attention ──────────────────────────────────────
     attention = _attention_summary(runtime, ready_tasks, blocked_tasks)
     lines.append(f"ATTENTION: {attention}")
+
+    fleet_line = _fleet_status_line(identity)
+    if fleet_line:
+        lines.append("")
+        lines.append(fleet_line)
 
     return "\n".join(lines)
 

@@ -20,7 +20,7 @@ agents:
     label: Claude Sonnet 4.5
     command: ["claude", "--model", "Sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
   - key: codex
-    label: GPT-5.5 medium
+    label: GPT-5.5
     command: ["codex", "exec", "--yolo", "{prompt}"]
     review_command: ["codex", "exec", "review", "--uncommitted", "{prompt}"]
   - key: antigravity
@@ -45,10 +45,10 @@ agents:
     label: Cursor Composer 2.5
     command: ["cursor", "agent", "-p", "--model", "composer-2.5", "--yolo", "--trust", "{prompt}"]
   - key: cursor-opus-4.6
-    label: Cursor Opus 4.6 High
+    label: Cursor Opus 4.6
     command: ["cursor", "agent", "-p", "--model", "claude-4.6-opus-high", "--yolo", "--trust", "{prompt}"]
   - key: cursor-opus-4.7
-    label: Cursor Opus 4.7 High
+    label: Cursor Opus 4.7
     command: ["cursor", "agent", "-p", "--model", "claude-opus-4-7-high", "--yolo", "--trust", "{prompt}"]
   - key: cursor-sonnet-4.6
     label: Cursor Sonnet 4.6
