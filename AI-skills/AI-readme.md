@@ -74,15 +74,21 @@ Registration writes two things:
   `~/.config/orchestra/skill-sync.repos`, or in the path named by
   `$ORCHESTRA_SKILL_SYNC_REPOS`.
 
-From the Orchestra checkout, sync every registered repo:
+From the Orchestra checkout, preview every registered repo:
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
 ```
 
-Registered sync runs fix mode and then normal sync for each repo whose path is
-still valid and whose repo root still contains `.orchestra-skill-sync`. Missing
-paths or repos without the marker are skipped rather than guessed.
+To actually sync every registered repo:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-sync-registered-skills" --apply
+```
+
+Applied registered sync runs fix mode and then normal sync for each repo whose
+path is still valid and whose repo root still contains `.orchestra-skill-sync`.
+Missing paths or repos without the marker are skipped rather than guessed.
 
 To opt out:
 

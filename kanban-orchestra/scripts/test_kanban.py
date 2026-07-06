@@ -3696,7 +3696,7 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                     registered_skill_wrappers.parse_args()
         self.assertEqual(exc.exception.code, 2)
 
-    def test_registered_sync_main_prints_summary(self):
+    def test_registered_sync_main_lists_by_default_without_syncing(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
             orchestra_dir = Path(orchestra_tmp)
             target = Path(repo_tmp)
@@ -3719,6 +3719,40 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                     str(orchestra_dir),
                     "--registry",
                     str(registry),
+                ],
+            ), redirect_stdout(stdout):
+                rc = registered_skill_wrappers.main()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("Registered AI skill repos (dry run; pass --apply to sync):", stdout.getvalue())
+            self.assertIn("ok", stdout.getvalue())
+            self.assertIn("MIDI Designer", stdout.getvalue())
+            self.assertFalse((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
+
+    def test_registered_sync_main_applies_when_requested(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            _write_test_ai_skills(orchestra_dir)
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            skill_wrappers.register_repo_for_skill_sync(
+                target,
+                registry,
+                project_name="MIDI Designer",
+            )
+
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "sync_registered_ai_skill_wrappers.py",
+                    "--orchestra-dir",
+                    str(orchestra_dir),
+                    "--registry",
+                    str(registry),
+                    "--apply",
                 ],
             ), redirect_stdout(stdout):
                 rc = registered_skill_wrappers.main()
