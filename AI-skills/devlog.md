@@ -38,7 +38,8 @@ directory names such as `orchestra` or `midi-designer3`.
    activity outside the active conversation unless the user explicitly asks for
    a date range or historical summary.
 3. Write for a human scanning the journal later, not for code review. Default
-   to one short outcome-focused sentence per project.
+   to one short outcome-focused sentence per project, but use multiple nested
+   bullets when one project has several distinct outcomes worth preserving.
 4. Summarize what got done and why it matters. Avoid file lists, command lists,
    commit hashes, branch names, and exhaustive verification details unless one
    is the point of the entry.
@@ -54,8 +55,9 @@ directory names such as `orchestra` or `midi-designer3`.
 - **project-name**: Entry text.
 ```
 
-8. When a day has multiple entries for the same project, group them under one
-   bold project bullet with no colon, and indent the entries:
+8. When a day has multiple entries for the same project, or when a single
+   project entry needs multiple bullets, group them under one bold project
+   bullet with no colon, and indent the entries:
 
 ```markdown
 - **project-name**
@@ -84,6 +86,14 @@ printf '%s\n' "Moved non-Kanban shared skills into Orchestra." "Kept private Obs
   "$ORCHESTRA_DIR/AI-skills/devlog/scripts/log_work.py" --stdin
 ```
 
+Multiple input lines become multiple nested bullets under the project:
+
+```markdown
+- **Orchestra**
+  - Moved non-Kanban shared skills into Orchestra.
+  - Kept private Obsidian paths in local environment.
+```
+
 If the helper is not available, implement the same behavior directly:
 
 - Compute the current local date.
@@ -92,14 +102,14 @@ If the helper is not available, implement the same behavior directly:
   `.orchestra-skill-sync` `devlog_project`.
 - Open `$ORCH_DEVLOG_DIR/<sunday> - Week.md`.
 - Ensure a daily heading exists.
-- Append a project-first bullet:
+- Append a compact project-first bullet for one-line entries:
 
 ```markdown
 - **project-name**: Entry text.
 ```
 
-- If the same project already has an entry for that day, convert it to or append
-  under a grouped project bullet:
+- If the entry has multiple lines, or the same project already has an entry for
+  that day, convert it to or append under a grouped project bullet:
 
 ```markdown
 - **project-name**

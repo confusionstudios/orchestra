@@ -94,14 +94,28 @@ def format_project(raw: str) -> str:
     return f"**{project.strip('`*')}**"
 
 
+def entry_items(entry: str) -> list[str]:
+    items = []
+    for line in entry.splitlines():
+        item = line.strip()
+        for marker in ("- ", "* "):
+            if item.startswith(marker):
+                item = item[len(marker) :].strip()
+                break
+        if item:
+            items.append(item)
+    return items
+
+
 def format_single_project_bullet(project: str, entry: str) -> list[str]:
-    lines = entry.splitlines()
-    return [f"- {project}: {lines[0]}", *[f"  {line}" for line in lines[1:]]]
+    items = entry_items(entry)
+    if len(items) == 1:
+        return [f"- {project}: {items[0]}"]
+    return [f"- {project}", *[f"  - {item}" for item in items]]
 
 
 def format_nested_entry(entry: str) -> list[str]:
-    lines = entry.splitlines()
-    return [f"  - {lines[0]}", *[f"    {line}" for line in lines[1:]]]
+    return [f"  - {item}" for item in entry_items(entry)]
 
 
 def find_day_bounds(lines: list[str], heading: str) -> tuple[int, int]:

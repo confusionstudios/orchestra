@@ -4176,6 +4176,55 @@ class TestDevlogSkillHelper(unittest.TestCase):
                 ),
             )
 
+    def test_append_entry_uses_nested_bullets_for_multiline_single_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_dir = Path(tmp)
+
+            note = devlog_helper.append_entry(
+                journal_dir=journal_dir,
+                day=devlog_helper.parse_day("2026-07-05"),
+                project="Orchestra",
+                entry="- First outcome.\n- Second outcome.",
+            )
+
+            self.assertEqual(
+                note.read_text(encoding="utf-8"),
+                (
+                    "# 2026-07-05 - Sunday\n"
+                    "- **Orchestra**\n"
+                    "  - First outcome.\n"
+                    "  - Second outcome.\n"
+                ),
+            )
+
+    def test_append_entry_adds_each_multiline_item_to_existing_project_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_dir = Path(tmp)
+
+            note = devlog_helper.append_entry(
+                journal_dir=journal_dir,
+                day=devlog_helper.parse_day("2026-07-05"),
+                project="Orchestra",
+                entry="First outcome.",
+            )
+            devlog_helper.append_entry(
+                journal_dir=journal_dir,
+                day=devlog_helper.parse_day("2026-07-05"),
+                project="Orchestra",
+                entry="Second outcome.\nThird outcome.",
+            )
+
+            self.assertEqual(
+                note.read_text(encoding="utf-8"),
+                (
+                    "# 2026-07-05 - Sunday\n"
+                    "- **Orchestra**\n"
+                    "  - First outcome.\n"
+                    "  - Second outcome.\n"
+                    "  - Third outcome.\n"
+                ),
+            )
+
     def test_default_journal_dir_requires_orch_devlog_dir(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "ORCH_DEVLOG_DIR is not set"):
