@@ -38,6 +38,7 @@ from pathlib import Path
 AGENTS = ("claude", "agents")
 SKILL_SYNC_MARKER = ".orchestra-skill-sync"
 SKILL_SYNC_REGISTRY_ENV = "ORCHESTRA_SKILL_SYNC_REPOS"
+SKILL_SYNC_MARKER_GITIGNORE_ENTRY = f"!{SKILL_SYNC_MARKER}"
 KANBAN_SKILLS = frozenset(
     {
         "get-kanban-update",
@@ -258,6 +259,28 @@ def _ensure_generated_wrapper_gitignore(target: Path) -> list[str]:
     return missing
 
 
+def _ensure_skill_sync_marker_gitignore(repo_root: Path) -> bool:
+    marker = _skill_sync_marker_path(repo_root)
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "check-ignore", "-q", "--", str(marker.relative_to(repo_root))],
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+
+    gitignore = repo_root / ".gitignore"
+    original = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    lines = original.splitlines()
+    if SKILL_SYNC_MARKER_GITIGNORE_ENTRY in lines:
+        return False
+    if lines and lines[-1] != "":
+        lines.append("")
+    lines.append("# Orchestra shared AI skill sync opt-in marker.")
+    lines.append(SKILL_SYNC_MARKER_GITIGNORE_ENTRY)
+    gitignore.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
 def _git_repo_root(path: Path) -> Path | None:
     result = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
@@ -345,6 +368,7 @@ def register_repo_for_skill_sync(
         if isinstance(raw_project, str) and raw_project.strip():
             project_name = raw_project.strip()
     marker.write_text(_marker_text(project_name), encoding="utf-8")
+    marker_gitignore_added = _ensure_skill_sync_marker_gitignore(repo_root)
 
     registered: list[Path] = []
     for path in _read_registered_repo_paths(registry_path):
@@ -365,6 +389,7 @@ def register_repo_for_skill_sync(
         "marker": str(marker),
         "registry": str(registry_path.expanduser()),
         "marker_created": marker_created,
+        "marker_gitignore_added": marker_gitignore_added,
         "registry_added": not already_registered,
     }
 

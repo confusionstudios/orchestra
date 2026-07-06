@@ -4070,6 +4070,31 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
                 (target / skill_wrappers.SKILL_SYNC_MARKER).read_text(encoding="utf-8"),
             )
 
+    def test_register_repo_for_skill_sync_unignores_marker_when_repo_uses_whitelist_gitignore(self):
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            (target / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+
+            result = skill_wrappers.register_repo_for_skill_sync(
+                target,
+                registry,
+                project_name="MIDI Designer WordPress Site",
+            )
+
+            self.assertTrue(result["marker_gitignore_added"])
+            self.assertIn(
+                f"!{skill_wrappers.SKILL_SYNC_MARKER}",
+                (target / ".gitignore").read_text(encoding="utf-8"),
+            )
+            tracked_check = subprocess.run(
+                ["git", "check-ignore", "-q", "--", skill_wrappers.SKILL_SYNC_MARKER],
+                cwd=target,
+                check=False,
+            )
+            self.assertNotEqual(tracked_check.returncode, 0)
+
     def test_sync_registered_repos_runs_fix_then_sync_for_opted_in_repo(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
             orchestra_dir = Path(orchestra_tmp)
