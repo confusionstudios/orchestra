@@ -656,8 +656,8 @@ def parse_args() -> argparse.Namespace:
         "--registry",
         default=None,
         help=(
-            "Private repo registry path for --register, --unregister, and "
-            "--registered. Defaults to $ORCHESTRA_SKILL_SYNC_REPOS or "
+            "Private repo registry path for --register and --unregister. "
+            "Defaults to $ORCHESTRA_SKILL_SYNC_REPOS or "
             "~/.config/orchestra/skill-sync.repos."
         ),
     )
@@ -682,23 +682,16 @@ def parse_args() -> argparse.Namespace:
         metavar="REPO",
         help="Remove a git repo from registered shared skill sync.",
     )
-    parser.add_argument(
-        "--registered",
-        action="store_true",
-        help="Run fix mode and normal skill sync for every registered opted-in repo.",
-    )
     args = parser.parse_args()
     if not args.orchestra_dir:
         parser.error("set ORCHESTRA_DIR or pass --orchestra-dir")
-    mode_count = sum(bool(value) for value in (args.register, args.unregister, args.registered))
+    mode_count = sum(bool(value) for value in (args.register, args.unregister))
     if mode_count > 1:
-        parser.error("--register, --unregister, and --registered are mutually exclusive")
+        parser.error("--register and --unregister are mutually exclusive")
     if mode_count and args.fix:
-        parser.error("--fix cannot be combined with --register, --unregister, or --registered")
+        parser.error("--fix cannot be combined with --register or --unregister")
     if args.project_name and not args.register:
         parser.error("--project-name can only be used with --register")
-    if args.registered and args.target != ".":
-        parser.error("--registered does not accept a target repo argument")
     return args
 
 
@@ -724,24 +717,6 @@ def main() -> int:
         print(f"Registry removed: {result['registry_removed']}")
         print(f"Registry: {result['registry']}")
         return 0
-
-    if args.registered:
-        summary = sync_registered_repos(Path(args.orchestra_dir), registry_path)
-        print(
-            "Registered AI skill repos synchronized:"
-            f" synced={len(summary['synced'])}"
-            f" skipped={len(summary['skipped'])}"
-            f" failed={len(summary['failed'])}"
-        )
-        for key, label in (
-            ("synced", "Synced"),
-            ("skipped", "Skipped"),
-            ("failed", "Failed"),
-        ):
-            print(f"{label} ({len(summary[key])}):")
-            for item in summary[key]:
-                print(f"  - {item}")
-        return 1 if summary["failed"] else 0
 
     if args.fix:
         summary = fix_skill_wrappers(Path(args.target), Path(args.orchestra_dir))

@@ -53,6 +53,10 @@ fleet = _load_local_module("kanban_test_fleet", "fleet.py")
 import agent_registry
 import agent_smoke
 skill_wrappers = _load_local_module("kanban_test_skill_wrappers", str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_ai_skill_wrappers.py"))
+registered_skill_wrappers = _load_local_module(
+    "kanban_test_registered_skill_wrappers",
+    str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_registered_ai_skill_wrappers.py"),
+)
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
 devlog_helper = _load_local_module("kanban_test_devlog_helper", str(SCRIPT_DIR.parent.parent / "AI-skills" / "devlog" / "scripts" / "log_work.py"))
 
@@ -3677,6 +3681,51 @@ class TestSyncAiSkillWrappers(unittest.TestCase):
             with patch.object(sys, "argv", ["sync_ai_skill_wrappers.py", "--fix"]):
                 args = skill_wrappers.parse_args()
         self.assertTrue(args.fix)
+
+    def test_parse_args_rejects_old_registered_mode(self):
+        with patch.dict(os.environ, {"ORCHESTRA_DIR": "/tmp/orchestra-test"}, clear=False):
+            with patch.object(sys, "argv", ["sync_ai_skill_wrappers.py", "--registered"]):
+                with self.assertRaises(SystemExit) as exc:
+                    skill_wrappers.parse_args()
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_registered_sync_parse_args_requires_orchestra_dir_when_env_missing(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["sync_registered_ai_skill_wrappers.py"]):
+                with self.assertRaises(SystemExit) as exc:
+                    registered_skill_wrappers.parse_args()
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_registered_sync_main_prints_summary(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            target = Path(repo_tmp)
+            registry = Path(config_tmp) / "skill-sync.repos"
+            _write_test_ai_skills(orchestra_dir)
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            skill_wrappers.register_repo_for_skill_sync(
+                target,
+                registry,
+                project_name="MIDI Designer",
+            )
+
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "sync_registered_ai_skill_wrappers.py",
+                    "--orchestra-dir",
+                    str(orchestra_dir),
+                    "--registry",
+                    str(registry),
+                ],
+            ), redirect_stdout(stdout):
+                rc = registered_skill_wrappers.main()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("Registered AI skill repos synchronized: synced=1 skipped=0 failed=0", stdout.getvalue())
+            self.assertTrue((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
 
     def test_sync_skill_wrappers_creates_all_agent_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:

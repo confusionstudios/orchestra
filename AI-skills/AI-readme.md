@@ -77,7 +77,7 @@ Registration writes two things:
 From the Orchestra checkout, sync every registered repo:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --registered
+"$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
 ```
 
 Registered sync runs fix mode and then normal sync for each repo whose path is
