@@ -57,7 +57,7 @@ the task requires detail:
    ```
    When you skipped the build, state that explicitly here — e.g. `"Purely
    additive change — no build step"` or `"Full build deferred by
-   SKIP_BUILD_UNTIL_APPROVED policy; will run during finalization after approval."`
+   KANBAN_SKIP_BUILD_UNTIL_APPROVED policy; will run during finalization after approval."`
    The deferral comment is required when the policy is active so reviewers
    know the missing build output is intentional.
 6. **Stage everything** with `git add .` so reviewers see the diff via
