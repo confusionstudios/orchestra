@@ -53,7 +53,7 @@ Orchestra shells out to local agent CLIs. It ships with built-in support for:
 | `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | Default reviewer, plan reviewer, and supertask reviewer |
 | `antigravity` | Antigravity (`agy`) | Uses `agy --print` with tool permission auto-approval |
 | `kilo` / `kilo-opus-4.6` / `kilo-opus-4.7` / `kilo-sonnet-4.6` | [Kilo Code](https://kilocode.ai) | `kilo` uses Kilo auto/free; the other keys pin specific Anthropic models |
-| `cursor-auto` / `cursor-composer-2.5` / `cursor-opus-4.6` / `cursor-opus-4.7` / `cursor-sonnet-4.6` | [Cursor Agent](https://cursor.com) | Cursor model availability depends on your Cursor account and installed CLI version |
+| `cursor-auto` / `cursor-composer-2.5` / `cursor-grok-4.5` / `cursor-opus-4.6` / `cursor-opus-4.7` / `cursor-sonnet-4.6` | [Cursor Agent](https://cursor.com) | Cursor model availability depends on your Cursor account and installed CLI version |
 | `cursor:<model>` / `kilo:<model>` | Provider/model specs | Resolve dynamically through the registry, for example `cursor:claude-opus-4-8-high` |
 
 Agent keys, command templates, and display labels live in

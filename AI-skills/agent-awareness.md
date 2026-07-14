@@ -100,6 +100,7 @@ At the time this skill was written, useful keys included:
 - `opus`
 - `antigravity`
 - `cursor-composer-2.5`
+- `cursor-grok-4.5`
 - `cursor-opus-4.6`
 - `cursor-opus-4.7`
 - `kilo-opus-4.6`

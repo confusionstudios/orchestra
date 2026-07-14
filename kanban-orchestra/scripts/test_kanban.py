@@ -3216,7 +3216,6 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -3246,7 +3245,6 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -7883,6 +7881,7 @@ class TestCommitFooter(unittest.TestCase):
         "kilo-sonnet-4.6",
         "cursor-auto",
         "cursor-composer-2.5",
+        "cursor-grok-4.5",
         "cursor-opus-4.6",
         "cursor-opus-4.7",
         "cursor-sonnet-4.6",
@@ -7952,6 +7951,7 @@ class TestCommitFooter(unittest.TestCase):
             "kilo-sonnet-4.6": "Kilo Claude Sonnet 4.6",
             "cursor-auto": "Cursor Auto",
             "cursor-composer-2.5": "Cursor Composer 2.5",
+            "cursor-grok-4.5": "Cursor Grok 4.5",
             "cursor-opus-4.6": "Cursor Opus 4.6",
             "cursor-opus-4.7": "Cursor Opus 4.7",
             "cursor-sonnet-4.6": "Cursor Sonnet 4.6",
@@ -7970,7 +7970,6 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_agent_command("cursor:claude-opus-4-8-high"),
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -7985,7 +7984,6 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor-composer-2.5"),
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -8002,7 +8000,6 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor:claude-opus-4-8-high"),
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -8376,7 +8373,6 @@ class TestAgentPingACKGate(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
