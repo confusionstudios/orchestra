@@ -8532,10 +8532,10 @@ class TestCommitFooter(unittest.TestCase):
     def test_display_name_claude_alias(self):
         self.assertEqual(config.get_agent_display_name("claude"), "Claude Sonnet 4.5")
 
-    def test_display_name_fallback_for_codex(self):
-        self.assertEqual(agent_registry.AGENT_DISPLAY_LABELS["codex"], "GPT-5.5")
+    def test_display_name_for_codex(self):
+        self.assertEqual(agent_registry.AGENT_DISPLAY_LABELS["codex"], "Codex")
         result = config.get_agent_display_name("codex")
-        self.assertEqual(result, "GPT-5.5")
+        self.assertEqual(result, "Codex")
 
     def test_existing_registry_labels_preserve_previous_fallbacks(self):
         self.assertEqual(config.get_agent_display_name("antigravity"), "Antigravity")
@@ -8596,6 +8596,31 @@ class TestCommitFooter(unittest.TestCase):
             ],
         )
 
+    def test_dynamic_provider_model_attribution_preserves_explicit_model(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("cursor:claude-opus-4-8-high"),
+            "cursor:claude-opus-4-8-high",
+        )
+
+    def test_attribution_uses_command_values_not_display_label(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("sonnet"),
+            "sonnet (model: Sonnet)",
+        )
+        self.assertNotIn(
+            agent_registry.AGENT_DISPLAY_LABELS["sonnet"],
+            agent_registry.resolve_agent_attribution("sonnet"),
+        )
+
+    def test_attribution_omits_model_and_effort_when_command_omits_them(self):
+        self.assertEqual(agent_registry.resolve_agent_attribution("antigravity"), "antigravity")
+
+    def test_unknown_agent_attribution_does_not_repeat_unresolved_claim(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("claimed-gpt-99"),
+            "unattributed",
+        )
+
     def test_cursor_alias_review_command_uses_normal_permissive_mode(self):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor-composer-2.5"),
@@ -8629,7 +8654,27 @@ class TestCommitFooter(unittest.TestCase):
     def test_codex_review_command_uses_review_subcommand(self):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("codex"),
-            ["codex", "exec", "review", "--uncommitted", "{prompt}"],
+            [
+                "codex", "exec", "--model", "gpt-5.6-sol",
+                "-c", 'model_reasoning_effort="medium"',
+                "review", "--uncommitted", "{prompt}",
+            ],
+        )
+
+    def test_codex_run_command_explicitly_sets_model_effort_and_preserves_yolo(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_command("codex"),
+            [
+                "codex", "exec", "--model", "gpt-5.6-sol",
+                "-c", 'model_reasoning_effort="medium"',
+                "--yolo", "{prompt}",
+            ],
+        )
+
+    def test_codex_review_attribution_uses_explicit_command_configuration(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("codex", review=True),
+            "codex (model: gpt-5.6-sol; reasoning effort: medium)",
         )
 
     def test_review_command_falls_back_to_normal_command(self):
@@ -8659,7 +8704,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Claude Sonnet 4.5; reviewer: GPT-5.5; review rejections: 0)",
+            f"Task {tid} (coder: sonnet (model: Sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
     def test_get_commit_footer_default_agent(self):
@@ -8679,7 +8724,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
     def test_get_commit_footer_codex_agent(self):
-        """get-commit-footer uses config labels for agents without --model."""
+        """get-commit-footer uses explicit Codex command configuration."""
         r = self._run("add", "Codex footer task", "--branch", "test")
         self.assertEqual(r.returncode, 0)
         tid = json.loads(r.stdout)["id"]
@@ -8690,11 +8735,11 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: GPT-5.5; reviewer: pending; review rejections: 0)",
+            f"Task {tid} (coder: codex (model: gpt-5.6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)",
         )
 
     def test_get_commit_footer_provider_model_agent(self):
-        """get-commit-footer resolves labels for provider/model specs."""
+        """get-commit-footer preserves explicit dynamic provider/model specs."""
         spec = "cursor:claude-opus-4-8-high"
         r = self._run("add", "Dynamic footer task", "--branch", "test", "--coder-agent", spec)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -8705,7 +8750,24 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Cursor claude-opus-4-8-high; reviewer: Cursor claude-opus-4-8-high; review rejections: 0)",
+            f"Task {tid} (coder: {spec}; reviewer: {spec}; review rejections: 0)",
+        )
+
+    def test_get_commit_footer_does_not_repeat_unresolved_agent_claims(self):
+        r = self._run("add", "Unresolved footer task", "--branch", "test")
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        db.update_task(self.conn, tid, coder_agent="claimed-coder-model")
+        db.add_comment(
+            self.conn, tid, "Approved", kind="approval",
+            author="claimed-reviewer-model", review_round=0,
+        )
+
+        r2 = self._run("get-commit-footer", str(tid))
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(
+            r2.stdout.strip(),
+            f"Task {tid} (coder: unattributed; reviewer: unattributed; review rejections: 0)",
         )
 
     def test_get_commit_footer_counts_only_code_review_rejections(self):
@@ -8739,7 +8801,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Claude Haiku 4.5; reviewer: Claude Sonnet 4.5; review rejections: 2)",
+            f"Task {tid} (coder: haiku (model: Haiku); reviewer: sonnet (model: Sonnet); review rejections: 2)",
         )
 
     def test_get_commit_footer_uses_final_approval_reviewer(self):
@@ -8761,7 +8823,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Claude Haiku 4.5; reviewer: GPT-5.5; review rejections: 0)",
+            f"Task {tid} (coder: haiku (model: Haiku); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
 
@@ -8854,7 +8916,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: Claude Sonnet 4.5; reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: Sonnet); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
@@ -8879,7 +8941,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: Claude Sonnet 4.5; reviewer: GPT-5.5; review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: Sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)"
             ),
             repr(result),
         )
@@ -8891,19 +8953,19 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: Claude Haiku 4.5; reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: haiku (model: Haiku); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
 
-    def test_fallback_agent_in_normalized_footer(self):
-        """Normalization uses configured agent display labels."""
+    def test_explicit_codex_config_in_normalized_footer(self):
+        """Normalization uses command-backed Codex attribution."""
         tid = self._add_task("codex")
         message = f"Some work\n\nTask {tid}"
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: GPT-5.5; reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: codex (model: gpt-5.6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
@@ -8914,7 +8976,7 @@ class TestFinalizationFooter(unittest.TestCase):
         expected_footer = task_module.get_commit_footer(tid, self.conn)
         self.assertEqual(
             expected_footer,
-            f"Task {tid} (coder: Claude Opus 4.6; reviewer: pending; review rejections: 0)",
+            f"Task {tid} (coder: opus (model: claude-opus-4-6); reviewer: pending; review rejections: 0)",
         )
         message = "Refactor internals\n\nSome body."
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)

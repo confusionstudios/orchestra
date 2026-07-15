@@ -242,6 +242,52 @@ def resolve_agent_label(spec: str) -> str | None:
     return label.replace("{model}", model)
 
 
+def _command_option(command: list[str], *options: str) -> str | None:
+    """Return an explicitly supplied command option value, if present."""
+    for index, part in enumerate(command):
+        if part in options and index + 1 < len(command):
+            return command[index + 1]
+        for option in options:
+            prefix = f"{option}="
+            if part.startswith(prefix):
+                return part[len(prefix):]
+    return None
+
+
+def _command_reasoning_effort(command: list[str]) -> str | None:
+    """Return an explicit Codex reasoning-effort config value, if present."""
+    config_options = {"-c", "--config"}
+    for index, part in enumerate(command):
+        value = command[index + 1] if part in config_options and index + 1 < len(command) else None
+        if value is None and part.startswith("--config="):
+            value = part.removeprefix("--config=")
+        if value and value.startswith("model_reasoning_effort="):
+            return value.split("=", 1)[1].strip('"\'')
+    return None
+
+
+def resolve_agent_attribution(spec: str, *, review: bool = False) -> str:
+    """Return the exact agent spec plus facts explicit in its resolved command.
+
+    Display labels are intentionally excluded: they are UI copy and can become
+    stale. Only an explicit --model option and model_reasoning_effort config are
+    included as additional facts.
+    """
+    command = resolve_review_agent_command(spec) if review else resolve_agent_command(spec)
+    if not command:
+        return "unattributed"
+
+    model = _command_option(command, "-m", "--model")
+    effort = _command_reasoning_effort(command)
+
+    facts = []
+    if model and _split_provider_model(spec) is None:
+        facts.append(f"model: {model}")
+    if effort:
+        facts.append(f"reasoning effort: {effort}")
+    return f"{spec} ({'; '.join(facts)})" if facts else spec
+
+
 def is_valid_agent_spec(spec: str) -> bool:
     return resolve_agent_command(spec) is not None
 

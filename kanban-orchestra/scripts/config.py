@@ -12,6 +12,7 @@ from agent_registry import (  # type: ignore  # noqa: E402
     AGENT_PROVIDERS as AGENT_PROVIDERS,
     has_review_agent_command as has_review_agent_command,
     is_valid_agent_spec,
+    resolve_agent_attribution as resolve_agent_attribution,
     resolve_agent_command,
     resolve_agent_label,
     resolve_review_agent_command as resolve_review_agent_command,
@@ -27,12 +28,11 @@ def _agent_default(env_key: str, fallback: str) -> str:
 
 
 def get_agent_display_label(agent: str) -> str:
-    """Return the display label for an agent/model.
+    """Return the friendly UI display label for an agent/model.
 
     Prefer the shared human-readable label map. If no label is configured,
     infer a label from the configured --model value, then fall back to the key.
-    This keeps commit attribution tied to orchestration config rather than
-    agent self-reporting.
+    Commit attribution intentionally uses get_agent_attribution() instead.
     """
     label = resolve_agent_label(agent)
     if label is not None:
@@ -52,6 +52,11 @@ def is_valid_agent(agent: str) -> bool:
 def get_agent_display_name(agent: str) -> str:
     """Backward-compatible alias for get_agent_display_label()."""
     return get_agent_display_label(agent)
+
+
+def get_agent_attribution(agent: str, *, review: bool = False) -> str:
+    """Return command-backed commit attribution for an agent spec."""
+    return resolve_agent_attribution(agent, review=review)
 
 
 DEFAULT_SUPER_PLANNER = _agent_default("ORCHESTRA_DEFAULT_SUPER_PLANNER", "opus")

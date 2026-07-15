@@ -890,18 +890,18 @@ def get_commit_footer(task_id, conn):
     if not task:
         return None
     agent = task.get("coder_agent") or config.DEFAULT_CODER
-    coder_label = config.get_agent_display_label(agent)
+    coder_attribution = config.get_agent_attribution(agent)
 
     comments = db.get_comments(conn, task_id)
     approval_comments = [c for c in comments if c.get("kind") == "approval"]
     final_approval = approval_comments[-1] if approval_comments else None
     reviewer = final_approval.get("author") if final_approval else None
-    reviewer_label = config.get_agent_display_label(reviewer) if reviewer else "pending"
+    reviewer_attribution = config.get_agent_attribution(reviewer, review=True) if reviewer else "pending"
     rejection_count = sum(1 for c in comments if c.get("kind") == "rejection")
 
     attribution = (
-        f"coder: {coder_label}; "
-        f"reviewer: {reviewer_label}; "
+        f"coder: {coder_attribution}; "
+        f"reviewer: {reviewer_attribution}; "
         f"review rejections: {rejection_count}"
     )
     return f"Task {task_id} ({attribution})"
