@@ -11,6 +11,8 @@ Routes:
                        icebox, blocked tasks, recent done)
   GET /task/{id}     — task detail (metadata, edit form, comments, run log)
   POST /task/{id}/edit — update task title/description source text
+  POST /task/{id}/set-ready — queue a none/blocked task (not review-cap)
+  POST /task/{id}/continue-review-cap — continue a structured review-cap block
   GET /events        — SSE stream for overview fragments
   GET /events/{id}   — SSE stream for task-detail fragments
 """
@@ -358,6 +360,22 @@ class ReadyActionNeedsConfirmation(ReadyActionError):
     """Raised when the inferred next_step must be confirmed before queueing."""
 
 
+REVIEW_CAP_SET_READY_REFUSAL = (
+    "This task is blocked at its review cap. Use Continue with additional "
+    "review rounds instead of Set to ready."
+)
+
+
+def _is_structured_review_cap_block(task: dict) -> bool:
+    """True when structured review-cap resume metadata is present."""
+    return task_cli.is_structured_review_cap_block(task)
+
+
+def _is_review_cap_continue_action(task: dict) -> bool:
+    """True when the dashboard should offer review-cap continuation."""
+    return task.get("status") == "blocked" and _is_structured_review_cap_block(task)
+
+
 def _meaningful_next_step(next_step: str | None) -> bool:
     return bool(next_step and next_step.strip() and next_step.strip() != "none")
 
@@ -403,6 +421,9 @@ def _ready_update_fields(
     status = task.get("status")
     if status not in READY_ACTION_STATUSES:
         raise ReadyActionError(f"Only tasks with status none or blocked can be set to ready; got '{status}'.")
+
+    if _is_structured_review_cap_block(task):
+        raise ReadyActionError(REVIEW_CAP_SET_READY_REFUSAL)
 
     task_type = _normalize_task_type_for_ready(task)
     fields = {}
@@ -455,6 +476,8 @@ def _restore_parent_after_child_ready(conn, task: dict) -> None:
 def _ready_action_state(task: dict) -> dict | None:
     if task.get("status") not in READY_ACTION_STATUSES:
         return None
+    if _is_structured_review_cap_block(task):
+        return {"available": False, "error": REVIEW_CAP_SET_READY_REFUSAL}
     try:
         inferred_next_step = None
         if not _meaningful_next_step(task.get("next_step")):
@@ -1109,7 +1132,22 @@ def render_task_header(task: dict, conn=None, edit_error: str | None = None, *, 
     </div>"""
 
 
+def _continue_review_cap_form_html(task: dict) -> str:
+    """Render the dedicated continuation form for structured review-cap blocks."""
+    resume_step = task.get("resume_next_step") or ""
+    return f"""
+      <form class="action-form continue-review-cap-form" action="/task/{_esc(task['id'])}/continue-review-cap" method="post">
+        <p class="muted">Blocked at review cap. Resume at <code>{_esc(resume_step)}</code> with additional rounds.</p>
+        <label class="field-label" for="add-review-rounds-{_esc(task['id'])}">Additional review rounds</label>
+        <input class="text-input continue-rounds-input" id="add-review-rounds-{_esc(task['id'])}" type="number" name="add_review_rounds" min="1" value="3" required>
+        <button type="submit">Continue with additional rounds</button>
+      </form>"""
+
+
 def _set_ready_form_html(task: dict) -> str:
+    if _is_review_cap_continue_action(task):
+        return _continue_review_cap_form_html(task)
+
     state = _ready_action_state(task)
     if state is None:
         return ""
@@ -1583,6 +1621,16 @@ code {
 
 .action-form {
   margin-top: 12px;
+}
+
+.continue-review-cap-form {
+  display: grid;
+  gap: 8px;
+  max-width: 320px;
+}
+
+.continue-rounds-input {
+  width: 8em;
 }
 
 .action-form button {
@@ -2241,6 +2289,56 @@ async def task_set_ready(task_id: int, request: Request):
 
         db.update_task(conn, task_id, **fields)
         _restore_parent_after_child_ready(conn, task)
+    finally:
+        conn.close()
+
+    return RedirectResponse(url=f"/task/{task_id}", status_code=303)
+
+
+@app.post("/task/{task_id}/continue-review-cap")
+async def task_continue_review_cap(task_id: int, request: Request):
+    if not _is_local_origin(request):
+        return HTMLResponse("<p>Forbidden: cross-origin request.</p>", status_code=403)
+
+    conn = _open_conn()
+    if conn is None:
+        body = '<div class="card"><p class="muted">Database not available.</p></div>'
+        return HTMLResponse(_page_shell("Task Not Found", body), status_code=503)
+
+    try:
+        task = db.get_task(conn, task_id)
+        if task is None:
+            body = f'<div class="card"><p class="muted">Task #{task_id} not found.</p></div>'
+            return HTMLResponse(_page_shell("Task Not Found", body), status_code=404)
+
+        form_data = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        raw_rounds = form_data.get("add_review_rounds", [""])[0].strip()
+        try:
+            add_rounds = int(raw_rounds)
+        except (TypeError, ValueError):
+            return _task_detail_response(
+                task_id,
+                conn,
+                ready_error="Additional review rounds must be a positive integer.",
+                status_code=400,
+            )
+
+        try:
+            task_cli.continue_blocked_task(
+                conn,
+                task_id,
+                add_review_rounds=add_rounds,
+            )
+        except task_cli.ContinueTaskError as exc:
+            message = str(exc)
+            if message.startswith("Error: "):
+                message = message[len("Error: "):]
+            return _task_detail_response(
+                task_id,
+                conn,
+                ready_error=message,
+                status_code=400,
+            )
     finally:
         conn.close()
 

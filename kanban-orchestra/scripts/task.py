@@ -496,99 +496,134 @@ def _maybe_restore_parent_after_child_ready(conn, child_id, parent_id):
         db.update_task(conn, parent_id, status="pending_subtasks")
 
 
+class ContinueTaskError(ValueError):
+    """Raised when continue_blocked_task cannot proceed safely."""
+
+
+def is_structured_review_cap_block(task: dict) -> bool:
+    """True when a task has structured review-cap resume metadata."""
+    return (
+        task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP
+        and bool(task.get("resume_next_step"))
+    )
+
+
+def _continue_error(message: str) -> ContinueTaskError:
+    if message.startswith("Error:"):
+        return ContinueTaskError(message)
+    return ContinueTaskError(f"Error: {message}")
+
+
+def _resolve_branch_for_continue(conn, task):
+    """Resolve branch for continue; raises ContinueTaskError instead of exiting."""
+    if task.get("branch"):
+        return task["branch"]
+    if _is_interactive():
+        current = _current_branch()
+        if current and current not in ("master", "main"):
+            answer = input(f"Use current branch '{current}'? [Y/n] ").strip().lower()
+            if answer in ("", "y", "yes"):
+                return current
+        name = input("Enter branch name for this task: ").strip()
+        if name:
+            return name
+    raise _continue_error(
+        "task has no branch and none was provided. "
+        "Agents must specify --branch or operate on a task that already has one."
+    )
+
+
 def _prepare_task_for_ready(conn, task, next_step):
-    """Validate and resolve fields needed to move a blocked task to ready."""
+    """Validate and resolve fields needed to move a blocked task to ready.
+
+    Raises ContinueTaskError on validation or policy failure. May prompt for a
+    missing branch when stdin is a TTY (CLI interactive use).
+    """
     task_type = _normalize_task_type(task.get("kind", "commit"))
-    _validate_next_step_for_type(task_type, next_step)
+    try:
+        validate_next_step_for_type(task_type, next_step)
+    except TaskValidationError as exc:
+        raise _continue_error(str(exc)) from exc
     fields = {"status": "ready", "next_step": next_step}
     if task_type != "other":
-        branch = _resolve_branch_for_ready(conn, task, None)
-        _validate_branch_name(branch)
-        _reject_master_branch_without_marker(branch)
+        branch = _resolve_branch_for_continue(conn, task)
+        try:
+            validate_branch_name(branch)
+            validate_master_branch_policy(branch)
+        except TaskValidationError as exc:
+            raise _continue_error(str(exc)) from exc
         fields["branch"] = branch
-    _reject_ready_when_idle_worktree_dirty(conn)
+    try:
+        validate_ready_worktree(conn)
+    except TaskValidationError as exc:
+        raise _continue_error(str(exc)) from exc
     return fields
 
 
-def cmd_continue(args, conn):
-    """Resume a blocked task via review-cap extension or an explicit next step."""
-    task = db.get_task(conn, args.task_id)
+def continue_blocked_task(conn, task_id, *, add_review_rounds=None, next_step=None):
+    """Resume a blocked task via review-cap extension or an explicit next step.
+
+    Shared core used by the CLI and dashboard. Raises ContinueTaskError on
+    validation or policy failure. Returns the updated task row.
+    """
+    task = db.get_task(conn, task_id)
     if not task:
-        print(f"Error: task {args.task_id} not found", file=sys.stderr)
-        sys.exit(1)
+        raise _continue_error(f"task {task_id} not found")
 
     if task["status"] != "blocked":
-        print(
-            f"Error: continue requires status=blocked (got '{task['status']}').",
-            file=sys.stderr,
+        raise _continue_error(
+            f"continue requires status=blocked (got '{task['status']}')."
         )
-        sys.exit(1)
 
-    add_rounds = args.add_review_rounds
-    next_step = args.next_step
+    add_rounds = add_review_rounds
+    resume_next = next_step
     legacy_recovery = False
 
-    if add_rounds is not None and next_step is not None:
+    if add_rounds is not None and resume_next is not None:
         # Legacy pre-schema review-cap: no structured block_reason / resume step.
         # Operator must declare both the round grant and the maker step.
         if task.get("block_reason") or task.get("resume_next_step"):
             if task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP:
-                print(
-                    "Error: structured review-cap blocks must use --add-review-rounds N "
-                    "alone (the resume step is stored); do not pass --next-step.",
-                    file=sys.stderr,
+                raise _continue_error(
+                    "structured review-cap blocks must use --add-review-rounds N "
+                    "alone (the resume step is stored); do not pass --next-step."
                 )
-            else:
-                print(
-                    "Error: use either --add-review-rounds or --next-step, not both.",
-                    file=sys.stderr,
-                )
-            sys.exit(1)
+            raise _continue_error(
+                "use either --add-review-rounds or --next-step, not both."
+            )
         legacy_recovery = True
-    elif add_rounds is None and next_step is None:
-        if task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP and task.get("resume_next_step"):
-            print(
-                "Error: this task was blocked at its review cap; "
-                "use --add-review-rounds N to grant more rounds and resume.",
-                file=sys.stderr,
+    elif add_rounds is None and resume_next is None:
+        if is_structured_review_cap_block(task):
+            raise _continue_error(
+                "this task was blocked at its review cap; "
+                "use --add-review-rounds N to grant more rounds and resume."
             )
-            sys.exit(1)
         if task.get("resume_next_step"):
-            next_step = task["resume_next_step"]
+            resume_next = task["resume_next_step"]
         else:
-            print(
-                "Error: continue requires --next-step <step> unless the task has "
-                "structured resume metadata (or --add-review-rounds for a review-cap block).",
-                file=sys.stderr,
+            raise _continue_error(
+                "continue requires --next-step <step> unless the task has "
+                "structured resume metadata (or --add-review-rounds for a review-cap block)."
             )
-            sys.exit(1)
 
     if add_rounds is not None:
         if add_rounds <= 0:
-            print(
-                "Error: --add-review-rounds must be a positive integer.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise _continue_error("--add-review-rounds must be a positive integer.")
 
         if legacy_recovery:
-            resume_step = next_step
+            resume_step = resume_next
         else:
             if task.get("block_reason") != db.BLOCK_REASON_REVIEW_CAP:
-                print(
-                    "Error: --add-review-rounds is only valid for tasks blocked at "
-                    "their review cap (or legacy recovery with --next-step).",
-                    file=sys.stderr,
+                raise _continue_error(
+                    "--add-review-rounds is only valid for tasks blocked at "
+                    "their review cap (or legacy recovery with --next-step)."
                 )
-                sys.exit(1)
             resume_step = task.get("resume_next_step")
             if not resume_step:
-                print(
-                    "Error: task is missing structured resume_next_step metadata "
-                    "for review-cap continuation.",
-                    file=sys.stderr,
+                raise _continue_error(
+                    "task is missing structured resume_next_step metadata "
+                    "for review-cap continuation."
                 )
-                sys.exit(1)
 
         old_cap = task.get("max_review_rounds")
         if old_cap is None:
@@ -605,7 +640,7 @@ def cmd_continue(args, conn):
                 "resume_next_step": None,
             }
         )
-        db.update_task(conn, args.task_id, **fields)
+        db.update_task(conn, task_id, **fields)
         stash_note = (
             f" Preserved stash_ref={preserved_stash}."
             if preserved_stash
@@ -628,33 +663,31 @@ def cmd_continue(args, conn):
             )
         db.add_comment(
             conn,
-            args.task_id,
+            task_id,
             comment,
             kind="comment",
             author="operator",
         )
     else:
         if task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP:
-            print(
-                "Error: review-cap blocks require --add-review-rounds N "
-                "(do not use --next-step alone; that would resume without raising the cap).",
-                file=sys.stderr,
+            raise _continue_error(
+                "review-cap blocks require --add-review-rounds N "
+                "(do not use --next-step alone; that would resume without raising the cap)."
             )
-            sys.exit(1)
 
-        fields = _prepare_task_for_ready(conn, task, next_step)
+        fields = _prepare_task_for_ready(conn, task, resume_next)
         fields.update(
             {
                 "block_reason": None,
                 "resume_next_step": None,
             }
         )
-        db.update_task(conn, args.task_id, **fields)
+        db.update_task(conn, task_id, **fields)
         db.add_comment(
             conn,
-            args.task_id,
+            task_id,
             (
-                f"Operator continued blocked task: requeued at next_step={next_step}. "
+                f"Operator continued blocked task: requeued at next_step={resume_next}. "
                 f"review_round={task.get('review_round')} and stash_ref={task.get('stash_ref')!r} "
                 "were left unchanged."
             ),
@@ -663,9 +696,24 @@ def cmd_continue(args, conn):
         )
 
     if task.get("parent_task_id") is not None:
-        _maybe_restore_parent_after_child_ready(conn, args.task_id, task["parent_task_id"])
+        _maybe_restore_parent_after_child_ready(conn, task_id, task["parent_task_id"])
 
-    _json_out(db.get_task(conn, args.task_id))
+    return db.get_task(conn, task_id)
+
+
+def cmd_continue(args, conn):
+    """Resume a blocked task via review-cap extension or an explicit next step."""
+    try:
+        updated = continue_blocked_task(
+            conn,
+            args.task_id,
+            add_review_rounds=args.add_review_rounds,
+            next_step=args.next_step,
+        )
+    except ContinueTaskError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    _json_out(updated)
 
 
 def cmd_list(args, conn):

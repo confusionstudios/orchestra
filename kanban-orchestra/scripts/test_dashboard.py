@@ -1432,6 +1432,39 @@ class TestTaskRuntimePanel(unittest.TestCase):
         html = dashboard.render_task_runtime_panel(task, None)
         self.assertIn('action="/task/5/set-ready"', html)
         self.assertIn("Set to ready", html)
+        self.assertNotIn("continue-review-cap", html)
+
+    def test_structured_review_cap_shows_continue_form(self):
+        task = {
+            "id": 5,
+            "status": "blocked",
+            "next_step": "none",
+            "kind": "commit",
+            "block_reason": db.BLOCK_REASON_REVIEW_CAP,
+            "resume_next_step": "commit-make",
+        }
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn('action="/task/5/continue-review-cap"', html)
+        self.assertIn('name="add_review_rounds"', html)
+        self.assertIn('min="1"', html)
+        self.assertIn('value="3"', html)
+        self.assertIn("Continue with additional rounds", html)
+        self.assertNotIn('action="/task/5/set-ready"', html)
+        self.assertNotIn("Set to ready", html)
+
+    def test_legacy_blocked_without_metadata_keeps_set_ready(self):
+        task = {
+            "id": 5,
+            "status": "blocked",
+            "next_step": "commit-review",
+            "kind": "commit",
+            "block_reason": None,
+            "resume_next_step": None,
+        }
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn('action="/task/5/set-ready"', html)
+        self.assertIn("Set to ready", html)
+        self.assertNotIn("continue-review-cap", html)
 
     def test_missing_next_step_prompts_for_inferred_default(self):
         task = {"id": 5, "status": "blocked", "next_step": "none", "kind": "pull_request"}
@@ -1566,6 +1599,22 @@ class TestReadyActionHelpers(unittest.TestCase):
              patch.object(dashboard.task_cli, "_repo_root_for_policy", return_value=Path("/tmp/repo")):
             with self.assertRaisesRegex(dashboard.ReadyActionError, "worktree is dirty"):
                 dashboard._ready_update_fields(self.conn, task)
+
+    def test_structured_review_cap_refused_by_helper(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "none",
+            "kind": "commit",
+            "branch": "feat-ready",
+            "block_reason": db.BLOCK_REASON_REVIEW_CAP,
+            "resume_next_step": "commit-make",
+        }
+        with self.assertRaisesRegex(dashboard.ReadyActionError, "review cap"):
+            dashboard._ready_update_fields(self.conn, task)
+        state = dashboard._ready_action_state(task)
+        self.assertFalse(state["available"])
+        self.assertIn("Continue with additional", state["error"])
 
 
 class TestTaskDetailLiveHeader(unittest.TestCase):
@@ -1822,6 +1871,159 @@ class TestTaskSetReadyRoutes(unittest.TestCase):
             headers={"origin": "http://evil.example.com"},
         )
         self.assertEqual(resp.status_code, 403)
+
+    def test_set_ready_rejects_structured_review_cap(self):
+        tid = db.add_task(self.conn, "Cap blocked", branch="feat-ready")
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            max_review_rounds=3,
+            review_round=3,
+        )
+
+        resp = self._post_ready(tid)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("review cap", resp.text.lower())
+        self.assertIn("Continue with additional", resp.text)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["max_review_rounds"], 3)
+
+
+class TestTaskContinueReviewCapRoutes(unittest.TestCase):
+    """Tests for task detail review-cap continuation flow."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+        os.environ["KANBAN_DB"] = self.db_path
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+        os.environ.pop("KANBAN_DB", None)
+
+    def _block_at_review_cap(self, *, stash_ref="stash@{0}", max_rounds=3, review_round=None):
+        tid = db.add_task(self.conn, "Cap blocked", branch="feat-continue")
+        if review_round is None:
+            review_round = max_rounds
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            review_round=review_round,
+            last_review_decision="reject",
+            stash_ref=stash_ref,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            max_review_rounds=max_rounds,
+        )
+        return tid, review_round, max_rounds
+
+    def _post_continue(self, task_id, data=None):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        return client.post(
+            f"/task/{task_id}/continue-review-cap",
+            data=data if data is not None else {"add_review_rounds": "3"},
+            headers={"origin": "http://127.0.0.1:8427"},
+            follow_redirects=False,
+        )
+
+    def test_continue_review_cap_success(self):
+        tid, review_round, max_rounds = self._block_at_review_cap()
+
+        resp = self._post_continue(tid, {"add_review_rounds": "2"})
+
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], f"/task/{tid}")
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+        self.assertEqual(task["max_review_rounds"], max_rounds + 2)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(
+            any(
+                c["author"] == "operator" and "additional review round" in c["message"]
+                for c in comments
+            ),
+        )
+
+    def test_continue_invalid_rounds_leaves_task_unchanged(self):
+        tid, review_round, max_rounds = self._block_at_review_cap()
+
+        for payload in (
+            {},
+            {"add_review_rounds": ""},
+            {"add_review_rounds": "abc"},
+            {"add_review_rounds": "0"},
+            {"add_review_rounds": "-1"},
+        ):
+            with self.subTest(payload=payload):
+                resp = self._post_continue(tid, payload)
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("positive integer", resp.text.lower())
+                self.assertIn("continue-review-cap", resp.text)
+                task = db.get_task(self.conn, tid)
+                self.assertEqual(task["status"], "blocked")
+                self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+                self.assertEqual(task["resume_next_step"], "commit-make")
+                self.assertEqual(task["review_round"], review_round)
+                self.assertEqual(task["max_review_rounds"], max_rounds)
+                self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_continue_restores_parent_supertask(self):
+        parent_id = db.add_task(
+            self.conn, "Parent", kind="supertask", branch="feat-parent",
+        )
+        child_id = db.add_task(
+            self.conn, "Child", branch="feat-parent", parent_task_id=parent_id,
+        )
+        db.update_task(
+            self.conn, child_id,
+            status="blocked", next_step="none",
+            review_round=3,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            stash_ref="stash@{3}",
+            max_review_rounds=3,
+        )
+        db.update_task(self.conn, parent_id, status="blocked")
+
+        resp = self._post_continue(child_id, {"add_review_rounds": "3"})
+
+        self.assertEqual(resp.status_code, 303)
+        child = db.get_task(self.conn, child_id)
+        self.assertEqual(child["status"], "ready")
+        self.assertEqual(child["stash_ref"], "stash@{3}")
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "pending_subtasks")
+
+    def test_continue_rejects_cross_origin(self):
+        from fastapi.testclient import TestClient
+
+        tid, _, _ = self._block_at_review_cap()
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{tid}/continue-review-cap",
+            data={"add_review_rounds": "3"},
+            headers={"origin": "http://evil.example.com"},
+        )
+        self.assertEqual(resp.status_code, 403)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
 
 
 class TestOverviewPage(unittest.TestCase):
