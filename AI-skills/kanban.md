@@ -169,6 +169,12 @@ task set <task-id> \
     [--commit-plan "<text>"] [--allow-when-blocked <bool>] \
     [--add-skip <step>] [--remove-skip <step>]
 
+# Resume a blocked task (review-cap extension or explicit recovery step):
+task continue <task-id> --add-review-rounds <n>
+task continue <task-id> --next-step <step>
+# Legacy pre-schema review-cap (no block_reason / resume_next_step):
+task continue <task-id> --add-review-rounds <n> --next-step commit-make
+
 # Comments (use --message-stdin for multi-line / shell-sensitive text):
 cat <<'EOF' | task comment <task-id> --message-stdin [--comment|--commit-message|--validation] [--author <name>]
 <message>
@@ -246,6 +252,22 @@ Notes:
 - Before setting a task to `ready`, set `next_step` to a meaningful step
   (typically `commit-make`); tasks left at `next_step: none` get picked up
   and immediately dropped with no work executed.
+- `task continue` to resume a blocked task safely:
+  - After a review-round cap block, use
+    `task continue <id> --add-review-rounds N`. This raises that task's
+    persisted `max_review_rounds` by N, preserves `review_round`, comments,
+    and `stash_ref`, and requeues at the stored maker step
+    (`commit-make`, `pull-request-make`, `other-make`, or
+    `commit-make-supertask`).
+  - For other blocks, use `task continue <id> --next-step <step>`. Do not
+    guess a recovery step; `--next-step` is required unless structured resume
+    metadata is already on the task. Review-cap blocks must use
+    `--add-review-rounds`, not `--next-step` alone. Do not use
+    `task set --status ready` to bypass a review-cap block.
+  - Legacy databases may have a pre-schema review-cap block with no
+    `block_reason` / `resume_next_step`. Recover those with
+    `task continue <id> --add-review-rounds N --next-step <maker-step>`
+    (operator-declared legacy recovery only).
 - `task add --branch master/main`, `task set --branch master/main`, and
   `task set --status ready` for a task whose branch resolves to `master` or
   `main` require the repo-local `ALLOW_TASKS_ON_MASTER` marker.
@@ -338,6 +360,11 @@ Read the result like this:
   check the blocked task comment and worktree before restarting.
 - `status = error` means an orchestrator-level failure.
 - List blocked tasks with `task list --status blocked`.
+- Resume a review-cap block with
+  `task continue <id> --add-review-rounds N`, or resume other blocks with
+  `task continue <id> --next-step <step>`. Legacy pre-schema review-cap
+  blocks (no structured metadata):
+  `task continue <id> --add-review-rounds N --next-step commit-make`.
 
 When any task is `blocked`, only `ready` tasks with `allow_when_blocked`
 enabled remain eligible for pickup.

@@ -243,6 +243,122 @@ class TestDB(unittest.TestCase):
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["allow_when_blocked"], 0)
 
+    def test_max_review_rounds_defaults_from_global(self):
+        tid = db.add_task(self.conn, "Cap default")
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_missing_max_review_rounds_and_resume_columns_are_migrated(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            legacy = sqlite3.connect(tmp.name)
+            legacy.execute(
+                """CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT NOT NULL DEFAULT 'none',
+                    next_step TEXT NOT NULL DEFAULT 'commit-make'
+                        CHECK(next_step IN ('commit-make', 'commit-review',
+                                            'commit-make-supertask', 'commit-review-supertask',
+                                            'commit-plan', 'commit-plan-review',
+                                            'pull-request-make', 'pull-request-review',
+                                            'other-make', 'other-review',
+                                            'none')),
+                    branch TEXT,
+                    commit_hash TEXT,
+                    stash_ref TEXT,
+                    coder_agent TEXT,
+                    reviewer_agent TEXT,
+                    review_round INTEGER DEFAULT 0,
+                    last_review_decision TEXT DEFAULT 'none',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ready_at DATETIME DEFAULT NULL,
+                    last_ready_at DATETIME DEFAULT NULL,
+                    done_at DATETIME DEFAULT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL DEFAULT 'commit',
+                    parent_task_id INTEGER REFERENCES tasks(id),
+                    sequence_index INTEGER,
+                    commit_plan TEXT,
+                    follow_up_task_id INTEGER REFERENCES tasks(id),
+                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE task_skips (
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    step TEXT NOT NULL
+                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
+                                       'commit-review-supertask','pull-request-review','other-review')),
+                    PRIMARY KEY (task_id, step)
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE run_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER REFERENCES tasks(id),
+                    verb TEXT,
+                    author TEXT,
+                    message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER REFERENCES tasks(id),
+                    review_round INTEGER,
+                    verb TEXT,
+                    author TEXT,
+                    message TEXT,
+                    kind TEXT DEFAULT 'comment'
+                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
+                                       'validation', 'plan-approval', 'plan-rejection',
+                                       'done-without-commit', 'deferred-build-changed')),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE orchestrator_runtime (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    status TEXT NOT NULL,
+                    pid INTEGER,
+                    started_at DATETIME,
+                    last_heartbeat_at DATETIME,
+                    current_task_id INTEGER REFERENCES tasks(id),
+                    current_step TEXT,
+                    current_branch TEXT,
+                    review_round INTEGER,
+                    active_agents INTEGER NOT NULL DEFAULT 0,
+                    status_message TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                "INSERT INTO tasks (id, title, status, next_step, kind) VALUES (1, 'Legacy', 'none', 'commit-plan', 'commit')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            migrated = db.connect(tmp.name)
+            try:
+                cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)").fetchall()}
+                self.assertIn("max_review_rounds", cols)
+                self.assertIn("block_reason", cols)
+                self.assertIn("resume_next_step", cols)
+                task = db.get_task(migrated, 1)
+                self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
+                self.assertIsNone(task["block_reason"])
+                self.assertIsNone(task["resume_next_step"])
+            finally:
+                migrated.close()
+        finally:
+            os.unlink(tmp.name)
+
     def test_task_add_defaults_normal_tasks_to_build_step(self):
         args = SimpleNamespace(
             title="Default skip planning",
@@ -2323,6 +2439,10 @@ class TestStateMachine(unittest.TestCase):
 
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(updated["resume_next_step"], "commit-make")
+        self.assertEqual(updated["review_round"], orchestrator.MAX_REVIEW_ROUNDS)
+        self.assertEqual(updated["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
 
     def test_max_review_rounds_dirty_worktree_preserves_wip(self):
         """Max review rounds with a dirty worktree stashes WIP and records stash_ref."""
@@ -5648,7 +5768,7 @@ class TestSupertaskStateMachine(unittest.TestCase):
     def test_advance_commit_review_supertask_approve_sets_pending_subtasks(self):
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "LGTM",
-                       kind="approval", author=DEFAULT_REVIEWER, review_round=0)
+                       kind="approval", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
 
         with patch.object(orchestrator, "run_agent", return_value=0):
             result = orchestrator.advance(task, self.conn)
@@ -5662,7 +5782,7 @@ class TestSupertaskStateMachine(unittest.TestCase):
     def test_advance_commit_review_supertask_reject_returns_to_make(self):
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "Needs more detail",
-                       kind="rejection", author=DEFAULT_REVIEWER, review_round=0)
+                       kind="rejection", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
 
         with patch.object(orchestrator, "run_agent", return_value=0):
             result = orchestrator.advance(task, self.conn)
@@ -5677,7 +5797,7 @@ class TestSupertaskStateMachine(unittest.TestCase):
         """After plan approval, supertask has no commit_hash."""
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "LGTM",
-                       kind="approval", author=DEFAULT_REVIEWER, review_round=0)
+                       kind="approval", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
 
         with patch.object(orchestrator, "run_agent", return_value=0):
             orchestrator.advance(task, self.conn)
@@ -6007,6 +6127,417 @@ class TestSupertaskCLI(unittest.TestCase):
 
         parent = json.loads(self._run("show", str(parent_id)).stdout)
         self.assertEqual(parent["status"], "blocked")
+
+
+class TestContinueBlockedTask(unittest.TestCase):
+    """CLI and orchestrator coverage for ko-task continue."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        self.task_py = str(Path(__file__).resolve().parent / "task.py")
+        self.env = {
+            **os.environ,
+            "KANBAN_DB": self.db_path,
+            "KANBAN_NONINTERACTIVE": "1",
+        }
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, self.task_py] + list(args),
+            capture_output=True, text=True, env=self.env,
+        )
+
+    def _block_at_review_cap(self, *, stash_ref="stash@{0}", review_round=None):
+        tid = db.add_task(self.conn, "Cap blocked", branch="feat-continue", coder_agent="claude")
+        if review_round is None:
+            review_round = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            review_round=review_round,
+            last_review_decision="reject",
+            stash_ref=stash_ref,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            max_review_rounds=orchestrator.MAX_REVIEW_ROUNDS,
+        )
+        db.add_comment(
+            self.conn, tid, "prior rejection", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round - 1,
+        )
+        return tid, review_round
+
+    def test_continue_add_review_rounds_preserves_history_and_stash(self):
+        tid, review_round = self._block_at_review_cap()
+        prior_comments = db.get_comments(self.conn, tid)
+
+        r = self._run("continue", str(tid), "--add-review-rounds", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS + 2)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+        comments = db.get_comments(self.conn, tid)
+        self.assertGreater(len(comments), len(prior_comments))
+        self.assertTrue(any(c["kind"] == "rejection" for c in comments))
+        self.assertTrue(
+            any(
+                c["author"] == "operator" and "additional review round" in c["message"]
+                for c in comments
+            ),
+        )
+
+    def test_continue_generic_next_step(self):
+        tid = db.add_task(self.conn, "Other block", branch="feat-generic", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="blocked", next_step="none",
+            review_round=1, stash_ref=None,
+        )
+
+        r = self._run("continue", str(tid), "--next-step", "commit-make")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], 1)
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(
+            any(c["author"] == "operator" and "requeued at next_step=commit-make" in c["message"]
+                for c in comments),
+        )
+
+    def test_continue_rejects_invalid_uses(self):
+        ready_id = db.add_task(self.conn, "Ready", branch="feat-ready")
+        db.update_task(self.conn, ready_id, status="ready", next_step="commit-make")
+        r = self._run("continue", str(ready_id), "--add-review-rounds", "1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("status=blocked", r.stderr)
+
+        tid, _ = self._block_at_review_cap()
+        r = self._run("continue", str(tid), "--add-review-rounds", "0")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("positive integer", r.stderr)
+
+        r = self._run("continue", str(tid), "--add-review-rounds", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("positive integer", r.stderr)
+
+        r = self._run(
+            "continue", str(tid),
+            "--add-review-rounds", "1", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("structured review-cap", r.stderr)
+
+        r = self._run("continue", str(tid), "--next-step", "commit-make")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        r = self._run("continue", str(tid))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        other = db.add_task(self.conn, "No metadata", branch="feat-none")
+        db.update_task(self.conn, other, status="blocked", next_step="none")
+        r = self._run("continue", str(other))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--next-step", r.stderr)
+
+        r = self._run("continue", str(other), "--add-review-rounds", "2")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr)
+
+    def test_set_status_ready_rejects_review_cap_bypass(self):
+        """task set --status ready must not bypass a review-cap block."""
+        tid, review_round = self._block_at_review_cap()
+        cap = db.get_task(self.conn, tid)["max_review_rounds"]
+
+        r = self._run(
+            "set", str(tid),
+            "--status", "ready", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr.lower())
+        self.assertIn("task continue", r.stderr.lower())
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["max_review_rounds"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_set_status_ready_rejects_two_step_review_cap_bypass(self):
+        """Clearing status alone must not open a set --status ready bypass."""
+        tid, review_round = self._block_at_review_cap()
+        cap = db.get_task(self.conn, tid)["max_review_rounds"]
+
+        r = self._run("set", str(tid), "--status", "none")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mid = db.get_task(self.conn, tid)
+        self.assertEqual(mid["status"], "none")
+        self.assertEqual(mid["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(mid["resume_next_step"], "commit-make")
+        self.assertEqual(mid["max_review_rounds"], cap)
+
+        r = self._run(
+            "set", str(tid),
+            "--status", "ready", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr.lower())
+        self.assertIn("task continue", r.stderr.lower())
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "none")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["max_review_rounds"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_continue_legacy_review_cap_with_next_step(self):
+        """Pre-schema review-cap blocks recover via --add-review-rounds + --next-step."""
+        tid = db.add_task(self.conn, "Legacy cap", branch="feat-legacy", coder_agent="claude")
+        review_round = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn, tid,
+            status="blocked", next_step="none",
+            review_round=review_round,
+            last_review_decision="reject",
+            stash_ref="stash@{9}",
+            block_reason=None,
+            resume_next_step=None,
+        )
+        db.add_comment(
+            self.conn, tid, "legacy rejection", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round - 1,
+        )
+        prior_comments = db.get_comments(self.conn, tid)
+
+        r = self._run(
+            "continue", str(tid),
+            "--add-review-rounds", "2", "--next-step", "commit-make",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{9}")
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS + 2)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+        comments = db.get_comments(self.conn, tid)
+        self.assertGreater(len(comments), len(prior_comments))
+        self.assertTrue(any(c["kind"] == "rejection" for c in comments))
+        self.assertTrue(
+            any(
+                c["author"] == "operator"
+                and "legacy/manual review-cap recovery" in c["message"]
+                and "additional review round" in c["message"]
+                for c in comments
+            ),
+        )
+
+    def test_continue_legacy_rejects_invalid_combinations(self):
+        """Legacy form is only for tasks with no structured block metadata."""
+        # Known non-review-cap block: --add-review-rounds alone still rejected.
+        other = db.add_task(self.conn, "Other block", branch="feat-other-block")
+        db.update_task(
+            self.conn, other,
+            status="blocked", next_step="none",
+            review_round=1, stash_ref="stash@{1}",
+        )
+        r = self._run("continue", str(other), "--add-review-rounds", "2")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr)
+
+        # Structured review-cap still rejects --next-step alongside rounds.
+        tid, review_round = self._block_at_review_cap()
+        r = self._run(
+            "continue", str(tid),
+            "--add-review-rounds", "1", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("structured review-cap", r.stderr)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+        # Resume step without block_reason is not legacy either.
+        partial = db.add_task(self.conn, "Partial meta", branch="feat-partial")
+        db.update_task(
+            self.conn, partial,
+            status="blocked", next_step="none",
+            resume_next_step="commit-make",
+            stash_ref="stash@{2}",
+            review_round=3,
+        )
+        r = self._run(
+            "continue", str(partial),
+            "--add-review-rounds", "1", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not both", r.stderr)
+        task = db.get_task(self.conn, partial)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["review_round"], 3)
+        self.assertEqual(task["stash_ref"], "stash@{2}")
+
+        # Legacy task still needs a valid maker step.
+        legacy = db.add_task(self.conn, "Legacy bad step", branch="feat-legacy-bad")
+        db.update_task(
+            self.conn, legacy,
+            status="blocked", next_step="none",
+            review_round=orchestrator.MAX_REVIEW_ROUNDS,
+            stash_ref="stash@{3}",
+        )
+        r = self._run(
+            "continue", str(legacy),
+            "--add-review-rounds", "1", "--next-step", "pull-request-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        task = db.get_task(self.conn, legacy)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["review_round"], orchestrator.MAX_REVIEW_ROUNDS)
+        self.assertEqual(task["stash_ref"], "stash@{3}")
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
+
+    def test_continue_cap_enforcement_after_extension(self):
+        tid, review_round = self._block_at_review_cap(stash_ref=None)
+        r = self._run("continue", str(tid), "--add-review-rounds", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["max_review_rounds"], review_round + 2)
+
+        # First rejection under the raised cap requeues for another make/review.
+        db.update_task(
+            self.conn, tid,
+            status="running", next_step="commit-review", review_round=review_round,
+        )
+        db.add_comment(
+            self.conn, tid, "Still no", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round,
+        )
+        task = db.get_task(self.conn, tid)
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(task, self.conn)
+        mid = db.get_task(self.conn, tid)
+        self.assertEqual(mid["status"], "ready")
+        self.assertEqual(mid["next_step"], "commit-make")
+        self.assertEqual(mid["review_round"], review_round + 1)
+
+        # The next rejection hits the new cap and blocks again.
+        db.update_task(
+            self.conn, tid,
+            status="running", next_step="commit-review",
+        )
+        db.add_comment(
+            self.conn, tid, "Final no", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round + 1,
+        )
+        task = db.get_task(self.conn, tid)
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(task, self.conn)
+        blocked = db.get_task(self.conn, tid)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(blocked["resume_next_step"], "commit-make")
+        self.assertEqual(blocked["review_round"], review_round + 2)
+        self.assertEqual(blocked["max_review_rounds"], review_round + 2)
+
+    def test_continue_restores_parent_supertask(self):
+        parent_id = db.add_task(
+            self.conn, "Parent", kind="supertask", branch="feat-parent",
+            coder_agent="claude",
+        )
+        child_id = db.add_task(
+            self.conn, "Child", branch="feat-parent", parent_task_id=parent_id,
+            coder_agent="claude",
+        )
+        db.update_task(
+            self.conn, child_id,
+            status="blocked", next_step="none",
+            review_round=orchestrator.MAX_REVIEW_ROUNDS,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            stash_ref="stash@{3}",
+        )
+        db.update_task(self.conn, parent_id, status="blocked")
+
+        r = self._run("continue", str(child_id), "--add-review-rounds", "3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        child = json.loads(r.stdout)
+        self.assertEqual(child["status"], "ready")
+        self.assertEqual(child["stash_ref"], "stash@{3}")
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "pending_subtasks")
+
+    def test_orchestrator_records_pr_and_other_resume_steps(self):
+        pr_id = db.add_task(
+            self.conn, "PR", kind="pull_request", branch="feat-pr", coder_agent="claude",
+        )
+        round_num = orchestrator.MAX_REVIEW_ROUNDS - 1
+        db.update_task(
+            self.conn, pr_id,
+            status="running", next_step="pull-request-review", review_round=round_num,
+        )
+        db.add_comment(
+            self.conn, pr_id, "No", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=round_num,
+        )
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_pull_request_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(db.get_task(self.conn, pr_id), self.conn)
+        pr = db.get_task(self.conn, pr_id)
+        self.assertEqual(pr["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(pr["resume_next_step"], "pull-request-make")
+
+        other_id = db.add_task(
+            self.conn, "Other", kind="other", coder_agent="claude",
+        )
+        db.update_task(
+            self.conn, other_id,
+            status="running", next_step="other-review", review_round=round_num,
+        )
+        db.add_comment(
+            self.conn, other_id, "No", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=round_num,
+        )
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_other_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(db.get_task(self.conn, other_id), self.conn)
+        other = db.get_task(self.conn, other_id)
+        self.assertEqual(other["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(other["resume_next_step"], "other-make")
 
 
 class TestTaskPlanningDB(unittest.TestCase):
@@ -6674,6 +7205,86 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertEqual(task["status"], "ready")
         self.assertEqual(task["next_step"], "commit-plan")
         self.assertIsNone(task["commit_plan"])
+
+    def test_recover_running_commit_review_at_cap_blocks(self):
+        """Startup recovery of interrupted commit-review at the task cap blocks as review_cap."""
+        tid = db.add_task(self.conn, "Stuck review at cap", coder_agent="claude")
+        cap = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review",
+            review_round=cap - 1, max_review_rounds=cap,
+        )
+
+        def fake_stash(task_id_, conn_):
+            db.update_task(conn_, task_id_, stash_ref="stash@{0}")
+            return "stash@{0}"
+
+        with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
+             patch.object(orchestrator, "stash_task_wip", side_effect=fake_stash):
+            orchestrator.recover_running_tasks(self.conn)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], cap)
+        self.assertEqual(task["max_review_rounds"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_recover_running_commit_review_raised_cap_remains_eligible(self):
+        """Startup recovery below a raised per-task cap requeues at the next review round."""
+        tid = db.add_task(self.conn, "Stuck review under raised cap", coder_agent="claude")
+        raised_cap = orchestrator.MAX_REVIEW_ROUNDS + 3
+        start_round = orchestrator.MAX_REVIEW_ROUNDS  # would hit default cap, but task cap is higher
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review",
+            review_round=start_round, max_review_rounds=raised_cap,
+        )
+
+        orchestrator.recover_running_tasks(self.conn)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-review")
+        self.assertEqual(task["review_round"], start_round + 1)
+        self.assertEqual(task["max_review_rounds"], raised_cap)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_keyboard_interrupt_commit_review_at_cap_blocks(self):
+        """KeyboardInterrupt during commit-review at the task cap blocks as review_cap."""
+        tid = db.add_task(self.conn, "Interrupted review at cap", coder_agent="claude")
+        cap = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn, tid,
+            status="ready", branch="b", next_step="commit-review",
+            review_round=cap - 1, max_review_rounds=cap,
+        )
+
+        def fake_agent(name, prompt, task_id, conn, verb, **kw):
+            raise KeyboardInterrupt
+
+        def fake_stash(task_id_, conn_):
+            db.update_task(conn_, task_id_, stash_ref="stash@{1}")
+            return "stash@{1}"
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_agent), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
+             patch.object(orchestrator, "stash_task_wip", side_effect=fake_stash):
+            with self.assertRaises(KeyboardInterrupt):
+                orchestrator.process_pinned_task(db.get_task(self.conn, tid), self.conn)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{1}")
 
     def test_build_prompt_role_filtering(self):
         """build_prompt filters skips from context, but keeps commit_plan for planners."""
@@ -7711,6 +8322,11 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertFalse(result)
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(updated["resume_next_step"], "commit-make")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["review_round"], orchestrator.MAX_REVIEW_ROUNDS - 1)
+        self.assertEqual(updated["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
 
     def test_path_b_deferred_build_changed_stale_signal_does_not_satisfy_new_run(self):
         """A deferred-build-changed comment from a prior run does not trigger re-review."""

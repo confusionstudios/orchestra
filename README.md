@@ -165,6 +165,9 @@ accounts, or billing — install and authenticate each CLI yourself.
    selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
    for opening the repo dashboard. Use `ko-get-update` for a concise status
    snapshot and `ko-task` to inspect, comment on, or update individual tasks.
+   Use `ko-task continue` to resume blocked tasks after a review-round cap
+   (`--add-review-rounds N`) or with an explicit recovery step (`--next-step`).
+   Legacy pre-schema review-cap blocks: `--add-review-rounds N --next-step <maker-step>`.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:

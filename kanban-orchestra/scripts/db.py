@@ -11,11 +11,15 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+import config
+
+SCHEMA_VERSION = 19
 LOCK_FILE_NAME = "kanban-orchestra.lock"
 COMMIT_TASK_KINDS = {"commit", "task"}
+BLOCK_REASON_REVIEW_CAP = "review_cap"
+DEFAULT_MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
 
-SCHEMA_SQL = """\
+SCHEMA_SQL = f"""\
 CREATE TABLE IF NOT EXISTS tasks (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     title                   TEXT NOT NULL,
@@ -35,6 +39,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     coder_agent             TEXT,
     reviewer_agent          TEXT,
     review_round            INTEGER DEFAULT 0,
+    max_review_rounds       INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS},
     last_review_decision    TEXT DEFAULT 'none'
         CHECK(last_review_decision IN ('none', 'approve', 'reject')),
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -48,7 +53,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     sequence_index          INTEGER,
     commit_plan             TEXT,
     follow_up_task_id       INTEGER REFERENCES tasks(id),
-    allow_when_blocked      INTEGER NOT NULL DEFAULT 0
+    allow_when_blocked      INTEGER NOT NULL DEFAULT 0,
+    block_reason            TEXT,
+    resume_next_step        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_skips (
@@ -374,9 +381,9 @@ def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
     """)
 
 
-def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str]) -> None:
-    """Migrate the old tasks.skip_commit_plan flag into task_skips rows."""
-    value_expr = {
+def _tasks_value_expr(task_cols: set[str]) -> dict[str, str]:
+    """Column expressions used when recreating the tasks table during migration."""
+    return {
         "id": "id",
         "title": "title",
         "description": "description" if "description" in task_cols else "NULL",
@@ -388,6 +395,10 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
         "coder_agent": "coder_agent" if "coder_agent" in task_cols else "NULL",
         "reviewer_agent": "reviewer_agent" if "reviewer_agent" in task_cols else "NULL",
         "review_round": "review_round" if "review_round" in task_cols else "0",
+        "max_review_rounds": (
+            "max_review_rounds" if "max_review_rounds" in task_cols
+            else str(DEFAULT_MAX_REVIEW_ROUNDS)
+        ),
         "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
@@ -400,16 +411,15 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
         "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
         "follow_up_task_id": "follow_up_task_id" if "follow_up_task_id" in task_cols else "NULL",
         "allow_when_blocked": "allow_when_blocked" if "allow_when_blocked" in task_cols else "0",
+        "block_reason": "block_reason" if "block_reason" in task_cols else "NULL",
+        "resume_next_step": "resume_next_step" if "resume_next_step" in task_cols else "NULL",
     }
-    columns = list(value_expr)
 
-    conn.execute("PRAGMA foreign_keys=OFF")
-    try:
-        conn.executescript(f"""
-            BEGIN;
-            CREATE TEMP TABLE skip_commit_plan_tasks AS
-                SELECT id FROM tasks WHERE skip_commit_plan = 1;
-            CREATE TABLE tasks_migrated (
+
+def _tasks_create_table_sql(table_name: str = "tasks_migrated") -> str:
+    """Current tasks DDL used by table-recreation migrations."""
+    return f"""
+            CREATE TABLE {table_name} (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 title                   TEXT NOT NULL,
                 description             TEXT,
@@ -428,6 +438,7 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                 coder_agent             TEXT,
                 reviewer_agent          TEXT,
                 review_round            INTEGER DEFAULT 0,
+                max_review_rounds       INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS},
                 last_review_decision    TEXT DEFAULT 'none'
                     CHECK(last_review_decision IN ('none', 'approve', 'reject')),
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -441,8 +452,25 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                 sequence_index          INTEGER,
                 commit_plan             TEXT,
                 follow_up_task_id       INTEGER REFERENCES tasks(id),
-                allow_when_blocked      INTEGER NOT NULL DEFAULT 0
+                allow_when_blocked      INTEGER NOT NULL DEFAULT 0,
+                block_reason            TEXT,
+                resume_next_step        TEXT
             );
+    """
+
+
+def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str]) -> None:
+    """Migrate the old tasks.skip_commit_plan flag into task_skips rows."""
+    value_expr = _tasks_value_expr(task_cols)
+    columns = list(value_expr)
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(f"""
+            BEGIN;
+            CREATE TEMP TABLE skip_commit_plan_tasks AS
+                SELECT id FROM tasks WHERE skip_commit_plan = 1;
+            {_tasks_create_table_sql("tasks_migrated")}
             INSERT INTO tasks_migrated ({", ".join(columns)})
                 SELECT {", ".join(value_expr[column] for column in columns)}
                 FROM tasks;
@@ -471,71 +499,14 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
 
 def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> None:
     """Recreate tasks with current next_step/kind CHECK constraints."""
-    value_expr = {
-        "id": "id",
-        "title": "title",
-        "description": "description" if "description" in task_cols else "NULL",
-        "status": "status" if "status" in task_cols else "'none'",
-        "next_step": "next_step" if "next_step" in task_cols else "'commit-make'",
-        "branch": "branch" if "branch" in task_cols else "NULL",
-        "commit_hash": "commit_hash" if "commit_hash" in task_cols else "NULL",
-        "stash_ref": "stash_ref" if "stash_ref" in task_cols else "NULL",
-        "coder_agent": "coder_agent" if "coder_agent" in task_cols else "NULL",
-        "reviewer_agent": "reviewer_agent" if "reviewer_agent" in task_cols else "NULL",
-        "review_round": "review_round" if "review_round" in task_cols else "0",
-        "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
-        "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
-        "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
-        "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
-        "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
-        "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
-        "kind": "kind" if "kind" in task_cols else "'commit'",
-        "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
-        "sequence_index": "sequence_index" if "sequence_index" in task_cols else "NULL",
-        "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
-        "follow_up_task_id": "follow_up_task_id" if "follow_up_task_id" in task_cols else "NULL",
-        "allow_when_blocked": "allow_when_blocked" if "allow_when_blocked" in task_cols else "0",
-    }
+    value_expr = _tasks_value_expr(task_cols)
     columns = list(value_expr)
 
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
         conn.executescript(f"""
             BEGIN;
-            CREATE TABLE tasks_migrated (
-                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                title                   TEXT NOT NULL,
-                description             TEXT,
-                status                  TEXT NOT NULL DEFAULT 'none'
-                    CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                next_step               TEXT NOT NULL DEFAULT 'commit-make'
-                    CHECK(next_step IN ('commit-make', 'commit-review',
-                                        'commit-make-supertask', 'commit-review-supertask',
-                                        'commit-plan', 'commit-plan-review',
-                                        'pull-request-make', 'pull-request-review',
-                                        'other-make', 'other-review',
-                                        'none')),
-                branch                  TEXT,
-                commit_hash             TEXT,
-                stash_ref               TEXT,
-                coder_agent             TEXT,
-                reviewer_agent          TEXT,
-                review_round            INTEGER DEFAULT 0,
-                last_review_decision    TEXT DEFAULT 'none'
-                    CHECK(last_review_decision IN ('none', 'approve', 'reject')),
-                created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ready_at                DATETIME DEFAULT NULL,
-                last_ready_at           DATETIME DEFAULT NULL,
-                done_at                 DATETIME DEFAULT NULL,
-                updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                kind                    TEXT NOT NULL DEFAULT 'commit'
-                    CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
-                parent_task_id          INTEGER REFERENCES tasks(id),
-                sequence_index          INTEGER,
-                commit_plan             TEXT,
-                follow_up_task_id       INTEGER REFERENCES tasks(id),
-                allow_when_blocked      INTEGER NOT NULL DEFAULT 0
-            );
+            {_tasks_create_table_sql("tasks_migrated")}
             INSERT INTO tasks_migrated ({", ".join(columns)})
                 SELECT {", ".join(value_expr[column] for column in columns)}
                 FROM tasks;
@@ -672,6 +643,22 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
             "ALTER TABLE tasks ADD COLUMN allow_when_blocked INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
+    if "max_review_rounds" not in task_cols:
+        # Existing tasks inherit the present global default; new tasks also use it.
+        conn.execute(
+            f"ALTER TABLE tasks ADD COLUMN max_review_rounds "
+            f"INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS}"
+        )
+        conn.commit()
+        task_cols.add("max_review_rounds")
+    if "block_reason" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN block_reason TEXT")
+        conn.commit()
+        task_cols.add("block_reason")
+    if "resume_next_step" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN resume_next_step TEXT")
+        conn.commit()
+        task_cols.add("resume_next_step")
     if "reviewer_agent" not in task_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN reviewer_agent TEXT")
         conn.commit()
@@ -847,9 +834,9 @@ def add_task(
         """INSERT INTO tasks (
                title, description, branch, coder_agent, reviewer_agent,
                kind, parent_task_id, sequence_index, next_step, status,
-               allow_when_blocked
+               allow_when_blocked, max_review_rounds
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             description,
@@ -862,6 +849,7 @@ def add_task(
             next_step,
             status,
             int(bool(allow_when_blocked)),
+            DEFAULT_MAX_REVIEW_ROUNDS,
         ),
     )
     task_id = cur.lastrowid
@@ -973,10 +961,10 @@ def update_task(conn, task_id, **fields):
     allowed = {
         "title", "description", "status", "next_step", "branch",
         "commit_hash", "stash_ref", "coder_agent", "reviewer_agent",
-        "review_round", "last_review_decision", "ready_at",
+        "review_round", "max_review_rounds", "last_review_decision", "ready_at",
         "last_ready_at", "done_at",
         "sequence_index", "commit_plan", "follow_up_task_id",
-        "allow_when_blocked",
+        "allow_when_blocked", "block_reason", "resume_next_step",
     }
     bad = set(fields) - allowed
     if bad:

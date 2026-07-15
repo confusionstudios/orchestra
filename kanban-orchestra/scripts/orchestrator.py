@@ -483,12 +483,24 @@ def stash_task_wip(task_id, conn):
         return None
 
 
-def mark_blocked(task_id, conn, comment, runtime_status, log_message=None, preserve_wip=False):
+def mark_blocked(
+    task_id,
+    conn,
+    comment,
+    runtime_status,
+    log_message=None,
+    preserve_wip=False,
+    block_reason=None,
+    resume_next_step=None,
+):
     """
     Block a task with a consistent state transition.
 
     When preserve_wip is True, any dirty worktree is treated as task-created WIP:
     stage it, stash it, record stash_ref, and leave a durable note.
+
+    Optional block_reason / resume_next_step record structured resume context so
+    operators can continue safely without parsing comments.
     """
     if preserve_wip and is_worktree_dirty():
         stash_ref = stash_task_wip(task_id, conn)
@@ -505,11 +517,76 @@ def mark_blocked(task_id, conn, comment, runtime_status, log_message=None, prese
                 kind="comment", author="orchestrator",
             )
 
-    db.update_task(conn, task_id, status="blocked", next_step="none")
+    db.update_task(
+        conn,
+        task_id,
+        status="blocked",
+        next_step="none",
+        block_reason=block_reason,
+        resume_next_step=resume_next_step,
+    )
     db.add_comment(conn, task_id, comment, kind="comment", author="orchestrator")
     db.update_runtime(conn, status_message=runtime_status)
     if log_message:
         log(log_message, task_id)
+
+
+def task_max_review_rounds(task):
+    """Return the per-task review round cap, falling back to the global default."""
+    cap = task.get("max_review_rounds")
+    if cap is None:
+        return MAX_REVIEW_ROUNDS
+    return int(cap)
+
+
+# Review steps that advance review_round on interrupt/recovery, mapped to the
+# maker step operators should resume at after a review-cap block.
+_INTERRUPT_REVIEW_RESUME = {
+    "commit-review": ("commit-make", True),
+    "commit-review-supertask": ("commit-make-supertask", False),
+    "pull-request-review": ("pull-request-make", False),
+    "other-review": ("other-make", False),
+}
+
+
+def _requeue_or_block_interrupted_review(task, conn):
+    """
+    Advance review_round after an interrupted review so stale votes are not reused.
+
+    If the advanced round reaches the task's persisted review cap, block as a
+    review-cap block at the maker resume step instead of leaving the task ready
+    for another review. Returns ("ready"|"blocked", new_round).
+    """
+    step = task["next_step"]
+    resume_step, preserve_wip = _INTERRUPT_REVIEW_RESUME[step]
+    new_round = task["review_round"] + 1
+    review_cap = task_max_review_rounds(task)
+    task_id = task["id"]
+
+    if new_round >= review_cap:
+        db.update_task(
+            conn, task_id,
+            review_round=new_round, last_review_decision="none",
+        )
+        mark_blocked(
+            task_id,
+            conn,
+            f"Blocked: interrupted {step} advanced to review round {new_round}, "
+            f"reaching max review rounds ({review_cap})",
+            f"Task {task_id} blocked after interrupted {step} reached review cap",
+            log_message=f"Interrupted {step} reached review cap at round {new_round}",
+            preserve_wip=preserve_wip,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step=resume_step,
+        )
+        return "blocked", new_round
+
+    db.update_task(
+        conn, task_id,
+        status="ready", next_step=step,
+        review_round=new_round, last_review_decision="none",
+    )
+    return "ready", new_round
 
 
 def ensure_branch(task, conn):
@@ -1639,7 +1716,8 @@ def advance(task, conn):
             _approve_supertask_plan(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1647,10 +1725,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Supertask {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Supertask blocked after {MAX_REVIEW_ROUNDS} review rounds",
+                    f"Blocked: reached max review rounds ({review_cap})",
+                    f"Supertask {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Supertask blocked after {review_cap} review rounds",
                     preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="commit-make-supertask",
                 )
             else:
                 db.update_task(conn, task_id,
@@ -1771,7 +1851,8 @@ def advance(task, conn):
             _finalize_pull_request(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1779,10 +1860,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max pull request review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Pull request task {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Blocked after {MAX_REVIEW_ROUNDS} pull request review rounds",
+                    f"Blocked: reached max pull request review rounds ({review_cap})",
+                    f"Pull request task {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Blocked after {review_cap} pull request review rounds",
                     preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="pull-request-make",
                 )
             else:
                 db.update_task(
@@ -1854,7 +1937,8 @@ def advance(task, conn):
             _finalize_other(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1862,10 +1946,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max other-review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Other task {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Blocked after {MAX_REVIEW_ROUNDS} other-review rounds",
+                    f"Blocked: reached max other-review rounds ({review_cap})",
+                    f"Other task {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Blocked after {review_cap} other-review rounds",
                     preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="other-make",
                 )
             else:
                 db.update_task(
@@ -1909,14 +1995,17 @@ def advance(task, conn):
             if needs_rereview:
                 # Deferred build (KANBAN_SKIP_BUILD_UNTIL_APPROVED) changed the diff: re-enter review.
                 new_round = task["review_round"] + 1
-                if new_round >= MAX_REVIEW_ROUNDS:
+                review_cap = task_max_review_rounds(task)
+                if new_round >= review_cap:
                     mark_blocked(
                         task_id,
                         conn,
-                        f"Blocked: deferred build changed diff and max review rounds ({MAX_REVIEW_ROUNDS}) reached.",
+                        f"Blocked: deferred build changed diff and max review rounds ({review_cap}) reached.",
                         f"Task {task_id} blocked after deferred build diff change at round limit",
                         log_message="Blocked: deferred build diff change at round limit",
                         preserve_wip=True,
+                        block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                        resume_next_step="commit-make",
                     )
                     return False
                 _requeue_for_review_after_deferred_build(task, conn)
@@ -1979,7 +2068,8 @@ def advance(task, conn):
             _approve_commit(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1987,10 +2077,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Task {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Blocked after {MAX_REVIEW_ROUNDS} review rounds",
+                    f"Blocked: reached max review rounds ({review_cap})",
+                    f"Task {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Blocked after {review_cap} review rounds",
                     preserve_wip=True,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="commit-make",
                 )
             else:
                 db.update_task(conn, task_id,
@@ -2039,7 +2131,7 @@ def recover_running_tasks(conn):
     On startup, reset any tasks stuck in 'running' from a previous orchestrator
     instance. These are invisible to find_ready_task and would be orphaned forever.
 
-    For commit-review tasks, advance review_round before re-queuing — matching the
+    For review tasks, advance review_round before re-queuing — matching the
     KeyboardInterrupt handler — so stale reviewer votes from the interrupted round are
     not mixed with fresh votes in the new run.
     """
@@ -2048,16 +2140,26 @@ def recover_running_tasks(conn):
     ).fetchall()
     for row in rows:
         task = db._row_to_task(row)
-        if task["next_step"] in ("commit-review", "commit-review-supertask", "pull-request-review", "other-review"):
-            new_round = task["review_round"] + 1
-            db.update_task(conn, task["id"], status="ready", review_round=new_round, last_review_decision="none")
-            db.add_comment(
-                conn, task["id"],
-                f"Task was stuck in 'running' state ({task['next_step']}) at orchestrator startup. "
-                f"Advanced to review round {new_round} to avoid mixing stale votes.",
-                kind="comment", author="orchestrator",
-            )
-            log(f"Recovered stuck {task['next_step']} task (advanced to round {new_round}): '{task['title']}'", task["id"])
+        if task["next_step"] in _INTERRUPT_REVIEW_RESUME:
+            outcome, new_round = _requeue_or_block_interrupted_review(task, conn)
+            if outcome == "ready":
+                db.add_comment(
+                    conn, task["id"],
+                    f"Task was stuck in 'running' state ({task['next_step']}) at orchestrator startup. "
+                    f"Advanced to review round {new_round} to avoid mixing stale votes.",
+                    kind="comment", author="orchestrator",
+                )
+                log(
+                    f"Recovered stuck {task['next_step']} task "
+                    f"(advanced to round {new_round}): '{task['title']}'",
+                    task["id"],
+                )
+            else:
+                log(
+                    f"Recovered stuck {task['next_step']} task "
+                    f"(blocked at review cap round {new_round}): '{task['title']}'",
+                    task["id"],
+                )
         elif task["next_step"] == "commit-plan-review":
             # For plan review, reset to commit-plan so the plan can be re-reviewed
             # cleanly without mixing stale approval/rejection comments.
@@ -2174,12 +2276,12 @@ def process_pinned_task(task, conn):
             # Ctrl-C during processing — recover task, then re-raise
             # so main() can run the stopping→stopped shutdown path.
             log("Interrupted!", task_id)
-            if current["next_step"] in ("commit-review", "commit-review-supertask", "pull-request-review", "other-review"):
-                new_round = current["review_round"] + 1
-                db.update_task(conn, task_id,
-                               status="ready", next_step=current["next_step"],
-                               review_round=new_round, last_review_decision="none")
-                log(f"Review interrupted, advancing to round {new_round}", task_id)
+            if current["next_step"] in _INTERRUPT_REVIEW_RESUME:
+                outcome, new_round = _requeue_or_block_interrupted_review(current, conn)
+                if outcome == "ready":
+                    log(f"Review interrupted, advancing to round {new_round}", task_id)
+                else:
+                    log(f"Review interrupted, blocked at review cap round {new_round}", task_id)
             elif current["next_step"] == "commit-plan-review":
                 # Reset to commit-plan so plan review starts fresh.
                 # Also clear commit_plan so a stale plan cannot be re-submitted as-is.
