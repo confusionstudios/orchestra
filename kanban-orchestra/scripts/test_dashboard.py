@@ -743,7 +743,7 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("antigravity", html)
         self.assertIn("<th class='col-agent'>Reviewer</th>", html)
         self.assertIn("<th class='col-count'>Rejections</th>", html)
-        self.assertIn("<td>2</td>", html)
+        self.assertIn("<td class='col-count'>2</td>", html)
         self.assertNotIn("Configured Reviewer", html)
         self.assertNotIn("Approver", html)
 
@@ -809,7 +809,7 @@ class TestRecentlyDone(unittest.TestCase):
 
         self.assertIn("Done task", html)
         self.assertIn("opus", html)
-        self.assertIn("<td>0</td>", html)
+        self.assertIn("<td class='col-count'>0</td>", html)
 
     def test_recently_done_initially_hides_rows_after_first_five(self):
         for i in range(7):

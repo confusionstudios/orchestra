@@ -1016,7 +1016,7 @@ def render_recently_done(conn) -> str:
           <td>{f'<code>{_esc(_short_hash(r["commit_hash"]))}</code>' if r['commit_hash'] else '-'}</td>
           <td>{_esc(r.get('coder_agent') or '') or '<span class="muted">-</span>'}</td>
           <td>{_esc(_task_done_reviewer(r))}</td>
-          <td>{_esc(r.get('rejection_count', 0))}</td>
+          <td class='col-count'>{_esc(r.get('rejection_count', 0))}</td>
           <td>{_esc(_done_elapsed_runtime(r))}</td>
         </tr>"""
         for idx, r in enumerate(rows_raw)
@@ -1750,7 +1750,7 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .col-step   { width: 126px; }
 .col-age    { width: 72px; }
 .col-skips  { width: 72px; }
-.col-count  { width: 82px; }
+.col-count  { width: 82px; text-align: right; }
 .col-state  { width: 114px; }
 .col-duration { width: 86px; }
 
