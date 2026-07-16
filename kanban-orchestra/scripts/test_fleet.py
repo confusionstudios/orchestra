@@ -132,6 +132,51 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertIn("dash_url", text)
             self.assertIn("http://127.0.0.1:8427", text)
 
+    def test_status_summarizes_the_current_managed_repo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "repo_root": str(root),
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_runtime(root, status="idle", current_step="none", active_agents=0)
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "tmux_has_session", return_value=False), \
+                 patch.object(fleet, "current_repo_root", return_value=root), \
+                 redirect_stdout(out):
+                fleet.print_status([repo])
+
+            self.assertIn(
+                "This repo (repo) is running/idle. Dash: http://127.0.0.1:8427",
+                out.getvalue(),
+            )
+
+    def test_status_does_not_summarize_an_unmanaged_current_repo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            repo = fleet.FleetRepo("repo", root, root, managed=False)
+            out = io.StringIO()
+
+            with patch.object(fleet, "current_repo_root", return_value=root), redirect_stdout(out):
+                fleet.print_status([repo])
+
+            self.assertNotIn("This repo", out.getvalue())
+
     def test_process_state_reports_running_busy_from_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()

@@ -574,6 +574,28 @@ def clean_start_repos(repos: list[FleetRepo]) -> list[FleetRepo]:
     return clean
 
 
+def current_repo_root() -> Path | None:
+    """Return the git root containing the current directory, if any."""
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd())
+    if result.returncode != 0:
+        return None
+    try:
+        return Path(result.stdout.strip()).resolve()
+    except OSError:
+        return None
+
+
+def current_fleet_repo(repos: list[FleetRepo]) -> FleetRepo | None:
+    """Return the configured fleet repo containing the current directory."""
+    root = current_repo_root()
+    if root is None:
+        return None
+    for repo in repos:
+        if repo.managed and repo.root is not None and repo.root.resolve() == root:
+            return repo
+    return None
+
+
 def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
@@ -619,6 +641,14 @@ def print_status(repos: list[FleetRepo]) -> None:
             f"{process_pids:>{widths[2]}}  {tmux:<{widths[3]}}  "
             f"{dashboard_url:<{widths[4]}}  {owner:<{widths[5]}}  {root}"
         )
+
+    current_repo = current_fleet_repo(repos)
+    if current_repo is not None:
+        status, _, _, _ = repo_process_state(current_repo)
+        dashboard_url = dashboard_status_url(current_repo) if not current_repo.error else "-"
+        dashboard_display = dashboard_url if dashboard_url != "-" else "not running"
+        print()
+        print(f"This repo ({current_repo.label}) is {status}. Dash: {dashboard_display}")
 
 
 def precheck(repos: list[FleetRepo]) -> int:
