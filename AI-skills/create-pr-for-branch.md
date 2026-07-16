@@ -1,23 +1,35 @@
-Create and publish a GitHub PR for the current branch, targeting master.
+Create and publish a GitHub PR for the current branch against the appropriate target branch.
 
-Steps:
+## Choose Target
 
-1. Determine the current branch: `git branch --show-current`. If it is `master`, stop and tell the user to switch to a feature branch.
-2. Verify there are commits on the branch vs master: `git log master..HEAD --oneline`. If empty, stop and tell the user there is nothing to PR.
-3. Inspect the branch contents to draft a title and body:
-   - `git log master..HEAD --reverse --pretty=format:'%s%n%n%b'` for commit history
-   - `git diff master...HEAD --stat` for scope
-4. Check for a repository PR template before drafting:
+1. Determine the current branch: `git branch --show-current`. If it is a long-lived branch such as `master`, `main`, or `develop`, stop and tell the user to switch to a working branch.
+2. Check for an existing PR for this branch: `gh pr list --head {branch} --json number,url,baseRefName`.
+3. Determine the target branch before inspecting the branch contents:
+   - Honor a target branch the user explicitly named.
+   - If a PR already exists for the current branch, keep its existing target branch.
+   - For a feature branch, infer the target from repository context. For example, use `develop` when it exists and the feature work is clearly based on it; otherwise use the repository default branch.
+   - If the likely target is ambiguous, ask the user. Do not silently assume `master`.
+4. Verify there are commits on the branch vs the selected target: `git log {target}..HEAD --oneline`. If empty, stop and tell the user there is nothing to PR.
+
+## Inspect And Draft
+
+5. Inspect the branch contents to draft a title and body:
+   - `git log {target}..HEAD --reverse --pretty=format:'%s%n%n%b'` for commit history
+   - `git diff {target}...HEAD --stat` for scope
+6. Check for a repository PR template before drafting:
    - Prefer `.github/PULL_REQUEST_TEMPLATE.md` when present.
    - If `.github/PULL_REQUEST_TEMPLATE/` contains templates, choose the one that best matches the branch scope.
    - Use the repository template's headings and intent; remove placeholder comments and omit optional sections when they do not add value.
    - If no repository template exists, use the fallback format below.
-5. Draft a PR title and body following the selected template or fallback format.
-6. Push the current branch: `git push -u origin HEAD`
-7. Check if a PR already exists for this branch: `gh pr list --head {branch} --json number,url`
+7. Draft a PR title and body following the selected template or fallback format.
+
+## Publish
+
+8. Push the current branch: `git push -u origin HEAD`
+9. Use the existing PR found above, if any:
    - If a PR exists: update it with `gh api repos/{owner}/{repo}/pulls/{number} -X PATCH -f title=... -f body=...`
-   - If no PR exists: create it with `gh pr create --title ... --body ... --base master`
-8. Report the PR URL to the user.
+   - If no PR exists: create it with `gh pr create --title ... --body ... --base {target}`
+10. Report the PR URL and target branch to the user.
 
 ## PR Format
 
