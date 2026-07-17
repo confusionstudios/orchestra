@@ -1,40 +1,44 @@
-Squash-merge a branch into master and commit using the latest available squash-merge notes.
-Target branch: `master`.
+Squash-merge a working branch into the appropriate target branch and commit using the latest available squash-merge notes.
 
-Branch selection rules:
-- If a branch name argument is provided (for example `/squash-merge-branch 2026-02-auv3/phase3` or `$squash-merge-branch 2026-02-auv3/phase3`), use it.
-- If no argument is provided and current branch is not `master`, use the current branch as source and switch to `master`.
-- If no argument is provided and current branch is `master`, ask which branch to merge and suggest the most recently updated local branch that is not `master`.
+## Choose Source And Target
+
+- If a source branch argument is provided (for example `/squash-merge-branch 2026-02-auv3/phase3` or `$squash-merge-branch 2026-02-auv3/phase3`), use it.
+- If no source branch is provided and the current branch is not a long-lived branch such as `master`, `main`, or `develop`, use the current branch as source.
+- If no source branch is provided and the current branch is long-lived, ask which working branch to merge and suggest the most recently updated local working branch.
+- Honor a target branch the user explicitly named.
+- Otherwise infer the target from repository context. For example, use `develop` when it exists and the source branch is clearly based on it; otherwise use the repository default branch.
+- If the likely target is ambiguous, ask the user. Do not silently assume `master`.
 
 Steps:
 
 1. Resolve the source branch using the rules above. Validate it exists locally.
-2. Ensure target branch is `master`:
-   - If currently not on `master`, run `git checkout master`.
+2. Resolve the target branch using the rules above. Validate it exists locally and is not the source branch.
+3. Ensure the target branch is checked out:
+   - If currently not on the target, run `git checkout <target-branch>`.
    - If checkout fails, stop and report the error.
-3. Resolve the input notes file from disk:
+4. Resolve the input notes file from disk:
    - Look for `Orchestration/projects/1-ad-hoc-ai-chatter/squash-merge-notes.md`.
    - If no candidate file exists on disk, stop and report missing notes source.
-4. Extract commit message from the selected notes file:
+5. Extract commit message from the selected notes file:
    - Expected format is:
      - first line: commit title
-     - body sections: `## Why`, `## Work`, `## Other`
+     - body sections: `## What`, `## Work`, `## Other`, `## Notes`
    - Use the full `squash-merge-notes.md` content as the commit message.
-   - Validate required sections exist (`## Why`, `## Work`, `## Other`); if missing, stop and report.
-5. Run the squash merge: `git merge --squash <source-branch>`.
+   - Validate required headings exist (`## What`, `## Work`, `## Other`, `## Notes`); `## Other` and `## Notes` may have blank content. Stop and report if a required heading is missing.
+6. Run the squash merge: `git merge --squash <source-branch>`.
    This stages all changes but does not commit.
-6. Update the notes file and stage it as part of the same commit:
+7. Update the notes file and stage it as part of the same commit:
    - Overwrite it with an empty file, then `git add` it.
-7. Read staged files (`git diff --cached --name-only`) and present them for explicit human confirmation against the notes intent.
-8. Show the user:
+8. Read staged files (`git diff --cached --name-only`) and present them for explicit human confirmation against the notes intent.
+9. Show the user:
    - source branch and target branch
    - selected notes file path
    - commit title and first few lines of body
    - staged file list summary
    Ask for confirmation before committing.
-9. Once confirmed, commit:
+10. Once confirmed, commit:
     `git commit -m "<Title>" -m "<Body>"`
-10. Run `git status` to confirm success. Report result and remind user to push when ready.
+11. Run `git status` to confirm success. Report result and remind user to push when ready.
 
 Rules:
 - Do not push automatically.
