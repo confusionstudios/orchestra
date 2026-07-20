@@ -292,6 +292,93 @@ def _task_done_reviewer(task: dict | None) -> str:
     return _task_reviewer(task)
 
 
+def _task_record_heading(task: dict) -> str:
+    """Render the leading ID + title line for a compact task record."""
+    glyph = _kind_glyph(task)
+    glyph_html = f'<span class="kind-glyph">{glyph}</span> ' if glyph else ""
+    return (
+        f'<div class="task-record-heading">'
+        f'<a class="task-record-id" href="/task/{_esc(task["id"])}">#{_esc(task["id"])}</a> '
+        f'{glyph_html}<span class="task-record-title">{_esc(task.get("title") or "")}</span>'
+        f"</div>"
+    )
+
+
+def _task_record_meta_item(html: str, *, css_class: str = "") -> str:
+    """Wrap one metadata fragment for a wrapping task-record meta row."""
+    classes = "task-record-meta-item"
+    if css_class:
+        classes = f"{classes} {css_class}"
+    return f'<span class="{classes}">{html}</span>'
+
+
+def _agents_meta_html(coder: str | None, reviewer: str | None) -> str:
+    """Natural 'by coder (reviewed by reviewer)' phrase for record metadata."""
+    coder = coder or ""
+    reviewer = reviewer or ""
+    if not coder and not reviewer:
+        return ""
+    if coder and reviewer:
+        body = (
+            f'by <span class="task-record-coder">{_esc(coder)}</span> '
+            f'<span class="task-record-reviewer">(reviewed by {_esc(reviewer)})</span>'
+        )
+    elif coder:
+        body = f'by <span class="task-record-coder">{_esc(coder)}</span>'
+    else:
+        body = f'<span class="task-record-reviewer">reviewed by {_esc(reviewer)}</span>'
+    return _task_record_meta_item(body, css_class="task-record-agents")
+
+
+def _branch_meta_html(branch: str | None, commit_hash: str | None = None) -> str:
+    """Branch code chip, optionally paired with a short commit hash."""
+    branch = branch or ""
+    short = _short_hash(commit_hash) if commit_hash else ""
+    if not branch and not short:
+        return ""
+    if branch and short:
+        body = f'<code>{_esc(branch)}</code> <code class="task-record-hash">{_esc(short)}</code>'
+    elif branch:
+        body = f'<code>{_esc(branch)}</code>'
+    else:
+        body = f'<code class="task-record-hash">{_esc(short)}</code>'
+    return _task_record_meta_item(body, css_class="task-record-branch")
+
+
+def _labeled_meta_html(label: str, value_html: str, *, css_class: str = "", muted: bool = False) -> str:
+    """Labeled metadata fragment such as 'next step: commit-make'."""
+    if not value_html:
+        return ""
+    classes = "task-record-meta-item"
+    if css_class:
+        classes = f"{classes} {css_class}"
+    if muted:
+        classes = f"{classes} muted"
+    return (
+        f'<span class="{classes}">'
+        f'<span class="task-record-label">{_esc(label)}</span> {value_html}'
+        f"</span>"
+    )
+
+
+def _task_record_html(task: dict, meta_items: list[str], *, attrs: str = "") -> str:
+    """Assemble one compact responsive task record."""
+    meta = "".join(item for item in meta_items if item)
+    meta_block = f'<div class="task-record-meta">{meta}</div>' if meta else ""
+    attr_suffix = f" {attrs}" if attrs else ""
+    return (
+        f'<div class="task-record"{attr_suffix}>'
+        f"{_task_record_heading(task)}"
+        f"{meta_block}"
+        f"</div>"
+    )
+
+
+def _task_record_list_html(records: list[str]) -> str:
+    """Wrap task records in a responsive list container."""
+    return f'<div class="task-record-list">{"".join(records)}</div>'
+
+
 def _open_conn() -> sqlite3.Connection | None:
     """Return a connection to the DB, or None if the DB doesn't exist."""
     path = Path(db.get_db_path())
@@ -842,42 +929,45 @@ def render_ready_queue(conn, runtime: dict | None = None) -> str:
 
     runnable_html = '<p class="muted">No tasks are currently runnable.</p>'
     if runnable:
-        rows = "\n".join(
-            f"""<tr>
-              <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-              <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-              <td><code>{_esc(t['branch'] or '')}</code></td>
-              <td>{_esc(t['coder_agent'] or '')}</td>
-              <td>{_esc(_task_reviewer(t))}</td>
-              <td>{_esc(t['next_step'] or '')}</td>
-              <td>{_esc(_format_skips(t.get('skips'))) or '<span class="muted">-</span>'}</td>
-            </tr>"""
-            for t in runnable
-        )
-        runnable_html = (
-            "<table>"
-            "<thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-step'>Next Step</th><th class='col-skips'>Skips</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>"
-        )
+        records = []
+        for t in runnable:
+            skips = _format_skips(t.get("skips"))
+            meta = [
+                _agents_meta_html(t.get("coder_agent"), _task_reviewer(t)),
+                _branch_meta_html(t.get("branch")),
+                _labeled_meta_html(
+                    "next step",
+                    _esc(t.get("next_step") or "") or '<span class="muted">-</span>',
+                    css_class="task-record-step",
+                ),
+            ]
+            if skips:
+                meta.append(_labeled_meta_html("skips", _esc(skips), css_class="task-record-skips"))
+            records.append(_task_record_html(t, meta))
+        runnable_html = _task_record_list_html(records)
 
     gated_html = ""
     if gated:
-        rows = "\n".join(
-            f"""<tr>
-              <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-              <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-              <td>{f'<a href="/task/{_esc(t["_ready_state"]["parent"]["id"])}">#{_esc(t["_ready_state"]["parent"]["id"])}</a>' if t["_ready_state"].get("parent") else '<span class="muted">missing</span>'}</td>
-              <td><code>{_esc(t['branch'] or '')}</code></td>
-              <td class="muted">{_esc(t['_ready_state']['reason'])}</td>
-              <td>{_esc(_format_skips(t.get('skips'))) or '<span class="muted">-</span>'}</td>
-            </tr>"""
-            for t in gated
-        )
-        gated_html = (
-            "<table>"
-            "<thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-id'>Supertask</th><th class='col-branch'>Branch</th><th>Why Not Yet</th><th class='col-skips'>Skips</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>"
-        )
+        records = []
+        for t in gated:
+            parent = t["_ready_state"].get("parent")
+            if parent:
+                parent_html = f'<a href="/task/{_esc(parent["id"])}">#{_esc(parent["id"])}</a>'
+            else:
+                parent_html = '<span class="muted">missing</span>'
+            skips = _format_skips(t.get("skips"))
+            meta = [
+                _labeled_meta_html("supertask", parent_html, css_class="task-record-supertask"),
+                _branch_meta_html(t.get("branch")),
+                _task_record_meta_item(
+                    _esc(t["_ready_state"]["reason"]),
+                    css_class="task-record-reason muted",
+                ),
+            ]
+            if skips:
+                meta.append(_labeled_meta_html("skips", _esc(skips), css_class="task-record-skips"))
+            records.append(_task_record_html(t, meta))
+        gated_html = _task_record_list_html(records)
 
     return f"""
     <div class="card" id="ready-queue">
@@ -929,24 +1019,23 @@ def render_icebox(conn) -> str:
     if not tasks:
         return '<div class="card" id="icebox"><h2>Icebox</h2><p class="muted">No parked tasks.</p></div>'
 
-    rows = "\n".join(
-        f"""<tr>
-          <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-          <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-          <td><code>{_esc(t['branch'] or '')}</code></td>
-          <td>{_esc(t['coder_agent'] or '')}</td>
-          <td>{_esc(_task_reviewer(t))}</td>
-          <td class="muted">{_esc(_age(t.get('updated_at') or t.get('created_at')))}</td>
-        </tr>"""
-        for t in tasks
-    )
+    records = []
+    for t in tasks:
+        meta = [
+            _agents_meta_html(t.get("coder_agent"), _task_reviewer(t)),
+            _branch_meta_html(t.get("branch")),
+            _labeled_meta_html(
+                "updated",
+                _esc(_age(t.get("updated_at") or t.get("created_at"))),
+                css_class="task-record-age",
+                muted=True,
+            ),
+        ]
+        records.append(_task_record_html(t, meta))
     return f"""
     <div class="card" id="icebox">
       <h2>Icebox</h2>
-      <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-age'>Updated</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
+      {_task_record_list_html(records)}
     </div>"""
 
 
@@ -958,7 +1047,7 @@ def render_blocked_tasks(conn) -> str:
     if not tasks:
         return '<div class="card" id="blocked-tasks"><h2>Blocked Tasks</h2><p class="muted">No blocked tasks.</p></div>'
 
-    rows_html = []
+    records = []
     for t in tasks:
         # Fetch most recent comment for blocker summary
         last_comment = conn.execute(
@@ -970,24 +1059,26 @@ def render_blocked_tasks(conn) -> str:
         if len(summary) > 120:
             summary = summary[:117] + "..."
         age = _age(t.get("updated_at") or t.get("created_at"))
-        rows_html.append(f"""<tr>
-          <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-          <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-          <td><code>{_esc(t['branch'] or '')}</code></td>
-          <td>{_esc(t.get('coder_agent') or '') or '<span class="muted">-</span>'}</td>
-          <td>{_esc(_task_reviewer(t))}</td>
-          <td class="muted">{_esc(age)}</td>
-          <td class="muted">{_esc(summary)}</td>
-          <td>{_esc(_format_skips(t.get('skips'))) or '<span class="muted">-</span>'}</td>
-        </tr>""")
+        skips = _format_skips(t.get("skips"))
+        meta = [
+            _agents_meta_html(t.get("coder_agent"), _task_reviewer(t)),
+            _branch_meta_html(t.get("branch")),
+            _labeled_meta_html("updated", _esc(age), css_class="task-record-age", muted=True),
+            _labeled_meta_html(
+                "last note",
+                _esc(summary),
+                css_class="task-record-note",
+                muted=True,
+            ),
+        ]
+        if skips:
+            meta.append(_labeled_meta_html("skips", _esc(skips), css_class="task-record-skips"))
+        records.append(_task_record_html(t, meta))
 
     return f"""
     <div class="card" id="blocked-tasks">
       <h2>Blocked Tasks</h2>
-      <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-age'>Updated</th><th>Last Note</th><th class='col-skips'>Skips</th></tr></thead>
-        <tbody>{"".join(rows_html)}</tbody>
-      </table>
+      {_task_record_list_html(records)}
     </div>"""
 
 
@@ -1008,19 +1099,34 @@ def render_recently_done(conn) -> str:
 
     initial_visible = 5
     increment = 10
-    rows = "\n".join(
-        f"""<tr data-show-more-row data-row-index="{idx}"{" hidden" if idx >= initial_visible else ""}>
-          <td><a href="/task/{_esc(r['id'])}">#{_esc(r['id'])}</a></td>
-          <td>{_kind_glyph(r) and f'<span class="kind-glyph">{_kind_glyph(r)}</span> ' or ''}{_esc(r['title'])}</td>
-          <td><code>{_esc(r['branch'] or '')}</code></td>
-          <td>{f'<code>{_esc(_short_hash(r["commit_hash"]))}</code>' if r['commit_hash'] else '-'}</td>
-          <td>{_esc(r.get('coder_agent') or '') or '<span class="muted">-</span>'}</td>
-          <td>{_esc(_task_done_reviewer(r))}</td>
-          <td class='col-count'>{_esc(r.get('rejection_count', 0))}</td>
-          <td>{_esc(_done_elapsed_runtime(r))}</td>
-        </tr>"""
-        for idx, r in enumerate(rows_raw)
-    )
+    records = []
+    for idx, r in enumerate(rows_raw):
+        rejection_count = int(r.get("rejection_count", 0) or 0)
+        runtime = _done_elapsed_runtime(r)
+        meta = [
+            _agents_meta_html(r.get("coder_agent"), _task_done_reviewer(r)),
+            _branch_meta_html(r.get("branch"), r.get("commit_hash")),
+        ]
+        if rejection_count > 0:
+            label = "rejection" if rejection_count == 1 else "rejections"
+            meta.append(
+                _task_record_meta_item(
+                    f"{_esc(rejection_count)} {label}",
+                    css_class="task-record-rejections",
+                )
+            )
+        if runtime != "unknown":
+            meta.append(
+                _labeled_meta_html(
+                    "runtime",
+                    _esc(runtime),
+                    css_class="task-record-runtime",
+                )
+            )
+        attrs = f'data-show-more-row data-row-index="{idx}"'
+        if idx >= initial_visible:
+            attrs += " hidden"
+        records.append(_task_record_html(r, meta, attrs=attrs))
     total_rows = len(rows_raw)
     controls_html = ""
     if total_rows > initial_visible:
@@ -1036,10 +1142,7 @@ def render_recently_done(conn) -> str:
     return f"""
     <div class="card" id="recently-done" data-show-more-root data-initial-visible="{initial_visible}" data-visible-count="{initial_visible}" data-increment="{increment}" data-total-rows="{total_rows}">
       <h2>Recently Done</h2>
-      <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-commit'>Commit</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-count'>Rejections</th><th class='col-duration'>Runtime</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
+      {_task_record_list_html(records)}
       {controls_html}
     </div>"""
 
@@ -1735,12 +1838,8 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 
 .meta-table th { width: 100px; }
 
-/* Data table column width classes */
-#recently-done table,
-#ready-queue table,
+/* Comparative tables keep fixed columns; list sections use wrapping records. */
 #active-supertasks table,
-#icebox table,
-#blocked-tasks table,
 .hierarchy-table { table-layout: fixed; }
 
 .col-id     { width: 46px; }
@@ -1753,6 +1852,76 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .col-count  { width: 82px; text-align: right; }
 .col-state  { width: 114px; }
 .col-duration { width: 86px; }
+
+.task-record-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.task-record {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.task-record:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.task-record-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+  margin-bottom: 4px;
+}
+
+.task-record-id {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.task-record-title {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  min-width: 0;
+  font-size: 0.88em;
+}
+
+.task-record-meta-item {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-record-agents,
+.task-record-coder,
+.task-record-reviewer {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-record-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.86em;
+}
 
 .muted { color: var(--muted); font-size: 0.88em; }
 .task-ref  { font-family: monospace; font-size: 0.82em; }

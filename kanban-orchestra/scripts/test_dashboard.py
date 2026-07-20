@@ -741,9 +741,9 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("22222222", html)
         self.assertIn("claude", html)
         self.assertIn("antigravity", html)
-        self.assertIn("<th class='col-agent'>Reviewer</th>", html)
-        self.assertIn("<th class='col-count'>Rejections</th>", html)
-        self.assertIn("<td class='col-count'>2</td>", html)
+        self.assertIn('class="task-record-reviewer">(reviewed by antigravity)</span>', html)
+        self.assertIn("task-record-rejections", html)
+        self.assertIn("2 rejections", html)
         self.assertNotIn("Configured Reviewer", html)
         self.assertNotIn("Approver", html)
 
@@ -758,8 +758,8 @@ class TestRecentlyDone(unittest.TestCase):
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("<th class='col-duration'>Runtime</th>", html)
-        self.assertIn("<td>02:03:04</td>", html)
+        self.assertIn("task-record-runtime", html)
+        self.assertIn("02:03:04", html)
 
     def test_recently_done_elapsed_runtime_uses_latest_ready_time(self):
         tid = db.add_task(self.conn, "Requeued runtime task", branch="feat-runtime")
@@ -785,8 +785,8 @@ class TestRecentlyDone(unittest.TestCase):
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("<td>00:10:05</td>", html)
-        self.assertNotIn("<td>02:10:05</td>", html)
+        self.assertIn("00:10:05", html)
+        self.assertNotIn("02:10:05", html)
 
     def test_recently_done_elapsed_runtime_missing_timestamp_fallback(self):
         tid = db.add_task(self.conn, "Missing runtime task", branch="feat-runtime")
@@ -799,7 +799,9 @@ class TestRecentlyDone(unittest.TestCase):
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("<td>unknown</td>", html)
+        self.assertIn("Missing runtime task", html)
+        self.assertNotIn("task-record-runtime", html)
+        self.assertNotIn(">unknown<", html)
 
     def test_recently_done_reviewer_falls_back_to_configured_reviewer(self):
         tid = db.add_task(self.conn, "Done task", branch="feat-done", reviewer_agent="opus")
@@ -809,7 +811,7 @@ class TestRecentlyDone(unittest.TestCase):
 
         self.assertIn("Done task", html)
         self.assertIn("opus", html)
-        self.assertIn("<td class='col-count'>0</td>", html)
+        self.assertNotIn("task-record-rejections", html)
 
     def test_recently_done_initially_hides_rows_after_first_five(self):
         for i in range(7):
@@ -844,6 +846,135 @@ class TestRecentlyDone(unittest.TestCase):
         db.update_task(self.conn, older_id, status="done")
         html = dashboard.render_recently_done(self.conn)
         self.assertLess(html.find("Older task"), html.find("Newer task"))
+
+
+class TestTaskRecordLists(unittest.TestCase):
+    """Focused coverage for compact responsive task-record list markup."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+
+    def test_ready_queue_uses_wrapping_task_records(self):
+        long_agent = "cursor:provider/model-with-a-very-long-spec-name"
+        tid = db.add_task(
+            self.conn,
+            "Ready record",
+            branch="feat-ready",
+            coder_agent=long_agent,
+            reviewer_agent="codex",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.conn, tid, status="ready", next_step="commit-make")
+
+        html = dashboard.render_ready_queue(self.conn)
+
+        self.assertIn('class="task-record-list"', html)
+        self.assertIn('class="task-record"', html)
+        self.assertIn(f'href="/task/{tid}"', html)
+        self.assertIn('class="task-record-title">Ready record</span>', html)
+        self.assertIn(f'class="task-record-coder">{long_agent}</span>', html)
+        self.assertIn("(reviewed by codex)", html)
+        self.assertIn("task-record-step", html)
+        self.assertIn("commit-make", html)
+        self.assertIn("commit-plan", html)
+        self.assertNotIn("<table>", html)
+        self.assertIn("task-record-meta", dashboard.COMMON_CSS)
+        self.assertIn("overflow-wrap: anywhere", dashboard.COMMON_CSS)
+
+    def test_icebox_and_blocked_use_task_records(self):
+        ice_id = db.add_task(
+            self.conn,
+            "Parked idea",
+            branch="feat-ice",
+            coder_agent="antigravity",
+            reviewer_agent="opus",
+        )
+        blocked_id = db.add_task(
+            self.conn,
+            "Stuck work",
+            branch="feat-block",
+            coder_agent="claude",
+            reviewer_agent="codex",
+            skips=["commit-review"],
+        )
+        db.update_task(self.conn, blocked_id, status="blocked")
+        db.add_comment(self.conn, blocked_id, "Waiting on dependency")
+
+        ice_html = dashboard.render_icebox(self.conn)
+        blocked_html = dashboard.render_blocked_tasks(self.conn)
+
+        self.assertIn('class="task-record-list"', ice_html)
+        self.assertIn(f'href="/task/{ice_id}"', ice_html)
+        self.assertIn("Parked idea", ice_html)
+        self.assertIn("by <span class=\"task-record-coder\">antigravity</span>", ice_html)
+        self.assertIn("(reviewed by opus)", ice_html)
+        self.assertNotIn("<table>", ice_html)
+
+        self.assertIn('class="task-record-list"', blocked_html)
+        self.assertIn(f'href="/task/{blocked_id}"', blocked_html)
+        self.assertIn("Stuck work", blocked_html)
+        self.assertIn("Waiting on dependency", blocked_html)
+        self.assertIn("commit-review", blocked_html)
+        self.assertNotIn("<table>", blocked_html)
+
+    def test_recently_done_record_metadata_and_show_more(self):
+        for i in range(6):
+            tid = db.add_task(
+                self.conn,
+                f"Done record {i}",
+                branch=f"feat-{i}",
+                coder_agent="cursor:grok-4.5-high",
+                reviewer_agent="codex",
+            )
+            db.update_task(
+                self.conn,
+                tid,
+                status="done",
+                commit_hash=f"{i:08x}deadbeef",
+            )
+            self.conn.execute(
+                "UPDATE tasks SET last_ready_at = ?, done_at = ? WHERE id = ?",
+                ("2026-05-31 10:00:00", "2026-05-31 10:05:00", tid),
+            )
+        self.conn.commit()
+        first_id = 1
+        db.add_comment(self.conn, first_id, "Fix", kind="rejection", author="codex", review_round=0)
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn('class="task-record-list"', html)
+        self.assertIn("task-record-agents", html)
+        self.assertIn("cursor:grok-4.5-high", html)
+        self.assertIn("(reviewed by codex)", html)
+        self.assertIn("task-record-hash", html)
+        self.assertIn("1 rejection", html)
+        self.assertIn("00:05:00", html)
+        self.assertIn('data-show-more-row data-row-index="5" hidden', html)
+        self.assertIn("Show More", html)
+        self.assertNotIn("<thead>", html)
+        self.assertNotIn("<table>", html)
+
+    def test_active_supertasks_remain_comparative_table(self):
+        parent_id = db.add_task(self.conn, "Parent", branch="feat-parent", kind="supertask")
+        db.update_task(self.conn, parent_id, status="pending_subtasks")
+        child_id = db.add_task(
+            self.conn,
+            "Child",
+            branch="feat-parent",
+            parent_task_id=parent_id,
+            sequence_index=100,
+        )
+        db.update_task(self.conn, child_id, status="ready")
+
+        html = dashboard.render_active_supertasks(self.conn)
+
+        self.assertIn("<table>", html)
+        self.assertIn("<th class='col-count'>Done</th>", html)
+        self.assertNotIn('class="task-record-list"', html)
 
 
 class TestTaskHeader(unittest.TestCase):
