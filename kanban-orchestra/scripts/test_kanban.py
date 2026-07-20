@@ -2187,6 +2187,16 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["next_step"], "none")
         self.assertEqual(updated["commit_hash"], "a" * 40)
         self.assertIsNone(updated["ready_at"])
+        completion = [
+            c for c in db.get_comments(self.conn, tid)
+            if c["author"] == "orchestrator" and c["message"].startswith("Task complete:")
+        ]
+        self.assertEqual(len(completion), 1)
+        self.assertEqual(
+            completion[0]["message"],
+            "Task complete: commit finalized locally on branch 'b'.",
+        )
+        self.assertNotIn("pushed", completion[0]["message"])
 
     def test_commit_make_path_b_no_new_commit_no_signal_blocks(self):
         """Path B exits 0 without a new commit and no DONE_WITHOUT_COMMIT: task is blocked, not done."""

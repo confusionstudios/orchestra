@@ -1355,7 +1355,7 @@ def _finalize_commit(task, conn, done_without_commit=False):
             log(f"Recorded commit_hash {new_hash[:8]}", task_id)
         db.update_task(conn, task_id, status="done", next_step="none")
         db.add_comment(conn, task_id,
-                       f"Task complete: commit finalized and pushed to branch '{task['branch']}'.",
+                       f"Task complete: commit finalized locally on branch '{task['branch']}'.",
                        kind="comment", author="orchestrator")
         db.update_runtime(conn, status_message=f"Task {task_id} done (commit finalized)")
         log("Task done (commit finalized)", task_id)
