@@ -3227,6 +3227,358 @@ class TestTaskCLI(unittest.TestCase):
                     path.unlink()
 
 
+class TestImportWorktree(unittest.TestCase):
+    """Focused coverage for task import-worktree / db.import_worktree_database."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.target_db = str(Path(self.tmpdir.name) / "target" / "kanban-orchestra.db")
+        self.source_root = Path(self.tmpdir.name) / "source-worktree"
+        self.source_root.mkdir(parents=True)
+        Path(self.target_db).parent.mkdir(parents=True)
+        self.source_db = str(self.source_root / "kanban-orchestra.db")
+        self.target_conn = db.connect(self.target_db)
+        self.source_conn = db.connect(self.source_db)
+        self.task_py = str(Path(__file__).resolve().parent / "task.py")
+        self.env = {
+            **os.environ,
+            "KANBAN_DB": self.target_db,
+            "KANBAN_NONINTERACTIVE": "1",
+        }
+
+    def tearDown(self):
+        self.target_conn.close()
+        self.source_conn.close()
+        self.tmpdir.cleanup()
+
+    def _run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, self.task_py] + list(args),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+    def _seed_source_graph(self):
+        parent_id = db.add_task(
+            self.source_conn,
+            "Parent task",
+            description="parent desc",
+            branch="feat-import",
+            skips=["commit-plan"],
+        )
+        child_id = db.add_task(
+            self.source_conn,
+            "Child task",
+            description="child desc",
+            branch="feat-import",
+            parent_task_id=parent_id,
+            sequence_index=1,
+            skips=["commit-plan"],
+        )
+        follow_id = db.add_task(
+            self.source_conn,
+            "Follow-up task",
+            description="follow desc",
+            branch="feat-import",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.source_conn, parent_id, follow_up_task_id=follow_id)
+        db.update_task(
+            self.source_conn,
+            child_id,
+            status="ready",
+            ready_at="2026-01-01 12:00:00",
+            stash_ref="stash@{0}",
+        )
+        db.update_task(
+            self.source_conn,
+            parent_id,
+            status="pending_subtasks",
+            next_step="commit-make-supertask",
+        )
+        done_id = db.add_task(
+            self.source_conn,
+            "Done task",
+            branch="feat-import",
+            skips=["commit-plan"],
+        )
+        db.update_task(
+            self.source_conn,
+            done_id,
+            status="done",
+            commit_hash="abc123",
+            done_at="2026-01-02 12:00:00",
+        )
+        db.add_comment(
+            self.source_conn,
+            child_id,
+            "needs changes",
+            kind="rejection",
+            author="codex",
+            review_round=1,
+        )
+        db.add_comment(
+            self.source_conn,
+            child_id,
+            "working on it",
+            kind="comment",
+            author="coder",
+        )
+        db.add_run_log(
+            self.source_conn,
+            child_id,
+            "ran commit-make",
+            verb="commit-make",
+            author="coder",
+        )
+        return {
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "follow_id": follow_id,
+            "done_id": done_id,
+        }
+
+    def test_import_success_remaps_ids_and_history(self):
+        existing_id = db.add_task(self.target_conn, "Already here", branch="develop")
+        ids = self._seed_source_graph()
+        source_stat = Path(self.source_db).stat()
+
+        result = db.import_worktree_database(self.target_conn, self.source_root)
+        id_map = {int(k): v for k, v in result["id_map"].items()}
+
+        self.assertEqual(result["imported_count"], 4)
+        self.assertEqual(
+            Path(result["source_db"]).resolve(),
+            Path(self.source_db).resolve(),
+        )
+        self.assertNotIn(existing_id, id_map.values())
+        self.assertEqual(
+            db.get_task(self.target_conn, existing_id)["title"],
+            "Already here",
+        )
+
+        new_parent = id_map[ids["parent_id"]]
+        new_child = id_map[ids["child_id"]]
+        new_follow = id_map[ids["follow_id"]]
+        new_done = id_map[ids["done_id"]]
+
+        parent = db.get_task(self.target_conn, new_parent)
+        child = db.get_task(self.target_conn, new_child)
+        follow = db.get_task(self.target_conn, new_follow)
+        done = db.get_task(self.target_conn, new_done)
+
+        self.assertEqual(parent["follow_up_task_id"], new_follow)
+        self.assertEqual(child["parent_task_id"], new_parent)
+        self.assertEqual(child["status"], "none")
+        self.assertIsNone(child["ready_at"])
+        self.assertIsNone(child["stash_ref"])
+        self.assertEqual(parent["status"], "none")
+        self.assertEqual(follow["status"], "none")
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["commit_hash"], "abc123")
+        self.assertEqual(child["skips"], ["commit-plan"])
+
+        comments = db.get_comments(self.target_conn, new_child)
+        kinds = [c["kind"] for c in comments]
+        self.assertIn("rejection", kinds)
+        self.assertTrue(
+            any(
+                c["verb"] == "import-worktree" and f"source task id {ids['child_id']}" in c["message"]
+                and "feat-import" in c["message"]
+                for c in comments
+            )
+        )
+        run_log = db.get_run_log(self.target_conn, new_child)
+        self.assertEqual(run_log[0]["message"], "ran commit-make")
+
+        # Source DB untouched.
+        after = Path(self.source_db).stat()
+        self.assertEqual(after.st_mtime_ns, source_stat.st_mtime_ns)
+        self.assertEqual(db.get_task(self.source_conn, ids["child_id"])["status"], "ready")
+
+    def test_import_cli_prints_id_map(self):
+        db.add_task(self.target_conn, "Keep me")
+        ids = self._seed_source_graph()
+        # Close writers so CLI can open the target DB.
+        self.target_conn.close()
+        self.source_conn.close()
+
+        result = self._run_cli("import-worktree", str(self.source_root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["imported_count"], 4)
+        self.assertEqual(
+            set(payload["id_map"]),
+            {str(ids["parent_id"]), str(ids["child_id"]), str(ids["follow_id"]), str(ids["done_id"])},
+        )
+
+        # Re-open for tearDown.
+        self.target_conn = db.connect(self.target_db)
+        self.source_conn = db.connect(self.source_db)
+
+    def test_import_cli_succeeds_without_git_or_kanban_db(self):
+        """import-worktree must not invoke Git when resolving the target DB."""
+        db.add_task(self.target_conn, "Keep me")
+        ids = self._seed_source_graph()
+        self.target_conn.close()
+        self.source_conn.close()
+
+        work_root = Path(self.target_db).resolve().parent
+        bin_dir = Path(self.tmpdir.name) / "no-git-bin"
+        bin_dir.mkdir()
+        git_call_marker = Path(self.tmpdir.name) / "git-was-called"
+        git_shim = bin_dir / "git"
+        git_shim.write_text(
+            "#!/bin/sh\n"
+            f'echo called > "{git_call_marker}"\n'
+            'echo "git should not be called" >&2\n'
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        git_shim.chmod(0o755)
+
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "KANBAN_DB"
+        }
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["KANBAN_NONINTERACTIVE"] = "1"
+
+        result = subprocess.run(
+            [sys.executable, self.task_py, "import-worktree", str(self.source_root)],
+            capture_output=True,
+            text=True,
+            cwd=str(work_root),
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            git_call_marker.exists(),
+            "import-worktree must not invoke git",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["imported_count"], 4)
+        self.assertEqual(
+            set(payload["id_map"]),
+            {
+                str(ids["parent_id"]),
+                str(ids["child_id"]),
+                str(ids["follow_id"]),
+                str(ids["done_id"]),
+            },
+        )
+
+        # Re-open for tearDown.
+        self.target_conn = db.connect(self.target_db)
+        self.source_conn = db.connect(self.source_db)
+
+    def test_import_normalizes_unfinished_statuses(self):
+        for status in ("ready", "running", "blocked", "pending_subtasks", "none"):
+            tid = db.add_task(self.source_conn, f"Status {status}", branch="b1")
+            fields = {"status": status}
+            if status == "ready":
+                fields["ready_at"] = "2026-01-01 00:00:00"
+            if status == "blocked":
+                fields["block_reason"] = "review_cap"
+            db.update_task(self.source_conn, tid, **fields)
+
+        result = db.import_worktree_database(self.target_conn, self.source_db)
+        for new_id in result["id_map"].values():
+            task = db.get_task(self.target_conn, new_id)
+            self.assertEqual(task["status"], "none")
+            self.assertIsNone(task["ready_at"])
+
+    def test_import_rolls_back_on_invalid_source(self):
+        existing_id = db.add_task(self.target_conn, "Untouched", branch="develop")
+        before_count = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+
+        bad_db = Path(self.tmpdir.name) / "bad.db"
+        bad_conn = sqlite3.connect(str(bad_db))
+        try:
+            bad_conn.execute("CREATE TABLE not_tasks (id INTEGER PRIMARY KEY)")
+            bad_conn.commit()
+        finally:
+            bad_conn.close()
+
+        with self.assertRaises(ValueError):
+            db.import_worktree_database(self.target_conn, bad_db)
+
+        after_count = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        self.assertEqual(after_count, before_count)
+        self.assertEqual(
+            db.get_task(self.target_conn, existing_id)["title"],
+            "Untouched",
+        )
+
+    def test_import_rolls_back_if_source_modified_during_import(self):
+        """Source mtime change must fail before commit and leave target unchanged."""
+        existing_id = db.add_task(self.target_conn, "Untouched", branch="develop")
+        before_count = self.target_conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks"
+        ).fetchone()["n"]
+        self._seed_source_graph()
+        source_resolved = Path(self.source_db).resolve()
+        real_stat = Path.stat
+        mtime_reads = {"n": 0}
+
+        def patched_stat(self, *args, **kwargs):
+            result = real_stat(self, *args, **kwargs)
+            try:
+                # Use os.path.samefile (os.stat) so we do not re-enter Path.stat.
+                matched = os.path.samefile(self, source_resolved)
+            except OSError:
+                matched = False
+            if not matched:
+                return result
+
+            class _StatProxy:
+                def __init__(self, st):
+                    self._st = st
+
+                @property
+                def st_mtime_ns(self):
+                    mtime_reads["n"] += 1
+                    # First read is the baseline snapshot; second is the
+                    # pre-commit check — report a change so import aborts.
+                    if mtime_reads["n"] >= 2:
+                        return self._st.st_mtime_ns + 1
+                    return self._st.st_mtime_ns
+
+                def __getattr__(self, name):
+                    return getattr(self._st, name)
+
+            return _StatProxy(result)
+
+        with patch.object(Path, "stat", patched_stat):
+            with self.assertRaises(RuntimeError) as ctx:
+                db.import_worktree_database(self.target_conn, self.source_root)
+            self.assertIn("modified during import", str(ctx.exception))
+
+        self.assertGreaterEqual(mtime_reads["n"], 2)
+        after_count = self.target_conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks"
+        ).fetchone()["n"]
+        self.assertEqual(after_count, before_count)
+        self.assertEqual(
+            db.get_task(self.target_conn, existing_id)["title"],
+            "Untouched",
+        )
+
+    def test_import_missing_path_fails_without_changing_target(self):
+        db.add_task(self.target_conn, "Stay")
+        before = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        missing = Path(self.tmpdir.name) / "no-such-worktree"
+        with self.assertRaises(FileNotFoundError):
+            db.import_worktree_database(self.target_conn, missing)
+        after = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        self.assertEqual(after, before)
+
+    def test_import_rejects_self(self):
+        with self.assertRaises(ValueError):
+            db.import_worktree_database(self.target_conn, self.target_db)
+
 
 class TestAgentTranscriptCapture(unittest.TestCase):
     """Regression: raw agent transcript output should be saved outside run_log."""

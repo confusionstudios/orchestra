@@ -19,6 +19,7 @@ Usage:
     task delete <id>
     task dump                       # dump DB to kanban-orchestra.sql
     task restore
+    task import-worktree <path>     # import another worktree's Kanban DB
 
 Policy:
     Branches master/main are disabled for tasks by default. Use a feature
@@ -950,6 +951,16 @@ def cmd_restore(args):
     print(f"Restored to {result['db_path']} from {result['sql_path']}")
 
 
+def cmd_import_worktree(args, conn):
+    """Import tasks and task-owned history from another worktree's Kanban DB."""
+    try:
+        result = db.import_worktree_database(conn, args.path)
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    _json_out(result)
+
+
 def _resolve_message_arg(args, command_name):
     """Resolve either a positional message or stdin-fed message text."""
     if getattr(args, "message_stdin", False):
@@ -1135,6 +1146,20 @@ def build_parser():
     # restore
     sub.add_parser("restore")
 
+    # import-worktree
+    p_import = sub.add_parser(
+        "import-worktree",
+        help=(
+            "Import another worktree's Kanban database into the current database. "
+            "PATH may be a worktree root or a kanban-orchestra.db file. "
+            "Does not run any Git commands."
+        ),
+    )
+    p_import.add_argument(
+        "path",
+        help="Worktree root directory or path to kanban-orchestra.db",
+    )
+
     # get-commit-footer
     p_gcf = sub.add_parser("get-commit-footer")
     p_gcf.add_argument("task_id", type=int)
@@ -1147,6 +1172,20 @@ def main():
     args = parser.parse_args()
     if args.command == "restore":
         cmd_restore(args)
+        return
+    # import-worktree must not invoke Git (acceptance criterion). Resolve the
+    # target DB via KANBAN_DB or a cwd walk for kanban-orchestra.db.
+    if args.command == "import-worktree":
+        try:
+            target_db = db.get_db_path_without_git()
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        conn = db.connect(target_db)
+        try:
+            cmd_import_worktree(args, conn)
+        finally:
+            conn.close()
         return
 
     conn = db.connect()
