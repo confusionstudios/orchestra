@@ -4,6 +4,7 @@
 
 - State assumptions explicitly; do not guess silently.
 - If the repo provides the Kanban skill, ask before doing work outside Kanban unless the context clearly calls for it.
+- Before creating a branch for Kanban work, ask whether a new branch is warranted; Kanban alone is not a reason to branch.
 - Prefer the minimum code needed to solve the problem.
 - Make surgical changes; do not refactor adjacent code unless required.
 - Define what success looks like, then verify the change against it.
