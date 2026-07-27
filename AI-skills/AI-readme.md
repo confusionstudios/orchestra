@@ -46,7 +46,9 @@ This creates or refreshes thin wrappers under:
 Wrappers reference the canonical skill through `$ORCHESTRA_DIR`. They do not
 copy skill text into the work repo. New worktrees and repos use these
 user-level skills without creating `.claude/skills`, `.agents/skills`, or a
-`.orchestra-skill-sync` registration marker.
+`.orchestra-skill-sync` registration marker. Operational skills resolve Orchestra
+tooling only through `$ORCHESTRA_DIR`; they do not treat the current worktree as
+an Orchestra checkout fallback.
 
 `AI-readme.md` is excluded from installation. Existing wrappers that the
 installer can identify as generated Orchestra wrappers are updated in place.

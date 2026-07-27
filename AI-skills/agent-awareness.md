@@ -13,12 +13,12 @@ $ORCHESTRA_DIR/shared_scripts/agent_registry.yaml
 ```
 
 Do not infer agent identity from model self-reporting. Use registry keys and
-labels from that file. The Python loader exposes the same data. Use the repo
-virtualenv, because the loader depends on the repo's Python dependencies:
+labels from that file. The Python loader exposes the same data. Use Orchestra's
+virtualenv via `$ORCHESTRA_DIR`; do not fall back to the current worktree.
 
 ```bash
-orchestra_dir="${ORCHESTRA_DIR:-$(git rev-parse --show-toplevel)}"
-PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/bin/ko-python" - <<'PY'
+: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
+PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
 from agent_registry import AGENTS, AGENT_PROVIDERS, resolve_agent_command, resolve_agent_label
 for key in AGENTS:
     print(f"{key}: {resolve_agent_label(key)} -> {resolve_agent_command(key)}")
@@ -42,13 +42,14 @@ ORCHESTRA_DEFAULT_REVIEWER
 `ORCHESTRA_DEFAULT_REVIEWER` is the default commit-review agent. If the user
 asks for the configured commit-review reviewer, use that value when it names a
 valid fixed alias or provider/model spec such as `cursor:<model>`. If it is
-unset or invalid, use the repo fallback from `kanban-orchestra/scripts/config.py`.
+unset or invalid, use the Orchestra fallback from
+`$ORCHESTRA_DIR/kanban-orchestra/scripts/config.py`.
 
 Resolve defaults from the active environment like this:
 
 ```bash
-orchestra_dir="${ORCHESTRA_DIR:-$(git rev-parse --show-toplevel)}"
-PYTHONPATH="$orchestra_dir/shared_scripts:$orchestra_dir/kanban-orchestra/scripts" "$orchestra_dir/bin/ko-python" - <<'PY'
+: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
+PYTHONPATH="$ORCHESTRA_DIR/shared_scripts:$ORCHESTRA_DIR/kanban-orchestra/scripts" "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
 import config
 for name in (
     "DEFAULT_SUPER_PLANNER",

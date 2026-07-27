@@ -21,14 +21,16 @@ with daily headings named `# YYYY-MM-DD - Weekday`.
 
 ## Project Name
 
-Use the human project name configured for the repo. The helper resolves it from:
+Resolve the project label from:
 
 1. `--project`, when explicitly passed.
-2. `$ORCH_DEVLOG_PROJECT`.
-3. `devlog_project` in the repo root `.orchestra-skill-sync` file.
+2. `$ORCH_DEVLOG_PROJECT`, when set.
+3. Otherwise a readable name derived from the current Git repo root directory
+   (hyphens/underscores become spaces; each word is title-cased). Example:
+   `orchestra` -> `Orchestra`, `midi-designer3` -> `Midi Designer3`.
 
-Prefer normal display names such as `Orchestra` or `MIDI Designer`, not repo
-directory names such as `orchestra` or `midi-designer3`.
+Prefer `$ORCH_DEVLOG_PROJECT` when the derived directory name would be unclear
+or ugly. Do not read `.orchestra-skill-sync` for the project name.
 
 ## Workflow
 
@@ -98,8 +100,8 @@ If the helper is not available, implement the same behavior directly:
 
 - Compute the current local date.
 - Compute the Sunday that starts that week.
-- Resolve the project label from `--project`, `$ORCH_DEVLOG_PROJECT`, or
-  `.orchestra-skill-sync` `devlog_project`.
+- Resolve the project label from `--project`, `$ORCH_DEVLOG_PROJECT`, or a
+  readable name derived from the current Git repo root directory.
 - Open `$ORCH_DEVLOG_DIR/<sunday> - Week.md`.
 - Ensure a daily heading exists.
 - Append a compact project-first bullet for one-line entries:

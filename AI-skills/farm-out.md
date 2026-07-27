@@ -15,30 +15,32 @@ resulting diff, run verification, and loop until converged or blocked.
 
 1. If the user names an agent alias or provider/model spec, use it.
 2. Otherwise use the configured default coding agent:
-   `ORCHESTRA_DEFAULT_CODER`, or the repo fallback `config.DEFAULT_CODER` when
-   working inside an Orchestra repo.
+   `ORCHESTRA_DEFAULT_CODER`, or the Orchestra fallback `config.DEFAULT_CODER`.
 3. If the delegate CLI is unavailable, report the blocker. Do not substitute
    another agent unless the user approves.
 
 ## Agent Command Resolution
 
-When an Orchestra checkout is available, prefer the shared agent registry at
-`$orchestra_dir/shared_scripts/agent_registry.py` (with `agent_registry.yaml`).
-Set `repo_root` from `git rev-parse --show-toplevel` when in a git repo, then
-`orchestra_dir="${ORCHESTRA_DIR:-$repo_root}"`.
+Require `$ORCHESTRA_DIR`. Do not fall back to the current worktree as the
+Orchestra checkout. Resolve commands through the shared agent registry at
+`$ORCHESTRA_DIR/shared_scripts/agent_registry.py` (with `agent_registry.yaml`).
+Set `repo_root` from `git rev-parse --show-toplevel` when in a git repo.
 
 Resolve spec: `USER_SPEC` -> `ORCHESTRA_DEFAULT_CODER` -> `config.DEFAULT_CODER`,
-then the command (only when `$orchestra_dir/bin/ko-python` exists):
+then the command:
 
 ```bash
 # USER_SPEC=opus  # optional user override
+: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || true
-orchestra_dir="${ORCHESTRA_DIR:-$repo_root}"
-ko_python="$orchestra_dir/bin/ko-python"
+ko_python="$ORCHESTRA_DIR/bin/ko-python"
+if [[ ! -x "$ko_python" ]]; then
+  echo "error: Orchestra Python wrapper missing: $ko_python" >&2
+  exit 1
+fi
 
-if [[ -n "$orchestra_dir" && -x "$ko_python" ]]; then
-  PYTHONPATH="$orchestra_dir/shared_scripts:$orchestra_dir/kanban-orchestra/scripts" \
-  "$ko_python" - <<'PY'
+PYTHONPATH="$ORCHESTRA_DIR/shared_scripts:$ORCHESTRA_DIR/kanban-orchestra/scripts" \
+"$ko_python" - <<'PY'
 import os
 from agent_registry import resolve_agent_command
 from config import DEFAULT_CODER
@@ -53,15 +55,13 @@ if not cmd:
     raise SystemExit(f"no command for spec: {spec!r}")
 print(" ".join(cmd))  # substitute {prompt}, run from repo root
 PY
-fi
 ```
 
 Replace the single `{prompt}` placeholder and run from `$repo_root` when set.
 
-If the registry or `ko-python` is unavailable, report the blocker. If the user
-named a delegate with a known CLI, invoke that directly with a normal permissive
-command (not ASK/read-only). Do not assume a default alias such as `sonnet` is
-resolvable outside the registry. The delegate may edit files.
+If the registry or `ko-python` is unavailable, report the blocker. Do not assume
+a default alias such as `sonnet` is resolvable outside the registry. The
+delegate may edit files.
 
 ## Pre-Delegation Worktree Check
 

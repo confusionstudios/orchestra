@@ -15,22 +15,23 @@ Priority:
 2. Otherwise use the configured commit-review agent from
    `ORCHESTRA_DEFAULT_REVIEWER` when it names a valid fixed alias or
    provider/model spec such as `cursor:<model>`.
-3. If the env var is unset or invalid, use the repo fallback exposed as
+3. If the env var is unset or invalid, use the Orchestra fallback exposed as
    `config.DEFAULT_REVIEWER`.
 
-Resolve the default reviewer from the repo root:
+Require `$ORCHESTRA_DIR`. Do not fall back to the current worktree as the
+Orchestra checkout. Resolve the default reviewer:
 
 ```bash
+: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
-orchestra_dir="${ORCHESTRA_DIR:-$repo_root}"
 reviewer="$(
-  PYTHONPATH="$orchestra_dir/shared_scripts:$orchestra_dir/kanban-orchestra/scripts" \
-  "$orchestra_dir/bin/ko-python" - <<'PY'
+  PYTHONPATH="$ORCHESTRA_DIR/shared_scripts:$ORCHESTRA_DIR/kanban-orchestra/scripts" \
+  "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
 import config
 print(config.DEFAULT_REVIEWER)
 PY
 )"
-PYTHONPATH="$orchestra_dir/shared_scripts" "$orchestra_dir/bin/ko-python" - "$reviewer" <<'PY'
+PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" "$ORCHESTRA_DIR/bin/ko-python" - "$reviewer" <<'PY'
 import sys
 from agent_registry import is_valid_agent_spec
 
@@ -51,15 +52,15 @@ command for providers without a review-specific template. Do not use restrictive
 ASK/read-only modes for agent CLIs; they tend to block necessary tool access.
 
 ```bash
+: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
-orchestra_dir="${ORCHESTRA_DIR:-$repo_root}"
 cd "$repo_root" || exit 1
 
 prompt_file="$(mktemp -t cross-review-prompt.XXXXXX)"
 trap 'rm -f "$prompt_file"' EXIT
 printf '%s' "<review prompt>" > "$prompt_file"
-PYTHONPATH="$orchestra_dir/shared_scripts" \
-  perl -e 'alarm shift; exec @ARGV' 300 "$orchestra_dir/bin/ko-python" - "$reviewer" "$prompt_file" <<'PY'
+PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" \
+  perl -e 'alarm shift; exec @ARGV' 300 "$ORCHESTRA_DIR/bin/ko-python" - "$reviewer" "$prompt_file" <<'PY'
 import os
 import sys
 from pathlib import Path

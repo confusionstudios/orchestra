@@ -5084,26 +5084,49 @@ class TestDevlogSkillHelper(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ORCH_DEVLOG_DIR is not set"):
                 devlog_helper.default_journal_dir()
 
-    def test_default_project_uses_repo_skill_sync_marker(self):
+    def test_default_project_uses_orch_devlog_project_env(self):
         with tempfile.TemporaryDirectory() as repo_tmp:
             target = Path(repo_tmp)
             subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            (target / devlog_helper.PROJECT_CONFIG).write_text(
+
+            with patch.dict(os.environ, {"ORCH_DEVLOG_PROJECT": "MIDI Designer"}, clear=True):
+                self.assertEqual(devlog_helper.default_project(target), "MIDI Designer")
+
+    def test_default_project_derives_readable_name_from_git_repo(self):
+        with tempfile.TemporaryDirectory() as parent_tmp:
+            target = Path(parent_tmp) / "midi-designer3"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(devlog_helper.default_project(target), "Midi Designer3")
+
+    def test_default_project_ignores_orchestra_skill_sync_marker(self):
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            target = Path(repo_tmp) / "orchestra"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            (target / ".orchestra-skill-sync").write_text(
                 "skills = true\ndevlog_project = \"MIDI Designer\"\n",
                 encoding="utf-8",
             )
 
             with patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(devlog_helper.default_project(target), "MIDI Designer")
+                self.assertEqual(devlog_helper.default_project(target), "Orchestra")
 
-    def test_default_project_requires_configured_project(self):
+    def test_default_project_requires_env_or_git_repo(self):
         with tempfile.TemporaryDirectory() as repo_tmp:
             target = Path(repo_tmp)
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
 
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaisesRegex(ValueError, "project is required"):
                     devlog_helper.default_project(target)
+
+    def test_readable_project_name_splits_hyphens_and_underscores(self):
+        self.assertEqual(
+            devlog_helper.readable_project_name(Path("/tmp/my_cool-repo")),
+            "My Cool Repo",
+        )
 
 
 class TestOrchestratorRuntime(unittest.TestCase):
