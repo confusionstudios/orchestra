@@ -98,36 +98,20 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/shared_scripts/bootstrap-python-env.sh"
    ```
 
-4. **Sync skills into a work repo:**
+4. **Install Orchestra skills globally** (once per machine; idempotent):
 
    ```bash
-   cd /path/to/work-repo
-   "$ORCHESTRA_DIR/bin/ko-sync-skills"
+   "$ORCHESTRA_DIR/bin/ko-install-global-skills"
    ```
 
-   To sync a specific repo from anywhere:
+   This writes thin `orch-kb-*` and `orch-adhoc-*` wrappers into
+   `~/.claude/skills` and `~/.codex/skills`. Each wrapper points at the
+   canonical skill under `$ORCHESTRA_DIR/AI-skills` through the environment
+   variable. New worktrees and repos use those user-level skills without
+   repo-local wrapper directories or a `.orchestra-skill-sync` marker.
 
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-skills" /path/to/work-repo
-   ```
-
-   To register a repo for future bulk skill sync:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/work-repo --project-name "Project Name"
-   ```
-
-   To inspect every registered repo without changing anything:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
-   ```
-
-   To update every registered repo:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-registered-skills" --apply
-   ```
+   Re-run after adding or changing canonical skills. Pass `--check` to verify
+   installed wrappers without writing.
 
 5. **Start the repo instance** from the work repo root and keep it running:
 
@@ -283,7 +267,7 @@ to write a short report, and stores local output under
 
 | Path | Contents |
 |------|----------|
-| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` syncs one repo, and `bin/ko-sync-registered-skills --apply` syncs repos registered with `.orchestra-skill-sync` |
+| `AI-skills/` | Canonical skill instructions — `bin/ko-install-global-skills` installs thin user-level Claude/Codex wrappers that reference this directory through `$ORCHESTRA_DIR` |
 | `kanban-orchestra/scripts/` | Task queue, dashboard, orchestrator, and CLI |
 | `kanban-orchestra/prompts/` | Prompts injected into task agents |
 | `bin/` | Thin wrappers that run through the checkout-local venv |

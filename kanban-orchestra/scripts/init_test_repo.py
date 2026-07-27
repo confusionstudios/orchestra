@@ -55,7 +55,8 @@ _orchestra_env = os.environ.get("ORCHESTRA_DIR", "")
 if not _orchestra_env:
     print("ERROR: ORCHESTRA_DIR is not set.", file=sys.stderr)
     sys.exit(1)
-orchestra_dir = Path(_orchestra_env).expanduser().resolve()
+# Resolve once so a broken ORCHESTRA_DIR fails fast during init.
+Path(_orchestra_env).expanduser().resolve()
 
 # ---------------------------------------------------------------------------
 # Target directory — always cwd
@@ -115,11 +116,7 @@ print("Wrote README.md")
     "kanban-orchestra.db-shm\n"
     "kanban-orchestra.db-wal\n"
     "kanban-orchestra.lock\n"
-    ".kanban-orchestra/\n"
-    ".claude/skills/orch-kb-*/\n"
-    ".claude/skills/orch-adhoc-*/\n"
-    ".agents/skills/orch-kb-*/\n"
-    ".agents/skills/orch-adhoc-*/\n",
+    ".kanban-orchestra/\n",
     encoding="utf-8",
 )
 print("Wrote .gitignore")
@@ -180,22 +177,9 @@ run("git", "commit", "-m", "Initial commit: counter module with off-by-one bug")
 print("Initialised git repo with one commit")
 
 # ---------------------------------------------------------------------------
-# AI skills (Claude and generic agent wrappers → shared skills in orchestra checkout)
-# ---------------------------------------------------------------------------
-
-_scripts_dir = Path(__file__).parent
-_shared_scripts_dir = _scripts_dir.parent.parent / "shared_scripts"
-sys.path.insert(0, str(_shared_scripts_dir))
-try:
-    from sync_ai_skill_wrappers import sync_skill_wrappers
-
-    sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-finally:
-    sys.path.pop(0)
-
-# ---------------------------------------------------------------------------
 # Kanban DB
 # ---------------------------------------------------------------------------
+# Skills come from user-level `ko-install-global-skills`; no repo-local wrappers.
 
 db_path_raw = os.environ.get("KANBAN_DB")
 db_path = Path(db_path_raw).expanduser().resolve() if db_path_raw else target / "kanban-orchestra.db"

@@ -26,74 +26,36 @@ Create `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` with the instructions the agen
 
 ### 2. Start the skill file with a one-line summary
 
-The wrapper sync script reads `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` directly. It uses the first non-empty line of the file as the wrapper description, so keep that opening line short and descriptive.
+The installer reads `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` directly. It uses
+the first non-empty line of the file as the wrapper description, so keep that
+opening line short and descriptive.
 
-### 3. Sync wrappers into the target repo
+### 3. Install wrappers into user-level skill directories
 
-From the repo that should receive the wrappers:
+Install once per machine (idempotent; safe to re-run after adding skills):
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills"
+"$ORCHESTRA_DIR/bin/ko-install-global-skills"
 ```
 
-This creates or refreshes:
+This creates or refreshes thin wrappers under:
 
-- `.claude/skills/orch-kb-{skill-name}/SKILL.md` or `.claude/skills/orch-adhoc-{skill-name}/SKILL.md`
-- `.agents/skills/orch-kb-{skill-name}/SKILL.md` or `.agents/skills/orch-adhoc-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Antigravity-, Kilo-, and other compatible agents)
+- `~/.claude/skills/orch-kb-{skill-name}/SKILL.md` or `~/.claude/skills/orch-adhoc-{skill-name}/SKILL.md`
+- `~/.codex/skills/orch-kb-{skill-name}/SKILL.md` or `~/.codex/skills/orch-adhoc-{skill-name}/SKILL.md`
 
-To explicitly repair generated wrapper policy and clean old generated wrappers
-from current output paths, run:
+Wrappers reference the canonical skill through `$ORCHESTRA_DIR`. They do not
+copy skill text into the work repo. New worktrees and repos use these
+user-level skills without creating `.claude/skills`, `.agents/skills`, or a
+`.orchestra-skill-sync` registration marker.
 
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --fix
-```
+`AI-readme.md` is excluded from installation. Existing wrappers that the
+installer can identify as generated Orchestra wrappers are updated in place.
+Unrecognized or hand-edited skills under the same names are left untouched.
 
-Fix mode ensures narrow `.gitignore` entries exist for generated
-`orch-kb-*` and `orch-adhoc-*` wrapper directories, removes generated
-unprefixed wrappers from current `.claude/skills` and `.agents/skills` paths,
-removes all legacy `ko-*` wrapper directories from those same current paths,
-and removes current generated wrappers from git tracking when run in a git
-repo. Current generated wrappers under `.claude/skills/orch-*` and
-`.agents/skills/orch-*` remain on disk as ignored local generated files.
-Hand-edited or unknown non-`ko-*` files are left untouched.
-
-### 4. Register repos for ad-hoc sync
-
-To opt a repo into future bulk syncs from the Orchestra checkout:
+To verify installed wrappers without writing:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/client-repo --project-name "MIDI Designer"
-```
-
-Registration writes two things:
-
-- A repo-local `.orchestra-skill-sync` marker. This is safe to commit and says
-  the repo accepts shared Orchestra skill sync. When `--project-name` is passed,
-  the marker also stores the human display name used by the devlog skill.
-- A private machine-local path entry in
-  `~/.config/orchestra/skill-sync.repos`, or in the path named by
-  `$ORCHESTRA_SKILL_SYNC_REPOS`.
-
-From the Orchestra checkout, preview every registered repo:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
-```
-
-To actually sync every registered repo:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-registered-skills" --apply
-```
-
-Applied registered sync runs fix mode and then normal sync for each repo whose
-path is still valid and whose repo root still contains `.orchestra-skill-sync`.
-Missing paths or repos without the marker are skipped rather than guessed.
-
-To opt out:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --unregister /path/to/client-repo
+"$ORCHESTRA_DIR/bin/ko-install-global-skills" --check
 ```
 
 Each wrapper uses the same thin shared format:
