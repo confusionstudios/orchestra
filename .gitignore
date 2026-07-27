@@ -24,8 +24,12 @@ eraseme/
 orchestra
 test_workspace/
 
-# Generated Orchestra skill wrappers. Canonical source lives in AI-skills/.
+# Local Kanban Orchestra runtime
 .kanban-orchestra/
+
+# Leftover repo-local skill wrappers from the retired sync path.
+# Skills install globally via bin/ko-install-global-skills; these patterns
+# only keep stale local wrappers out of git status.
 .claude/skills/orch-kb-*/
 .claude/skills/orch-adhoc-*/
 .agents/skills/orch-kb-*/

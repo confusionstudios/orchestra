@@ -30,7 +30,7 @@ Resolve the project label from:
    `orchestra` -> `Orchestra`, `midi-designer3` -> `Midi Designer3`.
 
 Prefer `$ORCH_DEVLOG_PROJECT` when the derived directory name would be unclear
-or ugly. Do not read `.orchestra-skill-sync` for the project name.
+or ugly.
 
 ## Workflow
 

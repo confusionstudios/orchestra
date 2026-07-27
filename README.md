@@ -104,11 +104,11 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-install-global-skills"
    ```
 
-   This writes thin `orch-kb-*` and `orch-adhoc-*` wrappers into
-   `~/.claude/skills` and `~/.codex/skills`. Each wrapper points at the
-   canonical skill under `$ORCHESTRA_DIR/AI-skills` through the environment
-   variable. New worktrees and repos use those user-level skills without
-   repo-local wrapper directories or a `.orchestra-skill-sync` marker.
+   This is the skill distribution path. It writes thin `orch-kb-*` and
+   `orch-adhoc-*` wrappers into `~/.claude/skills` and `~/.codex/skills`.
+   Each wrapper points at the canonical skill under `$ORCHESTRA_DIR/AI-skills`
+   through the environment variable. After that one-time install, every
+   worktree and repo on the machine uses the same user-level skills.
 
    Re-run after adding or changing canonical skills. Pass `--check` to verify
    installed wrappers without writing.
@@ -144,7 +144,10 @@ accounts, or billing — install and authenticate each CLI yourself.
    ```
 
    The fleet config is `~/.config/orchestra/fleet.repos`: one git repo root per
-   line, with blank lines and `#` comments allowed.
+   line, with blank lines and `#` comments allowed. Fleet only manages running
+   orchestrators and dashboards for those repos — it does not install, sync, or
+   distribute skills. Skills come from the one-time
+   `ko-install-global-skills` step above.
    `ko-fleet stop`, `restart`, `attach`, `logs`, and `dashboard` operate on the
    selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
    for opening the repo dashboard. Use `ko-get-update` for a concise status
@@ -208,9 +211,10 @@ For several repo instances, use the fleet command:
 ```
 
 `ko-fleet` reads `~/.config/orchestra/fleet.repos`, a private flat list with
-one repo root per line. It derives display names from each path. `start`
-skips dirty stopped repos and keeps launching clean stopped repos; invalid
-repo config remains a hard failure.
+one repo root per line. It derives display names from each path and only
+manages orchestrator/dashboard processes for those repos — not skill
+installation or distribution. `start` skips dirty stopped repos and keeps
+launching clean stopped repos; invalid repo config remains a hard failure.
 
 ### YOLO Mode and Hardening
 

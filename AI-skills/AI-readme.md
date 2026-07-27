@@ -12,8 +12,8 @@ How each agent discovers and loads custom commands and skills:
 ## Adding a Shared Orchestra Skill
 
 All shared Orchestra skills live in `$ORCHESTRA_DIR/AI-skills/{skill-name}.md`
-as the canonical source. Agents get a thin wrapper that points to the canonical
-file.
+as the canonical source. Agents load them through thin user-level wrappers
+installed once per machine.
 
 Wrappers use two prefixes:
 
@@ -30,9 +30,7 @@ The installer reads `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` directly. It uses
 the first non-empty line of the file as the wrapper description, so keep that
 opening line short and descriptive.
 
-### 3. Install wrappers into user-level skill directories
-
-Install once per machine (idempotent; safe to re-run after adding skills):
+### 3. Install wrappers once per machine
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-install-global-skills"
@@ -44,15 +42,19 @@ This creates or refreshes thin wrappers under:
 - `~/.codex/skills/orch-kb-{skill-name}/SKILL.md` or `~/.codex/skills/orch-adhoc-{skill-name}/SKILL.md`
 
 Wrappers reference the canonical skill through `$ORCHESTRA_DIR`. They do not
-copy skill text into the work repo. New worktrees and repos use these
-user-level skills without creating `.claude/skills`, `.agents/skills`, or a
-`.orchestra-skill-sync` registration marker. Operational skills resolve Orchestra
-tooling only through `$ORCHESTRA_DIR`; they do not treat the current worktree as
-an Orchestra checkout fallback.
+copy skill text into work repos. After the one-time install, every worktree and
+repo on the machine uses the same user-level skills. Re-run the installer after
+adding or changing canonical skills.
+
+Operational skills resolve Orchestra tooling only through `$ORCHESTRA_DIR`; they
+do not treat the current worktree as an Orchestra checkout fallback.
 
 `AI-readme.md` is excluded from installation. Existing wrappers that the
 installer can identify as generated Orchestra wrappers are updated in place.
 Unrecognized or hand-edited skills under the same names are left untouched.
+
+Fleet (`ko-fleet`) starts and stops orchestrators and dashboards for configured
+repos. It does not install, sync, or distribute skills.
 
 To verify installed wrappers without writing:
 
