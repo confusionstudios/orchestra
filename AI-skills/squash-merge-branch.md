@@ -1,5 +1,21 @@
 Squash-merge a working branch into the appropriate target branch and commit using the latest available squash-merge notes.
 
+## Ad Hoc State Location
+
+Resolve the shared handoff directory before reading or clearing notes:
+
+```bash
+ADHOC_STATE_DIR="$("$ORCHESTRA_DIR/bin/ko-adhoc-state-dir" --ensure)"
+```
+
+That helper is the single source of truth:
+
+1. If `$ORCH_ADHOC_STATE_DIR` is set, use that directory (exact path; caller owns isolation).
+2. Otherwise use `$XDG_STATE_HOME/orchestra/adhoc/<repo-key>/<worktree-key>/`, or `~/.local/state/orchestra/adhoc/<repo-key>/<worktree-key>/` when `XDG_STATE_HOME` is unset.
+3. `<repo-key>` is a stable hash of this repository's absolute `git-common-dir`. `<worktree-key>` is a stable hash of this worktree's absolute `git-dir`. Every affected skill in one worktree resolves the same directory; linked worktrees and distinct repositories do not share state.
+
+Do not write under `Orchestration/projects/` or any other worktree-local Orchestration path.
+
 ## Choose Source And Target
 
 - If a source branch argument is provided (for example `/squash-merge-branch 2026-02-auv3/phase3` or `$squash-merge-branch 2026-02-auv3/phase3`), use it.
@@ -17,7 +33,7 @@ Steps:
    - If currently not on the target, run `git checkout <target-branch>`.
    - If checkout fails, stop and report the error.
 4. Resolve the input notes file from disk:
-   - Look for `Orchestration/projects/1-ad-hoc-ai-chatter/squash-merge-notes.md`.
+   - Look for `$ADHOC_STATE_DIR/squash-merge-notes.md`.
    - If no candidate file exists on disk, stop and report missing notes source.
 5. Extract commit message from the selected notes file:
    - Expected format is:
@@ -27,8 +43,7 @@ Steps:
    - Validate required headings exist (`## What`, `## Work`, `## Other`, `## Notes`); `## Other` and `## Notes` may have blank content. Stop and report if a required heading is missing.
 6. Run the squash merge: `git merge --squash <source-branch>`.
    This stages all changes but does not commit.
-7. Update the notes file and stage it as part of the same commit:
-   - Overwrite it with an empty file, then `git add` it.
+7. Clear the notes file in the ad-hoc state directory (truncate or delete `$ADHOC_STATE_DIR/squash-merge-notes.md`). Do not `git add` it; the notes live outside the worktree.
 8. Read staged files (`git diff --cached --name-only`) and present them for explicit human confirmation against the notes intent.
 9. Show the user:
    - source branch and target branch

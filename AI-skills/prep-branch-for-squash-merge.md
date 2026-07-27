@@ -1,4 +1,20 @@
-Produce a squash-merge commit message for the current working branch against the appropriate target branch, then overwrite `Orchestration/projects/1-ad-hoc-ai-chatter/squash-merge-notes.md` with it.
+Produce a squash-merge commit message for the current working branch against the appropriate target branch, then overwrite `$ADHOC_STATE_DIR/squash-merge-notes.md` with it.
+
+## Ad Hoc State Location
+
+Resolve the shared handoff directory before writing notes:
+
+```bash
+ADHOC_STATE_DIR="$("$ORCHESTRA_DIR/bin/ko-adhoc-state-dir" --ensure)"
+```
+
+That helper is the single source of truth:
+
+1. If `$ORCH_ADHOC_STATE_DIR` is set, use that directory (exact path; caller owns isolation).
+2. Otherwise use `$XDG_STATE_HOME/orchestra/adhoc/<repo-key>/<worktree-key>/`, or `~/.local/state/orchestra/adhoc/<repo-key>/<worktree-key>/` when `XDG_STATE_HOME` is unset.
+3. `<repo-key>` is a stable hash of this repository's absolute `git-common-dir`. `<worktree-key>` is a stable hash of this worktree's absolute `git-dir`. Every affected skill in one worktree resolves the same directory; linked worktrees and distinct repositories do not share state.
+
+Do not write under `Orchestration/projects/` or any other worktree-local Orchestration path.
 
 ## Choose Target
 
@@ -18,7 +34,7 @@ Produce a squash-merge commit message for the current working branch against the
 
 Now synthesize. Do not list commits one by one. Group changes into coherent logical chunks based on what they collectively accomplish.
 
-Write `Orchestration/projects/1-ad-hoc-ai-chatter/squash-merge-notes.md` with this exact structure (overwrite completely):
+Write `$ADHOC_STATE_DIR/squash-merge-notes.md` with this exact structure (overwrite completely):
 
 ```
 <Title Case commit title under 80 chars>
