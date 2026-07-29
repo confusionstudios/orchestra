@@ -97,8 +97,11 @@ value. Otherwise use the role default that matches the work, especially
 The exact set can change, so check the registry before relying on this list.
 At the time this skill was written, useful keys included:
 
+- `haiku` — Claude Haiku
+- `sonnet` / `claude` — Claude Sonnet
 - `codex`
-- `opus`
+- `opus` — Claude Opus
+- `fable` — Claude Fable
 - `antigravity`
 - `cursor-composer-2.5`
 - `cursor-grok-4.5`

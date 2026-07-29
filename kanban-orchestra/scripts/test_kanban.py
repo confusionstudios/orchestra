@@ -8698,16 +8698,19 @@ class TestCommitFooter(unittest.TestCase):
         )
 
     def test_display_name_sonnet(self):
-        self.assertEqual(config.get_agent_display_name("sonnet"), "Claude Sonnet 4.5")
+        self.assertEqual(config.get_agent_display_name("sonnet"), "Claude Sonnet")
 
     def test_display_name_haiku(self):
-        self.assertEqual(config.get_agent_display_name("haiku"), "Claude Haiku 4.5")
+        self.assertEqual(config.get_agent_display_name("haiku"), "Claude Haiku")
 
     def test_display_name_opus(self):
-        self.assertEqual(config.get_agent_display_name("opus"), "Claude Opus 4.6")
+        self.assertEqual(config.get_agent_display_name("opus"), "Claude Opus")
+
+    def test_display_name_fable(self):
+        self.assertEqual(config.get_agent_display_name("fable"), "Claude Fable")
 
     def test_display_name_claude_alias(self):
-        self.assertEqual(config.get_agent_display_name("claude"), "Claude Sonnet 4.5")
+        self.assertEqual(config.get_agent_display_name("claude"), "Claude Sonnet")
 
     def test_display_name_for_codex(self):
         self.assertEqual(agent_registry.AGENT_DISPLAY_LABELS["codex"], "Codex")
@@ -8782,7 +8785,7 @@ class TestCommitFooter(unittest.TestCase):
     def test_attribution_uses_command_values_not_display_label(self):
         self.assertEqual(
             agent_registry.resolve_agent_attribution("sonnet"),
-            "sonnet (model: Sonnet)",
+            "sonnet (model: sonnet)",
         )
         self.assertNotIn(
             agent_registry.AGENT_DISPLAY_LABELS["sonnet"],
@@ -8881,7 +8884,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: sonnet (model: Sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
+            f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
     def test_get_commit_footer_default_agent(self):
@@ -8978,7 +8981,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: haiku (model: Haiku); reviewer: sonnet (model: Sonnet); review rejections: 2)",
+            f"Task {tid} (coder: haiku (model: haiku); reviewer: sonnet (model: sonnet); review rejections: 2)",
         )
 
     def test_get_commit_footer_uses_final_approval_reviewer(self):
@@ -9000,7 +9003,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: haiku (model: Haiku); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
+            f"Task {tid} (coder: haiku (model: haiku); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
 
@@ -9093,7 +9096,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: sonnet (model: Sonnet); reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: sonnet); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
@@ -9118,7 +9121,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: sonnet (model: Sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)"
             ),
             repr(result),
         )
@@ -9130,7 +9133,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: haiku (model: Haiku); reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: haiku (model: haiku); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
@@ -9153,7 +9156,7 @@ class TestFinalizationFooter(unittest.TestCase):
         expected_footer = task_module.get_commit_footer(tid, self.conn)
         self.assertEqual(
             expected_footer,
-            f"Task {tid} (coder: opus (model: claude-opus-4-6); reviewer: pending; review rejections: 0)",
+            f"Task {tid} (coder: opus (model: opus); reviewer: pending; review rejections: 0)",
         )
         message = "Refactor internals\n\nSome body."
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
