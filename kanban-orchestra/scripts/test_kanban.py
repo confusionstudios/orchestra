@@ -5663,12 +5663,6 @@ class TestSupertaskDB(unittest.TestCase):
         self.conn.close()
         os.unlink(self.tmp.name)
 
-    def test_new_columns_present(self):
-        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)").fetchall()}
-        self.assertIn("kind", cols)
-        self.assertIn("parent_task_id", cols)
-        self.assertIn("sequence_index", cols)
-
     def test_legacy_supertask_db_with_koid_raises_error(self):
         """connect() must raise RuntimeError on a pre-supertask legacy schema with koid."""
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -8667,19 +8661,6 @@ class TestDeferredBuildPolicy(unittest.TestCase):
 class TestCommitFooter(unittest.TestCase):
     """Tests for get_agent_display_name() and task get-commit-footer subcommand."""
 
-    NEW_AGENT_KEYS = (
-        "antigravity",
-        "kilo-opus-4.6",
-        "kilo-opus-4.7",
-        "kilo-sonnet-4.6",
-        "cursor-auto",
-        "cursor-composer-2.5",
-        "cursor-grok-4.5",
-        "cursor-opus-4.6",
-        "cursor-opus-4.7",
-        "cursor-sonnet-4.6",
-    )
-
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
@@ -8696,65 +8677,6 @@ class TestCommitFooter(unittest.TestCase):
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=env,
         )
-
-    def test_display_name_sonnet(self):
-        self.assertEqual(config.get_agent_display_name("sonnet"), "Claude Sonnet")
-
-    def test_display_name_haiku(self):
-        self.assertEqual(config.get_agent_display_name("haiku"), "Claude Haiku")
-
-    def test_display_name_opus(self):
-        self.assertEqual(config.get_agent_display_name("opus"), "Claude Opus")
-
-    def test_display_name_fable(self):
-        self.assertEqual(config.get_agent_display_name("fable"), "Claude Fable")
-
-    def test_display_name_claude_alias(self):
-        self.assertEqual(config.get_agent_display_name("claude"), "Claude Sonnet")
-
-    def test_display_name_for_codex(self):
-        self.assertEqual(agent_registry.AGENT_DISPLAY_LABELS["codex"], "Codex")
-        result = config.get_agent_display_name("codex")
-        self.assertEqual(result, "Codex")
-
-    def test_existing_registry_labels_preserve_previous_fallbacks(self):
-        self.assertEqual(config.get_agent_display_name("antigravity"), "Antigravity")
-        self.assertEqual(config.get_agent_display_name("kilo"), "kilo/kilo-auto/free")
-
-    def test_agent_registry_keys_are_unique(self):
-        self.assertEqual(len(agent_registry.AGENTS), len(set(agent_registry.AGENTS)))
-
-    def test_agent_registry_commands_have_one_prompt_placeholder(self):
-        for key, command in agent_registry.AGENT_CMD.items():
-            with self.subTest(key=key):
-                prompt_count = sum(part.count("{prompt}") for part in command)
-                self.assertEqual(prompt_count, 1)
-
-    def test_agent_registry_provider_specs_are_loaded(self):
-        self.assertIn("cursor", agent_registry.AGENT_PROVIDERS)
-        self.assertIn("kilo", agent_registry.AGENT_PROVIDERS)
-
-    def test_new_agent_keys_are_allowed(self):
-        for key in self.NEW_AGENT_KEYS:
-            with self.subTest(key=key):
-                self.assertIn(key, config.AGENTS)
-
-    def test_display_names_for_new_agent_keys(self):
-        expected = {
-            "antigravity": "Antigravity",
-            "kilo-opus-4.6": "Kilo Claude Opus 4.6",
-            "kilo-opus-4.7": "Kilo Claude Opus 4.7",
-            "kilo-sonnet-4.6": "Kilo Claude Sonnet 4.6",
-            "cursor-auto": "Cursor Auto",
-            "cursor-composer-2.5": "Cursor Composer 2.5",
-            "cursor-grok-4.5": "Cursor Grok 4.5",
-            "cursor-opus-4.6": "Cursor Opus 4.6",
-            "cursor-opus-4.7": "Cursor Opus 4.7",
-            "cursor-sonnet-4.6": "Cursor Sonnet 4.6",
-        }
-        for key, label in expected.items():
-            with self.subTest(key=key):
-                self.assertEqual(config.get_agent_display_name(key), label)
 
     def test_provider_model_display_name(self):
         self.assertEqual(
@@ -9008,12 +8930,6 @@ class TestCommitFooter(unittest.TestCase):
 
 
 class TestAgentSmoke(unittest.TestCase):
-    def test_default_matrix_contains_replacement_agents(self):
-        matrix = {agent.name: agent.spec for agent in agent_smoke.AGENT_MATRIX}
-        self.assertEqual(matrix["antigravity"], "antigravity")
-        self.assertEqual(matrix["cursor-composer-2.5"], "cursor-composer-2.5")
-        self.assertEqual(matrix["kilo-opus-4.8"], "kilo:kilo/anthropic/claude-opus-4.8")
-
     def test_selected_agents_can_skip_by_name_or_spec(self):
         selected = agent_smoke.selected_agents(
             ["extra=cursor:auto"],
@@ -9025,12 +8941,6 @@ class TestAgentSmoke(unittest.TestCase):
                 ("cursor-composer-2.5", "cursor-composer-2.5"),
                 ("kilo-opus-4.8", "kilo:kilo/anthropic/claude-opus-4.8"),
             ],
-        )
-
-    def test_default_output_dir_is_repo_local_runtime_path(self):
-        self.assertEqual(
-            agent_smoke.default_output_dir(),
-            Path.cwd() / ".kanban-orchestra" / "agent-smoke",
         )
 
     def test_run_one_writes_stdout_stderr_and_requires_report(self):

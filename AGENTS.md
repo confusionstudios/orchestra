@@ -8,6 +8,13 @@
 - Define what success looks like, then verify the change against it.
 - If verification fails, iterate until the issue is resolved or the blocker is clearly explained.
 
+## Local Test Policy
+
+Only generate tests when the code contains actual logic.
+
+- Skip tests for pure data: constants, config, DTOs, type definitions, simple mappings with no branching, no calculations, no side effects, and no business rules.
+- Write tests only for real behavior: conditionals, loops, calculations, state changes, error handling, and algorithms.
+
 There is no build step for this repo.
 
 Do not queue or run Kanban Orchestra tasks on `master` or `main` in this repo.
