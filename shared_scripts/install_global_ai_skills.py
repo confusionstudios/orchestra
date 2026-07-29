@@ -17,7 +17,8 @@ Wrappers are generated from `$ORCHESTRA_DIR/AI-skills/*.md` (excluding
 
 Each wrapper points at the canonical skill through `$ORCHESTRA_DIR` rather than
 copying skill text. The installer only overwrites wrappers it can identify as
-previously generated Orchestra wrappers. Unknown or hand-edited skills are left
+previously generated Orchestra wrappers. It removes generated wrappers whose
+canonical source no longer exists. Unknown or hand-edited skills are left
 untouched. Pass `--check` to verify installed wrappers without writing.
 """
 
@@ -113,6 +114,17 @@ def is_generated_wrapper(content: str, skill_name: str) -> bool:
     return _is_current_generated_body(match.group("body").strip(), skill_name)
 
 
+def _generated_wrapper_skill_name(content: str) -> str | None:
+    """Return the skill name when ``content`` is a managed Orchestra wrapper."""
+    match = _FRONT_MATTER_RE.match(content)
+    if not match:
+        return None
+    skill_name = _unwrap_wrapper_skill_name(match.group("name"))
+    if skill_name == match.group("name"):
+        return None
+    return skill_name if _is_current_generated_body(match.group("body").strip(), skill_name) else None
+
+
 def _agent_skills_root(home: Path, agent: str) -> Path:
     return home / f".{agent}" / "skills"
 
@@ -129,19 +141,24 @@ def install_global_skills(
 ) -> dict[str, list[str]]:
     """Install or verify user-level Orchestra skill wrappers.
 
-    Returns a summary with keys: created, updated, unchanged, skipped, missing.
+    Returns a summary with keys: created, updated, removed, unchanged, skipped,
+    missing, stale. In normal mode, ``removed`` lists obsolete generated wrappers.
     In check mode, ``created`` is unused; ``missing`` lists absent wrappers and
-    ``updated`` lists wrappers that would be rewritten.
+    ``updated`` lists wrappers that would be rewritten; ``stale`` lists wrappers
+    that would be removed.
     """
     home = (home or Path.home()).expanduser().resolve()
     orchestra_dir = orchestra_dir.resolve()
     summary: dict[str, list[str]] = {
         "created": [],
         "updated": [],
+        "removed": [],
         "unchanged": [],
         "skipped": [],
         "missing": [],
+        "stale": [],
     }
+    expected_paths: set[str] = set()
 
     for canonical_path in _canonical_skill_files(orchestra_dir):
         skill_name = canonical_path.stem
@@ -152,6 +169,7 @@ def install_global_skills(
         for agent in AGENTS:
             wrapper_path = _agent_skills_root(home, agent) / wrapper_name / "SKILL.md"
             relative_path = _relative_wrapper_path(agent, wrapper_name)
+            expected_paths.add(relative_path)
 
             if not wrapper_path.exists():
                 if check:
@@ -177,6 +195,25 @@ def install_global_skills(
 
             summary["skipped"].append(relative_path)
 
+    for agent in AGENTS:
+        root = _agent_skills_root(home, agent)
+        if not root.exists():
+            continue
+        for wrapper_path in root.glob("orch-*/SKILL.md"):
+            relative_path = _relative_wrapper_path(agent, wrapper_path.parent.name)
+            if relative_path in expected_paths:
+                continue
+            skill_name = _generated_wrapper_skill_name(wrapper_path.read_text(encoding="utf-8"))
+            if not skill_name:
+                continue
+            if check:
+                summary["stale"].append(relative_path)
+                continue
+            wrapper_path.unlink()
+            if not any(wrapper_path.parent.iterdir()):
+                wrapper_path.parent.rmdir()
+            summary["removed"].append(relative_path)
+
     return summary
 
 
@@ -186,12 +223,14 @@ def _print_summary(summary: dict[str, list[str]], *, check: bool) -> None:
             "Global AI skill wrappers check:"
             f" missing={len(summary['missing'])}"
             f" would_update={len(summary['updated'])}"
+            f" would_remove={len(summary['stale'])}"
             f" unchanged={len(summary['unchanged'])}"
             f" skipped={len(summary['skipped'])}"
         )
         ordered = (
             ("missing", "Missing"),
             ("updated", "Would update"),
+            ("stale", "Would remove"),
             ("unchanged", "All good"),
             ("skipped", "Skipped"),
         )
@@ -200,6 +239,7 @@ def _print_summary(summary: dict[str, list[str]], *, check: bool) -> None:
             "Global AI skill wrappers installed:"
             f" created={len(summary['created'])}"
             f" updated={len(summary['updated'])}"
+            f" removed={len(summary['removed'])}"
             f" unchanged={len(summary['unchanged'])}"
             f" skipped={len(summary['skipped'])}"
         )
@@ -207,6 +247,7 @@ def _print_summary(summary: dict[str, list[str]], *, check: bool) -> None:
             ("skipped", "Skipped"),
             ("created", "Added"),
             ("updated", "Updated"),
+            ("removed", "Removed"),
             ("unchanged", "All good"),
         )
 
@@ -263,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _print_summary(summary, check=args.check)
     if args.check and (
-        summary["missing"] or summary["updated"] or summary["skipped"]
+        summary["missing"] or summary["updated"] or summary["stale"] or summary["skipped"]
     ):
         return 1
     return 0

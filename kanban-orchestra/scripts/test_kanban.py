@@ -7,7 +7,6 @@ comment aggregation.
 """
 
 import json
-import hashlib
 import importlib.util
 import io
 import os
@@ -57,10 +56,6 @@ global_skill_installer = _load_local_module(
     "kanban_test_global_skill_installer",
     str(SCRIPT_DIR.parent.parent / "shared_scripts" / "install_global_ai_skills.py"),
 )
-adhoc_state = _load_local_module(
-    "kanban_test_adhoc_state",
-    str(SCRIPT_DIR.parent.parent / "shared_scripts" / "resolve_adhoc_state_dir.py"),
-)
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
 devlog_helper = _load_local_module("kanban_test_devlog_helper", str(SCRIPT_DIR.parent.parent / "AI-skills" / "devlog" / "scripts" / "log_work.py"))
 
@@ -75,13 +70,8 @@ def _write_test_ai_skills(orchestra_dir: Path) -> None:
         "get-kanban-update",
         "git-commit",
         "kanban",
-        "prep-branch-for-squash-merge",
-        "prep-for-review",
-        "respond-to-review",
-        "review-build",
         "review-screenshot",
         "squash-and-merge-one-shot",
-        "squash-merge-branch",
     ):
         (skills_dir / f"{skill_name}.md").write_text(
             f"{skill_name} description.\n\nCanonical instructions.\n",
@@ -4222,15 +4212,15 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             )
 
             expected = global_skill_installer.render_wrapper(
-                "review-build",
+                "git-commit",
                 global_skill_installer._skill_description(
-                    orchestra_dir / "AI-skills" / "review-build.md"
+                    orchestra_dir / "AI-skills" / "git-commit.md"
                 ),
-                orchestra_dir / "AI-skills" / "review-build.md",
+                orchestra_dir / "AI-skills" / "git-commit.md",
             )
             for agent in ("claude", "codex"):
                 wrapper_path = (
-                    home / f".{agent}" / "skills" / "orch-adhoc-review-build" / "SKILL.md"
+                    home / f".{agent}" / "skills" / "orch-adhoc-git-commit" / "SKILL.md"
                 )
                 self.assertEqual(wrapper_path.read_text(encoding="utf-8"), expected)
                 self.assertTrue(
@@ -4404,6 +4394,32 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("unchanged=", stdout.getvalue())
 
+    def test_removes_stale_generated_wrappers_but_keeps_user_skills(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+            stale_path = home / ".claude" / "skills" / "orch-adhoc-review-build" / "SKILL.md"
+            stale_path.parent.mkdir(parents=True)
+            stale_path.write_text(
+                global_skill_installer.render_wrapper(
+                    "review-build", "stale description.", orchestra_dir / "AI-skills" / "review-build.md"
+                ),
+                encoding="utf-8",
+            )
+            custom_path = home / ".codex" / "skills" / "orch-adhoc-review-build" / "SKILL.md"
+            custom_path.parent.mkdir(parents=True)
+            custom_path.write_text("custom skill\n", encoding="utf-8")
+
+            checked = global_skill_installer.install_global_skills(orchestra_dir, home=home, check=True)
+            self.assertIn(".claude/skills/orch-adhoc-review-build/SKILL.md", checked["stale"])
+            self.assertTrue(stale_path.exists())
+
+            summary = global_skill_installer.install_global_skills(orchestra_dir, home=home)
+            self.assertIn(".claude/skills/orch-adhoc-review-build/SKILL.md", summary["removed"])
+            self.assertFalse(stale_path.exists())
+            self.assertEqual(custom_path.read_text(encoding="utf-8"), "custom skill\n")
+
     def test_main_honors_home_environment_via_path_home(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
             orchestra_dir = Path(orchestra_tmp)
@@ -4431,146 +4447,6 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             self.assertTrue(
                 (home / ".codex" / "skills" / "orch-kb-get-kanban-update" / "SKILL.md").exists()
             )
-
-
-class TestAdhocStateDirHelper(unittest.TestCase):
-    """Test shared ad-hoc handoff state directory resolution."""
-
-    def test_override_env_uses_exact_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            override = Path(tmp) / "custom-state"
-            with patch.dict(os.environ, {adhoc_state.STATE_ENV: str(override)}, clear=False):
-                resolved = adhoc_state.resolve_adhoc_state_dir()
-            self.assertEqual(resolved, override.resolve())
-
-    def test_default_path_uses_xdg_state_and_repo_worktree_keys(self):
-        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as state_tmp:
-            repo = Path(repo_tmp) / "sample-repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-            common = adhoc_state.git_common_dir(repo)
-            git_dir = adhoc_state.git_dir(repo)
-            expected_repo_key = adhoc_state.repo_key(repo)
-            expected_worktree_key = adhoc_state.worktree_key(repo)
-            self.assertEqual(
-                expected_repo_key,
-                hashlib.sha256(str(common).encode("utf-8")).hexdigest(),
-            )
-            self.assertEqual(
-                expected_worktree_key,
-                hashlib.sha256(str(git_dir).encode("utf-8")).hexdigest(),
-            )
-
-            with patch.dict(
-                os.environ,
-                {adhoc_state.XDG_STATE_ENV: state_tmp, adhoc_state.STATE_ENV: ""},
-                clear=False,
-            ):
-                resolved = adhoc_state.resolve_adhoc_state_dir(repo)
-
-            self.assertEqual(
-                resolved,
-                (
-                    Path(state_tmp)
-                    / "orchestra"
-                    / "adhoc"
-                    / expected_repo_key
-                    / expected_worktree_key
-                ).resolve(),
-            )
-
-    def test_default_path_falls_back_to_home_local_state(self):
-        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as home_tmp:
-            repo = Path(repo_tmp) / "sample-repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-            repo_key = adhoc_state.repo_key(repo)
-            worktree_key = adhoc_state.worktree_key(repo)
-            home = Path(home_tmp)
-
-            env = {
-                adhoc_state.STATE_ENV: "",
-                adhoc_state.XDG_STATE_ENV: "",
-                "HOME": str(home),
-            }
-            with patch.dict(os.environ, env, clear=False), patch(
-                "pathlib.Path.home",
-                return_value=home,
-            ):
-                resolved = adhoc_state.resolve_adhoc_state_dir(repo)
-
-            self.assertEqual(
-                resolved,
-                (
-                    home
-                    / ".local"
-                    / "state"
-                    / "orchestra"
-                    / "adhoc"
-                    / repo_key
-                    / worktree_key
-                ).resolve(),
-            )
-
-    def test_linked_worktrees_are_distinct_and_same_worktree_is_stable(self):
-        with tempfile.TemporaryDirectory() as parent_tmp:
-            parent = Path(parent_tmp)
-            main = parent / "main"
-            other = parent / "other"
-            main.mkdir()
-            other.mkdir()
-            subprocess.run(["git", "init", "-q"], cwd=main, check=True)
-            subprocess.run(["git", "init", "-q"], cwd=other, check=True)
-            subprocess.run(
-                ["git", "commit", "--allow-empty", "-qm", "init"],
-                cwd=main,
-                check=True,
-            )
-            linked = parent / "linked"
-            subprocess.run(
-                ["git", "worktree", "add", "-q", str(linked), "HEAD"],
-                cwd=main,
-                check=True,
-            )
-
-            with patch.dict(
-                os.environ,
-                {adhoc_state.STATE_ENV: "", adhoc_state.XDG_STATE_ENV: str(parent / "state")},
-                clear=False,
-            ):
-                main_dir = adhoc_state.resolve_adhoc_state_dir(main)
-                main_dir_again = adhoc_state.resolve_adhoc_state_dir(main)
-                linked_dir = adhoc_state.resolve_adhoc_state_dir(linked)
-                other_dir = adhoc_state.resolve_adhoc_state_dir(other)
-
-            self.assertEqual(main_dir, main_dir_again)
-            self.assertEqual(adhoc_state.repo_key(main), adhoc_state.repo_key(linked))
-            self.assertNotEqual(adhoc_state.worktree_key(main), adhoc_state.worktree_key(linked))
-            self.assertNotEqual(main_dir, linked_dir)
-            self.assertNotEqual(main_dir, other_dir)
-            self.assertTrue(str(main_dir).startswith(str((parent / "state" / "orchestra" / "adhoc").resolve())))
-            self.assertTrue(str(linked_dir).startswith(str((parent / "state" / "orchestra" / "adhoc" / adhoc_state.repo_key(main)).resolve())))
-
-
-    def test_ensure_creates_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "nested" / "state"
-            with patch.dict(os.environ, {adhoc_state.STATE_ENV: str(target)}, clear=False):
-                created = adhoc_state.ensure_adhoc_state_dir()
-            self.assertEqual(created, target.resolve())
-            self.assertTrue(created.is_dir())
-
-    def test_requires_git_repo_without_override(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(
-                os.environ,
-                {adhoc_state.STATE_ENV: "", adhoc_state.XDG_STATE_ENV: tmp},
-                clear=False,
-            ):
-                with self.assertRaisesRegex(ValueError, "not inside a Git repository"):
-                    adhoc_state.resolve_adhoc_state_dir(Path(tmp))
-
-
 class TestDevlogSkillHelper(unittest.TestCase):
     """Test the bundled devlog helper used by the shared devlog skill."""
 

@@ -44,14 +44,15 @@ This creates or refreshes thin wrappers under:
 Wrappers reference the canonical skill through `$ORCHESTRA_DIR`. They do not
 copy skill text into work repos. After the one-time install, every worktree and
 repo on the machine uses the same user-level skills. Re-run the installer after
-adding or changing canonical skills.
+adding, changing, or deleting canonical skills.
 
 Operational skills resolve Orchestra tooling only through `$ORCHESTRA_DIR`; they
 do not treat the current worktree as an Orchestra checkout fallback.
 
 `AI-readme.md` is excluded from installation. Existing wrappers that the
-installer can identify as generated Orchestra wrappers are updated in place.
-Unrecognized or hand-edited skills under the same names are left untouched.
+installer can identify as generated Orchestra wrappers are updated in place or
+removed when their canonical skill was deleted. Unrecognized or hand-edited
+skills under the same names are left untouched.
 
 Fleet (`ko-fleet`) starts and stops orchestrators and dashboards for configured
 repos. It does not install, sync, or distribute skills.
