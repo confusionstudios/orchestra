@@ -1,5 +1,0 @@
-# Orchestra shared AI skill sync opt-in.
-# This file is safe to commit; machine-local repo paths live in
-# ~/.config/orchestra/skill-sync.repos or $ORCHESTRA_SKILL_SYNC_REPOS.
-skills = true
-devlog_project = "Orchestra"

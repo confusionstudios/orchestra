@@ -27,6 +27,7 @@ esac
 targets=(
   "$HOME/.claude/CLAUDE.md|Global Claude Code Instructions"
   "$HOME/.codex/AGENTS.md|Global Codex Instructions"
+  "$HOME/.config/kilo/AGENTS.md|Global Kilo Instructions"
   "$HOME/.gemini/GEMINI.md|Global Gemini Instructions"
 )
 

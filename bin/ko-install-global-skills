@@ -10,4 +10,4 @@ while [[ -L "$_ko_script" ]]; do
 done
 source "$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)/_ko-common"
 
-exec "$ko_python" "$ORCHESTRA_DIR/shared_scripts/sync_ai_skill_wrappers.py" "$@"
+exec "$ko_python" "$ORCHESTRA_DIR/shared_scripts/install_global_ai_skills.py" "$@"

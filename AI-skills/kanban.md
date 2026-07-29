@@ -220,7 +220,9 @@ Use status commands and repo-local metadata instead of PID hunting:
 Fleet config lives at `~/.config/orchestra/fleet.repos` by default. It is a
 private flat list: one git repo root per non-empty line, with `~`, environment
 variables, blank lines, and `#` comments supported. Every configured repo gets
-one orchestrator and one matching dashboard. `ko-fleet start` skips dirty
+one orchestrator and one matching dashboard. Fleet manages those running
+processes only; skill wrappers come from the one-time
+`ko-install-global-skills` install, not from Fleet. `ko-fleet start` skips dirty
 stopped repos, keeps launching clean stopped repos, and still treats invalid
 repo config as a hard failure.
 

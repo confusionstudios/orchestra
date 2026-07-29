@@ -1,6 +1,6 @@
 Review the current on-disk git diff and report approval or actionable defects.
 
-Use this skill when the user asks for a direct review of uncommitted work on disk, without the ad-hoc `build-notes.md` / `review-notes.md` handoff.
+Use this skill when the user asks for a direct review of uncommitted work on disk.
 
 ## Steps
 
