@@ -52,8 +52,10 @@ This creates or refreshes thin wrappers under:
 
 Wrappers reference the canonical skill through `$ORCHESTRA_DIR`. They do not
 copy skill text into work repos. After the one-time install, every worktree and
-repo on the machine uses the same user-level skills. Re-run the installer after
-adding, changing, or deleting canonical skills.
+repo on the machine uses the same user-level skills. Changes to an existing
+skill take effect immediately. Re-run the installer after adding, deleting, or
+renaming a skill, or after changing its first non-empty line (the wrapper
+description).
 
 The installer uses an explicit target map (not `.<agent>/skills` naming). It
 covers Claude, Codex, Kilo, and the installed `agy` Antigravity CLI. It does

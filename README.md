@@ -111,8 +111,11 @@ accounts, or billing — install and authenticate each CLI yourself.
    through the environment variable. After that one-time install, every
    worktree and repo on the machine uses the same user-level skills.
 
-   Re-run after adding or changing canonical skills. Pass `--check` to verify
-   installed wrappers without writing.
+   Changes to an existing skill take effect immediately because its wrapper
+   reads the canonical file through `$ORCHESTRA_DIR`. Re-run the installer when
+   adding, deleting, or renaming a skill, or when changing its opening summary
+   (the wrapper description). Pass `--check` to verify installed wrappers
+   without writing.
 
 5. **Start the repo instance** from the work repo root and keep it running:
 
