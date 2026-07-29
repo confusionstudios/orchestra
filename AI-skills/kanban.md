@@ -6,7 +6,7 @@ Before doing anything else, determine which role applies:
 
 | Role | How to tell | What to do |
 |------|-------------|------------|
-| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for status. Use `task list/show/add/set` for task management. |
+| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for a one-shot status. Use `narrate` for a live short feed every ~10s. Use `task list/show/add/set` for task management. |
 | **Sticky coder** | The orchestrator explicitly spawned you as the designated build agent for a specific task | Follow the full workflow for that task. |
 
 Default role: observer.

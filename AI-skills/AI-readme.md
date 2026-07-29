@@ -20,6 +20,13 @@ Wrappers use two prefixes:
 - `orch-kb-{skill-name}` for Kanban Orchestra skills.
 - `orch-adhoc-{skill-name}` for general shared workflow skills.
 
+Kanban skills (installed as `orch-kb-*`) are the names listed in
+`KANBAN_SKILLS` inside `shared_scripts/install_global_ai_skills.py`. Today that
+set is: `get-kanban-update`, `kanban`, `narrate`, `plan-to-tasks`, and
+`review-recent-kanban-tasks`. All other `AI-skills/*.md` files (except
+`AI-readme.md`) install as `orch-adhoc-*`. When you add a Kanban skill, update
+that frozenset so the wrapper name stays correct.
+
 ### 1. Write the canonical skill
 
 Create `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` with the instructions the agent should follow.

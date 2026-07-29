@@ -4190,6 +4190,38 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             self.assertIn(f"- Least Seen at: {canonical_path.resolve()}\n", rendered)
             self.assertNotIn("Canonical instructions.", rendered)
 
+    def test_wrapper_prefix_classifies_kanban_and_adhoc_skills(self):
+        self.assertIn("narrate", global_skill_installer.KANBAN_SKILLS)
+        self.assertEqual(
+            global_skill_installer._wrapper_skill_name("narrate"),
+            "orch-kb-narrate",
+        )
+        self.assertEqual(
+            global_skill_installer._wrapper_skill_name("kanban"),
+            "orch-kb-kanban",
+        )
+        self.assertEqual(
+            global_skill_installer._wrapper_skill_name("git-commit"),
+            "orch-adhoc-git-commit",
+        )
+
+        with tempfile.TemporaryDirectory() as orchestra_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            skills_dir = orchestra_dir / "AI-skills"
+            skills_dir.mkdir(parents=True)
+            narrate_path = skills_dir / "narrate.md"
+            narrate_path.write_text(
+                "Act as a live narrator.\n\nCanonical instructions.\n",
+                encoding="utf-8",
+            )
+            rendered = global_skill_installer.render_wrapper(
+                "narrate",
+                global_skill_installer._skill_description(narrate_path),
+                narrate_path,
+            )
+            self.assertIn("name: orch-kb-narrate\n", rendered)
+            self.assertIn("- Location: $ORCHESTRA_DIR/AI-skills/narrate.md\n", rendered)
+
     def test_install_global_skills_writes_all_target_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
             orchestra_dir = Path(orchestra_tmp)
