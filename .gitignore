@@ -27,10 +27,5 @@ test_workspace/
 # Local Kanban Orchestra runtime
 .kanban-orchestra/
 
-# Leftover repo-local skill wrappers from the retired sync path.
-.agents/skills/ko-*/
-.codex/skills/ko-*/
-.kilo/skills/ko-*/
-
 # Local Claude settings
 .claude/settings.local.json
