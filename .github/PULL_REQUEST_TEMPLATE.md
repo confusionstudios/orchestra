@@ -1,22 +1,14 @@
-## What
+<!-- One short paragraph describing the main story and why it matters. -->
 
-<!-- One short sentence describing the main story. -->
+## Work
 
 - <!-- Concrete change or behavior reviewers should understand. -->
 - <!-- Concrete change or behavior reviewers should understand. -->
-
-## Why
-
-<!-- Explain why the main change matters. -->
 
 ## Other
 
 <!-- Optional: list related or bundled changes that are not the main story. Remove this section if empty. -->
 
-## Review Notes
+## Notes
 
-<!-- Optional: summarize important review findings, follow-up fixes, or reviewer context. Remove this section if empty. -->
-
-## Test Plan
-
-- [ ] 
+<!-- Optional: validation, migration, follow-up, or review context. Remove this section if empty. -->

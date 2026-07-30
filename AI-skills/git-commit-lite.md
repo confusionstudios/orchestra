@@ -3,6 +3,9 @@ Make a one-line git commit from current conversation context.
 Use this when the user asks for a lightweight commit and explicitly wants speed
 over the normal diff-reading commit workflow.
 
+This is intentionally the exception to the normal commit format: it records
+only a title and never a body, `Work`, `Other`, or `Notes` section.
+
 Rules:
 
 - Do not inspect the diff.

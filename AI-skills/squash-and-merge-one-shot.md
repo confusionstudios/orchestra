@@ -22,28 +22,28 @@ Synthesize a squash-merge commit message in memory and immediately squash-merge 
    ```
    <Title Case commit title under 80 chars>
 
-   What
-
-   <1-3 concise paragraphs: what this branch delivers and why it matters>
+   <One concise paragraph: what this branch delivers and why it matters>
 
    Work
 
-   <concise bullets (use • not -) or short paragraphs describing major implementation chunks>
+   • <concise main implementation work>
 
+   <When there is related secondary work, add:>
    Other
 
-   <related work that does not fit under Work; leave blank when none>
+   • <related work that does not fit under Work>
 
+   <When there are useful process details, add:>
    Notes
 
-   <risks, follow-ups, or migration notes; leave blank when none>
+   • <validation, risks, follow-ups, or migration notes>
    ```
 
    Rules:
    - Do not list commits one by one. Group changes into coherent logical chunks.
    - Do not describe changes by file or method name. Write what was done and why at a feature/behavior level. Git has the file-level changes, you don't need to repeat them.
    - Keep it factual, concise, and human-readable. Keep it positive, avoid saying what was NOT done.
-   - Keep the `Other` and `Notes` headings even when their content is blank.
+   - Omit `Other` and `Notes` entirely when they have no bullets.
    - No AI references.
 
 4. Switch to the target branch: `git checkout <target-branch>`. Stop and report if checkout fails.

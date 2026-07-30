@@ -33,7 +33,8 @@ Create and publish a GitHub PR for the current branch against the appropriate ta
 
 ## PR Format
 
-PR descriptions are Markdown — use standard Markdown formatting (headings, bullets, code spans, task lists).
+PR descriptions are Markdown — use standard Markdown formatting (headings,
+bullets, and code spans).
 
 ### Title
 
@@ -45,40 +46,34 @@ PR descriptions are Markdown — use standard Markdown formatting (headings, bul
 
 Sections, in order:
 
-- **What** — The main story only: what changes for humans using or reviewing this branch. Start with one short sentence, then add at most one or two bullets for the core behavior. If a bullet is not part of that main story, move it to **Other**.
-- **Why** — The motivation and impact of the main change.
-- **Other** (optional) — Related or bundled changes that are not the main story. Put process/docs/tooling cleanup, supporting display changes, branch policy updates, tests, and implementation notes here when they support the branch but are not part of the primary user-facing change.
-- **Review Notes** (optional) — Scan the commit log for follow-up/fix commits (subjects starting with `fix`, `address`, `review`, `cr`, or commits that revise earlier work in the same branch). Synthesize one bullet per distinct issue category that was identified and resolved during the branch's life. Omit entirely if no such commits exist.
-- **Test Plan** — GitHub task-list checkboxes for verifying the PR.
+- **Leading paragraph** — One short paragraph describing the main branch story and why it matters.
+- **Work** — Main implementation work only, as concise Markdown bullets. If a bullet is not part of the main story, move it to **Other**.
+- **Other** (optional) — Related or bundled work that does not belong in the main story. Omit the entire section when empty.
+- **Notes** (optional) — Useful process detail, such as validation, migrations, review context, or follow-up/fix commits. Scan the commit log for meaningful follow-up/fix commits and summarize them here when they add reviewer value. Omit the entire section when empty.
 
 ### Style
 
 - Prefer direct statements of what changed and why. Avoid contrastive filler like "instead of", "rather than", or "no longer" unless the comparison is the point.
 - Only mention file paths if it adds value. The file changes are part of the PR.
-- Keep sections short. If there is a single main story plus minor related changes, put only the main story sentence and its one or two core bullets under **What**, then put every secondary change under **Other**.
+- Keep sections short. Use the leading paragraph and **Work** for the main story; put every secondary change under **Other**.
 
 ### Example
 
 ```
 Knob Braking and Ramp Unified Under Physics Base Class
 
-## What
-
 KnobSlider and XYPad now delegate to the same braking path via the base class.
+
+## Work
 
 - Moved shared braking math into the base control class.
 - Updated both controls to call the shared path on release.
-
-## Why
-
-The two controls had duplicated braking math, which made behavior drift likely.
 
 ## Other
 
 - Renamed `applyFriction` to `applyBraking` so the name matches the behavior.
 
-## Test Plan
-- [ ] Drag a knob and release — verify braking curve matches previous behavior
-- [ ] Drag XYPad and release — same check
-- [ ] Confirm no regressions in automation playback
+## Notes
+
+- Verified knob, XYPad, and automation playback behavior.
 ```

@@ -62,7 +62,14 @@ the direct `master` push.
      --head "$temp_branch" \
      --base master \
      --title "Temporary Check Run For Master Push" \
-     --body "Temporary PR to attach required GitHub checks to commit $head_sha before pushing master directly."
+     --body "$(cat <<EOF
+Temporary PR to attach required GitHub checks to commit $head_sha before pushing master directly.
+
+## Work
+
+- Run required GitHub checks for this exact SHA.
+EOF
+)"
    ```
 10. Wait for the temporary PR checks for the target SHA:
     ```bash
