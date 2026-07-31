@@ -116,10 +116,11 @@ Valid skip values: `commit-plan`, `commit-plan-review`, `commit-review`,
 
 ## Queueing semantics
 
-`ready` is the runnable backlog, not a concurrency request. Multiple tasks in
-`ready` are normal and expected. The orchestrator selects eligible `ready`
-tasks one at a time, applies branch, blocked-state, worktree, and lifecycle
-checks, and serializes execution through the configured `next_step`.
+Kanban Orchestra is a serialized work queue, not a task tree. `ready` is the
+runnable backlog, not a concurrency request. Multiple tasks in `ready` are
+normal and expected. The orchestrator selects eligible `ready` tasks one at a
+time, applies branch, blocked-state, worktree, and lifecycle checks, and
+serializes execution through the configured `next_step`.
 
 Operationally:
 - `none` means the task exists but is not queued yet.
@@ -129,6 +130,13 @@ Operationally:
 - Do not hold later tasks at `none` merely because earlier tasks should run
   first. Use ordering fields, explicit dependencies, blocked states, stop
   markers, or separate validation tasks when the workflow requires a gate.
+- Do not create child tasks or use a `supertask` to express normal sequencing.
+  Create independent tasks and set them `ready`. When priorities change,
+  reorder queued tasks with `task requeue <id> --before <other-id>` or
+  `task requeue <id> --after <other-id>`. New work can be added and positioned
+  while another task is running; it will be picked up later, one eligible task
+  at a time. Supertasks are optional grouping/reporting metadata and should be
+  used only when the user explicitly asks for that structure.
 
 Operator guidance:
 - If the user asks to queue or cue a batch of tasks, create or update them in
