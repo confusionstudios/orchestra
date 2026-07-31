@@ -95,8 +95,20 @@ editing files. The reviewer may approve with non-blocking requested changes;
 those requests do not require another approval pass unless the committer makes
 substantive changes or chooses to ask for another review.
 
+Before constructing the prompt, collect untracked files and append their paths
+to it. `git diff` does not include untracked files, so the reviewer needs an
+explicit list to inspect them directly:
+
+```bash
+git status --short
+git ls-files --others --exclude-standard
+```
+
 ```text
 Review the current uncommitted changes in this repository, including staged, unstaged, and untracked files. Run `git status --short` and inspect the current on-disk changes before reviewing. Focus on bugs, behavioral regressions, safety issues, and missing tests. Do not edit files. Return findings first with file/line references; if no issues, say so clearly and mention residual risk. End with OUTCOME: approved, OUTCOME: rejected, or OUTCOME: blocked.
+
+Untracked files that are in scope and must be read directly:
+<explicit newline-separated path list, or "None">
 
 If you approve but want non-blocking follow-up changes before commit, add a `NON_BLOCKING_REQUESTS:` section after `OUTCOME: approved`. Use this only for changes the committer may apply without another approval pass. Use `OUTCOME: rejected` for mandatory changes.
 ```
@@ -117,14 +129,42 @@ Add one sentence of task-specific context when it would materially improve the r
    another review pass when the approved behavior stays intact. Request another
    review if the edits become substantive.
 6. If the reviewer returns `OUTCOME: blocked`, stop and report the blocker, the command used, and the last reviewer output.
-7. If the reviewer returns no `OUTCOME:` line, treat the pass as blocked and report the raw reviewer output.
-8. If the reviewer returns actionable findings with `OUTCOME: rejected`:
+7. If the review response is blank, send the same reviewer a short
+   non-destructive health check such as `Reply with exactly PONG.`
+   - If it does not return the requested literal reply, stop and report the
+     reviewer as blocked.
+   - If it does reply, retry once with a bounded, numbered checklist. Name all
+     untracked target paths again. Ask for `yes` or `no` plus path/line evidence
+     for each question, and require a final `FINAL: approved`,
+     `FINAL: rejected`, or `FINAL: blocked` line.
+     Use this shape, adding task-specific questions when needed:
+     ```text
+     Read the current on-disk diff and these untracked files directly:
+     <explicit newline-separated path list, or "None">
+
+     Do not edit files. Answer each question with yes or no and brief path/line
+     evidence:
+     1. Does the current change implement the requested behavior?
+     2. Is there a concrete bug, regression, safety issue, or missing required
+        validation?
+     3. Are the required tests present and appropriate for real logic?
+
+     End with exactly one line: FINAL: approved, FINAL: rejected, or
+     FINAL: blocked.
+     ```
+   - Treat `FINAL: approved` as convergence, `FINAL: rejected` as actionable
+     findings, and `FINAL: blocked` as blocked. A second blank response is
+     blocked. Do not substitute another reviewer without user approval.
+8. If the reviewer returns non-blank output with no `OUTCOME:` line, treat the
+   pass as blocked and report the raw reviewer output.
+9. If the reviewer returns actionable findings with `OUTCOME: rejected` or
+   `FINAL: rejected`:
    - Fix only findings that are concrete defects, missing required validation, or clear behavioral regressions.
    - Ignore style-only, speculative, or unrelated suggestions unless they reveal a real defect.
    - Explain briefly when declining a reviewer note.
-9. Run the relevant verification after each fix. Follow repo instructions for required tests.
-10. Send the updated diff back to the same reviewer.
-11. Repeat until the reviewer approves or blocks. If the loop has not converged after three reviewer passes, stop and report the remaining findings and verification status.
+10. Run the relevant verification after each fix. Follow repo instructions for required tests.
+11. Send the updated diff back to the same reviewer.
+12. Repeat until the reviewer approves or blocks. If the loop has not converged after three reviewer passes, stop and report the remaining findings and verification status.
 
 ## Guardrails
 

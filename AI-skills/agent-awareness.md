@@ -92,6 +92,21 @@ If the user names a specific agent alias or provider/model spec, use that
 value. Otherwise use the role default that matches the work, especially
 `ORCHESTRA_DEFAULT_REVIEWER` for commit-review or convergence review.
 
+## Verify Agent Output
+
+A zero exit status proves that an agent CLI ran; it does not prove that the
+agent returned a usable response. Before relying on an unfamiliar route, send
+a tiny non-destructive ping and require a literal reply.
+
+For reviews, explicitly name untracked target files. `git diff` does not show
+them, so a reviewer must read those paths directly.
+
+If a broad review is blank but the ping succeeds, keep the selected reviewer
+and retry with a bounded numbered checklist that requires `yes` or `no` answers
+and path/line evidence. A blank response is never approval. If the bounded
+retry is also blank, report the reviewer as blocked; do not silently substitute
+another agent.
+
 ## Common Local Keys
 
 The exact set can change, so check the registry before relying on this list.
