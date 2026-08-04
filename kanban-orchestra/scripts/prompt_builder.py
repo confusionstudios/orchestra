@@ -44,8 +44,9 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
     complete context and do not need to rediscover the environment or rerun
     the maker's validation steps.
 
-    skip_build_policy: when True, the repo has KANBAN_SKIP_BUILD_UNTIL_APPROVED enabled,
-    so a deferred validation result is expected and normal.
+    skip_build_policy: when True, the repo has the
+    CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER policy enabled, so a
+    deferred validation result is expected and normal.
     """
     repo_root = _repo_root()
     # Extract the most recent commit-message comment (the maker's summary)
@@ -72,7 +73,8 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
     elif skip_build_policy:
         validation_summary = (
             "*(no full-build validation recorded — this repo has the standalone "
-            "`KANBAN_SKIP_BUILD_UNTIL_APPROVED` marker in `AGENTS.md`, so the full build is intentionally deferred to "
+            "`CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` marker in "
+            "`AGENTS.md`, so the full build is intentionally deferred to "
             "`commit-make` finalization. The missing full-build result (e.g. test suite output) "
             "is expected here. The maker is still required to have recorded a deferred-validation "
             "comment explicitly stating that the full build was intentionally skipped — if that "
@@ -82,7 +84,7 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
         validation_summary = "*(no validation comment recorded — maker may not have run the build)*"
 
     policy_note = (
-        "\n> **Repo policy:** `KANBAN_SKIP_BUILD_UNTIL_APPROVED` — full-build validation is "
+        "\n> **Repo policy:** `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` — full-build validation is "
         "deferred to post-approval `commit-make` finalization. You are reviewing the diff without "
         "a full-build result. If the maker recorded a deferred-validation comment, that is "
         "expected and correct per repo policy.\n"
@@ -292,7 +294,8 @@ def build_prompt(task, verb, agent_name, comments):
     if skip_build_policy:
         context_lines.append(
             "- skip_build_until_approved: yes "
-            "(standalone KANBAN_SKIP_BUILD_UNTIL_APPROVED marker detected in repo AGENTS.md — "
+            "(standalone CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER "
+            "marker detected in repo AGENTS.md — "
             "see the commit-make build/finalization guidance below)"
         )
 

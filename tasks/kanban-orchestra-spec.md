@@ -297,7 +297,7 @@ Rules:
 - The orchestrator records the resulting `HEAD` as `commit_hash`.
 - If `commit-make` becomes blocked after local changes exist, the orchestrator stages and stashes WIP, records `stash_ref`, and leaves a durable comment.
 
-## Deferred Full-Build Validation (SKIP_BUILD_UNTIL_APPROVED)
+## Deferred Full-Build Validation (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER)
 
 Some repos — particularly those with expensive builds (e.g. iOS apps) — may defer
 full-build validation until after initial code review rather than running it on every
@@ -308,7 +308,7 @@ full-build validation until after initial code review rather than running it on 
 Repos opt in by adding this exact line to their root `AGENTS.md`:
 
 ```
-SKIP_BUILD_UNTIL_APPROVED
+CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER
 ```
 
 The marker must appear as a standalone line (leading/trailing whitespace is ignored).
@@ -320,7 +320,8 @@ When the marker is present:
 
 - The coder **skips the full build** on Path A.
 - The coder **must** record a `validation` comment explicitly stating that the full
-  build was intentionally deferred by `SKIP_BUILD_UNTIL_APPROVED` policy.
+  build was intentionally deferred by
+  `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` policy.
 - Reviewers see this context in the `## Reviewer Handoff` section and must **not**
   reject solely because a full-build result is absent.
 
@@ -484,7 +485,8 @@ Required behavior:
 - Read prior comments, especially rejections and human guidance.
 - Implement the requested change.
 - Run the repo-defined validation command when the task requires it. If the repo has
-  `SKIP_BUILD_UNTIL_APPROVED` in `AGENTS.md`, skip the full build on Path A and
+  `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` in `AGENTS.md`, skip the
+  full build on Path A and
   record a `validation` comment stating the deferral explicitly.
 - Record validation results as a `validation` comment for the current round.
 - Stage the full candidate diff with `git add .`.
@@ -512,10 +514,10 @@ Required behavior:
   return to review or human triage.
 - Read the latest `commit-message` comment.
 - Ensure the canonical footer `Task <id> (<attribution>)` is present. Run `task get-commit-footer <id>` to produce it.
-- If the repo has `SKIP_BUILD_UNTIL_APPROVED`, run the full build now. If the
-  build changes the staged diff, record a `deferred-build-changed` comment and exit
-  without committing; the orchestrator re-enters review. If the build is clean,
-  proceed to commit.
+- If the repo has `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER`, run the
+  full build now. If the build changes the staged diff, record a
+  `deferred-build-changed` comment and exit without committing; the orchestrator
+  re-enters review. If the build is clean, proceed to commit.
 - Create the real commit with plain `git commit`.
 
 ### `commit-review`

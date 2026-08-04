@@ -2325,7 +2325,7 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(len(commit_calls), 1)
 
     def test_commit_make_with_skip_review_and_deferred_policy_requeues_path_b_validation(self):
-        """Skipped review still runs Path B when KANBAN_SKIP_BUILD_UNTIL_APPROVED requires final validation."""
+        """Skipped review still runs Path B when CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER requires final validation."""
         tid = db.add_task(
             self.conn,
             "Skip review deferred",
@@ -2360,7 +2360,7 @@ class TestStateMachine(unittest.TestCase):
         ]
         self.assertEqual(commit_calls, [])
         comments = db.get_comments(self.conn, tid)
-        self.assertTrue(any("KANBAN_SKIP_BUILD_UNTIL_APPROVED is active" in c["message"] for c in comments))
+        self.assertTrue(any("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is active" in c["message"] for c in comments))
 
     def test_commit_make_failure_blocks_immediately(self):
         """Failed commit-make immediately blocks the task."""
@@ -8251,22 +8251,27 @@ class TestRepoPolicy(unittest.TestCase):
         self.assertFalse(result)
 
     def test_marker_present_returns_true(self):
-        self._write_agents_md("KANBAN_SKIP_BUILD_UNTIL_APPROVED\n")
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n")
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
         self.assertTrue(result)
 
-    def test_old_marker_returns_false(self):
-        self._write_agents_md("SKIP_BUILD_UNTIL_APPROVED\n")
-        result = repo_policy.read_skip_build_until_approved(self.tmpdir)
-        self.assertFalse(result)
+    def test_old_markers_return_false(self):
+        for marker in (
+            "SKIP_BUILD_UNTIL_APPROVED",
+            "KANBAN_SKIP_BUILD_UNTIL_APPROVED",
+        ):
+            with self.subTest(marker=marker):
+                self._write_agents_md(f"{marker}\n")
+                result = repo_policy.read_skip_build_until_approved(self.tmpdir)
+                self.assertFalse(result)
 
     def test_marker_with_leading_whitespace_returns_true(self):
-        self._write_agents_md("  KANBAN_SKIP_BUILD_UNTIL_APPROVED  \n")
+        self._write_agents_md("  CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER  \n")
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
         self.assertTrue(result)
 
     def test_marker_with_extra_text_returns_false(self):
-        self._write_agents_md("KANBAN_SKIP_BUILD_UNTIL_APPROVED: false\n")
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER: false\n")
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
         self.assertFalse(result)
 
@@ -8277,7 +8282,7 @@ class TestRepoPolicy(unittest.TestCase):
 
     def test_prose_mention_of_marker_does_not_match(self):
         self._write_agents_md(
-            "You can use KANBAN_SKIP_BUILD_UNTIL_APPROVED in your AGENTS.md to defer builds.\n"
+            "You can use CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER in your AGENTS.md to defer builds.\n"
             "This file does not actually opt in.\n"
         )
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
@@ -8286,7 +8291,7 @@ class TestRepoPolicy(unittest.TestCase):
     def test_marker_in_multiline_file_returns_true(self):
         self._write_agents_md(
             "# Build policy\n\n"
-            "KANBAN_SKIP_BUILD_UNTIL_APPROVED\n\n"
+            "CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n\n"
             "Run lint before submitting.\n"
         )
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
@@ -8298,7 +8303,7 @@ class TestRepoPolicy(unittest.TestCase):
         self.assertFalse(result)
 
     def test_path_object_accepted(self):
-        self._write_agents_md("KANBAN_SKIP_BUILD_UNTIL_APPROVED\n")
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n")
         result = repo_policy.read_skip_build_until_approved(Path(self.tmpdir))
         self.assertTrue(result)
 
@@ -8331,7 +8336,7 @@ class TestRepoPolicy(unittest.TestCase):
 
 
 class TestDeferredBuildPolicy(unittest.TestCase):
-    """Tests for KANBAN_SKIP_BUILD_UNTIL_APPROVED orchestrator behavior."""
+    """Tests for CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER orchestrator behavior."""
 
     def setUp(self):
         self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
@@ -8382,7 +8387,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertNotIn("skip_build_until_approved:", task_context_block)
 
     def test_reviewer_handoff_notes_deferred_validation_when_policy_active(self):
-        """Reviewer handoff explains missing validation when KANBAN_SKIP_BUILD_UNTIL_APPROVED is set."""
+        """Reviewer handoff explains missing validation when CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is set."""
         task = {
             "id": 5, "title": "T", "description": None,
             "branch": "b", "status": "running", "next_step": "commit-review",
@@ -8392,7 +8397,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         with patch.object(orchestrator.repo_policy, "read_skip_build_until_approved", return_value=True), \
              patch.object(orchestrator, "_repo_root", return_value="/fake/repo"):
             prompt = orchestrator.build_prompt(task, "commit-review", "codex", [])
-        self.assertIn("KANBAN_SKIP_BUILD_UNTIL_APPROVED", prompt)
+        self.assertIn("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER", prompt)
         self.assertIn("deferred", prompt.lower())
         # Should not say the standard "may not have run the build" fallback
         self.assertNotIn("maker may not have run the build", prompt)
@@ -8442,7 +8447,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertIsNone(updated["commit_hash"])
 
     def test_path_b_clean_deferred_build_finalizes_normally(self):
-        """Path B with KANBAN_SKIP_BUILD_UNTIL_APPROVED and a clean deferred build (new commit): task becomes done."""
+        """Path B with CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER and a clean deferred build (new commit): task becomes done."""
         tid = db.add_task(self.conn, "Deferred build clean", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b",
                        next_step="commit-make", last_review_decision="approve",
@@ -8578,7 +8583,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertEqual(updated["status"], "blocked")
 
     def test_path_a_deferred_validation_comment_not_required_when_policy_inactive(self):
-        """Path A: no validation comment is fine when KANBAN_SKIP_BUILD_UNTIL_APPROVED is off."""
+        """Path A: no validation comment is fine when CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is off."""
         tid = db.add_task(self.conn, "Path A no policy", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b",
                        next_step="commit-make", last_review_decision="none",

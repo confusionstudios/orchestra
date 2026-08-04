@@ -85,7 +85,8 @@ Several operational concerns were addressed:
 - **Agent ACK ping gates** to verify agents are responsive before dispatching.
 - **Dirty-worktree guards** to refuse orchestration when uncommitted changes
   exist.
-- **Deferred build validation** (`SKIP_BUILD_UNTIL_APPROVED`) to avoid
+- **Deferred build validation**
+  (`CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER`) to avoid
   running expensive builds until a reviewer approves the change.
 
 ## Multi-Agent Model Exploration

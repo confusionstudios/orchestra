@@ -651,7 +651,7 @@ def ensure_branch(task, conn):
 def handle_commit_make(task, conn):
     """Execute a commit-make step. Returns (success, done_without_commit, needs_rereview).
 
-    needs_rereview is True when a KANBAN_SKIP_BUILD_UNTIL_APPROVED repo's Path B deferred build
+    needs_rereview is True when a CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER repo's Path B deferred build
     changed the staged diff. The orchestrator re-enters commit-review in that case instead
     of finalizing.
     """
@@ -721,13 +721,13 @@ def handle_commit_make(task, conn):
             validation_count_after = sum(1 for c in comments_after if c["kind"] == "validation")
             if validation_count_after <= validation_count_before:
                 log(
-                    f"commit-make Path A: {agent} exited 0 with KANBAN_SKIP_BUILD_UNTIL_APPROVED active "
+                    f"commit-make Path A: {agent} exited 0 with CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER active "
                     "but wrote no fresh validation comment stating deferral; treating as failure",
                     task["id"],
                 )
                 db.add_run_log(
                     conn, task["id"],
-                    f"{agent} exited 0 on Path A with KANBAN_SKIP_BUILD_UNTIL_APPROVED active "
+                    f"{agent} exited 0 on Path A with CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER active "
                     "but wrote no fresh validation comment",
                     verb="commit-make", author="orchestrator",
                 )
@@ -1424,7 +1424,7 @@ def _queue_deferred_validation_after_skipped_review(task, conn):
     db.add_comment(
         conn,
         task["id"],
-        "Commit review skipped, but KANBAN_SKIP_BUILD_UNTIL_APPROVED is active; queued "
+        "Commit review skipped, but CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is active; queued "
         "commit-make Path B so the deferred full-build validation still runs before "
         "finalization.",
         kind="comment",
@@ -1463,7 +1463,7 @@ def _finalize_other(task, conn):
 
 
 def _requeue_for_review_after_deferred_build(task, conn):
-    """Re-enter commit-review after a KANBAN_SKIP_BUILD_UNTIL_APPROVED Path B build changed the staged diff.
+    """Re-enter commit-review after a CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER Path B build changed the staged diff.
 
     The coder staged the build-modified diff and signaled deferred-build-changed.
     Increment review_round and route to commit-review so the reviewer sees the updated diff.
@@ -1475,7 +1475,7 @@ def _requeue_for_review_after_deferred_build(task, conn):
                    review_round=new_round, last_review_decision="none")
     db.add_comment(
         conn, task_id,
-        f"Deferred full build (KANBAN_SKIP_BUILD_UNTIL_APPROVED) changed the staged diff. "
+        f"Deferred full build (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER) changed the staged diff. "
         f"Re-entering review at round {new_round} so the updated diff is reviewed before landing.",
         kind="comment", author="orchestrator",
     )
@@ -1993,7 +1993,7 @@ def advance(task, conn):
 
         if task["last_review_decision"] == "approve":
             if needs_rereview:
-                # Deferred build (KANBAN_SKIP_BUILD_UNTIL_APPROVED) changed the diff: re-enter review.
+                # Deferred build (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER) changed the diff: re-enter review.
                 new_round = task["review_round"] + 1
                 review_cap = task_max_review_rounds(task)
                 if new_round >= review_cap:
