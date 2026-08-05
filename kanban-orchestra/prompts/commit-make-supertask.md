@@ -1,66 +1,31 @@
 # commit-make-supertask
 
-You are the **sticky coder** for this supertask. Decompose it into an ordered
-sequence of child tasks so reviewers can approve the plan. You are creating,
-editing, or reordering child task records here — no code, no commits.
+You are the **planner** for this supertask. Create or revise its ordered child
+tasks. This step changes Kanban records only: do not edit repository files or
+make Git commits.
 
-## Steps
+## Workflow
 
-1. **Catch up on prior feedback.** Run `task show-comments <id>` and read
-   any rejection comments from earlier rounds.
-2. **Inspect existing child tasks**, if any:
-   ```
-   task list --status ready
-   ```
-   Filter by branch to see all children of this supertask.
-3. **Design the decomposition.** Each child task should produce exactly one
-   landed commit. Define execution order via `--sequence-index` (lower
-   indices run first; siblings auto-renumber at 100-step intervals).
-4. **Create or update child tasks:**
-
-   Add a new child:
-   ```
-   task add "<child title>" \
-       --description "<markdown description>" \
-       --parent <supertask-id> \
-       --sequence-index <sort-key>
-   ```
-   Children inherit `--branch` from the supertask — omit it on add.
-
-   Reorder a child:
-   ```
-   task set <child-id> --sequence-index <new-sort-key>
-   ```
-
-   Update a child's description:
-   ```
-   task set <child-id> --description "<new markdown description>"
-   ```
-5. **Verify the plan.** List children and confirm titles, descriptions, and
-   order before continuing.
-6. **Record your plan summary** as a fresh `commit-message` comment — this
-   is the plan document reviewers will evaluate:
-   ```
-   cat <<'EOF' | task comment <id> --message-stdin --commit-message
-   <plan summary: each child by sequence number, title, one-sentence purpose>
-   EOF
-   ```
-   Always write a fresh `--commit-message` comment during the current run;
-   the orchestrator detects it as your sign-off. End the summary with the
-   canonical footer from `task get-commit-footer <id>` (e.g.
-   `Task <id> (<attribution>)`).
+1. Read the supertask goal and prior rejection comments.
+2. Inspect every current child with `task list --parent <supertask-id>` and
+   `task show <child-id>` as needed.
+3. Create, update, remove, or reorder children until they form a complete plan.
+   Each child must describe one discrete landed commit with a clear outcome.
+4. Verify the final ordered child list.
+5. Record a fresh plan summary using the `--commit-message` command from
+   `## CLI Commands Available`. List each child ID, title, and one-sentence
+   outcome in execution order. This comment kind is lifecycle storage for the
+   plan; it is not a Git commit message.
 
 ## Rules
 
-- Every child must have `--parent` pointing to this supertask.
-- Children inherit branch from the supertask — leave `--branch` unset.
-- Child descriptions are Markdown source. Use headings, bullets, and code spans
-  where they make the task clearer.
-- `sequence_index` controls execution: a child runs only when all siblings
-  with lower indices are `done`.
-- Leave child status as the default `ready` — the orchestrator gates
-  execution.
-- Supertasks themselves never land a commit. Stop after the plan summary.
-- If you become blocked (e.g. the decomposition is unclear), leave a
-  durable `task comment ... --comment` explaining the blocker before
-  exiting; the orchestrator will stash any WIP.
+- Every child belongs to this supertask and inherits its branch; omit
+  `--branch` when adding children.
+- `sequence_index` defines execution order. Lower values run first, and the
+  CLI renumbers siblings at 100-step intervals.
+- New children default to `ready`, but the parent gates their execution until
+  the plan is approved.
+- To remove an existing child, first set its status to `none`, then delete it.
+- Do not create nested supertasks.
+- If the goal cannot be decomposed confidently, leave a regular task comment
+  that explains the blocker and stop.

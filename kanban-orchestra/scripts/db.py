@@ -947,7 +947,15 @@ READY_TASK_ORDER_BY = (
 )
 
 
-def list_tasks(conn, status=None, next_step=None, branch=None, page=1, page_size=20):
+def list_tasks(
+    conn,
+    status=None,
+    next_step=None,
+    branch=None,
+    page=1,
+    page_size=20,
+    parent=None,
+):
     query = (
         "SELECT id, title, status, next_step, branch, coder_agent, reviewer_agent, "
         "review_round, created_at, ready_at, last_ready_at, done_at, updated_at, "
@@ -964,7 +972,10 @@ def list_tasks(conn, status=None, next_step=None, branch=None, page=1, page_size
     if branch:
         query += " AND branch = ?"
         params.append(branch)
-    if status == "ready":
+    if parent is not None:
+        query += " AND parent_task_id = ?"
+        params.append(parent)
+    if status == "ready" or parent is not None:
         query += f" ORDER BY {READY_TASK_ORDER_BY}"
     else:
         query += " ORDER BY id ASC"

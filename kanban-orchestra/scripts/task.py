@@ -8,7 +8,7 @@ Usage:
                   [--description "<markdown>"] [--stash-ref <ref>] [--allow-when-blocked <bool>] ...
     task continue <id> (--add-review-rounds N | --next-step <step>)
     task continue <id> --add-review-rounds N --next-step <step>   # legacy review-cap only
-    task list [--status ..] [--next-step ..] [--branch ..] [--page N]
+    task list [--status ..] [--next-step ..] [--branch ..] [--parent ID] [--page N]
     task show <id>
     task show-comments <id>
     task show-run-log <id>
@@ -726,7 +726,7 @@ def cmd_continue(args, conn):
 def cmd_list(args, conn):
     tasks = db.list_tasks(
         conn, status=args.status, next_step=args.next_step,
-        branch=args.branch, page=args.page,
+        branch=args.branch, parent=args.parent, page=args.page,
     )
     _json_out(tasks)
 
@@ -1085,6 +1085,7 @@ def build_parser():
     p_list.add_argument("--status", default=None)
     p_list.add_argument("--next-step", default=None)
     p_list.add_argument("--branch", default=None)
+    p_list.add_argument("--parent", type=int, default=None)
     p_list.add_argument("--page", type=int, default=1)
 
     # show

@@ -409,7 +409,7 @@ function. CLI and orchestrator behavior is driven by this function's output.
 ### Read Commands
 
 ```bash
-task list [--status <status>] [--next-step <step>] [--branch <branch>] [--page <n>]
+task list [--status <status>] [--next-step <step>] [--branch <branch>] [--parent <task-id>] [--page <n>]
 task show <task-id>
 task show-comments <task-id>
 task show-run-log <task-id>

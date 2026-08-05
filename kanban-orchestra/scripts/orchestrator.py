@@ -91,8 +91,9 @@ def format_task_ref(task):
 
 
 def _task_reviewer(task):
-    """Return the code-review agent configured for a task."""
-    return task.get("reviewer_agent") or DEFAULT_REVIEWER
+    """Return the reviewer agent configured for a task."""
+    fallback = DEFAULT_SUPER_REVIEWER if task.get("kind") == "supertask" else DEFAULT_REVIEWER
+    return task.get("reviewer_agent") or fallback
 
 
 # ── Heartbeat thread ─────────────────────────────────────────────────
@@ -1147,7 +1148,7 @@ def handle_commit_review_supertask(task, conn):
     Execute commit-review-supertask (plan review) with the single reviewer agent.
     Returns ('approve'|'reject'|'error').
     """
-    reviewer = DEFAULT_SUPER_REVIEWER
+    reviewer = _task_reviewer(task)
     ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
 
@@ -1704,7 +1705,8 @@ def advance(task, conn):
             mark_blocked(
                 task_id,
                 conn,
-                f"Reviewer '{DEFAULT_SUPER_REVIEWER}' failed supertask review round {task['review_round']}; "
+                f"Reviewer '{_task_reviewer(task)}' failed supertask review round "
+                f"{task['review_round']}; "
                 "task blocked for human triage.",
                 f"Blocked: reviewer failed on supertask {task_id}",
                 log_message="Blocked: reviewer failed on supertask",

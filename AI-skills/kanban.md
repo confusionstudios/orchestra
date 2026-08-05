@@ -165,7 +165,7 @@ task add "<title>" \
     [--type <commit|pull_request|supertask|other>] [--kind <legacy-kind>] [--parent <task-id>] \
     [--sequence-index <n>] [--skip <step>] [--allow-when-blocked]
 
-task list [--status <status>] [--next-step <step>] [--branch <branch>] [--page <n>]
+task list [--status <status>] [--next-step <step>] [--branch <branch>] [--parent <task-id>] [--page <n>]
 task show <task-id>
 task show-comments <task-id>
 task show-run-log <task-id>

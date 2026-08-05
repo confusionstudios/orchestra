@@ -5914,8 +5914,20 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.conn.close()
         os.unlink(self.tmp.name)
 
-    def _make_supertask(self, status="running", next_step="commit-make-supertask"):
-        tid = db.add_task(self.conn, "My plan", kind="supertask", branch="feat", coder_agent="claude")
+    def _make_supertask(
+        self,
+        status="running",
+        next_step="commit-make-supertask",
+        reviewer_agent=None,
+    ):
+        tid = db.add_task(
+            self.conn,
+            "My plan",
+            kind="supertask",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent=reviewer_agent,
+        )
         db.update_task(self.conn, tid, status=status, next_step=next_step)
         return db.get_task(self.conn, tid)
 
@@ -6001,6 +6013,32 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.assertEqual(updated["status"], "ready")
         self.assertEqual(updated["next_step"], "commit-make-supertask")
         self.assertEqual(updated["review_round"], 1)
+
+    def test_commit_review_supertask_uses_configured_reviewer(self):
+        task = self._make_supertask(
+            status="running",
+            next_step="commit-review-supertask",
+            reviewer_agent="antigravity",
+        )
+        invoked = []
+
+        def fake_reviewer(name, prompt, task_id, conn, verb, **kw):
+            invoked.append((name, verb))
+            db.add_comment(
+                conn,
+                task_id,
+                "Plan approved",
+                kind="approval",
+                author=name,
+                review_round=task["review_round"],
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_reviewer):
+            result = orchestrator.handle_commit_review_supertask(task, self.conn)
+
+        self.assertEqual(result, "approve")
+        self.assertEqual(invoked, [("antigravity", "commit-review-supertask")])
 
     def test_supertask_never_gets_commit_hash(self):
         """After plan approval, supertask has no commit_hash."""
@@ -6158,6 +6196,29 @@ class TestSupertaskCLI(unittest.TestCase):
         child_id = json.loads(r.stdout)["id"]
         child = json.loads(self._run("show", str(child_id)).stdout)
         self.assertEqual(child["status"], "ready")
+
+    def test_list_parent_returns_all_children_in_sequence_order(self):
+        parent_id = self._add_supertask(title="First", branch="feat")
+        other_parent_id = self._add_supertask(title="Second", branch="feat")
+        later = json.loads(self._run(
+            "add", "Later", "--parent", str(parent_id), "--sequence-index", "200",
+        ).stdout)["id"]
+        earlier = json.loads(self._run(
+            "add", "Earlier", "--parent", str(parent_id), "--sequence-index", "100",
+        ).stdout)["id"]
+        self._run("add", "Unrelated", "--parent", str(other_parent_id))
+        self._run("set", str(earlier), "--sequence-index", "50")
+
+        conn = db.connect(self.db_path)
+        db.update_task(conn, later, status="done")
+        conn.close()
+
+        result = self._run("list", "--parent", str(parent_id))
+
+        self.assertEqual(result.returncode, 0)
+        children = json.loads(result.stdout)
+        self.assertEqual([child["id"] for child in children], [earlier, later])
+        self.assertEqual({child["status"] for child in children}, {"ready", "done"})
 
     def test_add_child_fails_when_parent_has_no_branch(self):
         r = self._run("add", "Branchless supertask", "--kind", "supertask")
@@ -7574,6 +7635,56 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         # They may appear in the shared Rules text, but should be absent from the Context key-value list
         self.assertNotIn("- stash_ref:", prompt)
         self.assertNotIn("- commit_hash:", prompt)
+
+    def test_supertask_planner_prompt_is_plan_only(self):
+        task = {
+            "id": 99, "title": "Plan work", "description": "Split the work",
+            "branch": "b", "status": "running", "next_step": "commit-make-supertask",
+            "review_round": 0, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
+            "reviewer_agent": "antigravity", "kind": "supertask",
+        }
+
+        prompt = orchestrator.build_prompt(task, "commit-make-supertask", "claude", [])
+
+        self.assertIn("- role: planner", prompt)
+        self.assertIn("task list --parent 99", prompt)
+        self.assertIn('task add "<child title>"', prompt)
+        self.assertIn("task delete <child-id>", prompt)
+        self.assertNotIn("task set 99 --stash-ref", prompt)
+        self.assertNotIn("--validation", prompt)
+        self.assertNotIn("task get-commit-footer", prompt)
+        self.assertNotIn("git diff --cached", prompt)
+
+    def test_supertask_reviewer_prompt_is_plan_only(self):
+        task = {
+            "id": 99, "title": "Review plan", "description": "Split the work",
+            "branch": "b", "status": "running", "next_step": "commit-review-supertask",
+            "review_round": 2, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
+            "reviewer_agent": "antigravity", "kind": "supertask",
+        }
+        comments = [{
+            "kind": "commit-message",
+            "review_round": 2,
+            "author": "claude",
+            "message": "100: Add foundation\n200: Add behavior",
+        }]
+
+        prompt = orchestrator.build_prompt(
+            task,
+            "commit-review-supertask",
+            "antigravity",
+            comments,
+        )
+
+        self.assertIn("## Supertask Reviewer Handoff", prompt)
+        self.assertIn("100: Add foundation", prompt)
+        self.assertIn("task list --parent 99", prompt)
+        self.assertIn("task show <child-id>", prompt)
+        self.assertIn("- reviewer_agent: antigravity", prompt)
+        self.assertNotIn("git diff --cached", prompt)
+        self.assertNotIn("validation summary", prompt)
 
 
 class TestPickupRuntimeStep(unittest.TestCase):
