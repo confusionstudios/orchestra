@@ -3131,6 +3131,44 @@ class TestTaskCLI(unittest.TestCase):
         task = json.loads(r.stdout)
         self.assertEqual(task["reviewer_agent"], "antigravity")
 
+    def test_supertask_uses_super_agent_defaults(self):
+        env = {
+            **self.env,
+            "ORCHESTRA_DEFAULT_SUPER_PLANNER": "opus",
+            "ORCHESTRA_DEFAULT_SUPER_REVIEWER": "antigravity",
+            "ORCHESTRA_DEFAULT_CODER": "sonnet",
+            "ORCHESTRA_DEFAULT_REVIEWER": "codex",
+        }
+        r = self._run("add", "Default supertask", "--type", "supertask", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["coder_agent"], "opus")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
+
+    def test_supertask_preserves_explicit_agents(self):
+        r = self._run(
+            "add", "Explicit supertask", "--type", "supertask",
+            "--coder-agent", "haiku", "--reviewer-agent", "sonnet",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["coder_agent"], "haiku")
+        self.assertEqual(task["reviewer_agent"], "sonnet")
+
+    def test_commit_task_keeps_ordinary_agent_defaults(self):
+        env = {
+            **self.env,
+            "ORCHESTRA_DEFAULT_SUPER_PLANNER": "opus",
+            "ORCHESTRA_DEFAULT_SUPER_REVIEWER": "codex",
+            "ORCHESTRA_DEFAULT_CODER": "haiku",
+            "ORCHESTRA_DEFAULT_REVIEWER": "antigravity",
+        }
+        r = self._run("add", "Default commit", "--type", "commit", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["coder_agent"], "haiku")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
+
     def test_coder_agent_accepts_provider_model_spec(self):
         spec = "cursor:claude-opus-4-8-high"
         r = self._run("add", "Dynamic coder", "--branch", "feature-dynamic", "--coder-agent", spec)

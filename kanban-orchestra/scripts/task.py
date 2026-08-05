@@ -297,12 +297,18 @@ def validate_ready_worktree(conn):
 # ── Subcommands ────────────────────────────────────────────────────────
 
 def cmd_add(args, conn):
-    agent = args.coder_agent or config.DEFAULT_CODER
+    kind = _resolve_add_task_type(args)
+    default_coder = (
+        config.DEFAULT_SUPER_PLANNER if kind == "supertask" else config.DEFAULT_CODER
+    )
+    default_reviewer = (
+        config.DEFAULT_SUPER_REVIEWER if kind == "supertask" else config.DEFAULT_REVIEWER
+    )
+    agent = args.coder_agent or default_coder
     _validate_agent_arg("coder-agent", agent)
-    reviewer_agent = args.reviewer_agent or config.DEFAULT_REVIEWER
+    reviewer_agent = args.reviewer_agent or default_reviewer
     _validate_agent_arg("reviewer-agent", reviewer_agent)
 
-    kind = _resolve_add_task_type(args)
     parent_task_id = args.parent
     sequence_index = args.sequence_index
     branch = args.branch
