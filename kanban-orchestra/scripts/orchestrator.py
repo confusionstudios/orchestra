@@ -1145,26 +1145,55 @@ def handle_commit_make_supertask(task, conn):
 
 def handle_commit_review_supertask(task, conn):
     """
-    Execute commit-review-supertask (plan review) with the single reviewer agent.
+    Execute final aggregate supertask review with the configured reviewer.
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
     ensure_agent_acked(reviewer, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
+    children = db.get_child_tasks(conn, task["id"])
+    follow_up_sources = {
+        child["follow_up_task_id"]: child["id"]
+        for child in children
+        if child.get("follow_up_task_id") is not None
+    }
+    child_evidence = []
+    for child in children:
+        review_history = [
+            comment
+            for comment in db.get_comments(conn, child["id"])
+            if comment["kind"] in ("approval", "rejection")
+        ]
+        child_evidence.append(
+            {
+                "id": child["id"],
+                "title": child["title"],
+                "status": child["status"],
+                "commit_hash": child.get("commit_hash"),
+                "follow_up_of": follow_up_sources.get(child["id"]),
+                "review_history": review_history,
+            }
+        )
 
     db.update_runtime(
         conn,
         current_step="commit-review-supertask",
         active_agents=1,
         review_round=task["review_round"],
-        status_message=f"Round {task['review_round']}: {reviewer} reviewing plan",
+        status_message=f"Round {task['review_round']}: {reviewer} reviewing supertask result",
     )
 
     db.add_comment(conn, task["id"],
                    f"Starting commit-review-supertask round {task['review_round']} with reviewer: {reviewer}.",
                    kind="comment", author="orchestrator")
 
-    prompt = prompt_builder.build_prompt(task, "commit-review-supertask", reviewer, comments)
+    prompt = prompt_builder.build_prompt(
+        task,
+        "commit-review-supertask",
+        reviewer,
+        comments,
+        supertask_children=child_evidence,
+    )
     exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-review-supertask")
 
     if exit_code != 0:
@@ -1318,24 +1347,150 @@ def handle_commit_plan_review(task, conn):
     return "reject"
 
 
+def _complete_supertask(task, conn, *, review_skipped=False):
+    """Mark a supertask done after final review or an explicit review skip."""
+    task_id = task["id"]
+    db.update_task(
+        conn,
+        task_id,
+        status="done",
+        next_step="none",
+        last_review_decision="approve",
+    )
+    completion_message = (
+        "All child tasks and follow-ups done. Final supertask review skipped; "
+        "supertask complete."
+        if review_skipped
+        else "Final supertask review approved. Supertask complete."
+    )
+    db.add_comment(
+        conn,
+        task_id,
+        completion_message,
+        kind="comment",
+        author="orchestrator",
+    )
+    suffix = "with final review skipped" if review_skipped else "after final review"
+    db.update_runtime(conn, status_message=f"Supertask {task_id} done {suffix}")
+    log(f"Supertask {task_id} complete {suffix}", task_id)
+
+
+def _reconcile_supertask_follow_ups(parent_id, conn):
+    """Attach linked follow-up chains created before parent inheritance existed."""
+    pending = list(db.get_child_tasks(conn, parent_id))
+    visited = set()
+    while pending:
+        source = pending.pop(0)
+        if source["id"] in visited:
+            continue
+        visited.add(source["id"])
+        follow_up_id = source.get("follow_up_task_id")
+        if follow_up_id is None:
+            continue
+        follow_up = db.get_task(conn, follow_up_id)
+        if follow_up is None:
+            db.update_task(conn, source["id"], follow_up_task_id=None)
+            db.add_comment(
+                conn,
+                parent_id,
+                f"Cleared missing follow-up task {follow_up_id} referenced by "
+                f"child task {source['id']}.",
+                kind="comment",
+                author="orchestrator",
+            )
+            log(
+                f"Cleared missing follow-up {follow_up_id} from child {source['id']}",
+                parent_id,
+            )
+            continue
+        try:
+            db.attach_follow_up_to_supertask(conn, source["id"], follow_up_id)
+        except ValueError as error:
+            mark_blocked(
+                parent_id,
+                conn,
+                f"Could not associate follow-up task {follow_up_id}: {error}",
+                f"Blocked: supertask {parent_id} follow-up association needs correction",
+                log_message=f"Supertask follow-up reconciliation failed: {error}",
+                preserve_wip=False,
+                block_reason="follow_up_reconciliation",
+                resume_next_step="commit-review-supertask",
+            )
+            return False
+        follow_up = db.get_task(conn, follow_up_id)
+        if follow_up and follow_up.get("parent_task_id") == parent_id:
+            if follow_up["status"] == "none":
+                db.update_task(
+                    conn,
+                    follow_up_id,
+                    status="ready",
+                    next_step="commit-make",
+                )
+                db.add_comment(
+                    conn,
+                    follow_up_id,
+                    f"Queued after task {source['id']} during supertask reconciliation.",
+                    kind="comment",
+                    author="orchestrator",
+                )
+                log(
+                    f"Queued reconciled follow-up task {follow_up_id} after child {source['id']}",
+                    parent_id,
+                )
+                follow_up = db.get_task(conn, follow_up_id)
+            pending.append(follow_up)
+    return True
+
+
+def _queue_supertask_final_review_if_complete(parent_id, conn, *, log_task_id=None):
+    """Queue final review once every child and descendant follow-up is done."""
+    parent = db.get_task(conn, parent_id)
+    if not parent or parent["status"] != "pending_subtasks":
+        return False
+    if not _reconcile_supertask_follow_ups(parent_id, conn):
+        return False
+    children = db.get_child_tasks(conn, parent_id)
+    if not all(child["status"] == "done" for child in children):
+        return False
+
+    if db.should_skip_step(conn, parent_id, "commit-review-supertask"):
+        _complete_supertask(parent, conn, review_skipped=True)
+        return True
+
+    db.update_task(
+        conn,
+        parent_id,
+        status="ready",
+        next_step="commit-review-supertask",
+        last_review_decision="none",
+    )
+    db.add_comment(
+        conn,
+        parent_id,
+        "All child tasks and follow-ups done. Queued final supertask review.",
+        kind="comment",
+        author="orchestrator",
+    )
+    db.update_runtime(
+        conn,
+        status_message=f"Supertask {parent_id} children complete; queued final review",
+    )
+    log(
+        f"Supertask {parent_id} queued for final review",
+        log_task_id or parent_id,
+    )
+    return True
+
+
 def _check_parent_completion(task_id, conn):
-    """If task has a parent supertask and all siblings are done, mark parent done."""
+    """Queue final supertask review when this task completes the child sequence."""
     task = db.get_task(conn, task_id)
     if not task:
         return
     parent_id = task.get("parent_task_id")
     if not parent_id:
         return
-    parent = db.get_task(conn, parent_id)
-    if not parent or parent["status"] != "pending_subtasks":
-        return
-    children = db.get_child_tasks(conn, parent_id)
-    if all(c["status"] == "done" for c in children):
-        db.update_task(conn, parent_id, status="done", next_step="none")
-        db.add_comment(conn, parent_id,
-                       "All child tasks done. Supertask complete.",
-                       kind="comment", author="orchestrator")
-        log(f"Supertask {parent_id} complete (all children done)", task_id)
+    _queue_supertask_final_review_if_complete(parent_id, conn, log_task_id=task_id)
 
 
 def _finalize_commit(task, conn, done_without_commit=False):
@@ -1360,6 +1515,7 @@ def _finalize_commit(task, conn, done_without_commit=False):
                        kind="comment", author="orchestrator")
         db.update_runtime(conn, status_message=f"Task {task_id} done (commit finalized)")
         log("Task done (commit finalized)", task_id)
+    _queue_follow_up_if_needed(db.get_task(conn, task_id), conn)
     _check_parent_completion(task_id, conn)
 
 
@@ -1514,14 +1670,23 @@ def _queue_follow_up_if_needed(task, conn):
     if not follow_up:
         log(f"WARNING: follow_up_task_id {follow_up_id} not found; skipping requeue", task_id)
         return None
+
+    try:
+        attached = db.attach_follow_up_to_supertask(conn, task_id, follow_up_id)
+    except ValueError as error:
+        log(f"WARNING: could not attach follow-up {follow_up_id}: {error}", task_id)
+        return None
+    if attached:
+        follow_up = db.get_task(conn, follow_up_id)
     if follow_up["status"] != "none":
         log(f"Follow-up task {follow_up_id} already queued; skipping re-queue", task_id)
         return None
     db.update_task(conn, follow_up_id, status="ready", next_step="commit-make")
-    try:
-        db.reposition_task(conn, follow_up_id, after_id=task_id)
-    except ValueError as e:
-        log(f"WARNING: could not reposition follow-up {follow_up_id}: {e}", task_id)
+    if follow_up.get("parent_task_id") is None:
+        try:
+            db.reposition_task(conn, follow_up_id, after_id=task_id)
+        except ValueError as e:
+            log(f"WARNING: could not reposition follow-up {follow_up_id}: {e}", task_id)
     db.add_comment(conn, task_id,
                    f"Follow-up task {follow_up_id} ('{follow_up['title']}') queued after this task.",
                    kind="comment", author="orchestrator")
@@ -1532,14 +1697,15 @@ def _queue_follow_up_if_needed(task, conn):
     return follow_up_id
 
 
-def _approve_supertask_plan(task, conn):
-    """Advance supertask to pending_subtasks after approval or skip."""
+def _activate_supertask_children(task, conn):
+    """Activate a supertask's children after planning or final-review rework."""
     task_id = task["id"]
     db.update_task(conn, task_id,
                    status="pending_subtasks", next_step="none",
                    last_review_decision="approve")
-    db.update_runtime(conn, status_message=f"Supertask {task_id} plan approved; children now active")
-    log("Supertask plan approved, status=pending_subtasks", task_id)
+    db.update_runtime(conn, status_message=f"Supertask {task_id} planning complete; children now active")
+    log("Supertask planning complete, status=pending_subtasks", task_id)
+    _queue_supertask_final_review_if_complete(task_id, conn)
 
 
 def _approve_plan(task, conn):
@@ -1687,17 +1853,38 @@ def advance(task, conn):
             )
             return False
 
-        if db.should_skip_step(conn, task_id, "commit-review-supertask"):
-            _approve_supertask_plan(task, conn)
-        else:
-            db.update_task(conn, task_id,
-                           status="ready", next_step="commit-review-supertask",
-                           last_review_decision="none")
-            db.update_runtime(conn, status_message=f"Supertask {task_id} plan built, queued for review")
-            log("Supertask plan built, queued for review", task_id)
+        _activate_supertask_children(task, conn)
         return True
 
     elif step == "commit-review-supertask":
+
+        if not _reconcile_supertask_follow_ups(task_id, conn):
+            return False
+        incomplete_children = [
+            child
+            for child in db.get_child_tasks(conn, task_id)
+            if child["status"] != "done"
+        ]
+        if incomplete_children:
+            db.update_task(conn, task_id, status="pending_subtasks", next_step="none")
+            db.add_comment(
+                conn,
+                task_id,
+                "Final supertask review deferred because associated child or follow-up "
+                "work is not done.",
+                kind="comment",
+                author="orchestrator",
+            )
+            db.update_runtime(
+                conn,
+                status_message=f"Supertask {task_id} final review deferred; children still active",
+            )
+            log("Final supertask review deferred; child work remains", task_id)
+            return True
+
+        if db.should_skip_step(conn, task_id, "commit-review-supertask"):
+            _complete_supertask(task, conn, review_skipped=True)
+            return True
 
         outcome = handle_commit_review_supertask(task, conn)
 
@@ -1715,7 +1902,7 @@ def advance(task, conn):
             return False
 
         if outcome == "approve":
-            _approve_supertask_plan(task, conn)
+            _complete_supertask(task, conn)
         else:
             new_round = task["review_round"] + 1
             review_cap = task_max_review_rounds(task)

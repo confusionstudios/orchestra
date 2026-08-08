@@ -99,9 +99,10 @@ A commit task moves through these steps:
 5. `commit-make` finalization — same coder considers approval notes and finalizes the commit after approval.
    Always runs.
 
-Supertasks substitute `commit-make-supertask` and `commit-review-supertask`
-for steps 3–4; the supertask itself never lands a commit.
-`commit-review-supertask` is *skippable*.
+Supertasks use `commit-make-supertask` to create an ordered child plan, execute
+all children and their follow-ups, then use `commit-review-supertask` for a
+final aggregate review. The supertask itself never lands a commit, and its
+final review is *skippable*.
 
 Pull request tasks use `pull-request-make` and `pull-request-review`.
 Other tasks use `other-make` and `other-review`, and must leave durable

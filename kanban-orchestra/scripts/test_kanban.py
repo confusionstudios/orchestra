@@ -1060,6 +1060,16 @@ class TestDB(unittest.TestCase):
         db.delete_task(self.conn, tid)
         self.assertIsNone(db.get_task(self.conn, tid))
 
+    def test_delete_follow_up_clears_source_reference(self):
+        source_id = db.add_task(self.conn, "Source")
+        follow_up_id = db.add_task(self.conn, "Follow-up")
+        db.update_task(self.conn, source_id, follow_up_task_id=follow_up_id)
+
+        db.delete_task(self.conn, follow_up_id)
+
+        self.assertIsNone(db.get_task(self.conn, follow_up_id))
+        self.assertIsNone(db.get_task(self.conn, source_id)["follow_up_task_id"])
+
     def test_delete_task_rejects_non_none(self):
         tid = db.add_task(self.conn, "Cant delete")
         db.update_task(self.conn, tid, status="ready", branch="b")
@@ -5974,10 +5984,18 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         self.assertEqual(comments[-1]["message"], "Plan: do A then B")
 
-    def test_advance_commit_make_supertask_to_review(self):
+    def test_advance_commit_make_supertask_activates_children(self):
         task = self._make_supertask()
 
         def fake_coder(name, prompt, task_id, conn, verb, **kw):
+            db.add_task(
+                conn,
+                "Child",
+                parent_task_id=task_id,
+                sequence_index=100,
+                branch="feat",
+                status="ready",
+            )
             db.add_comment(conn, task_id, "Plan summary", kind="commit-message", author=name)
             return 0
 
@@ -5986,10 +6004,10 @@ class TestSupertaskStateMachine(unittest.TestCase):
 
         updated = db.get_task(self.conn, task["id"])
         self.assertTrue(result)
-        self.assertEqual(updated["status"], "ready")
-        self.assertEqual(updated["next_step"], "commit-review-supertask")
+        self.assertEqual(updated["status"], "pending_subtasks")
+        self.assertEqual(updated["next_step"], "none")
 
-    def test_advance_commit_review_supertask_approve_sets_pending_subtasks(self):
+    def test_advance_commit_review_supertask_approve_finishes_parent(self):
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "LGTM",
                        kind="approval", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
@@ -5999,7 +6017,7 @@ class TestSupertaskStateMachine(unittest.TestCase):
 
         updated = db.get_task(self.conn, task["id"])
         self.assertTrue(result)
-        self.assertEqual(updated["status"], "pending_subtasks")
+        self.assertEqual(updated["status"], "done")
         self.assertEqual(updated["next_step"], "none")
         self.assertIsNone(updated["commit_hash"])
 
@@ -6030,7 +6048,7 @@ class TestSupertaskStateMachine(unittest.TestCase):
             db.add_comment(
                 conn,
                 task_id,
-                "Plan approved",
+                "Combined implementation approved",
                 kind="approval",
                 author=name,
                 review_round=task["review_round"],
@@ -6042,6 +6060,88 @@ class TestSupertaskStateMachine(unittest.TestCase):
 
         self.assertEqual(result, "approve")
         self.assertEqual(invoked, [("antigravity", "commit-review-supertask")])
+
+    def test_final_review_defers_and_attaches_legacy_detached_follow_up(self):
+        parent = self._make_supertask(
+            status="running",
+            next_step="commit-review-supertask",
+        )
+        child_id = db.add_task(
+            self.conn,
+            "Completed child",
+            branch="feat",
+            parent_task_id=parent["id"],
+            sequence_index=100,
+            status="done",
+        )
+        follow_up_id = db.add_task(
+            self.conn,
+            "Detached follow-up",
+            branch="feat",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.conn, child_id, follow_up_task_id=follow_up_id)
+
+        with patch.object(orchestrator, "run_agent") as run_agent:
+            result = orchestrator.advance(parent, self.conn)
+
+        self.assertTrue(result)
+        run_agent.assert_not_called()
+        updated_parent = db.get_task(self.conn, parent["id"])
+        follow_up = db.get_task(self.conn, follow_up_id)
+        self.assertEqual(updated_parent["status"], "pending_subtasks")
+        self.assertEqual(updated_parent["next_step"], "none")
+        self.assertEqual(follow_up["parent_task_id"], parent["id"])
+        self.assertEqual(follow_up["sequence_index"], 200)
+        self.assertEqual(follow_up["status"], "ready")
+        self.assertEqual(follow_up["next_step"], "commit-make")
+
+    def test_follow_up_association_conflict_blocks_with_continue_metadata(self):
+        parent = self._make_supertask(
+            status="running",
+            next_step="commit-review-supertask",
+        )
+        other_parent_id = db.add_task(
+            self.conn,
+            "Other parent",
+            kind="supertask",
+            branch="feat",
+        )
+        child_id = db.add_task(
+            self.conn,
+            "Completed child",
+            branch="feat",
+            parent_task_id=parent["id"],
+            sequence_index=100,
+            status="done",
+        )
+        conflicting_follow_up_id = db.add_task(
+            self.conn,
+            "Conflicting follow-up",
+            branch="feat",
+            parent_task_id=other_parent_id,
+            sequence_index=100,
+            status="done",
+        )
+        db.update_task(
+            self.conn,
+            child_id,
+            follow_up_task_id=conflicting_follow_up_id,
+        )
+
+        result = orchestrator.advance(parent, self.conn)
+
+        self.assertFalse(result)
+        blocked = db.get_task(self.conn, parent["id"])
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["block_reason"], "follow_up_reconciliation")
+        self.assertEqual(blocked["resume_next_step"], "commit-review-supertask")
+
+        db.update_task(self.conn, child_id, follow_up_task_id=None)
+        with patch.object(orchestrator.task_cli, "validate_ready_worktree"):
+            resumed = orchestrator.task_cli.continue_blocked_task(self.conn, parent["id"])
+        self.assertEqual(resumed["status"], "ready")
+        self.assertEqual(resumed["next_step"], "commit-review-supertask")
 
     def test_supertask_never_gets_commit_hash(self):
         """After plan approval, supertask has no commit_hash."""
@@ -6055,8 +6155,8 @@ class TestSupertaskStateMachine(unittest.TestCase):
         updated = db.get_task(self.conn, task["id"])
         self.assertIsNone(updated["commit_hash"])
 
-    def test_child_done_completes_parent(self):
-        """When all children are done, supertask becomes done."""
+    def test_child_done_queues_parent_final_review(self):
+        """When all children are done, the supertask queues its final review."""
         parent_id = db.add_task(
             self.conn, "Parent", kind="supertask", branch="feat", coder_agent="claude",
         )
@@ -6086,8 +6186,38 @@ class TestSupertaskStateMachine(unittest.TestCase):
         updated_parent = db.get_task(self.conn, parent_id)
         self.assertEqual(updated_child["status"], "done")
         self.assertEqual(updated_child["commit_hash"], fake_hash)
-        self.assertEqual(updated_parent["status"], "done")
+        self.assertEqual(updated_parent["status"], "ready")
+        self.assertEqual(updated_parent["next_step"], "commit-review-supertask")
         self.assertIsNone(updated_parent["commit_hash"])
+
+    def test_child_done_completes_parent_when_final_review_is_skipped(self):
+        parent_id = db.add_task(
+            self.conn,
+            "Parent",
+            kind="supertask",
+            branch="feat",
+            coder_agent="claude",
+            skips=["commit-review-supertask"],
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks")
+        child_id = db.add_task(
+            self.conn,
+            "Child",
+            parent_task_id=parent_id,
+            sequence_index=100,
+            branch="feat",
+            status="done",
+        )
+
+        orchestrator._check_parent_completion(child_id, self.conn)
+
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "done")
+        self.assertEqual(parent["next_step"], "none")
+        self.assertTrue(any(
+            "Final supertask review skipped" in comment["message"]
+            for comment in db.get_comments(self.conn, parent_id)
+        ))
 
     def test_child_blocked_propagates_to_parent(self):
         """When a child task is blocked, the parent supertask is also blocked."""
@@ -7659,7 +7789,7 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertNotIn("task get-commit-footer", prompt)
         self.assertNotIn("git diff --cached", prompt)
 
-    def test_supertask_reviewer_prompt_is_plan_only(self):
+    def test_supertask_reviewer_prompt_includes_child_results(self):
         task = {
             "id": 99, "title": "Review plan", "description": "Split the work",
             "branch": "b", "status": "running", "next_step": "commit-review-supertask",
@@ -7679,12 +7809,30 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
             "commit-review-supertask",
             "antigravity",
             comments,
+            supertask_children=[{
+                "id": 101,
+                "title": "Add foundation",
+                "status": "done",
+                "commit_hash": "a" * 40,
+                "follow_up_of": None,
+                "review_history": [{
+                    "kind": "approval",
+                    "review_round": 1,
+                    "author": "codex",
+                    "message": "Implementation is correct.",
+                }],
+            }],
         )
 
-        self.assertIn("## Supertask Reviewer Handoff", prompt)
+        self.assertIn("## Supertask Final Review Handoff", prompt)
         self.assertIn("100: Add foundation", prompt)
+        self.assertIn("Task 101: Add foundation", prompt)
+        self.assertIn("a" * 40, prompt)
+        self.assertIn("Round 1 approval by codex", prompt)
         self.assertIn("task list --parent 99", prompt)
         self.assertIn("task show <child-id>", prompt)
+        self.assertIn("task show-comments <child-id>", prompt)
+        self.assertIn("git show <commit-hash>", prompt)
         self.assertIn("- reviewer_agent: antigravity", prompt)
         self.assertNotIn("git diff --cached", prompt)
         self.assertNotIn("validation summary", prompt)
@@ -7971,6 +8119,59 @@ class TestFollowUpCLI(unittest.TestCase):
         self.assertEqual(follow_up["coder_agent"], "sonnet")
         self.assertEqual(follow_up["reviewer_agent"], "antigravity")
 
+    def test_descendant_follow_ups_inherit_supertask_and_sequence(self):
+        conn = db.connect(self.db_path)
+        try:
+            parent_id = db.add_task(conn, "Parent", kind="supertask", branch="feat")
+            child_id = db.add_task(
+                conn,
+                "Child",
+                branch="feat",
+                parent_task_id=parent_id,
+                sequence_index=100,
+                status="running",
+                skips=["commit-plan"],
+            )
+            later_id = db.add_task(
+                conn,
+                "Later child",
+                branch="feat",
+                parent_task_id=parent_id,
+                sequence_index=200,
+                status="ready",
+                skips=["commit-plan"],
+            )
+            db.update_task(conn, child_id, next_step="commit-make")
+        finally:
+            conn.close()
+
+        first = self._run("follow-up", str(child_id), "--description", "First follow-up")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_id = json.loads(first.stdout)["id"]
+        self._set_running(first_id)
+        second = self._run("follow-up", str(first_id), "--description", "Nested follow-up")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_id = json.loads(second.stdout)["id"]
+
+        conn = db.connect(self.db_path)
+        try:
+            children = db.get_child_tasks(conn, parent_id)
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            [child["id"] for child in children],
+            [child_id, first_id, second_id, later_id],
+        )
+        self.assertEqual(
+            [child["parent_task_id"] for child in children],
+            [parent_id, parent_id, parent_id, parent_id],
+        )
+        self.assertEqual(
+            [child["sequence_index"] for child in children],
+            [100, 200, 300, 400],
+        )
+
     def test_follow_up_sets_follow_up_task_id_on_current(self):
         """follow_up_task_id is set on the current task after calling follow-up."""
         tid = self._add_task("My task")
@@ -8067,6 +8268,235 @@ class TestFollowUpOrchestrator(unittest.TestCase):
         self._ack_patcher.stop()
         self.conn.close()
         os.unlink(self.tmp.name)
+
+    def test_supertask_waits_for_follow_up_before_final_review(self):
+        parent_id = db.add_task(
+            self.conn,
+            "Parent supertask",
+            kind="supertask",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent="antigravity",
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks", next_step="none")
+        child_id = db.add_task(
+            self.conn,
+            "Original child",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent="codex",
+            parent_task_id=parent_id,
+            sequence_index=100,
+            status="running",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.conn, child_id, next_step="commit-make")
+        follow_up_id = None
+
+        def build_child(name, prompt, task_id, conn, verb, **kw):
+            nonlocal follow_up_id
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "task.py"),
+                    "follow-up",
+                    str(task_id),
+                    "--description",
+                    "Correct the integration discovered during implementation",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "KANBAN_DB": self.tmp.name,
+                    "KANBAN_NONINTERACTIVE": "1",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            follow_up_id = json.loads(result.stdout)["id"]
+            db.add_comment(
+                conn,
+                task_id,
+                "Original child commit",
+                kind="commit-message",
+                author=name,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=build_child), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, child_id), self.conn))
+
+        self.assertIsNotNone(follow_up_id)
+        follow_up = db.get_task(self.conn, follow_up_id)
+        self.assertEqual(follow_up["parent_task_id"], parent_id)
+        self.assertEqual(follow_up["status"], "ready")
+
+        db.add_comment(
+            self.conn,
+            child_id,
+            "Original child approved",
+            kind="approval",
+            author="codex",
+            review_round=0,
+        )
+        db.update_task(
+            self.conn,
+            child_id,
+            status="done",
+            next_step="none",
+            commit_hash="c" * 40,
+            last_review_decision="approve",
+        )
+        orchestrator._check_parent_completion(child_id, self.conn)
+
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "pending_subtasks")
+        self.assertEqual(parent["next_step"], "none")
+        self.assertFalse(any(
+            "Starting commit-review-supertask" in comment["message"]
+            for comment in db.get_comments(self.conn, parent_id)
+        ))
+
+        db.update_task(self.conn, follow_up_id, status="running", next_step="commit-make")
+
+        def build_follow_up(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(
+                conn,
+                task_id,
+                "Follow-up commit",
+                kind="commit-message",
+                author=name,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=build_follow_up), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, follow_up_id), self.conn))
+
+        db.update_task(self.conn, follow_up_id, status="running", next_step="commit-review")
+
+        def review_follow_up(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(
+                conn,
+                task_id,
+                "Follow-up integration approved",
+                kind="approval",
+                author=name,
+                review_round=0,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=review_follow_up), \
+             patch.object(orchestrator, "ensure_branch", return_value=True):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, follow_up_id), self.conn))
+
+        db.update_task(self.conn, follow_up_id, status="running", next_step="commit-make")
+        follow_up_hash = "f" * 40
+        with patch.object(orchestrator, "run_agent", return_value=0), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(
+                 orchestrator,
+                 "get_head_commit_hash",
+                 side_effect=["e" * 40, follow_up_hash, follow_up_hash],
+             ), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, follow_up_id), self.conn))
+
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "ready")
+        self.assertEqual(parent["next_step"], "commit-review-supertask")
+        self.assertEqual(db.get_task(self.conn, follow_up_id)["commit_hash"], follow_up_hash)
+
+        db.update_task(self.conn, parent_id, status="running")
+        final_prompt = []
+
+        def review_supertask(name, prompt, task_id, conn, verb, **kw):
+            final_prompt.append(prompt)
+            db.add_comment(
+                conn,
+                task_id,
+                "Combined implementation approved",
+                kind="approval",
+                author=name,
+                review_round=0,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=review_supertask):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, parent_id), self.conn))
+
+        self.assertEqual(db.get_task(self.conn, parent_id)["status"], "done")
+        self.assertIn(follow_up_hash, final_prompt[0])
+        self.assertIn("Follow-up integration approved", final_prompt[0])
+        self.assertIn("follow-up of task", final_prompt[0])
+
+    def test_supertask_path_b_follow_up_is_queued_before_parent_completion(self):
+        parent_id = db.add_task(
+            self.conn,
+            "Parent supertask",
+            kind="supertask",
+            branch="feat",
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks", next_step="none")
+        child_id = db.add_task(
+            self.conn,
+            "Finalizing child",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent="codex",
+            parent_task_id=parent_id,
+            sequence_index=100,
+            status="running",
+            skips=["commit-plan"],
+        )
+        db.update_task(
+            self.conn,
+            child_id,
+            next_step="commit-make",
+            last_review_decision="approve",
+        )
+        follow_up_id = None
+
+        def finalize_with_follow_up(name, prompt, task_id, conn, verb, **kw):
+            nonlocal follow_up_id
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "task.py"),
+                    "follow-up",
+                    str(task_id),
+                    "--description",
+                    "Work discovered during finalization",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "KANBAN_DB": self.tmp.name,
+                    "KANBAN_NONINTERACTIVE": "1",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            follow_up_id = json.loads(result.stdout)["id"]
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=finalize_with_follow_up), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", side_effect=["a" * 40, "b" * 40, "b" * 40]), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, child_id), self.conn))
+
+        self.assertIsNotNone(follow_up_id)
+        follow_up = db.get_task(self.conn, follow_up_id)
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(follow_up["parent_task_id"], parent_id)
+        self.assertEqual(follow_up["status"], "ready")
+        self.assertEqual(follow_up["next_step"], "commit-make")
+        self.assertEqual(parent["status"], "pending_subtasks")
+        self.assertEqual(parent["next_step"], "none")
 
     def test_commit_make_path_a_with_follow_up_queues_follow_up_after_current(self):
         """After commit-make Path A, if follow_up_task_id is set, both tasks become ready,

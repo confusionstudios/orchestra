@@ -1045,6 +1045,12 @@ def delete_task(conn, task_id):
         raise ValueError(f"Task {task_id} not found")
     if task["status"] != "none":
         raise ValueError(f"Can only delete tasks with status 'none', got '{task['status']}'")
+    conn.execute(
+        """UPDATE tasks
+           SET follow_up_task_id = NULL, updated_at = CURRENT_TIMESTAMP
+           WHERE follow_up_task_id = ?""",
+        (task_id,),
+    )
     conn.execute("DELETE FROM run_log WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM comments WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -1314,6 +1320,43 @@ def renumber_siblings(conn, parent_task_id):
             (new_index, child["id"]),
         )
     conn.commit()
+
+
+def attach_follow_up_to_supertask(conn, source_task_id, follow_up_task_id):
+    """Attach a detached follow-up after its source within the same supertask."""
+    source = get_task(conn, source_task_id)
+    follow_up = get_task(conn, follow_up_task_id)
+    if not source or not follow_up:
+        raise ValueError("source task and follow-up task must both exist")
+
+    parent_id = source.get("parent_task_id")
+    if parent_id is None:
+        return False
+    if follow_up.get("parent_task_id") == parent_id:
+        return True
+    if follow_up.get("parent_task_id") is not None:
+        raise ValueError(
+            f"Follow-up task {follow_up_task_id} already belongs to "
+            f"supertask {follow_up['parent_task_id']}"
+        )
+
+    parent = get_task(conn, parent_id)
+    if not parent or parent.get("kind") != "supertask":
+        raise ValueError(f"Parent task {parent_id} is not a supertask")
+
+    renumber_siblings(conn, parent_id)
+    source = get_task(conn, source_task_id)
+    sequence_index = (source.get("sequence_index") or 0) + 1
+    conn.execute(
+        """UPDATE tasks
+           SET parent_task_id = ?, sequence_index = ?, branch = ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?""",
+        (parent_id, sequence_index, parent["branch"], follow_up_task_id),
+    )
+    renumber_siblings(conn, parent_id)
+    conn.commit()
+    return True
 
 
 def reposition_task(conn, task_id, *, before_id=None, after_id=None):

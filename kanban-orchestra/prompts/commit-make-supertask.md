@@ -6,7 +6,9 @@ make Git commits.
 
 ## Workflow
 
-1. Read the supertask goal and prior rejection comments.
+1. Read the supertask goal and prior rejection comments. On initial planning,
+   create the implementation sequence. After a rejected final review, preserve
+   completed children and add corrective child tasks for the remaining work.
 2. Inspect every current child with `task list --parent <supertask-id>` and
    `task show <child-id>` as needed.
 3. Create, update, remove, or reorder children until they form a complete plan.
@@ -24,7 +26,7 @@ make Git commits.
 - `sequence_index` defines execution order. Lower values run first, and the
   CLI renumbers siblings at 100-step intervals.
 - New children default to `ready`, but the parent gates their execution until
-  the plan is approved.
+  planning finishes.
 - To remove an existing child, first set its status to `none`, then delete it.
 - Do not create nested supertasks.
 - If the goal cannot be decomposed confidently, leave a regular task comment

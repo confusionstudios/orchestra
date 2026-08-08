@@ -462,7 +462,7 @@ class TestReadyQueue(unittest.TestCase):
         html = dashboard.render_ready_queue(self.conn)
         self.assertLess(html.find("Earlier ready"), html.find("Later ready"))
 
-    def test_child_ready_task_waiting_for_plan_review_is_gated(self):
+    def test_child_ready_task_waiting_for_final_review_is_gated(self):
         parent_id = db.add_task(self.conn, "Parent supertask", branch="feat-parent", kind="supertask")
         db.update_task(self.conn, parent_id, status="ready", next_step="commit-review-supertask")
         child_id = db.add_task(
@@ -477,7 +477,7 @@ class TestReadyQueue(unittest.TestCase):
         html = dashboard.render_ready_queue(self.conn)
         self.assertIn("Runnable Now", html)
         self.assertIn("Queued Behind Supertask", html)
-        self.assertIn("waiting for supertask plan review", html)
+        self.assertIn("waiting for final supertask review", html)
         self.assertIn("Child task", html)
 
     def test_later_child_waits_for_earlier_sibling(self):

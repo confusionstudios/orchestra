@@ -271,14 +271,14 @@ Runtime status values:
 - `running`: currently being processed by the orchestrator
 - `done`: landed and submitted
 - `blocked`: requires human intervention
-- `pending_subtasks`: approved supertask plan with child execution in progress
+- `pending_subtasks`: supertask child and follow-up execution in progress
 
 ### `next_step`
 
 - `commit-make`: coder builds or finalizes a commit task
 - `commit-review`: reviewer inspects the staged diff for a commit task
 - `commit-make-supertask`: coder plans a supertask
-- `commit-review-supertask`: reviewer reviews a supertask plan
+- `commit-review-supertask`: reviewer performs final aggregate supertask review
 - `commit-plan`: coder drafts an implementation plan for a normal task
 - `commit-plan-review`: reviewer approves or rejects the drafted plan
 - `none`: no pending step
@@ -634,16 +634,21 @@ Supertasks are planning tasks with child execution.
 - A supertask uses `commit-make-supertask` and `commit-review-supertask`.
 - Child tasks must point at a supertask parent.
 - Child tasks inherit the supertask branch.
+- Follow-ups created by any child remain children of the same supertask and
+  are inserted immediately after their source task.
 - Child ordering is controlled by `sequence_index`.
 - Siblings are renumbered at `100` intervals after insertion or reorder.
 
 ### Supertask Planning Flow
 
-1. `commit-make-supertask`: coder writes the plan and creates child tasks
-2. `commit-review-supertask`: reviewer approves or rejects the plan
-3. On approval: supertask becomes `pending_subtasks`
-4. Child tasks execute in sequence
-5. When all children are `done`, the supertask becomes `done`
+1. `commit-make-supertask`: planner writes the plan and creates child tasks
+2. The supertask becomes `pending_subtasks`
+3. Child tasks and recursively created follow-ups execute in sequence
+4. When every associated task is `done`, the supertask queues
+   `commit-review-supertask`
+5. The reviewer evaluates the aggregate commits and child review history
+6. Approval completes the supertask; rejection returns to
+   `commit-make-supertask` so corrective child tasks can be added
 
 ### Child Task Eligibility
 
@@ -657,7 +662,8 @@ A ready child task is eligible only when:
 - Child tasks are created as `ready`.
 - If a child becomes `blocked`, the parent supertask becomes `blocked`.
 - If a blocked child is restored to `ready` and no other siblings remain blocked, the parent returns to `pending_subtasks`.
-- When all children are `done`, the orchestrator marks the parent `done`.
+- When all children and their follow-ups are `done`, the orchestrator queues
+  final supertask review. If that review is skipped, it marks the parent done.
 
 ## Orchestrator Contract
 

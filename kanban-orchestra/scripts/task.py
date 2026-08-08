@@ -838,6 +838,13 @@ def cmd_follow_up(args, conn):
 
     follow_up_title = f"{base_title} {n + 1}/x"
 
+    parent_task_id = task.get("parent_task_id")
+    sequence_index = None
+    if parent_task_id is not None:
+        db.renumber_siblings(conn, parent_task_id)
+        task = db.get_task(conn, args.task_id)
+        sequence_index = (task.get("sequence_index") or 0) + 1
+
     follow_up_id = db.add_task(
         conn,
         follow_up_title,
@@ -845,8 +852,14 @@ def cmd_follow_up(args, conn):
         branch=task["branch"],
         coder_agent=task["coder_agent"],
         reviewer_agent=task.get("reviewer_agent") or config.DEFAULT_REVIEWER,
+        parent_task_id=parent_task_id,
+        sequence_index=sequence_index,
         skips=["commit-plan"],
     )
+
+    if parent_task_id is not None:
+        db.renumber_siblings(conn, parent_task_id)
+        conn.commit()
 
     db.update_task(conn, args.task_id, follow_up_task_id=follow_up_id)
 

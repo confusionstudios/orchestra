@@ -615,7 +615,7 @@ def _child_ready_state(conn, task: dict) -> dict:
         if parent.get("status") == "ready" and step == "commit-make-supertask":
             reason = "waiting for supertask planning"
         elif parent.get("status") == "ready" and step == "commit-review-supertask":
-            reason = "waiting for supertask plan review"
+            reason = "waiting for final supertask review"
         elif parent.get("status") == "blocked":
             reason = "blocked by parent supertask"
         else:

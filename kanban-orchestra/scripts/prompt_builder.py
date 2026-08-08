@@ -116,8 +116,8 @@ checks (e.g. `grep`, reading a single file) over full test reruns.
 """
 
 
-def _build_supertask_reviewer_handoff(task, comments):
-    """Build the plan-only handoff for a supertask reviewer."""
+def _build_supertask_reviewer_handoff(task, comments, child_evidence):
+    """Build the aggregate implementation handoff for final supertask review."""
     summaries = [c for c in comments if c.get("kind") == "commit-message"]
     if summaries:
         summary = (
@@ -127,13 +127,43 @@ def _build_supertask_reviewer_handoff(task, comments):
     else:
         summary = "*(no plan summary recorded yet)*"
 
-    return f"""## Supertask Reviewer Handoff
+    child_lines = []
+    for child in child_evidence or []:
+        relationship = (
+            f"; follow-up of task {child['follow_up_of']}"
+            if child.get("follow_up_of") is not None
+            else ""
+        )
+        child_lines.append(
+            f"### Task {child['id']}: {child['title']}\n"
+            f"- Status: {child['status']}{relationship}\n"
+            f"- Commit: {child.get('commit_hash') or '(none)'}"
+        )
+        history = child.get("review_history") or []
+        if history:
+            child_lines.append("- Review history:")
+            for decision in history:
+                message = " ".join((decision.get("message") or "").split())
+                child_lines.append(
+                    f"  - Round {decision.get('review_round', 0)} "
+                    f"{decision['kind']} by {decision.get('author') or 'unknown'}: {message}"
+                )
+        else:
+            child_lines.append("- Review history: (none recorded)")
+
+    children_text = "\n".join(child_lines) or "*(no child tasks found)*"
+
+    return f"""## Supertask Final Review Handoff
 
 {summary}
 
-Verify this summary against the live ordered children from
-`task list --parent {task['id']}`. There is no code diff or build result to
-review during this step.
+### Completed Child Evidence
+
+{children_text}
+
+Verify the combined implementation against the supertask goal. Inspect each
+recorded commit and the live child comments when needed. Every child and
+descendant-created follow-up must be complete before this review runs.
 """
 
 
@@ -204,7 +234,7 @@ def _filter_comments_for_prompt(comments, verb, task=None):
     Filtering rules:
     - For reviewer verbs (commit-review, commit-review-supertask): exclude
       commit-message and validation kinds — both are already surfaced in the
-      ## Reviewer Handoff section, so including them again would be redundant.
+      reviewer handoff section, so including them again would be redundant.
     - For commit-make: exclude commit-message and validation kinds. The build
       prompt must create fresh versions, and the finalization prompt explicitly
       reads the canonical commit-message from `task show-comments`, so inlining
@@ -243,7 +273,7 @@ def _prompt_path_for_verb(verb, task):
     return _prompts_dir() / f"{prompt_name}.md"
 
 
-def build_prompt(task, verb, agent_name, comments):
+def build_prompt(task, verb, agent_name, comments, *, supertask_children=None):
     """Assemble the full prompt from shared context + verb-specific prompt."""
     shared_path = _prompts_dir() / "shared-task-context.md"
     verb_path = _prompt_path_for_verb(verb, task)
@@ -374,6 +404,8 @@ def build_prompt(task, verb, agent_name, comments):
             f"- {_t} show-comments {task['id']}",
             f"- {_t} list --parent {task['id']} [--page <n>]",
             f"- {_t} show <child-id>",
+            f"- {_t} show-comments <child-id>",
+            "- git show <commit-hash>",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --approval --author {agent_name} --review-round {task['review_round']}",
             f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --rejection --author {agent_name} --review-round {task['review_round']}",
         ])
@@ -426,7 +458,11 @@ def build_prompt(task, verb, agent_name, comments):
         return f"{shared_text}\n\n{task_context}\n\n{reviewer_handoff}\n\n{verb_text}"
 
     if verb == "commit-review-supertask":
-        reviewer_handoff = _build_supertask_reviewer_handoff(task, comments)
+        reviewer_handoff = _build_supertask_reviewer_handoff(
+            task,
+            comments,
+            supertask_children,
+        )
         return f"{shared_text}\n\n{task_context}\n\n{reviewer_handoff}\n\n{verb_text}"
 
     if verb == "commit-review":
