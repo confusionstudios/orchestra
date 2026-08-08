@@ -71,7 +71,9 @@ When you need to call an agent, resolve the command through
 `{prompt}` placeholder with the prompt text. This supports fixed aliases and
 provider/model specs such as `cursor:claude-opus-4-8-high`. Keep the call
 non-interactive, run it from the repo root, and include task-specific context
-in the prompt.
+in the prompt. Do not feed resolver source code through stdin; agent CLIs may
+consume inherited stdin as additional prompt content. Use `python -c`, a
+script file, or another invocation that leaves the child process stdin clean.
 
 Skill-specific instructions override the generic registry command. In
 particular, `cross-review-converge` uses `codex exec review --uncommitted` for

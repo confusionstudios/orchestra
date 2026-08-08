@@ -60,7 +60,7 @@ prompt_file="$(mktemp -t cross-review-prompt.XXXXXX)"
 trap 'rm -f "$prompt_file"' EXIT
 printf '%s' "<review prompt>" > "$prompt_file"
 PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" \
-  perl -e 'alarm shift; exec @ARGV' 300 "$ORCHESTRA_DIR/bin/ko-python" - "$reviewer" "$prompt_file" <<'PY'
+  perl -e 'alarm shift; exec @ARGV' 300 "$ORCHESTRA_DIR/bin/ko-python" -c '
 import os
 import sys
 from pathlib import Path
@@ -73,8 +73,11 @@ if cmd_template is None:
     raise SystemExit(f"unknown reviewer agent alias or provider/model spec: {reviewer}")
 cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
 os.execvp(cmd[0], cmd)
-PY
+' "$reviewer" "$prompt_file"
 ```
+
+Use `-c` rather than feeding the resolver program through stdin. Agent CLIs
+such as Claude may consume inherited stdin as additional prompt content.
 
 If the configured reviewer CLI is unavailable, report the blocker and do not
 substitute a different reviewer unless the user explicitly approves.
