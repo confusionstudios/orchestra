@@ -75,8 +75,9 @@ the task requires detail:
 
    Each round's message must stand alone: write it as if the review
    conversation never happened, describing the full task end-to-end. Follow
-   the format in `$ORCHESTRA_DIR/AI-skills/git-commit.md`. End with the
-   canonical footer from:
+   the format in `$ORCHESTRA_DIR/AI-skills/git-commit.md`, including an
+   optional `WHY` section only when the problem being solved adds useful
+   context. End with the canonical footer from:
    ```
    task get-commit-footer <id>
    ```

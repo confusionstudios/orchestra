@@ -46,7 +46,8 @@ bullets, and code spans).
 
 Sections, in order:
 
-- **Leading paragraph** — One short paragraph describing the main branch story and why it matters.
+- **Leading paragraph** — One short paragraph describing the main branch story.
+- **Why** (optional) — The problem this work solves: user pain, failure mode, or relevant constraint. Do not repeat the implementation. Omit the entire section when empty.
 - **Work** — Main implementation work only, as concise Markdown bullets. If a bullet is not part of the main story, move it to **Other**.
 - **Other** (optional) — Related or bundled work that does not belong in the main story. Omit the entire section when empty.
 - **Notes** (optional) — Useful process detail, such as validation, migrations, review context, or follow-up/fix commits. Scan the commit log for meaningful follow-up/fix commits and summarize them here when they add reviewer value. Omit the entire section when empty.
@@ -55,7 +56,7 @@ Sections, in order:
 
 - Prefer direct statements of what changed and why. Avoid contrastive filler like "instead of", "rather than", or "no longer" unless the comparison is the point.
 - Only mention file paths if it adds value. The file changes are part of the PR.
-- Keep sections short. Use the leading paragraph and **Work** for the main story; put every secondary change under **Other**.
+- Keep sections short. Use the leading paragraph and **Work** for the main story, **Why** for useful problem context, and **Other** for every secondary change.
 
 ### Example
 
@@ -63,6 +64,10 @@ Sections, in order:
 Knob Braking and Ramp Unified Under Physics Base Class
 
 KnobSlider and XYPad now delegate to the same braking path via the base class.
+
+## Why
+
+- Divergent release behavior made braking inconsistent across control types.
 
 ## Work
 

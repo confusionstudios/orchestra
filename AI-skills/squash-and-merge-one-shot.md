@@ -24,17 +24,22 @@ Synthesize a squash-merge commit message in memory and immediately squash-merge 
 
    <One concise paragraph: what this branch delivers and why it matters>
 
-   Work
+   <When the problem being solved adds useful context, add:>
+   WHY
+
+   • <user pain, failure mode, or constraint — not implementation detail>
+
+   WORK
 
    • <concise main implementation work>
 
    <When there is related secondary work, add:>
-   Other
+   OTHER
 
    • <related work that does not fit under Work>
 
    <When there are useful process details, add:>
-   Notes
+   NOTES
 
    • <validation, risks, follow-ups, or migration notes>
    ```
@@ -43,7 +48,7 @@ Synthesize a squash-merge commit message in memory and immediately squash-merge 
    - Do not list commits one by one. Group changes into coherent logical chunks.
    - Do not describe changes by file or method name. Write what was done and why at a feature/behavior level. Git has the file-level changes, you don't need to repeat them.
    - Keep it factual, concise, and human-readable. Keep it positive, avoid saying what was NOT done.
-   - Omit `Other` and `Notes` entirely when they have no bullets.
+   - Omit `WHY`, `OTHER`, and `NOTES` entirely when they have no bullets.
    - No AI references.
 
 4. Switch to the target branch: `git checkout <target-branch>`. Stop and report if checkout fails.

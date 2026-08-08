@@ -65,6 +65,10 @@ the direct `master` push.
      --body "$(cat <<EOF
 Temporary PR to attach required GitHub checks to commit $head_sha before pushing master directly.
 
+## Why
+
+- Protected master requires successful checks attached to the exact commit before accepting the direct push.
+
 ## Work
 
 - Run required GitHub checks for this exact SHA.

@@ -68,8 +68,10 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
    git -C "$target_root" merge --squash "$source_branch"
    ```
 4. Commit the staged squash result with the synthesized message. The message
-   must use: title, one leading paragraph, `Work` bullets, and optional
-   non-empty `Other` and `Notes` sections. Record the landed commit hash.
+   must use: title, one leading paragraph, an optional non-empty `WHY` section,
+   `WORK` bullets, and optional non-empty `OTHER` and `NOTES` sections. `WHY`
+   describes the problem being solved, not the implementation. Record the
+   landed commit hash.
 
 ## Import Kanban History
 

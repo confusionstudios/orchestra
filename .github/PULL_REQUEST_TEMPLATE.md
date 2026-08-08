@@ -1,4 +1,8 @@
-<!-- One short paragraph describing the main story and why it matters. -->
+<!-- One short paragraph describing the main story. -->
+
+## Why
+
+<!-- Optional: state the problem being solved, such as user pain, a failure mode, or a constraint. Remove this section if empty. -->
 
 ## Work
 

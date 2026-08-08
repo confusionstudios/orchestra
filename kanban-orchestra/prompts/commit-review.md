@@ -31,6 +31,8 @@ there instead of rebuilding context from scratch.
      - screenshots or assets presented poorly
      - missing or inadequate tests when the change is testable
    - Anything that contradicts the maker's commit message or validation summary
+   - If the commit message includes `WHY`, whether it states the problem being
+     solved without repeating the implementation
    - On rework, does it address the prior round's feedback?
 
    What NOT to check:

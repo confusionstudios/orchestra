@@ -13,8 +13,9 @@ pull request for the task branch against the appropriate target branch.
    `gh pr edit` for the current branch. If a PR already exists for this branch,
    update its title and body instead of creating a duplicate.
    Follow `$ORCHESTRA_DIR/AI-skills/create-pr-for-branch.md` for the title and
-   body format: a leading paragraph, `## Work` bullets, then optional
-   `## Other` and `## Notes` sections. Do not emit an empty optional section.
+   body format: a leading paragraph, optional `## Why`, `## Work` bullets,
+   then optional `## Other` and `## Notes` sections. `## Why` states the
+   problem being solved. Do not emit an empty optional section.
 3. **Record durable PR metadata.** Add a task comment containing all of:
    - `PR URL: https://github.com/<owner>/<repo>/pull/<number>`
    - `Title: <PR title>`

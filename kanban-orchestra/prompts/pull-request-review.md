@@ -15,8 +15,10 @@ PR title/body quality and branch-summary accuracy.
    What to check:
    - The title is clear, specific, and matches the branch purpose.
    - The body accurately summarizes the branch against the PR base.
-   - The body has a leading paragraph and concise `## Work` bullets. `## Other`
-     and `## Notes` appear only when they contain useful content.
+   - The body has a leading paragraph, optional `## Why`, and concise
+     `## Work` bullets in that order. `## Other` and `## Notes` appear only
+     when they contain useful content. When present, `## Why` states the
+     problem being solved without repeating the implementation.
    - The body gives reviewers enough context to understand scope and validation.
    - The PR URL is present and points to a GitHub pull request.
 
