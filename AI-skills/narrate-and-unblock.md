@@ -23,7 +23,57 @@ Immediately sample state and give one short plain-language summary:
 - Ready queue depth or blocked task
 - One grounded clause from new agent output when available
 
-Do not paste raw update output, JSON, logs, transcript dumps, or tables.
+Use the update prefix below. Do not paste raw update output, JSON, logs,
+transcript dumps, or tables.
+
+## Update prefix
+
+Immediately before every visible narration update, run:
+
+```bash
+date '+%H:%M:%S'
+```
+
+Prefix the update with the clock time, primary task, verb, and exact persisted
+`review_round`:
+
+```text
+[14:37:09] Task 162 · commit-review · round 2 — <short narration>
+```
+
+Choose the primary task in this order: active task, blocking leaf task, next
+ready task. Always read that task with `ko-task show <id>` to obtain its exact
+`review_round` and task fields. Resolve an active task's verb from runtime
+`current_step`, falling back to task `next_step`; resolve a ready task's verb
+from `next_step`.
+
+For a blocked task, use the latest verb-bearing run-log entry. If the stored
+`resume_next_step` exists and differs from that verb, include it as a
+transition:
+
+```text
+[14:38:12] Task 162 · blocked · commit-review → commit-make · round 2 — <short narration>
+```
+
+If the resume step is absent or matches the blocked verb, show only the
+blocked verb. If no authoritative verb exists, write `verb unknown`; never
+guess one:
+
+```text
+[14:38:12] Task 162 · blocked · verb unknown · round 2 — <short narration>
+```
+
+Use the task row's numeric round without converting it to one-based display.
+If there is genuinely no active, blocked, or ready task, use:
+
+```text
+[14:39:05] Idle — No active or queued work.
+```
+
+Generate the time immediately before writing the update so investigation does
+not leave it stale. Do not include a timezone or fractional seconds. Recovery
+notices, unchanged-state updates, questions, and the final idle report all use
+the same prefix contract.
 
 ## Monitoring loop
 
@@ -34,8 +84,10 @@ session; do not start a background process, cron job, or repository wrapper.
 Each sample:
 
 1. Run `"$ORCHESTRA_DIR/bin/ko-get-update"`.
-2. Identify the active or blocked task and current step.
-3. Read only targeted detail when needed:
+2. Identify the primary task. Run `ko-task show <id>` for its persisted
+   `review_round`, `next_step`, and block metadata. For a blocked task, inspect
+   `ko-task show-run-log <id>` to resolve the latest authoritative verb.
+3. Read other targeted detail only when needed:
 
    ```bash
    "$ORCHESTRA_DIR/bin/ko-task" show <id>
