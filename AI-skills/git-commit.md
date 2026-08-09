@@ -3,7 +3,7 @@ You will make a git commit.
 - Git Commit Message Format:
    - **Title**: Use Title Case For Commit Message Titles. Synthetic. Less than 80 characters.
    - **Leading paragraph**: After the title, write one short paragraph about the main change.
-   - **WHY** (optional): Add a `WHY` section when the problem being solved adds useful context. Describe the user pain, failure mode, or constraint — not the implementation again. Omit the heading when empty.
+   - **WHY** (optional): Explain the motivation for this commit when it adds useful context. Do not repeat the implementation. Omit the heading when empty.
    - **WORK**: Add a `WORK` section with concise Unicode `•` bullets for the main implementation work.
    - **OTHER** (optional): Add an `OTHER` section only for related work that does not belong in the main story. Omit the heading when empty.
    - **NOTES** (optional): Add a `NOTES` section only for useful process detail, such as validation, migration, follow-up, or review context. Omit the heading when empty.

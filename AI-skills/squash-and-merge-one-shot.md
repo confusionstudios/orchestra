@@ -24,10 +24,10 @@ Synthesize a squash-merge commit message in memory and immediately squash-merge 
 
    <One concise paragraph: what this branch delivers and why it matters>
 
-   <When the problem being solved adds useful context, add:>
+   <When the motivation adds useful context, add:>
    WHY
 
-   • <user pain, failure mode, or constraint — not implementation detail>
+   • <motivation, not implementation detail>
 
    WORK
 
