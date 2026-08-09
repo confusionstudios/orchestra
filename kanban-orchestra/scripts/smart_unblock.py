@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""
+smart_unblock.py - durable per-repo smart-unblock watcher.
+
+Runs independently of any narration session. One watcher may run per repo,
+guarded by a flock'd lock file next to the Kanban database. Each cycle the
+watcher gathers current evidence for every blocked task and hands that
+evidence to the configured LLM agent, which decides why the task is blocked,
+whether recovery is safe, and then either recovers the task or records an
+explanation for the user. This module makes no recovery decision itself.
+
+Commands:
+
+    smart_unblock.py start [--agent A] [--interval N]
+    smart_unblock.py status
+    smart_unblock.py stop
+    smart_unblock.py run [--once]     # foreground loop (used by start)
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import config
+import db
+
+POLL_INTERVAL = 60
+LOCK_FILE_NAME = "smart-unblock.lock"
+STATE_FILE_NAME = "smart-unblock-state.json"
+LOG_FILE_NAME = "smart-unblock.log"
+
+WATCHER_AUTHOR = "smart-unblock"
+WATCHER_VERB = "smart-unblock"
+
+# Bound one LLM consultation so a hung agent cannot wedge the watcher.
+AGENT_TIMEOUT = 900
+
+# Grace given to a consultation process group between SIGTERM and SIGKILL.
+CONSULTATION_GRACE = 5.0
+
+MAX_COMMENTS = 12
+MAX_RUN_LOG = 25
+MAX_TRANSCRIPT_LINES = 80
+
+
+class WatcherAlreadyRunning(RuntimeError):
+    """Raised when a second watcher tries to start for the same repo."""
+
+
+# The lock file doubles as the watcher's published metadata, so `stop` can find
+# an in-flight consultation even if the watcher itself has to be killed.
+_LOCK_STATE = {"handle": None, "fields": {}}
+_LOCK_STATE_LOCK = threading.Lock()
+
+# The consultation subprocess the current cycle is waiting on, if any.
+_ACTIVE_CONSULTATION = {"proc": None}
+_CONSULTATION_LOCK = threading.Lock()
+
+
+# ── Paths ──────────────────────────────────────────────────────────────
+
+
+def _runtime_root(db_path: str | None = None) -> Path:
+    root = db.get_runtime_root(db_path)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def watcher_lock_path(db_path: str | None = None) -> Path:
+    return _runtime_root(db_path) / LOCK_FILE_NAME
+
+
+def watcher_state_path(db_path: str | None = None) -> Path:
+    return _runtime_root(db_path) / STATE_FILE_NAME
+
+
+def watcher_log_path(db_path: str | None = None) -> Path:
+    return _runtime_root(db_path) / LOG_FILE_NAME
+
+
+def _repo_root(db_path: str | None = None) -> Path:
+    return Path(db.get_db_path(db_path)).resolve().parent
+
+
+# ── Lock and process lifecycle ─────────────────────────────────────────
+
+
+def _lock_is_free(path: Path) -> bool:
+    """Return whether the watcher lock file is currently unheld."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return True
+    finally:
+        handle.close()
+
+
+def read_watcher_metadata(db_path: str | None = None) -> dict:
+    """Read best-effort `key=value` metadata written by the running watcher."""
+    try:
+        lines = watcher_lock_path(db_path).read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return {}
+    metadata = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and key:
+            metadata[key] = value
+    return metadata
+
+
+def _metadata_int(metadata: dict, key: str) -> int | None:
+    value = metadata.get(key, "")
+    return int(value) if value.isdigit() else None
+
+
+def watcher_status(db_path: str | None = None) -> dict:
+    """Return the watcher's running state plus its recorded metadata."""
+    lock_path = watcher_lock_path(db_path)
+    running = not _lock_is_free(lock_path)
+    metadata = read_watcher_metadata(db_path)
+    pid = metadata.get("pid")
+    return {
+        "running": running,
+        "pid": int(pid) if pid and pid.isdigit() else None,
+        "consultation_pgid": _metadata_int(metadata, "consultation_pgid"),
+        "agent": metadata.get("agent"),
+        "interval": int(metadata["interval"]) if metadata.get("interval", "").isdigit() else None,
+        "started_at": metadata.get("started_at"),
+        "repo_root": str(_repo_root(db_path)),
+        "lock_path": str(lock_path),
+        "state_path": str(watcher_state_path(db_path)),
+        "log_path": str(watcher_log_path(db_path)),
+    }
+
+
+def acquire_watcher_lock(db_path: str | None = None, *, agent: str, interval: int):
+    """Take the repo-scoped watcher lock, or raise WatcherAlreadyRunning.
+
+    The returned handle must stay open for the lifetime of the watcher.
+    """
+    lock_path = watcher_lock_path(db_path)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise WatcherAlreadyRunning(
+            f"a smart-unblock watcher already holds {lock_path}"
+        ) from exc
+    fields = {
+        "pid": str(os.getpid()),
+        "agent": agent,
+        "interval": str(interval),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with _LOCK_STATE_LOCK:
+        _LOCK_STATE["handle"] = handle
+        _LOCK_STATE["fields"] = fields
+        _write_lock_metadata(handle, fields)
+    return handle
+
+
+def _write_lock_metadata(handle, fields: dict) -> None:
+    """Rewrite the lock file with the given `key=value` metadata.
+
+    Overwrite first and truncate after, so a concurrent `status` or `stop`
+    never observes an empty lock file mid-update.
+    """
+    try:
+        handle.seek(0)
+        handle.write("".join(f"{key}={value}\n" for key, value in fields.items()))
+        handle.truncate()
+        handle.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _set_lock_field(key: str, value) -> None:
+    """Publish (or clear, when `value` is None) one metadata field."""
+    with _LOCK_STATE_LOCK:
+        handle = _LOCK_STATE["handle"]
+        if handle is None:
+            return
+        if value is None:
+            _LOCK_STATE["fields"].pop(key, None)
+        else:
+            _LOCK_STATE["fields"][key] = str(value)
+        _write_lock_metadata(handle, _LOCK_STATE["fields"])
+
+
+def release_watcher_lock(handle) -> None:
+    """Drop the watcher lock and clear its metadata."""
+    with _LOCK_STATE_LOCK:
+        if _LOCK_STATE["handle"] is handle:
+            _LOCK_STATE["handle"] = None
+            _LOCK_STATE["fields"] = {}
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.flush()
+    except (OSError, ValueError):
+        pass
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError):
+        pass
+    try:
+        handle.close()
+    except (OSError, ValueError):
+        pass
+
+
+def start_watcher(
+    db_path: str | None = None,
+    *,
+    agent: str | None = None,
+    interval: int = POLL_INTERVAL,
+    wait_seconds: float = 10.0,
+) -> dict:
+    """Spawn the detached watcher process for this repo, at most one."""
+    agent = agent or config.DEFAULT_UNBLOCKER
+    status = watcher_status(db_path)
+    if status["running"]:
+        return {"started": False, "reason": "already running", **status}
+
+    resolved_db = db.get_db_path(db_path)
+    log_path = watcher_log_path(db_path)
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--db",
+        resolved_db,
+        "run",
+        "--agent",
+        agent,
+        "--interval",
+        str(interval),
+    ]
+    with log_path.open("a", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(_repo_root(db_path)),
+        )
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        status = watcher_status(db_path)
+        if status["running"]:
+            return {"started": True, "spawned_pid": proc.pid, **status}
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    return {
+        "started": False,
+        "reason": "watcher did not take the lock",
+        "spawned_pid": proc.pid,
+        **watcher_status(db_path),
+    }
+
+
+def _own_process_group() -> int | None:
+    try:
+        return os.getpgid(0)
+    except OSError:
+        return None
+
+
+def _group_is_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _signal_group(pgid: int, signum: int) -> None:
+    """Signal a process group, ignoring groups that are already gone."""
+    if not pgid or pgid <= 1 or pgid == _own_process_group():
+        return
+    try:
+        os.killpg(pgid, signum)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def kill_consultation_group(pgid: int | None, *, grace: float = CONSULTATION_GRACE) -> bool:
+    """TERM then KILL a consultation process group. Returns whether it was alive."""
+    if not pgid or pgid <= 1 or pgid == _own_process_group():
+        return False
+    if not _group_is_alive(pgid):
+        return False
+
+    _signal_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not _group_is_alive(pgid):
+            return True
+        time.sleep(0.05)
+    _signal_group(pgid, signal.SIGKILL)
+    return True
+
+
+def _terminate_process(proc, *, grace: float = CONSULTATION_GRACE) -> None:
+    """Tear down a consultation subprocess and everything it spawned."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+
+    if pgid:
+        _signal_group(pgid, signal.SIGTERM)
+    else:
+        proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if pgid:
+        _signal_group(pgid, signal.SIGKILL)
+    else:
+        proc.kill()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _register_consultation(proc) -> None:
+    """Track (or clear) the consultation the watcher is currently waiting on."""
+    with _CONSULTATION_LOCK:
+        _ACTIVE_CONSULTATION["proc"] = proc
+
+    pgid = None
+    if proc is not None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = proc.pid
+    _set_lock_field("consultation_pgid", pgid)
+
+
+def terminate_active_consultation() -> bool:
+    """Kill the in-flight consultation, if the watcher is inside one."""
+    with _CONSULTATION_LOCK:
+        proc = _ACTIVE_CONSULTATION["proc"]
+    if proc is None:
+        return False
+    _terminate_process(proc)
+    return True
+
+
+def stop_watcher(db_path: str | None = None, *, timeout: float = 15.0) -> dict:
+    """Signal the running watcher to exit, and take its consultation down too.
+
+    The consultation runs in its own process group, published in the lock
+    metadata, so a stop is complete even when the watcher has to be killed
+    before it can clean up after itself.
+    """
+    status = watcher_status(db_path)
+    if not status["running"]:
+        return {"stopped": False, "reason": "not running", **status}
+
+    pid = status["pid"]
+    if not pid:
+        return {"stopped": False, "reason": "watcher pid unknown", **status}
+
+    # Read before signalling: the watcher clears this as it exits.
+    consultation_pgid = status.get("consultation_pgid")
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        killed = kill_consultation_group(consultation_pgid)
+        return {
+            "stopped": False,
+            "reason": "watcher process is gone",
+            **status,
+            "consultation_killed": killed,
+        }
+    except PermissionError:
+        return {"stopped": False, "reason": "not permitted to signal watcher", **status}
+
+    lock_path = watcher_lock_path(db_path)
+    deadline = time.monotonic() + timeout
+    stopped = False
+    while time.monotonic() < deadline:
+        if _lock_is_free(lock_path):
+            stopped = True
+            break
+        time.sleep(0.1)
+
+    if not stopped:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        stopped = _lock_is_free(lock_path)
+
+    # The watcher normally reaps its own consultation; make sure of it either way.
+    killed = kill_consultation_group(consultation_pgid)
+    return {
+        **watcher_status(db_path),
+        "stopped": stopped,
+        "pid": pid,
+        "consultation_pgid": consultation_pgid,
+        "consultation_killed": killed,
+    }
+
+
+# ── Repeated-block suppression state ───────────────────────────────────
+
+
+def read_state(db_path: str | None = None) -> dict:
+    try:
+        raw = watcher_state_path(db_path).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(state: dict, db_path: str | None = None) -> None:
+    path = watcher_state_path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+# ── Evidence ───────────────────────────────────────────────────────────
+
+
+def _git_output(args, repo_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def _is_watcher_transcript(path: str) -> bool:
+    """Return whether a transcript was written by a smart-unblock consultation."""
+    return f"-{WATCHER_VERB}-" in os.path.basename(path)
+
+
+def _newest_transcript_tail(paths: list[str]) -> dict:
+    """Return the newest of `paths` with a bounded tail of its contents."""
+    if not paths:
+        return {"path": "", "tail": ""}
+    newest = max(paths, key=lambda p: (os.stat(p).st_mtime_ns, os.path.basename(p)))
+    try:
+        lines = Path(newest).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {"path": newest, "tail": ""}
+    return {"path": newest, "tail": "\n".join(lines[-MAX_TRANSCRIPT_LINES:])}
+
+
+def _transcript_tails(task_id: int, db_path: str | None = None) -> tuple[dict, dict]:
+    """Return the newest task transcript and the newest watcher transcript.
+
+    The watcher's own consultation transcripts are kept separate so they can be
+    offered to the LLM as prior context without disturbing the fingerprint.
+    """
+    task_dir = db.get_artifacts_root(db_path) / f"task-{task_id}"
+    candidates = [p for p in glob.glob(str(task_dir / "*.log")) if os.path.isfile(p)]
+    task_logs = [p for p in candidates if not _is_watcher_transcript(p)]
+    watcher_logs = [p for p in candidates if _is_watcher_transcript(p)]
+    return _newest_transcript_tail(task_logs), _newest_transcript_tail(watcher_logs)
+
+
+def collect_block_evidence(conn, task_id: int, db_path: str | None = None) -> dict:
+    """Gather the current repository evidence for one blocked task.
+
+    Everything the watcher itself produced — its comments, its run-log entries,
+    and its consultation transcripts — is separated into the `prior_unblock_*`
+    keys, which are excluded from the fingerprint below. The LLM still sees its
+    own earlier reasoning, but the watcher cannot retrigger itself.
+    """
+    repo_root = _repo_root(db_path)
+    task = db.get_task(conn, task_id) or {}
+
+    comments = db.get_comments(conn, task_id)
+    prior_notes = [c for c in comments if c.get("author") == WATCHER_AUTHOR]
+    other_comments = [c for c in comments if c.get("author") != WATCHER_AUTHOR]
+
+    run_log = [r for r in db.get_run_log(conn, task_id) if r.get("author") != WATCHER_AUTHOR]
+    transcript, watcher_transcript = _transcript_tails(task_id, db_path)
+
+    return {
+        "task": {k: v for k, v in task.items() if k != "updated_at"},
+        "comments": other_comments[-MAX_COMMENTS:],
+        "run_log": run_log[:MAX_RUN_LOG],
+        "transcript": transcript,
+        "stash_list": _git_output(["stash", "list"], repo_root),
+        "worktree_status": _git_output(["status", "--porcelain"], repo_root),
+        "current_branch": _git_output(["rev-parse", "--abbrev-ref", "HEAD"], repo_root),
+        "prior_unblock_notes": prior_notes[-MAX_COMMENTS:],
+        "prior_unblock_transcript": watcher_transcript,
+        "repo_root": str(repo_root),
+    }
+
+
+# Evidence the watcher produced itself; reacting to it would loop forever.
+SELF_AUTHORED_EVIDENCE_KEYS = ("prior_unblock_notes", "prior_unblock_transcript")
+
+
+def evidence_fingerprint(evidence: dict) -> str:
+    """Hash the parts of the evidence the watcher should react to."""
+    material = {
+        k: v for k, v in evidence.items() if k not in SELF_AUTHORED_EVIDENCE_KEYS
+    }
+    payload = json.dumps(material, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ── LLM consultation ───────────────────────────────────────────────────
+
+
+def build_unblock_prompt(evidence: dict) -> str:
+    """Render the decision prompt handed to the configured LLM."""
+    task = evidence.get("task", {})
+    task_id = task.get("id")
+    repo_root = evidence.get("repo_root", "")
+    return f"""You are the Kanban Orchestra smart-unblock agent for one repository.
+
+Task {task_id} is blocked. Decide why it is blocked, whether recovery is safe
+right now, and then either recover it or record a clear explanation for the
+user. Make exactly one decision and then stop.
+
+Repository root: {repo_root}
+Task CLI: "$ORCHESTRA_DIR/bin/ko-task"
+
+Collected evidence (JSON):
+
+{json.dumps(evidence, indent=2, default=str)}
+
+Investigate further with read-only commands when the evidence is not enough,
+for example `ko-task show {task_id}`, `ko-task show-comments {task_id}`,
+`ko-task show-run-log {task_id}`, `git status --porcelain`, `git stash list`,
+and reading the transcript path above.
+
+If recovery is clearly safe and supported by this evidence, recover the task:
+
+    "$ORCHESTRA_DIR/bin/ko-task" continue {task_id} [--add-review-rounds N]
+
+Then record what you resumed and why:
+
+    cat <<'EOF' | "$ORCHESTRA_DIR/bin/ko-task" comment {task_id} --message-stdin --comment --author {WATCHER_AUTHOR}
+    <what you resumed and the evidence that made it safe>
+    EOF
+
+If recovery is not clearly safe — the block needs a human decision, the
+worktree holds changes you cannot attribute, the evidence is ambiguous, or the
+task needs product input — change nothing and record one comment explaining
+the block, what evidence is missing, and what the user should decide:
+
+    cat <<'EOF' | "$ORCHESTRA_DIR/bin/ko-task" comment {task_id} --message-stdin --comment --author {WATCHER_AUTHOR}
+    <why this task is blocked and what the user must decide>
+    EOF
+
+Leave exactly one comment, and always pass `--author {WATCHER_AUTHOR}` so the
+watcher recognises the comment as its own and does not reconsider this block
+because of it. Do not edit files, change branches, stash, discard, or commit
+anything. Do not set task status directly.
+"""
+
+
+def _wait_for_consultation(proc, timeout: int, stop_event) -> int | None:
+    """Wait for the consultation, returning None if stopped or timed out."""
+    deadline = time.monotonic() + timeout if timeout else None
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return None
+        try:
+            return proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+
+
+def invoke_unblock_agent(
+    agent: str,
+    prompt: str,
+    task_id: int,
+    db_path: str | None = None,
+    *,
+    timeout: int = AGENT_TIMEOUT,
+    stop_event: threading.Event | None = None,
+) -> dict:
+    """Run the configured LLM on the prompt and capture its transcript.
+
+    The agent gets its own process group and is tracked while it runs, so a
+    watcher shutdown can take the consultation down with it instead of leaving
+    an orphan that acts on the task after `stop` reported success.
+    """
+    cmd_template = config.resolve_agent_command(agent)
+    if cmd_template is None:
+        return {
+            "agent": agent,
+            "returncode": None,
+            "error": f"unknown agent '{agent}'",
+            "transcript_path": "",
+        }
+
+    cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
+
+    transcript_path = ""
+    transcript_file = None
+    try:
+        path = db.new_agent_transcript_path(task_id, WATCHER_VERB, agent, db_path=db_path)
+        transcript_file = path.open("w", encoding="utf-8")
+        transcript_path = str(path)
+    except (RuntimeError, OSError):
+        transcript_file = None
+        transcript_path = ""
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(_repo_root(db_path)),
+            stdin=subprocess.DEVNULL,
+            stdout=transcript_file or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        if transcript_file is not None:
+            transcript_file.close()
+        return {
+            "agent": agent,
+            "returncode": None,
+            "error": f"could not launch agent: {exc}",
+            "transcript_path": transcript_path,
+        }
+
+    _register_consultation(proc)
+    try:
+        returncode = _wait_for_consultation(proc, timeout, stop_event)
+        if returncode is None:
+            interrupted = stop_event is not None and stop_event.is_set()
+            _terminate_process(proc)
+            error = (
+                "agent stopped with the watcher"
+                if interrupted
+                else f"agent timed out after {timeout}s"
+            )
+            return {
+                "agent": agent,
+                "returncode": None,
+                "error": error,
+                "interrupted": interrupted,
+                "transcript_path": transcript_path,
+            }
+    finally:
+        _register_consultation(None)
+        if transcript_file is not None:
+            transcript_file.close()
+
+    return {
+        "agent": agent,
+        "returncode": returncode,
+        "transcript_path": transcript_path,
+    }
+
+
+# ── Poll cycle ─────────────────────────────────────────────────────────
+
+
+def poll_once(
+    conn,
+    db_path: str | None = None,
+    *,
+    agent: str | None = None,
+    stop_event: threading.Event | None = None,
+) -> list[dict]:
+    """Consider every blocked task once and return one result per task."""
+    agent = agent or config.DEFAULT_UNBLOCKER
+    state = read_state(db_path)
+    blocked = db.list_tasks(conn, status="blocked", page_size=None)
+    results = []
+
+    for row in blocked:
+        if stop_event is not None and stop_event.is_set():
+            break
+        task_id = row["id"]
+        evidence = collect_block_evidence(conn, task_id, db_path)
+        fingerprint = evidence_fingerprint(evidence)
+        key = str(task_id)
+        if state.get(key, {}).get("fingerprint") == fingerprint:
+            results.append({"task_id": task_id, "action": "skipped-unchanged"})
+            continue
+
+        prompt = build_unblock_prompt(evidence)
+        outcome = invoke_unblock_agent(agent, prompt, task_id, db_path, stop_event=stop_event)
+        if outcome.get("interrupted"):
+            # The consultation never reached a decision; reconsider after restart.
+            results.append({"task_id": task_id, "action": "interrupted", **outcome})
+            break
+        state[key] = {
+            "fingerprint": fingerprint,
+            "considered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "agent": outcome.get("agent"),
+            "returncode": outcome.get("returncode"),
+        }
+        if outcome.get("error"):
+            message = f"smart-unblock could not consult {agent}: {outcome['error']}"
+        else:
+            message = (
+                f"smart-unblock consulted {agent} on this block "
+                f"(exit {outcome.get('returncode')})"
+            )
+            if outcome.get("transcript_path"):
+                message += f". Transcript: {outcome['transcript_path']}"
+        db.add_run_log(conn, task_id, message, verb=WATCHER_VERB, author=WATCHER_AUTHOR)
+        results.append({"task_id": task_id, "action": "consulted", **outcome})
+
+    blocked_keys = {str(row["id"]) for row in blocked}
+    state = {k: v for k, v in state.items() if k in blocked_keys}
+    write_state(state, db_path)
+    return results
+
+
+def run_watcher(
+    db_path: str | None = None,
+    *,
+    agent: str | None = None,
+    interval: int = POLL_INTERVAL,
+    max_cycles: int | None = None,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Hold the repo lock and poll for blocked tasks until stopped."""
+    agent = agent or config.DEFAULT_UNBLOCKER
+    stop_event = stop_event or threading.Event()
+    handle = acquire_watcher_lock(db_path, agent=agent, interval=interval)
+
+    def _request_stop(_signum, _frame):
+        stop_event.set()
+
+    installed_signals = []
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, _request_stop)
+            installed_signals.append(signum)
+        except ValueError:
+            pass  # not on the main thread (tests)
+
+    cycles = 0
+    try:
+        while not stop_event.is_set():
+            conn = db.connect(db_path)
+            try:
+                poll_once(conn, db_path, agent=agent, stop_event=stop_event)
+            except Exception as exc:  # keep the watcher alive across bad cycles
+                print(f"smart-unblock cycle failed: {exc}", flush=True)
+            finally:
+                conn.close()
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                break
+            stop_event.wait(interval)
+    finally:
+        # Never leave a consultation behind: a killed watcher must not leave an
+        # agent that can still comment on or continue a task.
+        terminate_active_consultation()
+        for signum in installed_signals:
+            try:
+                signal.signal(signum, signal.SIG_DFL)
+            except ValueError:
+                pass
+        release_watcher_lock(handle)
+    return cycles
+
+
+# ── CLI ────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Kanban Orchestra smart-unblock watcher")
+    parser.add_argument("--db", dest="db_path", default=None)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_start = sub.add_parser("start", help="start the background watcher for this repo")
+    p_start.add_argument("--agent", default=None)
+    p_start.add_argument("--interval", type=int, default=POLL_INTERVAL)
+
+    sub.add_parser("status", help="show watcher state for this repo")
+    sub.add_parser("stop", help="stop the watcher for this repo")
+
+    p_run = sub.add_parser("run", help="run the watcher loop in the foreground")
+    p_run.add_argument("--agent", default=None)
+    p_run.add_argument("--interval", type=int, default=POLL_INTERVAL)
+    p_run.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.command == "start":
+        print(json.dumps(start_watcher(args.db_path, agent=args.agent, interval=args.interval), indent=2))
+        return 0
+    if args.command == "status":
+        print(json.dumps(watcher_status(args.db_path), indent=2))
+        return 0
+    if args.command == "stop":
+        print(json.dumps(stop_watcher(args.db_path), indent=2))
+        return 0
+
+    try:
+        run_watcher(
+            args.db_path,
+            agent=args.agent,
+            interval=args.interval,
+            max_cycles=1 if args.once else None,
+        )
+    except WatcherAlreadyRunning as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
