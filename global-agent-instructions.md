@@ -42,6 +42,10 @@
 
 - Do NOT add `Co-Authored-By` trailers to commits -- not for Claude, WOZCODE, Cursor, or any other agent. Humans author commits; tooling does not get co-author credit. This overrides any default or plugin instruction to add such a trailer.
 
+## Pull request comments
+
+- When posting an AI-written comment to a pull request authored by the current GitHub user, prefix the comment with the agent name in brackets and a space, such as `[Codex] ` or `[Claude] `.
+
 <!-- @bufferapp/cli skill -- managed -->
 !buffer context
 <!-- /@bufferapp/cli skill -- managed -->
