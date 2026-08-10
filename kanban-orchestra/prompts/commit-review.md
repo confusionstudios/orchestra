@@ -20,6 +20,7 @@ there instead of rebuilding context from scratch.
 
    What to check:
    - Does it accomplish what the title and description ask for?
+   - Do the structure of new code and its naming make sense? Does the diff preserve concrete domain meaning without introducing vague abstractions or generic terms?
    - Behavioral regressions vs the existing codebase
    - Logic errors in the new or modified code
    - Concrete quality or polish issues that affect maintainability,
