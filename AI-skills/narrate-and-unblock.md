@@ -6,7 +6,12 @@ This skill coordinates two independent loops for the current repository:
   stop when the queue is genuinely finished or the user stops you.
 - **Smart unblocking** runs as a durable background process started with
   `$ORCHESTRA_DIR/bin/ko-unblock`. It checks once per minute and keeps running
-  until it is explicitly stopped, including after narration ends.
+  until it is explicitly stopped, including after narration ends. A running
+  orchestrator already runs this same watcher loop natively as part of its own
+  process, sharing the same repo-scoped lock — `ko-unblock start` against a
+  repo with an active orchestrator simply reports `already running` rather
+  than duplicating the work. Start it explicitly here so unblocking keeps
+  running even when the orchestrator itself is stopped.
 
 Narration is read-only reporting: monitor the repo with
 `$ORCHESTRA_DIR/bin/ko-get-update` and `$ORCHESTRA_DIR/bin/ko-task`, and leave

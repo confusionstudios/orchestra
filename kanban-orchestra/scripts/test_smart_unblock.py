@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config
 import db
 import smart_unblock
 
@@ -236,31 +237,41 @@ class TestDuplicateSuppression(SmartUnblockTestCase):
 
 
 class TestRepeatedBlockSuppression(SmartUnblockTestCase):
+    def _identifying_invoke(self, agent, prompt, tid, db_path=None, **kwargs):
+        """Fake `invoke_unblock_agent` that leaves a conforming BLOCKED decision."""
+        db.add_comment(
+            self.conn,
+            tid,
+            f"smart-unblock ({agent}): BLOCKED needs a human decision: unattributed worktree changes.",
+            author=smart_unblock.WATCHER_AUTHOR,
+        )
+        return {"agent": agent, "returncode": 0}
+
     def test_unchanged_block_is_only_sent_once(self):
         self._blocked_task()
 
         with patch.object(
-            smart_unblock, "invoke_unblock_agent", return_value={"agent": "sonnet", "returncode": 0}
+            smart_unblock, "invoke_unblock_agent", side_effect=self._identifying_invoke
         ) as invoke:
             first = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
             second = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
 
         self.assertEqual(invoke.call_count, 1)
-        self.assertEqual(first[0]["action"], "consulted")
+        self.assertEqual(first[0]["action"], "explained")
         self.assertEqual(second[0]["action"], "skipped-unchanged")
 
     def test_changed_evidence_is_reconsidered(self):
         task_id = self._blocked_task()
 
         with patch.object(
-            smart_unblock, "invoke_unblock_agent", return_value={"agent": "sonnet", "returncode": 0}
+            smart_unblock, "invoke_unblock_agent", side_effect=self._identifying_invoke
         ) as invoke:
             smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
             db.add_comment(self.conn, task_id, "Operator: use the stashed work", author="operator")
             results = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
 
         self.assertEqual(invoke.call_count, 2)
-        self.assertEqual(results[0]["action"], "consulted")
+        self.assertEqual(results[0]["action"], "explained")
 
     def test_watcher_own_comment_does_not_retrigger_consultation(self):
         task_id = self._blocked_task()
@@ -269,7 +280,7 @@ class TestRepeatedBlockSuppression(SmartUnblockTestCase):
             db.add_comment(
                 self.conn,
                 tid,
-                "Needs a human decision: unattributed worktree changes.",
+                f"smart-unblock ({agent}): BLOCKED needs a human decision: unattributed worktree changes.",
                 author=smart_unblock.WATCHER_AUTHOR,
             )
             return {"agent": agent, "returncode": 0}
@@ -293,7 +304,7 @@ class TestRepeatedBlockSuppression(SmartUnblockTestCase):
         task_cli = Path(__file__).resolve().parent / "task.py"
         script = (
             'echo "watcher consultation output"\n'
-            'printf %s "recovery is unsafe: unattributed worktree changes" '
+            'printf %s "smart-unblock (sonnet): BLOCKED recovery is unsafe: unattributed worktree changes" '
             f'| "{sys.executable}" "{task_cli}" comment {task_id} '
             "--message-stdin --comment --author smart-unblock\n"
         )
@@ -306,7 +317,7 @@ class TestRepeatedBlockSuppression(SmartUnblockTestCase):
                 first = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
                 second = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
 
-        self.assertEqual(first[0]["action"], "consulted")
+        self.assertEqual(first[0]["action"], "explained")
         self.assertEqual(first[0]["returncode"], 0)
         self.assertEqual(second[0]["action"], "skipped-unchanged")
 
@@ -325,7 +336,7 @@ class TestRepeatedBlockSuppression(SmartUnblockTestCase):
         task_id = self._blocked_task()
 
         with patch.object(
-            smart_unblock, "invoke_unblock_agent", return_value={"agent": "sonnet", "returncode": 0}
+            smart_unblock, "invoke_unblock_agent", side_effect=self._identifying_invoke
         ):
             smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
             self.assertIn(str(task_id), smart_unblock.read_state(self.db_path))
@@ -414,7 +425,10 @@ class TestEvidenceAndInvocation(SmartUnblockTestCase):
 
         self.assertIn(f"Task {task_id} is blocked", prompt)
         self.assertIn("review_cap", prompt)
-        self.assertIn(f"continue {task_id}", prompt)
+        self.assertIn(f"comment {task_id} --message-stdin", prompt)
+        self.assertIn("RESUME", prompt)
+        self.assertIn("BLOCKED", prompt)
+        self.assertIn("do not touch task status yourself", prompt)
         self.assertIn("Decide why it is blocked", prompt)
 
     def test_invoke_runs_the_configured_agent_command_with_the_prompt(self):
@@ -507,6 +521,131 @@ class TestEvidenceAndInvocation(SmartUnblockTestCase):
 
         messages = [r["message"] for r in db.get_run_log(self.conn, task_id)]
         self.assertTrue(any("smart-unblock consulted sonnet" in m for m in messages))
+
+
+class TestParseDecision(unittest.TestCase):
+    def test_resume_without_rounds(self):
+        decision = smart_unblock.parse_decision(
+            "smart-unblock (sonnet): RESUME the block is stale", "sonnet"
+        )
+        self.assertEqual(decision, {"action": "resume", "add_review_rounds": None, "reason": "the block is stale"})
+
+    def test_resume_with_rounds(self):
+        decision = smart_unblock.parse_decision(
+            "smart-unblock (sonnet): RESUME +2 grant more review rounds", "sonnet"
+        )
+        self.assertEqual(
+            decision, {"action": "resume", "add_review_rounds": 2, "reason": "grant more review rounds"}
+        )
+
+    def test_blocked(self):
+        decision = smart_unblock.parse_decision(
+            "smart-unblock (sonnet): BLOCKED needs a human", "sonnet"
+        )
+        self.assertEqual(decision, {"action": "blocked", "reason": "needs a human"})
+
+    def test_wrong_agent_is_not_recognised(self):
+        self.assertIsNone(
+            smart_unblock.parse_decision("smart-unblock (codex): RESUME safe", "sonnet")
+        )
+
+    def test_missing_verdict_is_not_recognised(self):
+        self.assertIsNone(
+            smart_unblock.parse_decision("smart-unblock (sonnet): looks fine to me", "sonnet")
+        )
+
+    def test_missing_identity_is_not_recognised(self):
+        self.assertIsNone(smart_unblock.parse_decision("RESUME safe", "sonnet"))
+
+
+class TestResumeAndRetryProtocol(SmartUnblockTestCase):
+    """The watcher -- never the agent -- performs the resume, strictly after
+    reading back an already-durable, verified decision comment. These cover
+    the recovery path itself and the retry behaviour for the ways a
+    consultation can fail to produce a trustworthy decision."""
+
+    def _resume_invoke(self, message):
+        def invoke(agent, prompt, tid, db_path=None, **kwargs):
+            db.add_comment(self.conn, tid, message.format(agent=agent), author=smart_unblock.WATCHER_AUTHOR)
+            return {"agent": agent, "returncode": 0}
+        return invoke
+
+    def test_verified_resume_is_applied_by_the_watcher_itself(self):
+        task_id = self._blocked_task()
+        with patch.object(
+            smart_unblock,
+            "invoke_unblock_agent",
+            side_effect=self._resume_invoke("smart-unblock ({agent}): RESUME +1 stale review cap"),
+        ):
+            results = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        self.assertEqual(results[0]["action"], "recovered")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["max_review_rounds"], config.MAX_REVIEW_ROUNDS + 1)
+        # The decision comment (already durable before the watcher acted) is
+        # necessarily older than the "Operator continued..." comment the
+        # watcher's own continuation adds.
+        decision = next(c for c in db.get_comments(self.conn, task_id) if c["author"] == smart_unblock.WATCHER_AUTHOR)
+        operator = next(c for c in db.get_comments(self.conn, task_id) if c["author"] == "operator")
+        self.assertLess(decision["id"], operator["id"])
+
+    def test_resume_that_cannot_be_applied_is_not_fingerprinted(self):
+        """RESUME without a rounds grant on a review-cap block is invalid --
+        the watcher must not silently trust or fingerprint it."""
+        task_id = self._blocked_task()  # review_cap block, needs +N
+        with patch.object(
+            smart_unblock,
+            "invoke_unblock_agent",
+            side_effect=self._resume_invoke("smart-unblock ({agent}): RESUME looks stale"),
+        ):
+            results = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        self.assertEqual(results[0]["action"], "resume-failed")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertNotIn(str(task_id), smart_unblock.read_state(self.db_path))
+
+    def test_nonzero_exit_is_not_trusted_even_with_a_decision_comment(self):
+        """A consultation that exits nonzero is treated as failed, even if it
+        left what looks like a valid decision comment on its way out."""
+        task_id = self._blocked_task()
+
+        def invoke(agent, prompt, tid, db_path=None, **kwargs):
+            db.add_comment(
+                self.conn, tid, f"smart-unblock ({agent}): RESUME +1 looks safe", author=smart_unblock.WATCHER_AUTHOR
+            )
+            return {"agent": agent, "returncode": 1}
+
+        with patch.object(smart_unblock, "invoke_unblock_agent", side_effect=invoke):
+            results = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        self.assertEqual(results[0]["action"], "consult-failed")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertNotIn(str(task_id), smart_unblock.read_state(self.db_path))
+
+    def test_nonzero_exit_is_retried_on_the_next_cycle(self):
+        task_id = self._blocked_task()
+        calls = []
+
+        def flaky_invoke(agent, prompt, tid, db_path=None, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                return {"agent": agent, "returncode": 1}
+            db.add_comment(
+                self.conn, tid, f"smart-unblock ({agent}): RESUME +1 safe now", author=smart_unblock.WATCHER_AUTHOR
+            )
+            return {"agent": agent, "returncode": 0}
+
+        with patch.object(smart_unblock, "invoke_unblock_agent", side_effect=flaky_invoke):
+            first = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+            second = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        self.assertEqual(first[0]["action"], "consult-failed")
+        self.assertEqual(second[0]["action"], "recovered")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(db.get_task(self.conn, task_id)["status"], "ready")
 
 
 class TestCli(SmartUnblockTestCase):

@@ -29,6 +29,7 @@ import task as task_cli
 import orchestrator_lock
 import agent_runner
 import prompt_builder
+import smart_unblock
 
 # Import shared agent registry from the orchestra repo
 ORCHESTRA_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -46,6 +47,7 @@ MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
 MAX_PRIOR_COMMENTS = config.MAX_PRIOR_COMMENTS
 POLL_INTERVAL = config.POLL_INTERVAL
 HEARTBEAT_INTERVAL = config.HEARTBEAT_INTERVAL
+SMART_UNBLOCK_INTERVAL = smart_unblock.POLL_INTERVAL
 STOP_AFTER_TASK_FILE = config.STOP_AFTER_TASK_FILE
 DASHBOARD_START_REQUEST_FILE = config.DASHBOARD_START_REQUEST_FILE
 MASTER_BRANCHES = {"master", "main"}
@@ -193,6 +195,51 @@ def stop_heartbeat():
     _heartbeat_stop.set()
     if _heartbeat_thread is not None:
         _heartbeat_thread.join(timeout=5)
+
+
+# ── Smart-unblock thread ────────────────────────────────────────────────
+#
+# Runs the same watcher loop used by the standalone `ko-unblock` CLI, but as a
+# background thread of this orchestrator process instead of a separate
+# process. It shares the watcher's repo-scoped lock, so a standalone watcher
+# and this thread never consult the same blocked task at once — whichever
+# takes the lock first does the work, and the other logs and stands down.
+
+_smart_unblock_stop = threading.Event()
+_smart_unblock_thread = None
+
+
+def _smart_unblock_loop(db_path):
+    """Reassess blocked tasks on SMART_UNBLOCK_INTERVAL until told to stop."""
+    try:
+        smart_unblock.run_watcher(
+            db_path,
+            agent=config.DEFAULT_UNBLOCKER,
+            interval=SMART_UNBLOCK_INTERVAL,
+            stop_event=_smart_unblock_stop,
+        )
+    except smart_unblock.WatcherAlreadyRunning as exc:
+        log(f"smart-unblock: {exc}; leaving blocked-task recovery to that watcher")
+    except Exception as exc:  # keep the orchestrator alive on watcher failures
+        log(f"smart-unblock thread failed: {exc}")
+
+
+def start_smart_unblock(db_path):
+    global _smart_unblock_thread
+    _smart_unblock_stop.clear()
+    _smart_unblock_thread = threading.Thread(
+        target=_smart_unblock_loop, args=(db_path,), daemon=True,
+    )
+    _smart_unblock_thread.start()
+
+
+def stop_smart_unblock():
+    _smart_unblock_stop.set()
+    # Belt-and-braces: also reach in and kill a consultation directly, in case
+    # the watcher loop hasn't yet reached its own stop_event check.
+    smart_unblock.terminate_active_consultation()
+    if _smart_unblock_thread is not None:
+        _smart_unblock_thread.join(timeout=15)
 
 
 def set_runtime_idle(conn, status_message="Waiting for ready tasks"):
@@ -2389,7 +2436,7 @@ def update_runtime_after_task(conn, task_id, succeeded):
         set_runtime_idle(conn)
         return
 
-    next_ready = db.find_ready_task(conn)
+    next_ready = smart_unblock.find_dispatchable_task(conn)
     if next_ready:
         db.update_runtime(
             conn,
@@ -2421,6 +2468,7 @@ def process_pinned_task(task, conn):
     """
     current = task
     task_id = task["id"]
+    db_path = db.get_connection_db_path(conn) or db.get_db_path()
 
     while True:
         if _task_on_disallowed_master_branch(current):
@@ -2433,6 +2481,17 @@ def process_pinned_task(task, conn):
                 author="orchestrator",
             )
             log(f"Blocked ready task on protected branch '{current['branch']}'", task_id)
+            update_runtime_after_task(conn, task_id, False)
+            return False
+
+        # Shared consultation gate: never mark running while smart-unblock still
+        # holds this task for validation/rollback (including a rogue ready).
+        if smart_unblock.is_consultation_gated(task_id, db_path):
+            log(
+                "Pinned task is under smart-unblock consultation; "
+                "not marking running until validation/rollback completes",
+                task_id,
+            )
             update_runtime_after_task(conn, task_id, False)
             return False
 
@@ -2521,6 +2580,16 @@ def process_pinned_task(task, conn):
                 log(f"Child task blocked; supertask {parent_id} also blocked", task_id)
 
         if current["status"] == "ready" and current["next_step"] != "none":
+            # Same gate as find_dispatchable_task: a rogue consultation can flip
+            # blocked→ready after advance() returns; do not pin-continue it.
+            if smart_unblock.is_consultation_gated(task_id, db_path):
+                log(
+                    "Pinned task became ready during smart-unblock consultation; "
+                    "not continuing until validation/rollback completes",
+                    task_id,
+                )
+                update_runtime_after_task(conn, task_id, False)
+                return False
             log(f"Continuing pinned task at step={current['next_step']}", task_id)
             continue
 
@@ -2536,6 +2605,7 @@ def main_loop(conn, *, db_path=None):
     init_runtime(conn)
     recover_running_tasks(conn)
     start_heartbeat(db.get_db_path())
+    start_smart_unblock(db.get_db_path())
     set_runtime_idle(conn)
 
     stop_file = Path(db.get_db_path()).parent / STOP_AFTER_TASK_FILE
@@ -2550,6 +2620,7 @@ def main_loop(conn, *, db_path=None):
             db.update_runtime(conn, status="stopping", active_agents=0,
                               status_message="Stop-after-task requested")
             stop_heartbeat()
+            stop_smart_unblock()
             db.update_runtime(conn, status="stopped",
                               status_message="Stopped")
             break
@@ -2567,7 +2638,7 @@ def main_loop(conn, *, db_path=None):
             )
             blocked_gate_logged_task_ids.add(gated_task["id"])
 
-        task = db.find_ready_task(conn)
+        task = smart_unblock.find_dispatchable_task(conn)
         if not task:
             time.sleep(POLL_INTERVAL)
             continue
@@ -2654,6 +2725,7 @@ def main(argv=None):
         except Exception:
             pass
         stop_heartbeat()
+        stop_smart_unblock()
         try:
             db.update_runtime(conn, status="stopped",
                               status_message="Stopped")
@@ -2667,6 +2739,7 @@ def main(argv=None):
     finally:
         stop_dashboard()
         stop_heartbeat()
+        stop_smart_unblock()
         release_singleton_lock()
         if conn is not None:
             conn.close()

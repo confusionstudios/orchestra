@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -47,6 +48,7 @@ active_agent_processes = _load_local_module(
 orchestrator_lock = _load_local_module("kanban_test_orchestrator_lock", "orchestrator_lock.py", canonical_name="orchestrator_lock")
 orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
 agent_runner = orchestrator.agent_runner
+smart_unblock = orchestrator.smart_unblock
 config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
 fleet = _load_local_module("kanban_test_fleet", "fleet.py")
@@ -1137,6 +1139,18 @@ class TestDB(unittest.TestCase):
 
         found = db.find_ready_task(self.conn)
         self.assertEqual(found["id"], t3)
+
+    def test_find_ready_task_exclude_ids(self):
+        first = db.add_task(self.conn, "First", branch="b", sequence_index=1)
+        second = db.add_task(self.conn, "Second", branch="b", sequence_index=2)
+        db.update_task(self.conn, first, status="ready")
+        db.update_task(self.conn, second, status="ready")
+        self.assertEqual(db.find_ready_task(self.conn)["id"], first)
+        self.assertEqual(
+            db.find_ready_task(self.conn, exclude_ids=[first])["id"],
+            second,
+        )
+        self.assertIsNone(db.find_ready_task(self.conn, exclude_ids=[first, second]))
 
     def test_find_ready_task_tie_breaks_by_id_when_sequence_index_matches(self):
         t1 = db.add_task(self.conn, "Ready one", branch="b", sequence_index=100)
@@ -5090,6 +5104,649 @@ class TestHeartbeat(unittest.TestCase):
         rt_after = db.get_runtime(self.conn)
         # Heartbeat should have updated; at minimum updated_at should differ
         self.assertIsNotNone(rt_after["last_heartbeat_at"])
+
+
+class TestSmartUnblockThread(unittest.TestCase):
+    """Test the orchestrator's native smart-unblock thread wiring."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.repo_root = Path(self.tmpdir.name)
+        self.db_path = str(self.repo_root / "kanban-orchestra.db")
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        orchestrator.stop_smart_unblock()
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def test_start_delegates_to_the_watcher_with_task_defaults(self):
+        calls = []
+
+        def fake_run_watcher(db_path, *, agent=None, interval=None, stop_event=None):
+            calls.append((db_path, agent, interval, stop_event))
+
+        with patch.object(smart_unblock, "run_watcher", side_effect=fake_run_watcher):
+            orchestrator.start_smart_unblock(self.db_path)
+            orchestrator._smart_unblock_thread.join(timeout=5)
+
+        self.assertEqual(len(calls), 1)
+        called_db_path, called_agent, called_interval, called_stop_event = calls[0]
+        self.assertEqual(called_db_path, self.db_path)
+        self.assertEqual(called_agent, config.DEFAULT_UNBLOCKER)
+        self.assertEqual(called_interval, orchestrator.SMART_UNBLOCK_INTERVAL)
+        self.assertIs(called_stop_event, orchestrator._smart_unblock_stop)
+
+    def test_stop_sets_stop_event_and_terminates_active_consultation(self):
+        released = threading.Event()
+
+        def blocking_run_watcher(db_path, *, agent=None, interval=None, stop_event=None):
+            stop_event.wait()
+            released.set()
+
+        with (
+            patch.object(smart_unblock, "run_watcher", side_effect=blocking_run_watcher),
+            patch.object(smart_unblock, "terminate_active_consultation") as terminate,
+        ):
+            orchestrator.start_smart_unblock(self.db_path)
+            self.assertFalse(orchestrator._smart_unblock_stop.is_set())
+            orchestrator.stop_smart_unblock()
+
+        self.assertTrue(orchestrator._smart_unblock_stop.is_set())
+        terminate.assert_called_once()
+        self.assertTrue(released.wait(timeout=5))
+        self.assertFalse(orchestrator._smart_unblock_thread.is_alive())
+
+    def test_thread_survives_a_conflicting_watcher_lock(self):
+        log_messages = []
+
+        def capture_log(message, task_id=None):
+            log_messages.append(message)
+
+        handle = smart_unblock.acquire_watcher_lock(self.db_path, agent="sonnet", interval=60)
+        try:
+            with patch.object(orchestrator, "log", side_effect=capture_log):
+                orchestrator.start_smart_unblock(self.db_path)
+                orchestrator._smart_unblock_thread.join(timeout=5)
+        finally:
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertFalse(orchestrator._smart_unblock_thread.is_alive())
+        self.assertTrue(
+            any("smart-unblock" in m and "already" in m.lower() for m in log_messages),
+            log_messages,
+        )
+
+    def test_main_loop_starts_and_stops_it_around_stop_after_task(self):
+        stop_file = self.repo_root / config.STOP_AFTER_TASK_FILE
+        stop_file.write_text("")
+
+        start_calls = []
+        stop_calls = []
+
+        with (
+            patch.object(orchestrator, "start_smart_unblock", side_effect=lambda p: start_calls.append(p)),
+            patch.object(orchestrator, "stop_smart_unblock", side_effect=lambda: stop_calls.append(True)),
+            patch.object(orchestrator, "start_heartbeat"),
+            patch.object(orchestrator, "stop_heartbeat"),
+            patch.object(orchestrator.db, "get_db_path", return_value=self.db_path),
+        ):
+            orchestrator.main_loop(self.conn)
+
+        self.assertEqual(start_calls, [self.db_path])
+        self.assertEqual(stop_calls, [True])
+
+
+class TestSmartUnblockNativeRecovery(unittest.TestCase):
+    """End-to-end: the orchestrator's own thread recovers or explains blocked tasks."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.repo_root = Path(self.tmpdir.name)
+        self.db_path = str(self.repo_root / "kanban-orchestra.db")
+        self.conn = db.connect(self.db_path)
+        self.old_interval = orchestrator.SMART_UNBLOCK_INTERVAL
+        orchestrator.SMART_UNBLOCK_INTERVAL = 3600  # one poll only per test
+
+    def tearDown(self):
+        orchestrator.stop_smart_unblock()
+        orchestrator.SMART_UNBLOCK_INTERVAL = self.old_interval
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _blocked_task(self, title="Blocked task"):
+        # A plain resume_next_step (no review-cap block_reason) lets a bare
+        # `ko-task continue` recover it, unlike a structured review-cap block
+        # which requires an explicit --add-review-rounds grant.
+        task_id = db.add_task(self.conn, title, branch="feat-x")
+        db.update_task(
+            self.conn, task_id, status="blocked",
+            resume_next_step="commit-make",
+        )
+        return task_id
+
+    def _wait_until(self, predicate, timeout=10.0, interval=0.05):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return False
+
+    def test_recoverable_block_resumes_with_one_decision_comment(self):
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        # The agent only ever records its decision comment -- it never calls
+        # `continue` itself. The watcher performs the resume afterward, once
+        # it has read this already-durable comment back from the database.
+        # The orchestrator always consults `config.DEFAULT_UNBLOCKER`
+        # ("sonnet" here), so the decision must identify that agent by name.
+        script = (
+            'printf %s "smart-unblock (sonnet): RESUME safe to resume: '
+            'only a stale review-cap block" '
+            f'| "{sys.executable}" "{task_cli}" comment {task_id} '
+            "--message-stdin --comment --author smart-unblock\n"
+        )
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                orchestrator.start_smart_unblock(self.db_path)
+                recovered = self._wait_until(
+                    lambda: any(
+                        c["author"] == "smart-unblock"
+                        for c in db.get_comments(self.conn, task_id)
+                    )
+                )
+                self._wait_until(lambda: db.get_task(self.conn, task_id)["status"] == "ready")
+
+        self.assertTrue(recovered)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "ready")
+        notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "smart-unblock"]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0]["message"].startswith("smart-unblock (sonnet):"))
+        # The decision comment must have been recorded before the `continue`
+        # call's own "Operator continued..." comment, proving the protocol
+        # order and not just the eventual presence of both.
+        operator_notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "operator"]
+        self.assertEqual(len(operator_notes), 1)
+        self.assertLess(notes[0]["id"], operator_notes[0]["id"])
+
+    def test_unresolved_block_stays_blocked_with_one_explanatory_comment(self):
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        script = (
+            'printf %s "smart-unblock (sonnet): BLOCKED not safe: worktree '
+            'holds unattributed changes; a human must decide" '
+            f'| "{sys.executable}" "{task_cli}" comment {task_id} '
+            "--message-stdin --comment --author smart-unblock\n"
+        )
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                orchestrator.start_smart_unblock(self.db_path)
+                commented = self._wait_until(
+                    lambda: any(
+                        c["author"] == "smart-unblock"
+                        for c in db.get_comments(self.conn, task_id)
+                    )
+                )
+
+        self.assertTrue(commented)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "smart-unblock"]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0]["message"].startswith("smart-unblock (sonnet):"))
+
+    def test_nonconforming_agent_cannot_make_the_task_runnable(self):
+        """A resume now happens only through the watcher's own verified-decision
+        path (`_apply_resume_decision`); the agent is never told to call
+        `continue` at all. If a misbehaving agent ignores that and tries to
+        mutate the task directly instead of leaving a decision comment, the
+        CLI itself refuses the call inside the consultation's process tree
+        (task.SMART_UNBLOCK_CONSULTATION_ENV_VAR), so the task cannot be made
+        runnable no matter how the orchestrator's task loop is scheduled."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        script = f'"{sys.executable}" "{task_cli}" continue {task_id}\n'
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                results = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+
+        # The refused `continue` makes the consultation exit nonzero, so the
+        # watcher treats it as a failed consult rather than a verified decision.
+        self.assertEqual(results[0]["action"], "consult-failed")
+        run_log = db.get_run_log(self.conn, task_id)
+        self.assertTrue(
+            any("could not consult" in r["message"] for r in run_log),
+            run_log,
+        )
+        # The watcher itself never called _apply_resume_decision for this
+        # cycle, so it must not fingerprint the evidence as handled.
+        self.assertNotIn(str(task_id), smart_unblock.read_state(self.db_path))
+        # The rogue `continue` call itself was refused by the CLI (it ran
+        # inside the consultation's process tree), so the task genuinely
+        # never left `blocked` -- not merely "unfingerprinted".
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        operator_notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "operator"]
+        self.assertEqual(operator_notes, [])
+
+    def test_rogue_continue_is_refused_even_outside_the_watcher(self):
+        """Direct proof that the CLI itself -- not just the watcher's own
+        bookkeeping -- refuses `continue`/`set` while the consultation
+        environment flag is set, regardless of who invokes it or when."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+
+        env = dict(os.environ)
+        env["KANBAN_DB"] = self.db_path
+        env[task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR] = "1"
+        result = subprocess.run(
+            [sys.executable, str(task_cli), "continue", str(task_id)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("disabled during a smart-unblock consultation", result.stderr)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+
+    def test_lock_gate_refuses_continue_even_without_env_flag(self):
+        """The shared lock metadata gate refuses continue for the task under
+        consultation even when ORCHESTRA_SMART_UNBLOCK_CONSULTATION is unset."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        handle = smart_unblock.acquire_watcher_lock(
+            self.db_path, agent="fake-unblocker", interval=60
+        )
+        try:
+            smart_unblock._set_lock_field("consultation_task_id", task_id)
+            env = dict(os.environ)
+            env["KANBAN_DB"] = self.db_path
+            env.pop(task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR, None)
+            result = subprocess.run(
+                [sys.executable, str(task_cli), "continue", str(task_id)],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            smart_unblock._set_lock_field("consultation_task_id", None)
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("disabled during a smart-unblock consultation", result.stderr)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+
+    def test_stale_unlocked_consultation_metadata_does_not_gate(self):
+        """Leftover consultation_task_id after crash/SIGKILL must not permanently
+        gate dispatch or continue/set once the watcher flock is gone."""
+        ready_id = db.add_task(self.conn, "Stale gate ready", branch="feat-x")
+        db.update_task(self.conn, ready_id, status="ready", next_step="commit-make")
+
+        lock_path = smart_unblock.watcher_lock_path(self.db_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Simulate abrupt exit: metadata left behind, flock not held.
+        lock_path.write_text(
+            "\n".join(
+                [
+                    "pid=999999",
+                    "agent=fake-unblocker",
+                    "interval=60",
+                    f"consultation_task_id={ready_id}",
+                    "consultation_pgid=999998",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        status = smart_unblock.watcher_status(self.db_path)
+        self.assertFalse(status["running"])
+        self.assertIsNone(status["consultation_task_id"])
+        self.assertIsNone(status["consultation_pgid"])
+        self.assertIsNone(smart_unblock.active_consultation_task_id(self.db_path))
+        self.assertEqual(
+            smart_unblock.find_dispatchable_task(self.conn, self.db_path)["id"],
+            ready_id,
+        )
+
+        blocked_id = self._blocked_task("Stale unlocked consultation")
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        env = dict(os.environ)
+        env["KANBAN_DB"] = self.db_path
+        env.pop(task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR, None)
+
+        # Point the stale gate at the blocked task for continue/set checks.
+        lock_path.write_text(
+            f"pid=999999\nconsultation_task_id={blocked_id}\n",
+            encoding="utf-8",
+        )
+
+        set_result = subprocess.run(
+            [
+                sys.executable,
+                str(task_cli),
+                "set",
+                str(blocked_id),
+                "--title",
+                "stale-gate-renamed",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(set_result.returncode, 0, set_result.stderr)
+        self.assertEqual(
+            db.get_task(self.conn, blocked_id)["title"],
+            "stale-gate-renamed",
+        )
+
+        continue_result = subprocess.run(
+            [sys.executable, str(task_cli), "continue", str(blocked_id)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(continue_result.returncode, 0, continue_result.stderr)
+        task = db.get_task(self.conn, blocked_id)
+        self.assertEqual(task["status"], "ready")
+
+    def test_agent_originated_continuation_is_rolled_back(self):
+        """If a consultation somehow mutates status without a verified decision
+        (e.g. by clearing the env gate), the watcher restores blocked before
+        returning so the orchestrator cannot dispatch the rogue-ready task."""
+        task_id = self._blocked_task()
+        # Bypass the env gate and continue in-process via a tiny Python agent
+        # that imports task.continue_blocked_task directly -- proving the
+        # post-consultation rollback, not merely the CLI refusal.
+        script = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import db, task as task_module\n"
+            f"conn = db.connect({self.db_path!r})\n"
+            f"task_module.continue_blocked_task(conn, {task_id})\n"
+            "conn.close()\n"
+        )
+        agent_cmd = [sys.executable, "-c", script, "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                results = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+
+        self.assertEqual(results[0]["action"], "rejected-agent-continuation")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertNotIn(str(task_id), smart_unblock.read_state(self.db_path))
+        run_log = db.get_run_log(self.conn, task_id)
+        self.assertTrue(
+            any("rejected agent-originated status change" in r["message"] for r in run_log),
+            run_log,
+        )
+
+    def test_rogue_ready_stays_undispatchable_while_consultation_runs(self):
+        """A consultation that bypasses the CLI and sets ready must remain
+        undispatchable for the whole subprocess lifetime through rollback.
+
+        The prior synchronous rollback test only checked eventual state after
+        poll_once returned. This asserts the shared gate keeps find_ready_task
+        / dispatch from picking the task up while status is already ready and
+        the consultation has not exited.
+        """
+        task_id = self._blocked_task()
+        ready_marker = self.repo_root / "rogue-ready"
+        release_marker = self.repo_root / "release-rogue"
+        script = (
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import db, task as task_module\n"
+            f"conn = db.connect({self.db_path!r})\n"
+            f"task_module.continue_blocked_task(conn, {task_id})\n"
+            "conn.close()\n"
+            f"open({str(ready_marker)!r}, 'w').close()\n"
+            "deadline = time.time() + 30\n"
+            f"while time.time() < deadline and not os.path.exists({str(release_marker)!r}):\n"
+            "    time.sleep(0.05)\n"
+        )
+        agent_cmd = [sys.executable, "-c", script, "{prompt}"]
+        results_holder: list = []
+        errors: list = []
+
+        def run_poll():
+            conn = db.connect(self.db_path)
+            try:
+                results_holder.extend(
+                    smart_unblock.poll_once(conn, self.db_path, agent="fake-unblocker")
+                )
+            except Exception as exc:  # noqa: BLE001 - surface to main thread
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        handle = smart_unblock.acquire_watcher_lock(
+            self.db_path, agent="fake-unblocker", interval=60
+        )
+        try:
+            with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+                with patch.object(
+                    smart_unblock.config, "resolve_agent_command", return_value=agent_cmd
+                ):
+                    poll_thread = threading.Thread(target=run_poll)
+                    poll_thread.start()
+                    self.assertTrue(
+                        self._wait_until(ready_marker.exists, timeout=10.0),
+                        "rogue consultation never marked the task ready",
+                    )
+                    self.assertEqual(
+                        smart_unblock.active_consultation_task_id(self.db_path),
+                        task_id,
+                    )
+                    check_conn = db.connect(self.db_path)
+                    try:
+                        task = db.get_task(check_conn, task_id)
+                        self.assertEqual(task["status"], "ready")
+                        # Ungated query would see the rogue-ready row.
+                        self.assertEqual(db.find_ready_task(check_conn)["id"], task_id)
+                        # Shared dispatch gate must keep it undispatchable.
+                        self.assertIsNone(
+                            smart_unblock.find_dispatchable_task(check_conn, self.db_path)
+                        )
+                    finally:
+                        check_conn.close()
+                    release_marker.touch()
+                    poll_thread.join(timeout=15)
+                    self.assertFalse(poll_thread.is_alive())
+        finally:
+            if not release_marker.exists():
+                release_marker.touch()
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results_holder[0]["action"], "rejected-agent-continuation")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertIsNone(smart_unblock.active_consultation_task_id(self.db_path))
+
+    def test_rogue_ready_does_not_continue_pinned_task_while_consultation_runs(self):
+        """process_pinned_task must honor consultation_task_id at its post-advance
+        continuation decision, not only main-queue find_dispatchable_task.
+
+        Scenario: advance() blocks the pinned task; a rogue consultation then
+        mutates it to ready while the gate is held. The pinned loop must not
+        mark it running or call advance again until validation/rollback finish.
+        """
+        task_id = db.add_task(self.conn, "Pinned rogue race", branch="feat-x")
+        db.update_task(
+            self.conn,
+            task_id,
+            status="ready",
+            next_step="commit-make",
+            resume_next_step="commit-make",
+        )
+        task = db.get_task(self.conn, task_id)
+
+        ready_marker = self.repo_root / "pinned-rogue-ready"
+        release_marker = self.repo_root / "pinned-release-rogue"
+        advance_blocked = threading.Event()
+        advance_calls = {"n": 0}
+        pinned_errors: list = []
+        pinned_result: list = []
+        results_holder: list = []
+        poll_errors: list = []
+
+        def advance_side_effect(current, conn):
+            advance_calls["n"] += 1
+            if advance_calls["n"] > 1:
+                raise AssertionError(
+                    "process_pinned_task continued into a second advance while "
+                    "the consultation gate was held"
+                )
+            # Plain resume metadata (not review_cap) so the rogue in-process
+            # continue_blocked_task can actually flip the row to ready.
+            db.update_task(
+                conn,
+                task_id,
+                status="blocked",
+                next_step="none",
+                resume_next_step="commit-make",
+            )
+            advance_blocked.set()
+            # Stay inside advance until the rogue consultation has published
+            # ready under the shared gate, so the post-advance continuation
+            # check observes ready + consultation_task_id together.
+            if not self._wait_until(ready_marker.exists, timeout=10.0):
+                raise AssertionError("rogue consultation never marked the task ready")
+            return False
+
+        script = (
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import db, task as task_module\n"
+            f"conn = db.connect({self.db_path!r})\n"
+            f"task_module.continue_blocked_task(conn, {task_id})\n"
+            "conn.close()\n"
+            f"open({str(ready_marker)!r}, 'w').close()\n"
+            "deadline = time.time() + 30\n"
+            f"while time.time() < deadline and not os.path.exists({str(release_marker)!r}):\n"
+            "    time.sleep(0.05)\n"
+        )
+        agent_cmd = [sys.executable, "-c", script, "{prompt}"]
+
+        def run_poll():
+            # Wait until advance has blocked the task so poll_once can see it.
+            if not advance_blocked.wait(timeout=10.0):
+                poll_errors.append(AssertionError("advance never blocked the task"))
+                return
+            conn = db.connect(self.db_path)
+            try:
+                results_holder.extend(
+                    smart_unblock.poll_once(conn, self.db_path, agent="fake-unblocker")
+                )
+            except Exception as exc:  # noqa: BLE001 - surface to main thread
+                poll_errors.append(exc)
+            finally:
+                conn.close()
+
+        def run_pinned():
+            conn = db.connect(self.db_path)
+            try:
+                pinned_result.append(
+                    orchestrator.process_pinned_task(db.get_task(conn, task_id), conn)
+                )
+            except Exception as exc:  # noqa: BLE001 - surface to main thread
+                pinned_errors.append(exc)
+            finally:
+                conn.close()
+
+        handle = smart_unblock.acquire_watcher_lock(
+            self.db_path, agent="fake-unblocker", interval=60
+        )
+        try:
+            with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+                with patch.object(
+                    smart_unblock.config, "resolve_agent_command", return_value=agent_cmd
+                ):
+                    with patch.object(
+                        orchestrator, "advance", side_effect=advance_side_effect
+                    ):
+                        pinned_thread = threading.Thread(target=run_pinned)
+                        poll_thread = threading.Thread(target=run_poll)
+                        pinned_thread.start()
+                        poll_thread.start()
+                        self.assertTrue(
+                            self._wait_until(ready_marker.exists, timeout=10.0),
+                            "rogue consultation never marked the task ready",
+                        )
+                        self.assertEqual(
+                            smart_unblock.active_consultation_task_id(self.db_path),
+                            task_id,
+                        )
+                        check_conn = db.connect(self.db_path)
+                        try:
+                            row = db.get_task(check_conn, task_id)
+                            self.assertEqual(row["status"], "ready")
+                            # Give the pinned loop time to reach the
+                            # post-advance continuation decision under the gate.
+                            time.sleep(0.2)
+                            row = db.get_task(check_conn, task_id)
+                            self.assertEqual(
+                                row["status"],
+                                "ready",
+                                "pinned path must not mark the rogue-ready task running",
+                            )
+                            self.assertEqual(advance_calls["n"], 1)
+                        finally:
+                            check_conn.close()
+                        release_marker.touch()
+                        pinned_thread.join(timeout=15)
+                        poll_thread.join(timeout=15)
+                        self.assertFalse(pinned_thread.is_alive())
+                        self.assertFalse(poll_thread.is_alive())
+        finally:
+            if not release_marker.exists():
+                release_marker.touch()
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertEqual(pinned_errors, [])
+        self.assertEqual(poll_errors, [])
+        self.assertEqual(pinned_result, [False])
+        self.assertEqual(advance_calls["n"], 1)
+        self.assertEqual(results_holder[0]["action"], "rejected-agent-continuation")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertIsNone(smart_unblock.active_consultation_task_id(self.db_path))
+
+    def test_missing_identification_is_not_fingerprinted_forever(self):
+        """A decision comment that never names the configured agent must be
+        reconsidered next cycle instead of being trusted as handled forever."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        script = (
+            'printf %s "not safe: needs a human decision" '
+            f'| "{sys.executable}" "{task_cli}" comment {task_id} '
+            "--message-stdin --comment --author smart-unblock\n"
+        )
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                first = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+                second = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+
+        self.assertEqual(first[0]["action"], "unverified-decision")
+        self.assertEqual(second[0]["action"], "unverified-decision")
+        notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "smart-unblock"]
+        self.assertEqual(len(notes), 2)
 
 
 class TestSingletonLock(unittest.TestCase):

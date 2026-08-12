@@ -1166,7 +1166,7 @@ def get_comments(conn, task_id):
 
 # ── Queries for orchestrator ───────────────────────────────────────────
 
-def find_ready_task(conn):
+def find_ready_task(conn, exclude_ids=None):
     """Find the first queued ready task, ordered by sequence_index then id.
 
     When any supertask is in ``pending_subtasks``, only its runnable children
@@ -1176,9 +1176,19 @@ def find_ready_task(conn):
     Child tasks (parent_task_id IS NOT NULL) are only eligible when:
       1. Their parent supertask has status = 'pending_subtasks', AND
       2. No earlier sibling (lower sequence_index) is still non-done.
+
+    ``exclude_ids`` skips those task ids (used to keep a task under
+    smart-unblock consultation undispatchable even if status was mutated).
     """
+    excluded = [int(i) for i in (exclude_ids or ()) if i is not None]
+    exclude_sql = ""
+    params: list = []
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        exclude_sql = f" AND id NOT IN ({placeholders})"
+        params.extend(excluded)
     row = conn.execute(
-        """WITH has_active_supertask(active) AS (
+        f"""WITH has_active_supertask(active) AS (
                SELECT EXISTS (
                    SELECT 1 FROM tasks active_parent WHERE active_parent.status = 'pending_subtasks'
                )
@@ -1190,6 +1200,7 @@ def find_ready_task(conn):
            )
            SELECT * FROM tasks
            WHERE status = 'ready'
+           {exclude_sql}
            AND (
                (SELECT blocked FROM has_blocked_task) = 0
                OR allow_when_blocked = 1
@@ -1231,7 +1242,8 @@ def find_ready_task(conn):
            )
            ORDER BY CASE WHEN sequence_index IS NULL THEN 1 ELSE 0 END ASC,
                     sequence_index ASC, id ASC
-           LIMIT 1"""
+           LIMIT 1""",
+        params,
     ).fetchone()
     return _row_to_task(row) if row else None
 

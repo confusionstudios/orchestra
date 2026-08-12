@@ -27,6 +27,7 @@ Policy:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -373,7 +374,80 @@ def cmd_add(args, conn):
     _json_out(db.get_task(conn, task_id))
 
 
+# Set on the environment of a smart-unblock consultation subprocess (see
+# smart_unblock.invoke_unblock_agent) so that no shell command it runs -- or
+# any grandchild it spawns -- can mutate task status. The agent is asked to
+# record a decision comment instead of touching status directly, but it is an
+# external LLM with real shell access; nothing in the prompt can be trusted to
+# stop it from ignoring that instruction. Refusing here, in the CLI itself,
+# makes "the agent cannot make the task runnable" true structurally rather
+# than by policing timing afterward: even a rogue `ko-task continue` (or
+# `set`) run from inside a consultation simply errors out and leaves the task
+# untouched, regardless of how the orchestrator's own task loop is scheduled.
+SMART_UNBLOCK_CONSULTATION_ENV_VAR = "ORCHESTRA_SMART_UNBLOCK_CONSULTATION"
+
+# Kept in sync with smart_unblock.LOCK_FILE_NAME. Read here without importing
+# smart_unblock so a consultation subprocess can enforce the shared gate even
+# if it unsets the env flag above.
+_SMART_UNBLOCK_LOCK_NAME = "smart-unblock.lock"
+
+
+def _consultation_task_id_from_lock() -> int | None:
+    """Return the task id under a live smart-unblock consultation, if any.
+
+    The watcher publishes `consultation_task_id` in its flock'd lock metadata
+    for the whole consultation plus validation/rollback window. That metadata
+    is authoritative only while the flock is actually held: abrupt exits
+    (including SIGKILL) can leave stale key=value bytes behind, and those must
+    not permanently refuse continue/set. Probe with a non-blocking exclusive
+    lock — acquire means no live watcher (ignore metadata); BlockingIOError
+    means the watcher holds the flock (trust metadata).
+    """
+    try:
+        lock_path = db.get_runtime_root() / _SMART_UNBLOCK_LOCK_NAME
+        handle = lock_path.open("a+", encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                lines = lock_path.read_text(encoding="utf-8").splitlines()
+            except (FileNotFoundError, OSError):
+                return None
+            for line in lines:
+                key, sep, value = line.partition("=")
+                if sep and key == "consultation_task_id" and value.isdigit():
+                    return int(value)
+            return None
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return None
+    finally:
+        handle.close()
+
+
+def _reject_if_smart_unblock_consultation(command: str, task_id: int | None = None) -> None:
+    blocked_by_env = bool(os.environ.get(SMART_UNBLOCK_CONSULTATION_ENV_VAR))
+    blocked_by_lock = (
+        task_id is not None and _consultation_task_id_from_lock() == task_id
+    )
+    if not blocked_by_env and not blocked_by_lock:
+        return
+    print(
+        f"Error: '{command}' is disabled during a smart-unblock consultation. "
+        "Record a decision comment instead; the watcher applies it after "
+        "verifying it from durable state.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_set(args, conn):
+    _reject_if_smart_unblock_consultation("set", args.task_id)
     task = db.get_task(conn, args.task_id)
     if not task:
         print(f"Error: task {args.task_id} not found", file=sys.stderr)
@@ -710,6 +784,7 @@ def continue_blocked_task(conn, task_id, *, add_review_rounds=None, next_step=No
 
 def cmd_continue(args, conn):
     """Resume a blocked task via review-cap extension or an explicit next step."""
+    _reject_if_smart_unblock_consultation("continue", args.task_id)
     try:
         updated = continue_blocked_task(
             conn,
