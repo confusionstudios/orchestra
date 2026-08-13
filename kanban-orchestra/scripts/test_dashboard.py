@@ -54,6 +54,32 @@ class TestHelpers(unittest.TestCase):
     def test_format_duration_hhmmss(self):
         self.assertEqual(dashboard._format_duration_hhmmss(3661), "01:01:01")
 
+    def test_format_done_recency_recent_uses_relative_words(self):
+        ts = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(dashboard._format_done_recency(ts), "2 hours ago")
+
+    def test_format_done_recency_just_under_cutoff_stays_relative(self):
+        ts = (
+            datetime.now(timezone.utc) - dashboard.DONE_RECENCY_CUTOFF + timedelta(hours=12)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(dashboard._format_done_recency(ts), "6 days ago")
+
+    def test_format_done_recency_at_cutoff_uses_calendar_date(self):
+        done_at = datetime.now(timezone.utc) - dashboard.DONE_RECENCY_CUTOFF
+        ts = done_at.strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(dashboard._format_done_recency(ts), done_at.strftime("%Y-%m-%d"))
+
+    def test_format_done_recency_older_uses_calendar_date(self):
+        self.assertEqual(
+            dashboard._format_done_recency("2026-01-15 09:30:00"),
+            "2026-01-15",
+        )
+
+    def test_format_done_recency_missing_or_invalid_is_empty(self):
+        self.assertEqual(dashboard._format_done_recency(None), "")
+        self.assertEqual(dashboard._format_done_recency(""), "")
+        self.assertEqual(dashboard._format_done_recency("not-a-timestamp"), "")
+
     def test_client_timestamp_is_utc_iso(self):
         self.assertEqual(
             dashboard._client_timestamp("2026-03-30 12:34:56"),
@@ -803,6 +829,43 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertNotIn("task-record-runtime", html)
         self.assertNotIn(">unknown<", html)
 
+    def test_recently_done_shows_finished_after_runtime_from_done_at(self):
+        tid = db.add_task(self.conn, "Finished recency task", branch="feat-finished")
+        db.update_task(self.conn, tid, status="done")
+        done_at = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=5)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self.conn.execute(
+            "UPDATE tasks SET last_ready_at = ?, done_at = ?, updated_at = ? WHERE id = ?",
+            ("2026-01-01 00:00:00", done_at, "2026-01-01 00:00:00", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        runtime_at = html.find("task-record-runtime")
+        finished_at = html.find("task-record-finished")
+        self.assertNotEqual(runtime_at, -1)
+        self.assertNotEqual(finished_at, -1)
+        self.assertLess(runtime_at, finished_at)
+        self.assertIn("2 hours ago", html)
+        self.assertNotIn("2026-01-01", html)
+
+    def test_recently_done_finished_missing_timestamp_is_omitted(self):
+        tid = db.add_task(self.conn, "Missing finished task", branch="feat-finished")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET last_ready_at = ?, done_at = NULL WHERE id = ?",
+            ("2026-05-31 10:00:00", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("Missing finished task", html)
+        self.assertNotIn("task-record-finished", html)
+        self.assertNotIn(">unknown<", html)
+
     def test_recently_done_reviewer_falls_back_to_configured_reviewer(self):
         tid = db.add_task(self.conn, "Done task", branch="feat-done", reviewer_agent="opus")
         db.update_task(self.conn, tid, status="done")
@@ -953,6 +1016,9 @@ class TestTaskRecordLists(unittest.TestCase):
         self.assertIn("task-record-hash", html)
         self.assertIn("1 rejection", html)
         self.assertIn("00:05:00", html)
+        self.assertIn("task-record-finished", html)
+        self.assertIn("2026-05-31", html)
+        self.assertLess(html.find("task-record-runtime"), html.find("task-record-finished"))
         self.assertIn('data-show-more-row data-row-index="5" hidden', html)
         self.assertIn("Show More", html)
         self.assertNotIn("<thead>", html)

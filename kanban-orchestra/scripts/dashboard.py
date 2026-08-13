@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -49,6 +49,7 @@ _FAVICON = Path(__file__).resolve().parent.parent / "favicon.ico"
 # ── Helpers ────────────────────────────────────────────────────────────
 
 STALE_SECONDS = 60  # heartbeat older than this → "stale"
+DONE_RECENCY_CUTOFF = timedelta(days=7)
 _REVIEW_ROUND_DISPLAY_RE = re.compile(r"\b((?:[Rr]eview round)|(?:[Rr]ound)) (\d+)\b")
 
 
@@ -127,6 +128,36 @@ def _done_elapsed_runtime(task: dict) -> str:
     if elapsed < 0:
         return "unknown"
     return _format_duration_hhmmss(elapsed)
+
+
+def _format_done_recency(dt_str: str | None) -> str:
+    """Format a completion timestamp as relative recency or YYYY-MM-DD.
+
+    Completions younger than DONE_RECENCY_CUTOFF use phrases such as
+    "2 hours ago". Older completions use an unambiguous UTC calendar date.
+    Missing or unparseable timestamps return an empty string so callers can
+    omit the Finished field.
+    """
+    dt = _parse_utc_datetime(dt_str)
+    if dt is None:
+        return ""
+    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if secs < 0:
+        secs = 0
+    if secs >= int(DONE_RECENCY_CUTOFF.total_seconds()):
+        return dt.strftime("%Y-%m-%d")
+    if secs < 60:
+        if secs <= 1:
+            return "just now" if secs == 0 else "1 second ago"
+        return f"{secs} seconds ago"
+    if secs < 3600:
+        count = secs // 60
+        return f"{count} minute ago" if count == 1 else f"{count} minutes ago"
+    if secs < 86400:
+        count = secs // 3600
+        return f"{count} hour ago" if count == 1 else f"{count} hours ago"
+    count = secs // 86400
+    return f"{count} day ago" if count == 1 else f"{count} days ago"
 
 
 def _parse_utc_datetime(dt_str: str | None) -> datetime | None:
@@ -1121,6 +1152,15 @@ def render_recently_done(conn) -> str:
                     "runtime",
                     _esc(runtime),
                     css_class="task-record-runtime",
+                )
+            )
+        finished = _format_done_recency(r.get("done_at"))
+        if finished:
+            meta.append(
+                _labeled_meta_html(
+                    "finished",
+                    _esc(finished),
+                    css_class="task-record-finished",
                 )
             )
         attrs = f'data-show-more-row data-row-index="{idx}"'
