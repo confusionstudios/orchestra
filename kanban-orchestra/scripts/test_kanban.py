@@ -4666,19 +4666,26 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
         canonical = repo_root / "AI-skills" / "narrate.md"
         self.assertTrue(canonical.is_file())
         self.assertFalse((repo_root / "AI-skills" / "narrate-and-unblock.md").exists())
+        canonical_text = canonical.read_text(encoding="utf-8")
         first_line = next(
             line.strip()
-            for line in canonical.read_text(encoding="utf-8").splitlines()
+            for line in canonical_text.splitlines()
             if line.strip()
         )
         self.assertNotIn("ko-unblock", first_line)
+        self.assertRegex(first_line, r"(?i)dashboard URL")
+        opening = canonical_text.split("## Opening report", 1)[1].split("## ", 1)[0]
+        self.assertRegex(opening, r"(?i)dashboard URL")
+        self.assertIn("ko-get-update", opening)
+        self.assertNotRegex(canonical_text, r"127\.0\.0\.1:\d+|localhost:\d+")
+        self.assertNotIn("8427", canonical_text)
 
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
             orchestra_dir = Path(orchestra_tmp)
             skills_dir = orchestra_dir / "AI-skills"
             skills_dir.mkdir(parents=True)
             (skills_dir / "narrate.md").write_text(
-                canonical.read_text(encoding="utf-8"),
+                canonical_text,
                 encoding="utf-8",
             )
             home = Path(home_tmp)
@@ -4712,6 +4719,7 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             text = wrapper.read_text(encoding="utf-8")
             self.assertIn("name: orch-kb-narrate\n", text)
             self.assertIn(first_line, text)
+            self.assertRegex(text, r"(?i)dashboard URL")
             self.assertNotIn("ko-unblock", text)
             self.assertIn(
                 "- Location: $ORCHESTRA_DIR/AI-skills/narrate.md\n",

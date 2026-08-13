@@ -1,4 +1,4 @@
-Narrate Kanban Orchestra live in this session.
+Narrate Kanban Orchestra live in this session, including the current dashboard URL when narration starts.
 
 This skill is a read-only narration loop for the current repository. A running
 orchestrator already recovers blocked tasks on its own: about once a minute it
@@ -30,6 +30,13 @@ Immediately sample state and give one short plain-language summary:
 - One grounded clause from new agent output when available
 - Whether native smart unblocking is active (orchestrator running) or idle
   because the orchestrator is stopped
+- Dashboard URL for this repo instance
+
+Take the dashboard URL from the current `ko-get-update` `dashboard:` line, or
+from this repo's runtime metadata (`.kanban-orchestra/dashboard.json` `url`)
+when that metadata matches the monitored instance. Do not hard-code a host or
+port. If the dashboard is not running, say so. Include the URL in this first
+visible update only; later samples stay concise and omit it.
 
 Use the update prefix below. Do not paste raw update output, JSON, logs,
 transcript dumps, or tables. Do not start a background recovery service.
