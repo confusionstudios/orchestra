@@ -199,11 +199,11 @@ def stop_heartbeat():
 
 # ── Smart-unblock thread ────────────────────────────────────────────────
 #
-# Runs the same watcher loop used by the standalone `ko-unblock` CLI, but as a
-# background thread of this orchestrator process instead of a separate
-# process. It shares the watcher's repo-scoped lock, so a standalone watcher
-# and this thread never consult the same blocked task at once — whichever
-# takes the lock first does the work, and the other logs and stands down.
+# Runs blocked-task recovery as a background thread of this orchestrator
+# process. Each cycle gathers evidence for blocked tasks and asks the
+# configured LLM whether to continue the task or leave a durable explanation.
+# The loop holds a repo-scoped flock so a second thread cannot consult the
+# same blocked task at once.
 
 _smart_unblock_stop = threading.Event()
 _smart_unblock_thread = None
@@ -219,7 +219,7 @@ def _smart_unblock_loop(db_path):
             stop_event=_smart_unblock_stop,
         )
     except smart_unblock.WatcherAlreadyRunning as exc:
-        log(f"smart-unblock: {exc}; leaving blocked-task recovery to that watcher")
+        log(f"smart-unblock: {exc}; recovery already running for this repo")
     except Exception as exc:  # keep the orchestrator alive on watcher failures
         log(f"smart-unblock thread failed: {exc}")
 

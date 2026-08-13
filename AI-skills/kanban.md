@@ -6,7 +6,7 @@ Before doing anything else, determine which role applies:
 
 | Role | How to tell | What to do |
 |------|-------------|------------|
-| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for a one-shot status. Use `narrate-and-unblock` for a live feed with conservative recovery. Use `task list/show/add/set` for task management. |
+| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for a one-shot status. Use `narrate-and-unblock` for a live feed that observes native orchestrator recovery. Use `task list/show/add/set` for task management. |
 | **Sticky coder** | The orchestrator explicitly spawned you as the designated build agent for a specific task | Follow the full workflow for that task. |
 
 Default role: observer.
@@ -254,6 +254,10 @@ Notes:
 - The dashboard is the repo-scoped read-only status surface. For intervention,
   stop or interrupt the repo instance, inspect with `ko-get-update`, use
   `ko-task` to record or unblock the affected task, and restart explicitly.
+- A running orchestrator reassesses blocked tasks natively about once a
+  minute. It consults `$ORCHESTRA_DEFAULT_UNBLOCKER` and either continues a
+  recoverable task or leaves a durable `smart-unblock` comment. Narration
+  observes those comments and does not start a separate recovery process.
 
 ## Default operating pattern
 
@@ -371,6 +375,8 @@ Read the result like this:
   check the blocked task comment and worktree before restarting.
 - `status = error` means an orchestrator-level failure.
 - List blocked tasks with `task list --status blocked`.
+- Native smart-unblock comments (author `smart-unblock`) record whether
+  recovery was safe or what the operator must decide.
 - Resume a review-cap block with
   `task continue <id> --add-review-rounds N`, or resume other blocks with
   `task continue <id> --next-step <step>`. Legacy pre-schema review-cap

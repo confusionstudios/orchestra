@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Focused tests for the durable smart-unblock watcher."""
+"""Focused tests for native smart-unblock recovery."""
 
-import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import threading
 import time
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,19 +35,9 @@ def capture_popen():
         yield popen
 
 
-def wait_until(predicate, timeout=10.0, interval=0.05):
-    """Poll `predicate` until it is true or the timeout expires."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
-
-
 class SmartUnblockTestCase(unittest.TestCase):
     def setUp(self):
-        self.repo_root = Path(tempfile.mkdtemp(prefix="ko-unblock-"))
+        self.repo_root = Path(tempfile.mkdtemp(prefix="ko-smart-unblock-"))
         self.db_path = str(self.repo_root / "kanban-orchestra.db")
         self.conn = db.connect(self.db_path)
 
@@ -91,87 +79,6 @@ class TestProcessLifecycle(SmartUnblockTestCase):
         self.assertEqual(cycles, 1)
         self.assertTrue(seen["running_during_cycle"])
         self.assertFalse(smart_unblock.watcher_status(self.db_path)["running"])
-
-    def test_stop_watcher_terminates_running_process(self):
-        started = smart_unblock.start_watcher(self.db_path, agent="sonnet", interval=3600)
-        self.addCleanup(smart_unblock.stop_watcher, self.db_path)
-        self.assertTrue(started["started"], started)
-        pid = started["pid"]
-        self.assertIsNotNone(pid)
-
-        stopped = smart_unblock.stop_watcher(self.db_path)
-        self.assertTrue(stopped["stopped"], stopped)
-        self.assertFalse(smart_unblock.watcher_status(self.db_path)["running"])
-
-    def test_stop_kills_an_in_flight_consultation_and_its_delayed_actions(self):
-        """A real detached watcher inside a long-running consultation: `stop`
-        must remove the watcher *and* the agent, so nothing acts on the task
-        afterwards."""
-        task_id = self._blocked_task()
-        scripts_dir = str(Path(__file__).resolve().parent)
-        task_cli = Path(scripts_dir) / "task.py"
-        started = self.repo_root / "agent-started"
-        late = self.repo_root / "agent-late-action"
-        agent_script = (
-            f'touch "{started}"\n'
-            "sleep 2\n"
-            f'printf %s "late unblock action" | "{sys.executable}" "{task_cli}" '
-            f"comment {task_id} --message-stdin --comment --author smart-unblock\n"
-            f'touch "{late}"\n'
-            "sleep 30\n"
-        )
-        agent_cmd = ["/bin/sh", "-c", agent_script, "fake-agent", "{prompt}"]
-        runner = self.repo_root / "run_watcher.py"
-        runner.write_text(
-            textwrap.dedent(
-                f"""
-                import sys
-                sys.path.insert(0, {scripts_dir!r})
-                import smart_unblock
-                smart_unblock.config.resolve_agent_command = lambda agent: {agent_cmd!r}
-                sys.exit(smart_unblock.main(
-                    ["--db", {self.db_path!r}, "run", "--agent", "sonnet", "--interval", "3600"]
-                ))
-                """
-            ).strip(),
-            encoding="utf-8",
-        )
-
-        env = dict(os.environ, KANBAN_DB=self.db_path)
-        watcher = subprocess.Popen(
-            [sys.executable, str(runner)],
-            cwd=str(self.repo_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        )
-        self.addCleanup(smart_unblock.stop_watcher, self.db_path)
-
-        self.assertTrue(
-            wait_until(lambda: started.exists()), "fake agent never started"
-        )
-        self.assertTrue(
-            wait_until(lambda: smart_unblock.watcher_status(self.db_path)["consultation_pgid"]),
-            "watcher never published its consultation process group",
-        )
-        pgid = smart_unblock.watcher_status(self.db_path)["consultation_pgid"]
-
-        stopped = smart_unblock.stop_watcher(self.db_path)
-
-        self.assertTrue(stopped["stopped"], stopped)
-        self.assertFalse(smart_unblock.watcher_status(self.db_path)["running"])
-        self.assertFalse(
-            smart_unblock._group_is_alive(pgid), "consultation survived the stop"
-        )
-        watcher.wait(timeout=10)
-
-        # Well past the point where the agent would have acted on the task.
-        time.sleep(2.5)
-        self.assertFalse(late.exists(), "stopped agent still performed a delayed action")
-        messages = [c["message"] for c in db.get_comments(self.conn, task_id)]
-        self.assertNotIn("late unblock action", messages)
 
     def test_watcher_survives_a_failing_cycle(self):
         calls = []
@@ -221,17 +128,6 @@ class TestDuplicateSuppression(SmartUnblockTestCase):
                 with self.assertRaises(smart_unblock.WatcherAlreadyRunning):
                     smart_unblock.run_watcher(self.db_path, agent="sonnet", interval=0, max_cycles=1)
             poll.assert_not_called()
-        finally:
-            smart_unblock.release_watcher_lock(handle)
-
-    def test_start_watcher_is_a_no_op_when_already_running(self):
-        handle = smart_unblock.acquire_watcher_lock(self.db_path, agent="sonnet", interval=60)
-        try:
-            with patch.object(subprocess, "Popen") as popen:
-                result = smart_unblock.start_watcher(self.db_path, agent="sonnet")
-            popen.assert_not_called()
-            self.assertFalse(result["started"])
-            self.assertEqual(result["reason"], "already running")
         finally:
             smart_unblock.release_watcher_lock(handle)
 
@@ -648,26 +544,21 @@ class TestResumeAndRetryProtocol(SmartUnblockTestCase):
         self.assertEqual(db.get_task(self.conn, task_id)["status"], "ready")
 
 
-class TestCli(SmartUnblockTestCase):
-    def test_status_command_prints_json(self):
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            code = smart_unblock.main(["--db", self.db_path, "status"])
+class TestStandaloneWatcherRemoved(unittest.TestCase):
+    def test_ko_unblock_wrapper_is_gone(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        self.assertFalse((repo_root / "bin" / "ko-unblock").exists())
 
-        self.assertEqual(code, 0)
-        self.assertIn('"running": false', buffer.getvalue())
-
-    def test_run_command_reports_an_existing_watcher(self):
-        handle = smart_unblock.acquire_watcher_lock(self.db_path, agent="sonnet", interval=60)
-        buffer = io.StringIO()
-        try:
-            with redirect_stderr(buffer):
-                code = smart_unblock.main(["--db", self.db_path, "run", "--once"])
-        finally:
-            smart_unblock.release_watcher_lock(handle)
-
-        self.assertEqual(code, 1)
-        self.assertIn("already holds", buffer.getvalue())
+    def test_user_facing_docs_do_not_describe_a_standalone_watcher(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        for relative in (
+            "README.md",
+            "AI-skills/narrate-and-unblock.md",
+            "AI-skills/kanban.md",
+            "tasks/kanban-orchestra-spec.md",
+        ):
+            text = (repo_root / relative).read_text(encoding="utf-8")
+            self.assertNotIn("ko-unblock", text, relative)
 
 
 if __name__ == "__main__":

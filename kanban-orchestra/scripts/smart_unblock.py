@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 """
-smart_unblock.py - durable per-repo smart-unblock watcher.
+smart_unblock.py - native blocked-task recovery for the orchestrator.
 
-Runs independently of any narration session. One watcher may run per repo,
-guarded by a flock'd lock file next to the Kanban database. Each cycle the
-watcher gathers current evidence for every blocked task and hands that
-evidence to the configured LLM agent, which decides why the task is blocked,
-whether recovery is safe, and then either recovers the task or records an
-explanation for the user. This module makes no recovery decision itself.
+The orchestrator runs this loop as a background thread. Each cycle gathers
+current evidence for every blocked task and hands that evidence to the
+configured LLM agent, which decides why the task is blocked, whether recovery
+is safe, and then either recovers the task or records an explanation for the
+user. This module makes no recovery decision itself.
 
-Commands:
-
-    smart_unblock.py start [--agent A] [--interval N]
-    smart_unblock.py status
-    smart_unblock.py stop
-    smart_unblock.py run [--once]     # foreground loop (used by start)
+A repo-scoped flock serializes the loop and publishes live consultation
+metadata so dispatch and `ko-task continue`/`set` can refuse a task while a
+consultation is in flight.
 """
 
 from __future__ import annotations
 
-import argparse
 import fcntl
 import glob
 import hashlib
@@ -42,7 +37,6 @@ import task as task_module
 POLL_INTERVAL = 60
 LOCK_FILE_NAME = "smart-unblock.lock"
 STATE_FILE_NAME = "smart-unblock-state.json"
-LOG_FILE_NAME = "smart-unblock.log"
 
 WATCHER_AUTHOR = "smart-unblock"
 WATCHER_VERB = "smart-unblock"
@@ -62,8 +56,9 @@ class WatcherAlreadyRunning(RuntimeError):
     """Raised when a second watcher tries to start for the same repo."""
 
 
-# The lock file doubles as the watcher's published metadata, so `stop` can find
-# an in-flight consultation even if the watcher itself has to be killed.
+# The lock file doubles as published consultation metadata so dispatch and
+# `ko-task continue`/`set` can see which task is gated while a consultation
+# is in flight.
 _LOCK_STATE = {"handle": None, "fields": {}}
 _LOCK_STATE_LOCK = threading.Lock()
 
@@ -89,33 +84,11 @@ def watcher_state_path(db_path: str | None = None) -> Path:
     return _runtime_root(db_path) / STATE_FILE_NAME
 
 
-def watcher_log_path(db_path: str | None = None) -> Path:
-    return _runtime_root(db_path) / LOG_FILE_NAME
-
-
 def _repo_root(db_path: str | None = None) -> Path:
     return Path(db.get_db_path(db_path)).resolve().parent
 
 
-# ── Lock and process lifecycle ─────────────────────────────────────────
-
-
-def _lock_is_free(path: Path) -> bool:
-    """Return whether the watcher lock file is currently unheld."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+", encoding="utf-8")
-    try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return True
-    finally:
-        handle.close()
+# ── Lock and consultation lifecycle ────────────────────────────────────
 
 
 def read_watcher_metadata(db_path: str | None = None) -> dict:
@@ -189,7 +162,6 @@ def watcher_status(db_path: str | None = None) -> dict:
         "repo_root": str(_repo_root(db_path)),
         "lock_path": str(lock_path),
         "state_path": str(watcher_state_path(db_path)),
-        "log_path": str(watcher_log_path(db_path)),
     }
 
 
@@ -256,8 +228,8 @@ def acquire_watcher_lock(db_path: str | None = None, *, agent: str, interval: in
 def _write_lock_metadata(handle, fields: dict) -> None:
     """Rewrite the lock file with the given `key=value` metadata.
 
-    Overwrite first and truncate after, so a concurrent `status` or `stop`
-    never observes an empty lock file mid-update.
+    Overwrite first and truncate after, so a concurrent probe never observes
+    an empty lock file mid-update.
     """
     try:
         handle.seek(0)
@@ -303,59 +275,6 @@ def release_watcher_lock(handle) -> None:
         pass
 
 
-def start_watcher(
-    db_path: str | None = None,
-    *,
-    agent: str | None = None,
-    interval: int = POLL_INTERVAL,
-    wait_seconds: float = 10.0,
-) -> dict:
-    """Spawn the detached watcher process for this repo, at most one."""
-    agent = agent or config.DEFAULT_UNBLOCKER
-    status = watcher_status(db_path)
-    if status["running"]:
-        return {"started": False, "reason": "already running", **status}
-
-    resolved_db = db.get_db_path(db_path)
-    log_path = watcher_log_path(db_path)
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--db",
-        resolved_db,
-        "run",
-        "--agent",
-        agent,
-        "--interval",
-        str(interval),
-    ]
-    with log_path.open("a", encoding="utf-8") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            cwd=str(_repo_root(db_path)),
-        )
-
-    deadline = time.monotonic() + wait_seconds
-    while time.monotonic() < deadline:
-        status = watcher_status(db_path)
-        if status["running"]:
-            return {"started": True, "spawned_pid": proc.pid, **status}
-        if proc.poll() is not None:
-            break
-        time.sleep(0.1)
-
-    return {
-        "started": False,
-        "reason": "watcher did not take the lock",
-        "spawned_pid": proc.pid,
-        **watcher_status(db_path),
-    }
-
-
 def _own_process_group() -> int | None:
     try:
         return os.getpgid(0)
@@ -381,23 +300,6 @@ def _signal_group(pgid: int, signum: int) -> None:
         os.killpg(pgid, signum)
     except (ProcessLookupError, PermissionError, OSError):
         pass
-
-
-def kill_consultation_group(pgid: int | None, *, grace: float = CONSULTATION_GRACE) -> bool:
-    """TERM then KILL a consultation process group. Returns whether it was alive."""
-    if not pgid or pgid <= 1 or pgid == _own_process_group():
-        return False
-    if not _group_is_alive(pgid):
-        return False
-
-    _signal_group(pgid, signal.SIGTERM)
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        if not _group_is_alive(pgid):
-            return True
-        time.sleep(0.05)
-    _signal_group(pgid, signal.SIGKILL)
-    return True
 
 
 def _terminate_process(proc, *, grace: float = CONSULTATION_GRACE) -> None:
@@ -452,64 +354,6 @@ def terminate_active_consultation() -> bool:
         return False
     _terminate_process(proc)
     return True
-
-
-def stop_watcher(db_path: str | None = None, *, timeout: float = 15.0) -> dict:
-    """Signal the running watcher to exit, and take its consultation down too.
-
-    The consultation runs in its own process group, published in the lock
-    metadata, so a stop is complete even when the watcher has to be killed
-    before it can clean up after itself.
-    """
-    status = watcher_status(db_path)
-    if not status["running"]:
-        return {"stopped": False, "reason": "not running", **status}
-
-    pid = status["pid"]
-    if not pid:
-        return {"stopped": False, "reason": "watcher pid unknown", **status}
-
-    # Read before signalling: the watcher clears this as it exits.
-    consultation_pgid = status.get("consultation_pgid")
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        killed = kill_consultation_group(consultation_pgid)
-        return {
-            "stopped": False,
-            "reason": "watcher process is gone",
-            **status,
-            "consultation_killed": killed,
-        }
-    except PermissionError:
-        return {"stopped": False, "reason": "not permitted to signal watcher", **status}
-
-    lock_path = watcher_lock_path(db_path)
-    deadline = time.monotonic() + timeout
-    stopped = False
-    while time.monotonic() < deadline:
-        if _lock_is_free(lock_path):
-            stopped = True
-            break
-        time.sleep(0.1)
-
-    if not stopped:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-        stopped = _lock_is_free(lock_path)
-
-    # The watcher normally reaps its own consultation; make sure of it either way.
-    killed = kill_consultation_group(consultation_pgid)
-    return {
-        **watcher_status(db_path),
-        "stopped": stopped,
-        "pid": pid,
-        "consultation_pgid": consultation_pgid,
-        "consultation_killed": killed,
-    }
 
 
 # ── Repeated-block suppression state ───────────────────────────────────
@@ -1072,17 +916,6 @@ def run_watcher(
     stop_event = stop_event or threading.Event()
     handle = acquire_watcher_lock(db_path, agent=agent, interval=interval)
 
-    def _request_stop(_signum, _frame):
-        stop_event.set()
-
-    installed_signals = []
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(signum, _request_stop)
-            installed_signals.append(signum)
-        except ValueError:
-            pass  # not on the main thread (tests)
-
     cycles = 0
     try:
         while not stop_event.is_set():
@@ -1098,65 +931,8 @@ def run_watcher(
                 break
             stop_event.wait(interval)
     finally:
-        # Never leave a consultation behind: a killed watcher must not leave an
+        # Never leave a consultation behind: a stopped loop must not leave an
         # agent that can still comment on or continue a task.
         terminate_active_consultation()
-        for signum in installed_signals:
-            try:
-                signal.signal(signum, signal.SIG_DFL)
-            except ValueError:
-                pass
         release_watcher_lock(handle)
     return cycles
-
-
-# ── CLI ────────────────────────────────────────────────────────────────
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Kanban Orchestra smart-unblock watcher")
-    parser.add_argument("--db", dest="db_path", default=None)
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_start = sub.add_parser("start", help="start the background watcher for this repo")
-    p_start.add_argument("--agent", default=None)
-    p_start.add_argument("--interval", type=int, default=POLL_INTERVAL)
-
-    sub.add_parser("status", help="show watcher state for this repo")
-    sub.add_parser("stop", help="stop the watcher for this repo")
-
-    p_run = sub.add_parser("run", help="run the watcher loop in the foreground")
-    p_run.add_argument("--agent", default=None)
-    p_run.add_argument("--interval", type=int, default=POLL_INTERVAL)
-    p_run.add_argument("--once", action="store_true", help="run a single cycle and exit")
-    return parser
-
-
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
-
-    if args.command == "start":
-        print(json.dumps(start_watcher(args.db_path, agent=args.agent, interval=args.interval), indent=2))
-        return 0
-    if args.command == "status":
-        print(json.dumps(watcher_status(args.db_path), indent=2))
-        return 0
-    if args.command == "stop":
-        print(json.dumps(stop_watcher(args.db_path), indent=2))
-        return 0
-
-    try:
-        run_watcher(
-            args.db_path,
-            agent=args.agent,
-            interval=args.interval,
-            max_cycles=1 if args.once else None,
-        )
-    except WatcherAlreadyRunning as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

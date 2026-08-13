@@ -159,11 +159,11 @@ accounts, or billing — install and authenticate each CLI yourself.
    Use `ko-task continue` to resume blocked tasks after a review-round cap
    (`--add-review-rounds N`) or with an explicit recovery step (`--next-step`).
    Legacy pre-schema review-cap blocks: `--add-review-rounds N --next-step <maker-step>`.
-   For hands-off recovery, `ko-unblock start` runs one background watcher per
-   repo that checks blocked tasks every minute and asks the configured LLM to
-   decide, from current repository evidence, whether to continue a task or
-   record an explanation for you. `ko-unblock status` and `ko-unblock stop`
-   manage it; it keeps running until stopped.
+   While the orchestrator is running, native smart unblocking also reassesses
+   blocked tasks about once a minute. It asks the configured unblocker agent
+   (`ORCHESTRA_DEFAULT_UNBLOCKER`) to continue a recoverable task or leave a
+   durable `smart-unblock` comment explaining what you must decide. Stopping
+   the orchestrator stops that recovery loop.
 
 6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
    plain-language request:
@@ -262,6 +262,7 @@ export ORCHESTRA_DEFAULT_PLANNER=sonnet
 export ORCHESTRA_DEFAULT_PLAN_REVIEWER=codex
 export ORCHESTRA_DEFAULT_SUPER_PLANNER=opus
 export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
+export ORCHESTRA_DEFAULT_UNBLOCKER=sonnet
 ```
 
 To smoke-test the configured replacement agents, run:

@@ -701,6 +701,21 @@ When the file is detected:
 
 The file is a one-shot signal: deletion is the acknowledgment, so the orchestrator will not stop again on the next run unless the file is recreated.
 
+### Native Smart Unblocking
+
+While the orchestrator is running, a background thread reassesses each
+`blocked` task about once a minute. It collects current evidence (task row,
+durable comments, run log, latest transcript, git stash list, and worktree
+status) and asks the configured unblocker agent (`ORCHESTRA_DEFAULT_UNBLOCKER`,
+default `sonnet`) whether recovery is safe.
+
+The agent records exactly one durable comment authored as `smart-unblock`,
+starting with either `RESUME` or `BLOCKED`. The orchestrator then either
+continues the task or leaves that explanation for the operator. Unchanged
+evidence is not reconsidered until something in the task's evidence changes.
+Stopping the orchestrator stops this recovery loop. There is no separate
+unblock process or command.
+
 ### Instance and Fleet Control
 
 The primary runtime unit is a repo instance: one orchestrator process and one
@@ -967,7 +982,10 @@ sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, curre
 ### Unblock A Task
 
 When a task is blocked because the agent needs a decision, context, or manual
-repair:
+repair, first read any durable `smart-unblock` comment already on the task.
+A running orchestrator may have already explained the block or resumed it.
+
+To intervene by hand:
 
 ```bash
 cat <<'EOF' | python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py comment <task-id> --message-stdin --comment

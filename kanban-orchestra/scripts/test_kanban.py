@@ -4287,6 +4287,36 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
                 rendered,
             )
 
+    def test_install_deploys_updated_narrate_and_unblock_skill(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        canonical = repo_root / "AI-skills" / "narrate-and-unblock.md"
+        first_line = next(
+            line.strip()
+            for line in canonical.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        self.assertNotIn("ko-unblock", first_line)
+
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            skills_dir = orchestra_dir / "AI-skills"
+            skills_dir.mkdir(parents=True)
+            (skills_dir / "narrate-and-unblock.md").write_text(
+                canonical.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            home = Path(home_tmp)
+            global_skill_installer.install_global_skills(orchestra_dir, home=home)
+            wrapper = home / ".claude" / "skills" / "orch-kb-narrate-and-unblock" / "SKILL.md"
+            text = wrapper.read_text(encoding="utf-8")
+            self.assertIn("name: orch-kb-narrate-and-unblock\n", text)
+            self.assertIn(first_line, text)
+            self.assertNotIn("ko-unblock", text)
+            self.assertIn(
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate-and-unblock.md\n",
+                text,
+            )
+
     def test_install_global_skills_writes_all_target_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
             orchestra_dir = Path(orchestra_tmp)

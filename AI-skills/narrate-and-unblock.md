@@ -1,56 +1,24 @@
-Narrate Kanban Orchestra live in this session and run a durable background smart-unblock watcher.
+Narrate Kanban Orchestra live in this session and observe native smart unblocking.
 
-This skill coordinates two independent loops for the current repository:
+This skill is a read-only narration loop for the current repository. A running
+orchestrator already recovers blocked tasks on its own: about once a minute it
+collects evidence, consults the configured unblocker agent, and either continues
+the task or leaves a durable `smart-unblock` comment explaining what the
+operator must decide. Narration does not start, stop, or manage any recovery
+process.
 
-- **Narration** runs inside your agent session. You sample every 10 seconds and
-  stop when the queue is genuinely finished or the user stops you.
-- **Smart unblocking** runs as a durable background process started with
-  `$ORCHESTRA_DIR/bin/ko-unblock`. It checks once per minute and keeps running
-  until it is explicitly stopped, including after narration ends. A running
-  orchestrator already runs this same watcher loop natively as part of its own
-  process, sharing the same repo-scoped lock — `ko-unblock start` against a
-  repo with an active orchestrator simply reports `already running` rather
-  than duplicating the work. Start it explicitly here so unblocking keeps
-  running even when the orchestrator itself is stopped.
-
-Narration is read-only reporting: monitor the repo with
-`$ORCHESTRA_DIR/bin/ko-get-update` and `$ORCHESTRA_DIR/bin/ko-task`, and leave
-every recovery decision to the watcher.
+Leave every recovery decision to that native loop. Monitor the repo with
+`$ORCHESTRA_DIR/bin/ko-get-update` and `$ORCHESTRA_DIR/bin/ko-task`.
 
 ## Prerequisites
 
 1. Resolve the repo root with `git rev-parse --show-toplevel`. Stop if the
    command fails.
-2. Require `$ORCHESTRA_DIR`, `bin/ko-get-update`, `bin/ko-task`, and
-   `bin/ko-unblock`.
+2. Require `$ORCHESTRA_DIR`, `bin/ko-get-update`, and `bin/ko-task`.
 3. Require `<repo-root>/kanban-orchestra.db`.
 4. Monitor only this repo. A running orchestrator is preferred, but report
-   stopped or stale state honestly.
-
-## Start smart unblocking first
-
-Before the opening report, make sure the background watcher is running for this
-repo:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-unblock" status
-"$ORCHESTRA_DIR/bin/ko-unblock" start
-```
-
-`start` is safe to call when a watcher already runs: only one watcher may hold
-the repo lock, and a second start reports `"started": false` with reason
-`already running` instead of launching a duplicate. Stop it only when the user
-asks:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-unblock" stop
-```
-
-`stop` also ends any consultation the watcher is in the middle of, so no agent
-can comment on or continue a task after stop reports success.
-
-Report in one clause whether the watcher was already running or you started it.
-Never stop the watcher because narration is ending.
+   stopped or stale state honestly. Native unblocking runs only while the
+   orchestrator itself is running.
 
 ## Opening report
 
@@ -60,9 +28,11 @@ Immediately sample state and give one short plain-language summary:
 - Active task, phase, and agent when known
 - Ready queue depth or blocked task
 - One grounded clause from new agent output when available
+- Whether native smart unblocking is active (orchestrator running) or idle
+  because the orchestrator is stopped
 
 Use the update prefix below. Do not paste raw update output, JSON, logs,
-transcript dumps, or tables.
+transcript dumps, or tables. Do not start a background recovery service.
 
 ## Update prefix
 
@@ -117,8 +87,7 @@ the same prefix contract.
 
 Sample every 10 seconds until the user stops you or the queue is genuinely
 idle with no active, ready, or blocked work. Keep this loop in your agent
-session: narration ends with the session, and the only background process you
-start is the smart-unblock watcher above.
+session: narration ends with the session. Do not start any background process.
 
 Each sample:
 
@@ -138,8 +107,8 @@ Each sample:
 4. Sample the current phase's latest transcript using the recipe below.
 5. Narrate material change in one or two sentences. If nothing changed, say
    so briefly without inventing progress.
-6. If work is blocked, report the block and what the watcher has recorded for
-   it; do not recover it yourself.
+6. If work is blocked, report the block and what native smart unblocking has
+   recorded for it; do not recover it yourself.
 
 ## Live agent output
 
@@ -181,48 +150,35 @@ short tail hash. Summarize concrete new actions and results; distinguish an
 agent's stated intention from completed work. Header-only output is not
 progress.
 
-## Smart unblocking
+## Native smart unblocking
 
-The watcher owns every recovery decision. Once per minute it collects current
-evidence for each blocked task — task row, durable comments, run log, latest
-transcript, `git stash list`, and worktree status — and hands that evidence to
-the configured LLM. The LLM decides why the task is blocked, whether recovery
-is safe, and then either runs `ko-task continue` itself or records one comment
-explaining the block and what the user must decide. Nothing in the watcher
-hard-codes a clean-worktree or resume-step rule.
+The running orchestrator owns every recovery decision. About once a minute it
+collects current evidence for each blocked task — task row, durable comments,
+run log, latest transcript, `git stash list`, and worktree status — and hands
+that evidence to the configured LLM (`$ORCHESTRA_DEFAULT_UNBLOCKER`, falling
+back to `sonnet`). The LLM records exactly one durable comment explaining
+whether recovery is safe. The orchestrator then either continues the task or
+leaves that explanation for the operator. Nothing in that loop hard-codes a
+clean-worktree or resume-step rule.
 
-The watcher also suppresses repeats: it fingerprints the evidence it sent and
-skips a blocked task whose evidence has not changed since the last
-consultation. Everything the watcher produced — comments it authored as
-`smart-unblock`, its run-log entries, and its own consultation transcripts — is
-excluded from that fingerprint, so an explanation it wrote does not retrigger
-itself. The prompt requires the LLM to pass `--author smart-unblock` on the one
-comment it leaves; the watcher still shows that prior reasoning back to the LLM
-on later cycles as context.
+Repeats are suppressed: unchanged evidence is skipped until something in the
+task's evidence changes. Everything the loop produced — comments authored as
+`smart-unblock`, its run-log entries, and its own consultation transcripts —
+is excluded from that fingerprint, so an explanation it wrote does not
+retrigger itself. The prompt requires the LLM to pass `--author smart-unblock`
+on the one comment it leaves.
 
-Commands:
+Per-consultation agent transcripts are written to the usual
+`artifacts/task-<id>/` directory with the `smart-unblock` verb.
 
-```bash
-"$ORCHESTRA_DIR/bin/ko-unblock" start [--agent <agent>] [--interval <seconds>]
-"$ORCHESTRA_DIR/bin/ko-unblock" status
-"$ORCHESTRA_DIR/bin/ko-unblock" stop
-```
-
-`--agent` defaults to `$ORCHESTRA_DEFAULT_UNBLOCKER` (falling back to `sonnet`)
-and `--interval` defaults to 60 seconds. Watcher artifacts live under
-`<repo-root>/.kanban-orchestra/`: `smart-unblock.lock` (the singleton lock plus
-pid/agent metadata and the process group of any live consultation, which is how
-`stop` reaches an in-flight agent), `smart-unblock-state.json` (fingerprints),
-and `smart-unblock.log` (watcher stdout). Per-consultation agent transcripts are
-written to the usual `artifacts/task-<id>/` directory with the
-`smart-unblock` verb.
-
-While narrating, treat the watcher's comments and run-log entries as evidence:
-report what it decided in one or two sentences. Do not run `ko-task continue`,
-edit task fields, or touch the worktree yourself. If the watcher is not running
-and the user wants unblocking, start it. If the blocked-task gate leaves
+While narrating, treat those comments and run-log entries as evidence: report
+what native recovery decided in one or two sentences. Do not run
+`ko-task continue`, edit task fields, or touch the worktree yourself. If the
+orchestrator is stopped, say that native unblocking is idle and keep
+narrating; do not start a replacement watcher. If the blocked-task gate leaves
 nothing runnable, keep sampling state every 10 seconds but report the blocker
-only once until the evidence changes or the watcher records a decision.
+only once until the evidence changes or a `smart-unblock` comment records a
+decision.
 
 ## Situation handling
 
@@ -232,9 +188,9 @@ only once until the evidence changes or the watcher records a decision.
 | Active task, unchanged transcript | Say there is no new agent output |
 | Phase transition | Name the new phase and reset transcript baseline |
 | Review decision | Summarize the durable approval or rejection |
-| Blocked task, watcher running | Report the block and the watcher's latest decision |
-| Blocked task, watcher stopped | Say so and start the watcher |
-| No active, ready, or blocked work | Give a final idle sentence and stop narrating; leave the watcher running |
+| Blocked task, orchestrator running | Report the block and the latest `smart-unblock` decision |
+| Blocked task, orchestrator stopped | Say native unblocking is idle; do not start a watcher |
+| No active, ready, or blocked work | Give a final idle sentence and stop narrating |
 
 Keep updates short, current-repo-only, and grounded in Kanban state plus fresh
 transcript evidence.
