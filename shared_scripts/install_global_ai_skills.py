@@ -48,7 +48,7 @@ KANBAN_SKILLS = frozenset(
     {
         "get-kanban-update",
         "kanban",
-        "narrate-and-unblock",
+        "narrate",
         "plan-to-tasks",
         "review-recent-kanban-tasks",
     }

@@ -22,7 +22,7 @@ Wrappers use two prefixes:
 
 Kanban skills (installed as `orch-kb-*`) are the names listed in
 `KANBAN_SKILLS` inside `shared_scripts/install_global_ai_skills.py`. Today that
-set is: `get-kanban-update`, `kanban`, `narrate-and-unblock`,
+set is: `get-kanban-update`, `kanban`, `narrate`,
 `plan-to-tasks`, and `review-recent-kanban-tasks`. All other
 `AI-skills/*.md` files (except
 `AI-readme.md`) install as `orch-adhoc-*`. When you add a Kanban skill, update

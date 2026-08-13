@@ -1,11 +1,11 @@
-Narrate Kanban Orchestra live in this session and observe native smart unblocking.
+Narrate Kanban Orchestra live in this session.
 
 This skill is a read-only narration loop for the current repository. A running
 orchestrator already recovers blocked tasks on its own: about once a minute it
 collects evidence, consults the configured unblocker agent, and either continues
 the task or leaves a durable `smart-unblock` comment explaining what the
 operator must decide. Narration does not start, stop, or manage any recovery
-process.
+process. It may report native smart-unblock decisions as observed Kanban events.
 
 Leave every recovery decision to that native loop. Monitor the repo with
 `$ORCHESTRA_DIR/bin/ko-get-update` and `$ORCHESTRA_DIR/bin/ko-task`.

@@ -553,7 +553,7 @@ class TestStandaloneWatcherRemoved(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[2]
         for relative in (
             "README.md",
-            "AI-skills/narrate-and-unblock.md",
+            "AI-skills/narrate.md",
             "AI-skills/kanban.md",
             "tasks/kanban-orchestra-spec.md",
         ):

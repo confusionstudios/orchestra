@@ -4626,10 +4626,11 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             self.assertNotIn("Canonical instructions.", rendered)
 
     def test_wrapper_prefix_classifies_kanban_and_adhoc_skills(self):
-        self.assertIn("narrate-and-unblock", global_skill_installer.KANBAN_SKILLS)
+        self.assertIn("narrate", global_skill_installer.KANBAN_SKILLS)
+        self.assertNotIn("narrate-and-unblock", global_skill_installer.KANBAN_SKILLS)
         self.assertEqual(
-            global_skill_installer._wrapper_skill_name("narrate-and-unblock"),
-            "orch-kb-narrate-and-unblock",
+            global_skill_installer._wrapper_skill_name("narrate"),
+            "orch-kb-narrate",
         )
         self.assertEqual(
             global_skill_installer._wrapper_skill_name("kanban"),
@@ -4644,25 +4645,27 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             orchestra_dir = Path(orchestra_tmp)
             skills_dir = orchestra_dir / "AI-skills"
             skills_dir.mkdir(parents=True)
-            narrate_and_unblock_path = skills_dir / "narrate-and-unblock.md"
-            narrate_and_unblock_path.write_text(
+            narrate_path = skills_dir / "narrate.md"
+            narrate_path.write_text(
                 "Act as a live narrator.\n\nCanonical instructions.\n",
                 encoding="utf-8",
             )
             rendered = global_skill_installer.render_wrapper(
-                "narrate-and-unblock",
-                global_skill_installer._skill_description(narrate_and_unblock_path),
-                narrate_and_unblock_path,
+                "narrate",
+                global_skill_installer._skill_description(narrate_path),
+                narrate_path,
             )
-            self.assertIn("name: orch-kb-narrate-and-unblock\n", rendered)
+            self.assertIn("name: orch-kb-narrate\n", rendered)
             self.assertIn(
-                "- Location: $ORCHESTRA_DIR/AI-skills/narrate-and-unblock.md\n",
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate.md\n",
                 rendered,
             )
 
-    def test_install_deploys_updated_narrate_and_unblock_skill(self):
+    def test_install_creates_narrate_wrapper_and_removes_obsolete_wrapper(self):
         repo_root = Path(__file__).resolve().parents[2]
-        canonical = repo_root / "AI-skills" / "narrate-and-unblock.md"
+        canonical = repo_root / "AI-skills" / "narrate.md"
+        self.assertTrue(canonical.is_file())
+        self.assertFalse((repo_root / "AI-skills" / "narrate-and-unblock.md").exists())
         first_line = next(
             line.strip()
             for line in canonical.read_text(encoding="utf-8").splitlines()
@@ -4674,21 +4677,52 @@ class TestInstallGlobalAiSkills(unittest.TestCase):
             orchestra_dir = Path(orchestra_tmp)
             skills_dir = orchestra_dir / "AI-skills"
             skills_dir.mkdir(parents=True)
-            (skills_dir / "narrate-and-unblock.md").write_text(
+            (skills_dir / "narrate.md").write_text(
                 canonical.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
             home = Path(home_tmp)
-            global_skill_installer.install_global_skills(orchestra_dir, home=home)
-            wrapper = home / ".claude" / "skills" / "orch-kb-narrate-and-unblock" / "SKILL.md"
+            obsolete = home / ".claude" / "skills" / "orch-kb-narrate-and-unblock" / "SKILL.md"
+            obsolete.parent.mkdir(parents=True)
+            obsolete.write_text(
+                "---\n"
+                "name: orch-kb-narrate-and-unblock\n"
+                'description: "obsolete wrapper."\n'
+                "---\n\n"
+                "Follow the shared skill:\n\n"
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate-and-unblock.md\n"
+                "- Least Seen at: /tmp/AI-skills/narrate-and-unblock.md\n",
+                encoding="utf-8",
+            )
+
+            checked = global_skill_installer.install_global_skills(
+                orchestra_dir, home=home, check=True
+            )
+            self.assertIn(".claude/skills/orch-kb-narrate/SKILL.md", checked["missing"])
+            self.assertIn(
+                ".claude/skills/orch-kb-narrate-and-unblock/SKILL.md",
+                checked["stale"],
+            )
+            self.assertTrue(obsolete.exists())
+
+            summary = global_skill_installer.install_global_skills(
+                orchestra_dir, home=home
+            )
+            wrapper = home / ".claude" / "skills" / "orch-kb-narrate" / "SKILL.md"
             text = wrapper.read_text(encoding="utf-8")
-            self.assertIn("name: orch-kb-narrate-and-unblock\n", text)
+            self.assertIn("name: orch-kb-narrate\n", text)
             self.assertIn(first_line, text)
             self.assertNotIn("ko-unblock", text)
             self.assertIn(
-                "- Location: $ORCHESTRA_DIR/AI-skills/narrate-and-unblock.md\n",
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate.md\n",
                 text,
             )
+            self.assertIn(".claude/skills/orch-kb-narrate/SKILL.md", summary["created"])
+            self.assertIn(
+                ".claude/skills/orch-kb-narrate-and-unblock/SKILL.md",
+                summary["removed"],
+            )
+            self.assertFalse(obsolete.exists())
 
     def test_install_global_skills_writes_all_target_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
