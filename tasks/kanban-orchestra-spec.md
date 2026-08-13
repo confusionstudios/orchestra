@@ -220,6 +220,14 @@ Ephemeral operational log.
 - Stores task-scoped orchestrator and agent progress messages
 - Ordered newest-first in the CLI
 - May be purged
+- Automatic retention keeps seven days of history for `done` tasks and for
+  global orchestrator rows (`task_id IS NULL`)
+- Rows belonging to `none`, `ready`, `running`, `blocked`, or
+  `pending_subtasks` tasks are retained
+- `task purge` uses the same eligibility rules; `--days 0` deletes eligible
+  history immediately without changing unfinished-task preservation
+- After a purge that deleted rows, idle-time maintenance runs `VACUUM` so the
+  database file on disk can shrink
 
 #### `orchestrator_runtime`
 
@@ -257,7 +265,13 @@ Runtime status values:
 - `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
 - `.kanban-orchestra/dashboard.json`: repo-scoped metadata for the dashboard
   owned by the orchestrator instance, including PID, host, port, and URL.
-- `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts
+- `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts.
+  Idle-time maintenance deletes `*.log` transcript files older than seven days
+  only for completed (`done`) tasks, then removes empty `task-<id>` directories.
+  File cleanup starts from the trusted database-parent directory, opens
+  `.kanban-orchestra` and `artifacts` descriptor-relatively without following
+  links, then traverses and deletes through no-follow directory descriptors.
+  It does not take paths from database content.
 - `.kanban-orchestra/active-agent-processes.json`: transient process-group
   metadata for active agent children, maintained by the active-agent runtime
   helpers
@@ -866,6 +880,10 @@ Primary questions:
 ### Runtime Semantics
 
 - The orchestrator writes a singleton runtime row on startup.
+- When runtime becomes `idle`, the orchestrator runs automatic runtime-history
+  retention: old eligible `run_log` rows and completed-task transcripts are
+  removed, and SQLite is compacted only when rows were deleted. One maintenance
+  summary is logged when anything was deleted.
 - The orchestrator starts the matching dashboard for the same repo instance.
 - Heartbeat updates every `10` seconds.
 - A stale heartbeat indicates a dead or wedged orchestrator even if stored status still says `running`.

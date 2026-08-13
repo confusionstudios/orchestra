@@ -255,6 +255,18 @@ def set_runtime_idle(conn, status_message="Waiting for ready tasks"):
         status_message=status_message,
         last_heartbeat_at="CURRENT_TIMESTAMP",
     )
+    _run_idle_maintenance(conn)
+
+
+def _run_idle_maintenance(conn):
+    """Purge expired runtime history while the orchestrator is idle."""
+    try:
+        result = db.purge_run_log(conn, compact=True)
+    except Exception as exc:
+        log(f"Maintenance purge failed: {exc}")
+        return
+    if result["deleted_rows"] or result["deleted_transcripts"]:
+        log(db.format_purge_summary(result))
 
 
 def _dashboard_metadata_path(db_path=None):

@@ -1223,9 +1223,370 @@ class TestDB(unittest.TestCase):
         db.purge_run_log(self.conn)
         self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
 
-        # Purge by days=0 removes everything
+        # days=0 still preserves unfinished-task history
         db.purge_run_log(self.conn, days=0)
-        self.assertEqual(len(db.get_run_log(self.conn, tid)), 0)
+        self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
+
+
+
+class TestRuntimeHistoryPurge(unittest.TestCase):
+    """Retention, eligibility, transcript safety, and idle compaction."""
+
+    UNFINISHED_STATUSES = ("none", "ready", "running", "blocked", "pending_subtasks")
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _age_latest_run_log(self, *sql_modifiers):
+        row_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        placeholders = ", ".join("?" for _ in sql_modifiers)
+        self.conn.execute(
+            f"UPDATE run_log SET created_at = datetime('now', {placeholders}) WHERE id = ?",
+            (*sql_modifiers, row_id),
+        )
+        self.conn.commit()
+        return row_id
+
+    def _add_aged_run_log(self, task_id, message, *sql_modifiers, author="orchestrator"):
+        db.add_run_log(self.conn, task_id, message, author=author)
+        return self._age_latest_run_log(*sql_modifiers)
+
+    def _write_transcript(self, task_id, name, text, age_seconds):
+        task_dir = db.get_artifacts_root(self.db_path) / f"task-{task_id}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        path = task_dir / name
+        path.write_text(text, encoding="utf-8")
+        aged = time.time() - age_seconds
+        os.utime(path, (aged, aged))
+        return path
+
+    def test_seven_day_boundary_deletes_only_older_done_rows(self):
+        tid = db.add_task(self.conn, "Done boundary")
+        db.update_task(self.conn, tid, status="done")
+        old_id = self._add_aged_run_log(tid, "old", "-7 days", "-1 hour")
+        boundary_id = self._add_aged_run_log(tid, "boundary", "-7 days", "+1 hour")
+        recent_id = self._add_aged_run_log(tid, "recent", "-6 days")
+
+        result = db.purge_run_log(self.conn)
+
+        remaining = {row["id"] for row in db.get_run_log(self.conn, tid)}
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertNotIn(old_id, remaining)
+        self.assertIn(boundary_id, remaining)
+        self.assertIn(recent_id, remaining)
+
+    def test_eligible_statuses_only_done_rows_are_deleted(self):
+        done_id = db.add_task(self.conn, "Done")
+        db.update_task(self.conn, done_id, status="done")
+        self._add_aged_run_log(done_id, "done old", "-8 days")
+
+        kept = {}
+        for status in self.UNFINISHED_STATUSES:
+            tid = db.add_task(self.conn, f"Status {status}", branch="feat")
+            db.update_task(self.conn, tid, status=status)
+            self._add_aged_run_log(tid, f"{status} old", "-8 days")
+            kept[status] = tid
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertEqual(db.get_run_log(self.conn, done_id), [])
+        for status, tid in kept.items():
+            logs = db.get_run_log(self.conn, tid)
+            self.assertEqual(len(logs), 1, status)
+            self.assertEqual(db.get_task(self.conn, tid)["status"], status)
+
+    def test_old_global_rows_are_purged(self):
+        self._add_aged_run_log(None, "old global", "-8 days")
+        self._add_aged_run_log(None, "recent global", "-1 days")
+
+        result = db.purge_run_log(self.conn)
+
+        remaining = [row["message"] for row in db.get_global_run_log(self.conn)]
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertEqual(remaining, ["recent global"])
+
+    def test_old_transcripts_deleted_only_for_completed_tasks(self):
+        done_id = db.add_task(self.conn, "Done transcripts")
+        db.update_task(self.conn, done_id, status="done")
+        old_done = self._write_transcript(
+            done_id, "old-done.log", "old done\n", 8 * 86400
+        )
+        recent_done = self._write_transcript(
+            done_id, "recent-done.log", "recent done\n", 2 * 86400
+        )
+
+        running_id = db.add_task(self.conn, "Running transcripts")
+        db.update_task(self.conn, running_id, status="running")
+        old_running = self._write_transcript(
+            running_id, "old-running.log", "old running\n", 8 * 86400
+        )
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 1)
+        self.assertGreater(result["reclaimed_artifact_bytes"], 0)
+        self.assertFalse(old_done.exists())
+        self.assertTrue(recent_done.exists())
+        self.assertTrue(old_running.exists())
+        self.assertTrue((db.get_artifacts_root(self.db_path) / f"task-{done_id}").is_dir())
+        self.assertTrue((db.get_artifacts_root(self.db_path) / f"task-{running_id}").is_dir())
+
+    def test_empty_task_artifact_directory_is_removed_after_transcript_purge(self):
+        done_id = db.add_task(self.conn, "Empty dir")
+        db.update_task(self.conn, done_id, status="done")
+        old = self._write_transcript(done_id, "only.log", "gone\n", 8 * 86400)
+        task_dir = old.parent
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 1)
+        self.assertFalse(old.exists())
+        self.assertFalse(task_dir.exists())
+
+    def test_unfinished_work_comments_and_tasks_are_preserved(self):
+        tid = db.add_task(self.conn, "Keep me", description="durable")
+        db.update_task(self.conn, tid, status="blocked")
+        db.add_comment(self.conn, tid, "keep this comment")
+        self._add_aged_run_log(tid, "blocked old log", "-30 days")
+        transcript = self._write_transcript(
+            tid, "blocked.log", "blocked transcript\n", 30 * 86400
+        )
+
+        result = db.purge_run_log(self.conn, days=0)
+
+        self.assertEqual(result["deleted_rows"], 0)
+        self.assertEqual(result["deleted_transcripts"], 0)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["title"], "Keep me")
+        self.assertEqual(task["description"], "durable")
+        self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
+        comments = db.get_comments(self.conn, tid)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["message"], "keep this comment")
+        self.assertTrue(transcript.exists())
+
+    def test_path_safety_does_not_follow_links_or_leave_artifacts_root(self):
+        done_id = db.add_task(self.conn, "Path safety")
+        db.update_task(self.conn, done_id, status="done")
+        outside_dir = Path(self.tmpdir.name) / "outside"
+        outside_dir.mkdir()
+        outside_file = outside_dir / "secret.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+
+        artifacts = db.get_artifacts_root(self.db_path)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        linked_task = artifacts / f"task-{done_id}"
+        linked_task.symlink_to(outside_dir)
+
+        other_done = db.add_task(self.conn, "Real done")
+        db.update_task(self.conn, other_done, status="done")
+        real_old = self._write_transcript(
+            other_done, "real-old.log", "delete me\n", 8 * 86400
+        )
+        linked_file = real_old.parent / "linked.log"
+        linked_file.symlink_to(outside_file)
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 1)
+        self.assertFalse(real_old.exists())
+        self.assertTrue(linked_file.is_symlink())
+        self.assertTrue(outside_file.exists())
+        self.assertTrue(linked_task.is_symlink())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+
+    def test_path_safety_survives_task_dir_symlink_swap_before_deletion(self):
+        done_id = db.add_task(self.conn, "Swap race")
+        db.update_task(self.conn, done_id, status="done")
+        planted = self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
+        task_dir = planted.parent
+
+        outside_dir = Path(self.tmpdir.name) / "outside"
+        outside_dir.mkdir()
+        outside_file = outside_dir / "old.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+        moved_dir = Path(self.tmpdir.name) / "moved-task-dir"
+        orig_purge_dir = db._purge_task_transcript_dir
+        swapped = {"done": False}
+
+        def swap_then_purge(*args, **kwargs):
+            if not swapped["done"]:
+                swapped["done"] = True
+                os.rename(task_dir, moved_dir)
+                os.symlink(outside_dir, task_dir)
+            return orig_purge_dir(*args, **kwargs)
+
+        with patch.object(db, "_purge_task_transcript_dir", side_effect=swap_then_purge):
+            db.purge_run_log(self.conn)
+
+        self.assertTrue(swapped["done"])
+        self.assertTrue(outside_file.exists())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+        self.assertTrue(task_dir.is_symlink())
+
+    def test_path_safety_survives_artifacts_root_symlink_swap_before_scan(self):
+        done_id = db.add_task(self.conn, "Root swap")
+        db.update_task(self.conn, done_id, status="done")
+        self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
+        artifacts = db.get_artifacts_root(self.db_path)
+
+        outside_root = Path(self.tmpdir.name) / "outside-artifacts"
+        outside_task = outside_root / f"task-{done_id}"
+        outside_task.mkdir(parents=True)
+        outside_file = outside_task / "old.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+        moved_root = Path(self.tmpdir.name) / "moved-artifacts"
+        orig_scandir = db.os.scandir
+        swapped = {"done": False}
+
+        def swap_then_scandir(path, *args, **kwargs):
+            if not swapped["done"]:
+                swapped["done"] = True
+                os.rename(artifacts, moved_root)
+                os.symlink(outside_root, artifacts)
+            return orig_scandir(path, *args, **kwargs)
+
+        with patch.object(db.os, "scandir", side_effect=swap_then_scandir):
+            db.purge_run_log(self.conn)
+
+        self.assertTrue(swapped["done"])
+        self.assertTrue(outside_file.exists())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+        self.assertTrue(artifacts.is_symlink())
+
+    def test_path_safety_skips_symlinked_artifacts_root(self):
+        done_id = db.add_task(self.conn, "Symlink root")
+        db.update_task(self.conn, done_id, status="done")
+        real_artifacts = Path(self.tmpdir.name) / "elsewhere" / "artifacts"
+        task_dir = real_artifacts / f"task-{done_id}"
+        task_dir.mkdir(parents=True)
+        planted = task_dir / "planted.log"
+        planted.write_text("keep\n", encoding="utf-8")
+        os.utime(planted, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+
+        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "artifacts").symlink_to(real_artifacts)
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 0)
+        self.assertTrue(planted.exists())
+
+    def test_path_safety_skips_symlinked_runtime_parent(self):
+        done_id = db.add_task(self.conn, "Symlink runtime")
+        db.update_task(self.conn, done_id, status="done")
+        outside_runtime = Path(self.tmpdir.name) / "elsewhere" / ".kanban-orchestra"
+        task_dir = outside_runtime / "artifacts" / f"task-{done_id}"
+        task_dir.mkdir(parents=True)
+        planted = task_dir / "planted.log"
+        planted.write_text("keep\n", encoding="utf-8")
+        os.utime(planted, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+
+        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+        runtime.symlink_to(outside_runtime)
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 0)
+        self.assertTrue(planted.exists())
+        self.assertEqual(planted.read_text(encoding="utf-8"), "keep\n")
+
+    def test_path_safety_survives_runtime_parent_symlink_swap_before_open(self):
+        done_id = db.add_task(self.conn, "Runtime swap")
+        db.update_task(self.conn, done_id, status="done")
+        self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
+        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+
+        outside_runtime = Path(self.tmpdir.name) / "outside-runtime"
+        outside_task = outside_runtime / "artifacts" / f"task-{done_id}"
+        outside_task.mkdir(parents=True)
+        outside_file = outside_task / "old.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+        moved_runtime = Path(self.tmpdir.name) / "moved-runtime"
+        orig_open = db._open_directory_nofollow
+        swapped = {"done": False}
+
+        def swap_then_open(path, *, dir_fd=None):
+            if path == ".kanban-orchestra" and not swapped["done"]:
+                swapped["done"] = True
+                os.rename(runtime, moved_runtime)
+                os.symlink(outside_runtime, runtime)
+            return orig_open(path, dir_fd=dir_fd)
+
+        with patch.object(db, "_open_directory_nofollow", side_effect=swap_then_open):
+            db.purge_run_log(self.conn)
+
+        self.assertTrue(swapped["done"])
+        self.assertTrue(outside_file.exists())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+        self.assertTrue(runtime.is_symlink())
+
+    def test_noop_purge_is_idempotent_and_skips_compact(self):
+        tid = db.add_task(self.conn, "Recent done")
+        db.update_task(self.conn, tid, status="done")
+        db.add_run_log(self.conn, tid, "fresh")
+        db.add_comment(self.conn, tid, "fresh comment")
+        transcript = self._write_transcript(tid, "fresh.log", "fresh\n", 60)
+
+        first = db.purge_run_log(self.conn, compact=True)
+        second = db.purge_run_log(self.conn, compact=True)
+
+        self.assertEqual(first["deleted_rows"], 0)
+        self.assertEqual(first["deleted_transcripts"], 0)
+        self.assertFalse(first["compacted"])
+        self.assertEqual(second, first)
+        self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
+        self.assertEqual(len(db.get_comments(self.conn, tid)), 1)
+        self.assertTrue(transcript.exists())
+
+    def test_compact_reclaims_database_pages_after_row_deletes(self):
+        tid = db.add_task(self.conn, "Compact me")
+        db.update_task(self.conn, tid, status="done")
+        payload = "x" * 8000
+        for index in range(40):
+            self._add_aged_run_log(tid, f"{payload}-{index}", "-8 days")
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = db._sqlite_disk_usage(self.db_path)
+
+        result = db.purge_run_log(self.conn, compact=True)
+
+        self.assertEqual(result["deleted_rows"], 40)
+        self.assertTrue(result["compacted"])
+        self.assertGreater(result["reclaimed_db_bytes"], 0)
+        self.assertLess(db._sqlite_disk_usage(self.db_path), before)
+        self.assertEqual(db.get_run_log(self.conn, tid), [])
+
+    def test_days_zero_purges_recent_eligible_history_only(self):
+        done_id = db.add_task(self.conn, "Done recent")
+        db.update_task(self.conn, done_id, status="done")
+        db.add_run_log(self.conn, done_id, "recent done")
+        db.add_comment(self.conn, done_id, "keep comment")
+        ready_id = db.add_task(self.conn, "Ready recent", branch="feat")
+        db.update_task(self.conn, ready_id, status="ready")
+        db.add_run_log(self.conn, ready_id, "recent ready")
+
+        result = db.purge_run_log(self.conn, days=0)
+
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertEqual(db.get_run_log(self.conn, done_id), [])
+        self.assertEqual(len(db.get_run_log(self.conn, ready_id)), 1)
+        self.assertEqual(len(db.get_comments(self.conn, done_id)), 1)
 
 
 
@@ -4934,6 +5295,43 @@ class TestInitRuntime(unittest.TestCase):
         self.assertEqual(rt["active_agents"], 0)
         self.assertEqual(rt["status_message"], "Waiting for ready tasks")
 
+    def test_set_runtime_idle_runs_history_purge_and_logs_summary(self):
+        orchestrator.init_runtime(self.conn)
+        summary = {
+            "deleted_rows": 2,
+            "deleted_transcripts": 1,
+            "reclaimed_db_bytes": 100,
+            "reclaimed_artifact_bytes": 50,
+            "compacted": True,
+        }
+        with (
+            patch.object(orchestrator.db, "purge_run_log", return_value=summary) as purge,
+            patch.object(orchestrator, "log") as log,
+        ):
+            orchestrator.set_runtime_idle(self.conn)
+
+        purge.assert_called_once_with(self.conn, compact=True)
+        log.assert_called_once()
+        self.assertEqual(
+            log.call_args[0][0],
+            db.format_purge_summary(summary),
+        )
+
+    def test_set_runtime_idle_stays_quiet_on_noop_purge(self):
+        orchestrator.init_runtime(self.conn)
+        with (
+            patch.object(
+                orchestrator.db,
+                "purge_run_log",
+                return_value=db._empty_purge_result(),
+            ) as purge,
+            patch.object(orchestrator, "log") as log,
+        ):
+            orchestrator.set_runtime_idle(self.conn)
+
+        purge.assert_called_once_with(self.conn, compact=True)
+        log.assert_not_called()
+
 
 class TestMainLoop(unittest.TestCase):
     """Test main_loop scheduling-side behavior."""
@@ -5064,6 +5462,31 @@ class TestRuntimeAfterTask(unittest.TestCase):
         self.assertIsNone(rt["current_task_id"])
         self.assertEqual(rt["current_step"], "none")
         self.assertEqual(rt["status_message"], f"Task {blocked_tid} blocked; continuing to next ready task")
+
+    def test_blocked_continue_skips_idle_history_purge(self):
+        blocked_tid = db.add_task(self.conn, "Blocked task", branch="feat-blocked")
+        next_tid = db.add_task(
+            self.conn,
+            "Next ready task",
+            branch="feat-next",
+            allow_when_blocked=True,
+        )
+        db.update_task(self.conn, blocked_tid, status="blocked", next_step="none")
+        db.update_task(self.conn, next_tid, status="ready", next_step="commit-make")
+        db.update_runtime(
+            self.conn,
+            status="running",
+            current_task_id=blocked_tid,
+            current_step="commit-make",
+            current_branch="feat-blocked",
+            status_message=f"Blocked: task {blocked_tid}",
+        )
+
+        with patch.object(orchestrator.db, "purge_run_log") as purge:
+            orchestrator.update_runtime_after_task(self.conn, blocked_tid, succeeded=False)
+
+        purge.assert_not_called()
+        self.assertEqual(db.get_runtime(self.conn)["status"], "running")
 
     def test_blocked_task_with_non_opted_in_ready_follow_up_goes_idle(self):
         blocked_tid = db.add_task(self.conn, "Blocked task", branch="feat-blocked")

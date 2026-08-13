@@ -8,6 +8,7 @@ and all queries used by task.py and orchestrator.py.
 import sqlite3
 import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +19,9 @@ LOCK_FILE_NAME = "kanban-orchestra.lock"
 COMMIT_TASK_KINDS = {"commit", "task"}
 BLOCK_REASON_REVIEW_CAP = "review_cap"
 DEFAULT_MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
+RUN_LOG_RETENTION_DAYS = 7
+COMPLETED_TASK_STATUS = "done"
+TASK_ARTIFACT_DIR_PREFIX = "task-"
 
 SCHEMA_SQL = f"""\
 CREATE TABLE IF NOT EXISTS tasks (
@@ -1098,28 +1102,280 @@ def get_orchestrator_run_log(conn, limit=200):
     return [dict(r) for r in rows]
 
 
-def purge_run_log(conn, before_date=None, days=None):
-    """Purge ephemeral run_log entries. Defaults to done tasks older than 30 days."""
-    if before_date:
-        conn.execute(
-            "DELETE FROM run_log WHERE created_at < ?", (before_date,)
-        )
-    elif days is not None:
-        if days == 0:
-            conn.execute("DELETE FROM run_log")
-        else:
-            conn.execute(
-                "DELETE FROM run_log WHERE created_at < datetime('now', ?)",
-                (f"-{days} days",),
-            )
-    else:
-        # Default: purge logs for done tasks older than 30 days
-        conn.execute(
-            """DELETE FROM run_log WHERE task_id IN (
-                SELECT id FROM tasks WHERE status = 'done'
-            ) AND created_at < datetime('now', '-30 days')"""
-        )
+def _empty_purge_result(**overrides):
+    result = {
+        "deleted_rows": 0,
+        "deleted_transcripts": 0,
+        "reclaimed_db_bytes": 0,
+        "reclaimed_artifact_bytes": 0,
+        "compacted": False,
+    }
+    result.update(overrides)
+    return result
+
+
+def format_purge_summary(result):
+    """Return one concise maintenance line for a purge result."""
+    return (
+        "Maintenance purge: "
+        f"deleted {result.get('deleted_rows', 0)} run_log rows, "
+        f"{result.get('deleted_transcripts', 0)} transcripts; "
+        f"reclaimed {result.get('reclaimed_db_bytes', 0)} B database, "
+        f"{result.get('reclaimed_artifact_bytes', 0)} B artifacts"
+    )
+
+
+def _sqlite_disk_usage(db_path):
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += Path(f"{db_path}{suffix}").stat().st_size
+        except FileNotFoundError:
+            pass
+    return total
+
+
+def _vacuum(conn):
+    """Rewrite the database to reclaim free pages. Requires no open transaction.
+
+    In WAL mode the compact copy lands in the WAL, so a truncate checkpoint is
+    required before the main database file shrinks on disk.
+    """
     conn.commit()
+    isolation = conn.isolation_level
+    try:
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.isolation_level = isolation
+
+
+def _parse_before_date_posix(before_date):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(before_date, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_task_artifact_id(name):
+    if not name.startswith(TASK_ARTIFACT_DIR_PREFIX):
+        return None
+    suffix = name[len(TASK_ARTIFACT_DIR_PREFIX):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+_DIRECTORY_NOFOLLOW_FLAGS = _DIRECTORY_FLAGS | os.O_NOFOLLOW
+_RUNTIME_DIR_NAME = ".kanban-orchestra"
+_ARTIFACTS_DIR_NAME = "artifacts"
+
+
+def _open_directory_nofollow(path, *, dir_fd=None):
+    """Open a directory without following a symlink at the last component."""
+    if dir_fd is None:
+        return os.open(path, _DIRECTORY_NOFOLLOW_FLAGS)
+    return os.open(path, _DIRECTORY_NOFOLLOW_FLAGS, dir_fd=dir_fd)
+
+
+def _open_nested_directory_nofollow(parent_path, *components):
+    """Open nested directories from a trusted parent without following links.
+
+    The parent is opened by its already-resolved path. Each additional
+    component is opened descriptor-relatively with O_DIRECTORY|O_NOFOLLOW so
+    an intermediate symlink cannot redirect traversal.
+    """
+    fds = []
+    try:
+        fds.append(os.open(os.fspath(parent_path), _DIRECTORY_FLAGS))
+        for component in components:
+            if not _is_simple_filename(component):
+                raise OSError("refusing unsafe path component")
+            fds.append(_open_directory_nofollow(component, dir_fd=fds[-1]))
+        return fds.pop()
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _open_canonical_artifacts_fd(db_path):
+    """Open the canonical artifacts directory from the database parent."""
+    return _open_nested_directory_nofollow(
+        Path(db_path).resolve().parent,
+        _RUNTIME_DIR_NAME,
+        _ARTIFACTS_DIR_NAME,
+    )
+
+
+def _is_simple_filename(name):
+    return (
+        name not in (".", "..")
+        and os.sep not in name
+        and (os.altsep is None or os.altsep not in name)
+    )
+
+
+def _completed_task_ids(conn):
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = ?",
+        (COMPLETED_TASK_STATUS,),
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def _purge_completed_task_transcripts(db_path, done_task_ids, cutoff_ts):
+    """Delete old transcript files under the canonical artifacts root.
+
+    Starts from the trusted directory that contains the database, then opens
+    `.kanban-orchestra` and `artifacts` descriptor-relatively with
+    O_DIRECTORY|O_NOFOLLOW. Task directories are opened the same way so a
+    swapped symlink cannot redirect cleanup outside the canonical tree.
+    """
+    deleted = 0
+    reclaimed = 0
+    if cutoff_ts is None or not done_task_ids:
+        return deleted, reclaimed
+
+    try:
+        root_fd = _open_canonical_artifacts_fd(db_path)
+    except OSError:
+        return deleted, reclaimed
+
+    try:
+        with os.scandir(root_fd) as dir_entries:
+            for entry in dir_entries:
+                task_id = _parse_task_artifact_id(entry.name)
+                if task_id is None or task_id not in done_task_ids:
+                    continue
+                if not _is_simple_filename(entry.name):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    task_fd = _open_directory_nofollow(entry.name, dir_fd=root_fd)
+                except OSError:
+                    continue
+                try:
+                    deleted_here, reclaimed_here = _purge_task_transcript_dir(
+                        task_fd, cutoff_ts
+                    )
+                finally:
+                    os.close(task_fd)
+                deleted += deleted_here
+                reclaimed += reclaimed_here
+                try:
+                    os.rmdir(entry.name, dir_fd=root_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(root_fd)
+    return deleted, reclaimed
+
+
+def _purge_task_transcript_dir(task_fd, cutoff_ts):
+    deleted = 0
+    reclaimed = 0
+    try:
+        file_entries = os.scandir(task_fd)
+    except OSError:
+        return deleted, reclaimed
+
+    with file_entries:
+        for entry in file_entries:
+            if not entry.name.endswith(".log") or not _is_simple_filename(entry.name):
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_mtime >= cutoff_ts:
+                continue
+            try:
+                os.unlink(entry.name, dir_fd=task_fd)
+            except OSError:
+                continue
+            deleted += 1
+            reclaimed += max(0, st.st_size)
+    return deleted, reclaimed
+
+
+def purge_run_log(conn, before_date=None, days=None, compact=False):
+    """Purge ephemeral runtime history for completed work.
+
+    Default retention is seven days. Eligible rows are run_log entries for
+    done tasks and global orchestrator entries (`task_id IS NULL`). Unfinished
+    task history, task records, and comments are preserved. Old transcript
+    files for completed tasks are removed from the canonical artifacts root.
+    Cleanup opens `.kanban-orchestra` and `artifacts` from the database parent
+    through no-follow directory descriptors. When `compact` is true and rows
+    were deleted, SQLite pages are reclaimed with VACUUM.
+    """
+    if days is not None and days < 0:
+        raise ValueError("days must be >= 0")
+
+    params = [COMPLETED_TASK_STATUS]
+    if before_date:
+        cutoff_sql = "created_at < ?"
+        params.append(before_date)
+        file_cutoff = _parse_before_date_posix(before_date)
+    elif days == 0:
+        cutoff_sql = "1"
+        file_cutoff = time.time()
+    else:
+        retention = RUN_LOG_RETENTION_DAYS if days is None else days
+        cutoff_sql = "created_at < datetime('now', ?)"
+        params.append(f"-{retention} days")
+        file_cutoff = time.time() - retention * 86400
+
+    db_path = get_connection_db_path(conn)
+    before_disk = _sqlite_disk_usage(db_path) if compact and db_path else 0
+
+    deleted_rows = conn.execute(
+        "DELETE FROM run_log WHERE "
+        "(task_id IS NULL OR task_id IN "
+        "(SELECT id FROM tasks WHERE status = ?)) "
+        f"AND ({cutoff_sql})",
+        params,
+    ).rowcount
+    conn.commit()
+    if deleted_rows is None or deleted_rows < 0:
+        deleted_rows = 0
+
+    deleted_transcripts = 0
+    reclaimed_artifact_bytes = 0
+    if db_path and file_cutoff is not None:
+        deleted_transcripts, reclaimed_artifact_bytes = (
+            _purge_completed_task_transcripts(
+                db_path,
+                _completed_task_ids(conn),
+                file_cutoff,
+            )
+        )
+
+    compacted = False
+    reclaimed_db_bytes = 0
+    if compact and deleted_rows and db_path:
+        try:
+            _vacuum(conn)
+            compacted = True
+        except sqlite3.Error:
+            compacted = False
+        if compacted:
+            reclaimed_db_bytes = max(0, before_disk - _sqlite_disk_usage(db_path))
+
+    return _empty_purge_result(
+        deleted_rows=deleted_rows,
+        deleted_transcripts=deleted_transcripts,
+        reclaimed_db_bytes=reclaimed_db_bytes,
+        reclaimed_artifact_bytes=reclaimed_artifact_bytes,
+        compacted=compacted,
+    )
 
 
 # ── Comments ───────────────────────────────────────────────────────────

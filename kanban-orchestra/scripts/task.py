@@ -956,8 +956,13 @@ def cmd_requeue(args, conn):
 
 
 def cmd_purge(args, conn):
-    db.purge_run_log(conn, before_date=args.before, days=args.days)
-    print("OK")
+    result = db.purge_run_log(
+        conn,
+        before_date=args.before,
+        days=args.days,
+        compact=True,
+    )
+    print(db.format_purge_summary(result))
 
 
 def cmd_delete(args, conn):
