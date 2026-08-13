@@ -3560,6 +3560,18 @@ class TestTaskCLI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["coder_agent"], spec)
 
+    def test_coder_agent_accepts_registry_alias(self):
+        r = self._run("add", "Alias coder", "--branch", "feature-alias", "--coder-agent", "grok")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["coder_agent"], "grok")
+
+    def test_set_reviewer_agent_accepts_registry_alias(self):
+        r = self._run("add", "Alias reviewer")
+        tid = json.loads(r.stdout)["id"]
+        r2 = self._run("set", str(tid), "--reviewer-agent", "grok")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["reviewer_agent"], "grok")
+
     def test_set_reviewer_agent_accepts_provider_model_spec(self):
         spec = "cursor:claude-opus-4-8-high"
         r = self._run("add", "Dynamic reviewer")
@@ -9878,6 +9890,12 @@ class TestConfigEnvOverrides(unittest.TestCase):
             for _, attr, _ in self._CASES:
                 self.assertEqual(getattr(cfg, attr), spec)
 
+    def test_registry_alias_env_override_applies(self):
+        """Registry aliases such as grok are valid role defaults."""
+        with patch.dict(os.environ, {"ORCHESTRA_DEFAULT_CODER": "grok"}, clear=False):
+            cfg = self._load_config()
+            self.assertEqual(cfg.DEFAULT_CODER, "grok")
+
     def test_fallback_when_env_var_empty(self):
         """Empty string env vars fall back to the hard-coded defaults."""
         env = {env_key: "" for env_key, _, _ in self._CASES}
@@ -10353,6 +10371,169 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         deferred = [c for c in comments if c["kind"] == "deferred-build-changed"]
         self.assertEqual(len(deferred), 1)
         self.assertEqual(deferred[0]["message"], "Build generated new file")
+
+
+class TestAgentRegistryAliases(unittest.TestCase):
+    """Registry aliases target existing specs without duplicating commands."""
+
+    _MINIMAL_REGISTRY = """
+providers:
+  cursor:
+    label: Cursor {model}
+    command: ["agent", "--model", "{model}", "{prompt}"]
+agents:
+  - key: sonnet
+    label: Claude Sonnet
+    command: ["claude", "--model", "sonnet", "{prompt}"]
+"""
+
+    def _write_registry(self, body: str) -> Path:
+        handle = tempfile.NamedTemporaryFile(
+            suffix=".yaml", delete=False, mode="w", encoding="utf-8"
+        )
+        handle.write(body)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return Path(handle.name)
+
+    def test_grok_is_alias_not_command_entry(self):
+        self.assertNotIn("grok", agent_registry.AGENT_CMD)
+        self.assertEqual(
+            agent_registry.AGENT_ALIASES["grok"],
+            "cursor:cursor-grok-4.6-high",
+        )
+
+    def test_grok_command_resolution(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_command("grok"),
+            [
+                "agent",
+                "-p",
+                "--model",
+                "cursor-grok-4.6-high",
+                "--yolo",
+                "--trust",
+                "{prompt}",
+            ],
+        )
+
+    def test_grok_display_label_uses_resolved_target(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_label("grok"),
+            "Cursor cursor-grok-4.6-high",
+        )
+
+    def test_grok_attribution_keeps_alias_and_includes_model(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("grok"),
+            "grok (model: cursor-grok-4.6-high)",
+        )
+
+    def test_alias_chain_resolves_command_label_and_attribution(self):
+        aliases = {
+            "current": "grok",
+            "grok": "cursor:cursor-grok-4.6-high",
+        }
+        with patch.object(agent_registry, "AGENT_ALIASES", aliases):
+            self.assertEqual(
+                agent_registry.resolve_agent_command("current"),
+                agent_registry.resolve_agent_command("cursor:cursor-grok-4.6-high"),
+            )
+            self.assertEqual(
+                agent_registry.resolve_agent_label("current"),
+                "Cursor cursor-grok-4.6-high",
+            )
+            self.assertEqual(
+                agent_registry.resolve_agent_attribution("current"),
+                "current (model: cursor-grok-4.6-high)",
+            )
+
+    def test_alias_chain_to_fixed_agent_preserves_requested_name(self):
+        with patch.object(
+            agent_registry, "AGENT_ALIASES", {"favorite": "sonnet", "current": "favorite"}
+        ):
+            self.assertEqual(
+                agent_registry.resolve_agent_command("current"),
+                agent_registry.resolve_agent_command("sonnet"),
+            )
+            self.assertEqual(
+                agent_registry.resolve_agent_attribution("current"),
+                "current (model: sonnet)",
+            )
+
+    def test_alias_chain_loads_from_registry(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  current: grok
+  grok: cursor:cursor-grok-4.6-high
+"""
+        )
+        aliases = agent_registry.load_agent_aliases(path)
+        self.assertEqual(aliases["current"], "grok")
+        self.assertEqual(aliases["grok"], "cursor:cursor-grok-4.6-high")
+
+    def test_duplicate_alias_name_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  sonnet: cursor:cursor-grok-4.6-high
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("duplicate agent name in registry: sonnet", str(raised.exception))
+
+    def test_missing_alias_target_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  grok: nope
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias grok target not found: nope", str(raised.exception))
+
+    def test_unknown_provider_target_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  grok: unknown:model
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias grok target not found: unknown:model", str(raised.exception))
+
+    def test_alias_cycle_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  a: b
+  b: a
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias cycle: a -> b -> a", str(raised.exception))
+
+    def test_self_alias_cycle_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  grok: grok
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias cycle: grok -> grok", str(raised.exception))
 
 
 class TestCommitFooter(unittest.TestCase):

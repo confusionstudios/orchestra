@@ -41,6 +41,7 @@ import repo_policy
 
 
 AGENTS = config.AGENTS
+AGENT_ALIASES = config.AGENT_ALIASES
 AGENT_PROVIDERS = config.AGENT_PROVIDERS
 VALID_SKIPS = {
     "commit-plan",
@@ -249,7 +250,7 @@ def _validate_next_step_for_type(task_type, next_step):
 
 
 def _agent_error(role):
-    aliases = ", ".join(AGENTS)
+    aliases = ", ".join(list(AGENTS) + list(AGENT_ALIASES))
     providers = ", ".join(AGENT_PROVIDERS)
     provider_text = f" (providers: {providers})" if providers else ""
     return (

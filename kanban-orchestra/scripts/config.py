@@ -7,6 +7,7 @@ if str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
 from agent_registry import (  # type: ignore  # noqa: E402
     AGENTS as AGENTS,
+    AGENT_ALIASES as AGENT_ALIASES,
     AGENT_CMD as AGENT_CMD,
     AGENT_DISPLAY_LABELS as AGENT_DISPLAY_LABELS,
     AGENT_PROVIDERS as AGENT_PROVIDERS,

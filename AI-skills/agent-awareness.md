@@ -19,12 +19,24 @@ virtualenv via `$ORCHESTRA_DIR`; do not fall back to the current worktree.
 ```bash
 : "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
 PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
-from agent_registry import AGENTS, AGENT_PROVIDERS, resolve_agent_command, resolve_agent_label
+from agent_registry import AGENTS, AGENT_ALIASES, AGENT_PROVIDERS, resolve_agent_command, resolve_agent_label
 for key in AGENTS:
     print(f"{key}: {resolve_agent_label(key)} -> {resolve_agent_command(key)}")
+for name, target in AGENT_ALIASES.items():
+    print(f"{name} -> {target}: {resolve_agent_label(name)} -> {resolve_agent_command(name)}")
 print("Dynamic providers:", ", ".join(AGENT_PROVIDERS))
 PY
 ```
+
+## Registry Aliases vs Live Model IDs
+
+Registry `aliases` are Orchestra semantic names. They target an existing fixed
+key or `provider:model` spec and do not define their own commands. `grok` is
+the current preferred Cursor Grok model.
+
+`agent --list-models` is authoritative for live, account-specific Cursor model
+IDs. Dynamic `cursor:<exact-model-id>` remains supported when you need a model
+that is not named in the registry.
 
 ## Current Role Defaults
 
@@ -41,8 +53,8 @@ ORCHESTRA_DEFAULT_REVIEWER
 
 `ORCHESTRA_DEFAULT_REVIEWER` is the default commit-review agent. If the user
 asks for the configured commit-review reviewer, use that value when it names a
-valid fixed alias or provider/model spec such as `cursor:<model>`. If it is
-unset or invalid, use the Orchestra fallback from
+valid fixed alias, registry alias, or provider/model spec such as
+`cursor:<model>`. If it is unset or invalid, use the Orchestra fallback from
 `$ORCHESTRA_DIR/kanban-orchestra/scripts/config.py`.
 
 Resolve defaults from the active environment like this:
@@ -68,8 +80,9 @@ PY
 
 When you need to call an agent, resolve the command through
 `agent_registry.resolve_agent_command(agent_spec)`, then replace the single
-`{prompt}` placeholder with the prompt text. This supports fixed aliases and
-provider/model specs such as `cursor:claude-opus-4-8-high`. Keep the call
+`{prompt}` placeholder with the prompt text. This supports fixed aliases,
+registry aliases such as `grok`, and provider/model specs such as
+`cursor:claude-opus-4-8-high`. Keep the call
 non-interactive, run it from the repo root, and include task-specific context
 in the prompt. Do not feed resolver source code through stdin; agent CLIs may
 consume inherited stdin as additional prompt content. Use `python -c`, a
@@ -120,6 +133,7 @@ At the time this skill was written, useful keys included:
 - `opus` — Claude Opus
 - `fable` — Claude Fable
 - `antigravity`
+- `grok` — current preferred Cursor Grok model (`cursor:cursor-grok-4.6-high`)
 - `cursor-composer-2.5`
 - `cursor-grok-4.5`
 - `cursor-opus-4.6`
@@ -127,5 +141,5 @@ At the time this skill was written, useful keys included:
 - `kilo-opus-4.6`
 - `kilo-opus-4.7`
 - `kilo-sonnet-4.6`
-- `cursor:<model>` for dynamic Cursor Agent model specs
+- `cursor:<exact-model-id>` for dynamic Cursor Agent model specs; use `agent --list-models` for live account IDs
 - `kilo:<model>` for dynamic Kilo model specs

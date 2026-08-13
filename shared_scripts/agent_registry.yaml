@@ -59,3 +59,6 @@ agents:
   - key: cursor-sonnet-4.6
     label: Cursor Sonnet 4.6
     command: ["agent", "-p", "--model", "claude-4.6-sonnet-medium", "--yolo", "--trust", "{prompt}"]
+
+aliases:
+  grok: cursor:cursor-grok-4.6-high
