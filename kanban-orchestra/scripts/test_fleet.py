@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -53,6 +54,64 @@ def write_runtime(root, **overrides):
 
 
 class TestFleetOperatorFlows(unittest.TestCase):
+    def test_tailscale_dashboard_url_matches_existing_https_proxy(self):
+        status = {
+            "TCP": {"8427": {"HTTPS": True}},
+            "Web": {
+                "node.example.ts.net:8427": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:8427"}}
+                }
+            },
+        }
+        result = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
+
+        with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
+             patch.object(fleet, "run", return_value=result):
+            remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
+
+        self.assertEqual(remote, "https://node.example.ts.net:8427/")
+
+    def test_tailscale_dashboard_url_requires_matching_https_proxy(self):
+        status = {
+            "TCP": {"8427": {"HTTPS": True}, "8428": {"HTTPS": False}},
+            "Web": {
+                "node.example.ts.net:8427": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+                },
+                "node.example.ts.net:8428": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:8427"}}
+                },
+            },
+        }
+        result = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
+
+        with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
+             patch.object(fleet, "run", return_value=result):
+            remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
+
+        self.assertIsNone(remote)
+
+    def test_tailscale_dashboard_url_is_absent_without_cli(self):
+        with patch.object(fleet.shutil, "which", return_value=None), \
+             patch.object(fleet, "run") as run_mock:
+            remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
+
+        self.assertIsNone(remote)
+        run_mock.assert_not_called()
+
+    def test_tailscale_dashboard_url_is_absent_without_serve_config(self):
+        for stdout in ("null", "{}"):
+            with self.subTest(stdout=stdout), \
+                 patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
+                 patch.object(
+                     fleet,
+                     "run",
+                     return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
+                 ):
+                remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
+
+            self.assertIsNone(remote)
+
     def test_parser_exposes_operator_replacement_commands(self):
         parser = fleet.build_parser()
 
@@ -158,6 +217,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
             with patch.object(fleet, "tmux_has_session", return_value=False), \
                  patch.object(fleet, "current_repo_root", return_value=root), \
+                 patch.object(fleet, "tailscale_dashboard_url", return_value=None), \
                  redirect_stdout(out):
                 fleet.print_status([repo])
 
@@ -165,6 +225,45 @@ class TestFleetOperatorFlows(unittest.TestCase):
                 "This repo (repo) is running/idle. Dash: http://127.0.0.1:8427",
                 out.getvalue(),
             )
+
+    def test_status_summarizes_current_repo_remote_dashboard_below_table(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "repo_root": str(root),
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_runtime(root, status="idle", current_step="none", active_agents=0)
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "tmux_has_session", return_value=False), \
+                 patch.object(fleet, "current_repo_root", return_value=root), \
+                 patch.object(
+                     fleet,
+                     "tailscale_dashboard_url",
+                     return_value="https://node.example.ts.net:8427/",
+                 ), \
+                 redirect_stdout(out):
+                fleet.print_status([repo])
+
+            lines = out.getvalue().splitlines()
+            self.assertNotIn("Remote", lines[0])
+            self.assertIn("http://127.0.0.1:8427", lines[2])
+            self.assertIn("Remote: https://node.example.ts.net:8427/", lines)
 
     def test_status_does_not_summarize_an_unmanaged_current_repo(self):
         with tempfile.TemporaryDirectory() as tmpdir:

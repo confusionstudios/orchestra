@@ -243,6 +243,9 @@ def build_update(conn) -> str:
         dashboard_url = _dashboard_status_url(identity)
         if dashboard_url:
             lines.append(f"  dashboard: {dashboard_url}")
+            remote_url = fleet.tailscale_dashboard_url(dashboard_url)
+            if remote_url:
+                lines.append(f"  Remote: {remote_url}")
         else:
             lines.append("  dashboard: not running")
 
