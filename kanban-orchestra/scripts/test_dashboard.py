@@ -1907,6 +1907,52 @@ class TestTaskEditingRoutes(unittest.TestCase):
         self.assertEqual(task["title"], "Updated title")
         self.assertEqual(task["description"], "## Heading\n\nNew text")
 
+    def test_post_edit_accepts_same_origin_proxy_host(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{self.tid}/edit",
+            data={"title": "Tailscale title", "description": "Proxy origin"},
+            headers={
+                "host": "100.123.67.105:8427",
+                "origin": "http://100.123.67.105:8427",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+
+        fresh = db.connect(self.db_path)
+        try:
+            task = db.get_task(fresh, self.tid)
+        finally:
+            fresh.close()
+        self.assertEqual(task["title"], "Tailscale title")
+        self.assertEqual(task["description"], "Proxy origin")
+
+    def test_post_edit_accepts_same_origin_referer_proxy_host(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{self.tid}/edit",
+            data={"title": "Referer title", "description": "Referer origin"},
+            headers={
+                "host": "100.123.67.105:8427",
+                "referer": f"http://100.123.67.105:8427/task/{self.tid}",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+
+        fresh = db.connect(self.db_path)
+        try:
+            task = db.get_task(fresh, self.tid)
+        finally:
+            fresh.close()
+        self.assertEqual(task["title"], "Referer title")
+        self.assertEqual(task["description"], "Referer origin")
+
     def test_post_edit_blank_description_clears_description(self):
         from fastapi.testclient import TestClient
 

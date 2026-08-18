@@ -30,7 +30,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
@@ -2410,10 +2410,14 @@ def task_detail(task_id: int):
 
 def _is_local_origin(request: Request) -> bool:
     """Reject cross-origin POST requests to prevent CSRF."""
+    host = request.headers.get("host")
     for header in ("origin", "referer"):
         value = request.headers.get(header)
         if value:
             if value.startswith("http://127.0.0.1:") or value.startswith("http://localhost:"):
+                return True
+            parsed = urlparse(value)
+            if host and parsed.netloc == host and parsed.scheme in {"http", "https"}:
                 return True
             return False
     return False
