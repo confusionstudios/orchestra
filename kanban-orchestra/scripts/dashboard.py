@@ -512,15 +512,15 @@ def _branch_meta_html(branch: str | None, commit_hash: str | None = None) -> str
 
 
 def _review_rounds_meta_html(review_round, *, reviewed: bool) -> str:
-    """Compact 1-based review-round count, omitted unless a review occurred."""
+    """Labeled 1-based review-round count, omitted unless a review occurred."""
     if not reviewed:
         return ""
     count = _display_review_round_count(review_round)
     if count is None:
         return ""
-    noun = "review round" if count == 1 else "review rounds"
-    return _task_record_meta_item(
-        f"{_esc(count)} {noun}",
+    return _labeled_meta_html(
+        "review rounds",
+        _esc(count),
         css_class="task-record-review-rounds",
     )
 
@@ -1289,14 +1289,6 @@ def render_recently_done(conn) -> str:
             _branch_meta_html(r.get("branch"), r.get("commit_hash")),
             _review_rounds_meta_html(r.get("review_round"), reviewed=reviewed),
         ]
-        if rejection_count > 0:
-            label = "rejection" if rejection_count == 1 else "rejections"
-            meta.append(
-                _task_record_meta_item(
-                    f"{_esc(rejection_count)} {label}",
-                    css_class="task-record-rejections",
-                )
-            )
         if runtime != "unknown":
             meta.append(
                 _labeled_meta_html(

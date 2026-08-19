@@ -819,8 +819,8 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("claude", html)
         self.assertIn("antigravity", html)
         self.assertIn('class="task-record-reviewer">(reviewed by antigravity)</span>', html)
-        self.assertIn("task-record-rejections", html)
-        self.assertIn("2 rejections", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("2 rejections", html)
         self.assertNotIn("Configured Reviewer", html)
         self.assertNotIn("Approver", html)
 
@@ -840,12 +840,17 @@ class TestRecentlyDone(unittest.TestCase):
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("task-record-review-rounds", html)
-        self.assertIn("1 review round", html)
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-review-rounds">'
+            '<span class="task-record-label">review rounds</span> 1</span>',
+            html,
+        )
+        self.assertNotIn("1 review round", html)
         self.assertNotIn("0 review round", html)
         self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("rejection", html)
 
-    def test_recently_done_shows_multiple_review_rounds_apart_from_rejections(self):
+    def test_recently_done_shows_multiple_review_rounds_without_rejection_count(self):
         tid = db.add_task(self.conn, "Multi-round task", branch="feat-round-multi")
         db.update_task(
             self.conn,
@@ -867,12 +872,17 @@ class TestRecentlyDone(unittest.TestCase):
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("task-record-review-rounds", html)
-        self.assertIn("3 review rounds", html)
-        self.assertIn("task-record-rejections", html)
-        self.assertIn("2 rejections", html)
-        self.assertNotIn("3 rejections", html)
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-review-rounds">'
+            '<span class="task-record-label">review rounds</span> 3</span>',
+            html,
+        )
+        self.assertNotIn("3 review rounds", html)
         self.assertNotIn("2 review rounds", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("2 rejections", html)
+        self.assertNotIn("3 rejections", html)
+        self.assertNotIn("rejection", html)
 
     def test_recently_done_omits_review_rounds_when_not_applicable(self):
         other_id = db.add_task(
@@ -891,7 +901,10 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("Legacy other task", html)
         self.assertIn("Legacy pull request", html)
         self.assertNotIn("task-record-review-rounds", html)
+        self.assertNotIn("task-record-label\">review rounds", html)
         self.assertNotIn("review round", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("rejection", html)
 
     def test_recently_done_omits_review_rounds_for_default_round_without_decision(self):
         tid = db.add_task(self.conn, "Skipped review task", branch="feat-skip")
@@ -903,7 +916,10 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertEqual(task["review_round"], 0)
         self.assertIn("Skipped review task", html)
         self.assertNotIn("task-record-review-rounds", html)
+        self.assertNotIn("task-record-label\">review rounds", html)
         self.assertNotIn("review round", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("rejection", html)
 
     def test_recently_done_shows_elapsed_runtime(self):
         tid = db.add_task(self.conn, "Runtime task", branch="feat-runtime")
@@ -1146,11 +1162,25 @@ class TestTaskRecordLists(unittest.TestCase):
         self.assertIn("cursor:grok-4.5-high", html)
         self.assertIn("(reviewed by codex)", html)
         self.assertIn("task-record-hash", html)
-        self.assertIn("1 review round", html)
-        self.assertIn("1 rejection", html)
-        self.assertIn("00:05:00", html)
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-review-rounds">'
+            '<span class="task-record-label">review rounds</span> 1</span>',
+            html,
+        )
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-runtime">'
+            '<span class="task-record-label">runtime</span> 00:05:00</span>',
+            html,
+        )
         self.assertIn("task-record-finished", html)
+        self.assertIn('<span class="task-record-label">finished</span>', html)
         self.assertIn("2026-05-31", html)
+        self.assertNotIn("1 review round", html)
+        self.assertNotIn("1 rejection", html)
+        self.assertNotIn("task-record-rejections", html)
+        review_at = html.find("task-record-review-rounds")
+        self.assertNotEqual(review_at, -1)
+        self.assertLess(review_at, html.find("task-record-runtime", review_at))
         self.assertLess(html.find("task-record-runtime"), html.find("task-record-finished"))
         self.assertIn('data-show-more-row data-row-index="5" hidden', html)
         self.assertIn("Show More", html)
