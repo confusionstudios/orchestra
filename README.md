@@ -145,6 +145,7 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-fleet" add .
    "$ORCHESTRA_DIR/bin/ko-fleet" status
    "$ORCHESTRA_DIR/bin/ko-fleet" start
+   "$ORCHESTRA_DIR/bin/ko-fleet" dashboard
    ```
 
    The fleet config is `~/.config/orchestra/fleet.repos`: one git repo root per
@@ -152,10 +153,19 @@ accounts, or billing — install and authenticate each CLI yourself.
    orchestrators and dashboards for those repos — it does not install, sync, or
    distribute skills. Skills come from the one-time
    `ko-install-global-skills` step above.
-   `ko-fleet stop`, `restart`, `attach`, `logs`, and `dashboard` operate on the
-   selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
-   for opening the repo dashboard. Use `ko-get-update` for a concise status
-   snapshot and `ko-task` to inspect, comment on, or update individual tasks.
+   `ko-fleet stop`, `restart`, `attach`, and `logs` operate on the selected
+   repo label or path. `ko-fleet dashboard` starts or opens the Fleet Dashboard;
+   `ko-fleet dashboard <repo>` still opens that repo dashboard.
+   `ko-fleet dashboard-open <repo>` is an explicit open verb for a repo
+   dashboard.
+
+   Each Fleet Dashboard card shows the repo name, path, branch, status, current
+   task, and ready / recently done / icebox counts. Via Tailscale appears only
+   when `tailscale serve status --json` has an exact HTTPS proxy to that repo
+   dashboard port. Play on a stopped card starts that configured repo and is
+   equivalent to `ko-fleet start <configured-repo-label>`.
+   Use `ko-get-update` for a concise status snapshot and `ko-task` to inspect,
+   comment on, or update individual tasks.
    Use `ko-task continue` to resume blocked tasks after a review-round cap
    (`--add-review-rounds N`) or with an explicit recovery step (`--next-step`).
    Legacy pre-schema review-cap blocks: `--add-review-rounds N --next-step <maker-step>`.
@@ -224,6 +234,8 @@ one repo root per line. It derives display names from each path and only
 manages orchestrator/dashboard processes for those repos — not skill
 installation or distribution. `start` skips dirty stopped repos and keeps
 launching clean stopped repos; invalid repo config remains a hard failure.
+`ko-fleet dashboard` starts or opens the Fleet Dashboard;
+`ko-fleet dashboard <repo>` still opens that repo dashboard.
 
 ### YOLO Mode and Hardening
 

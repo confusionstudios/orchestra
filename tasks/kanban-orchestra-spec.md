@@ -758,6 +758,7 @@ names are derived from the basename of the resolved repo path.
 "$ORCHESTRA_DIR/bin/ko-fleet" restart <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" attach <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" logs <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
@@ -773,15 +774,23 @@ names are derived from the basename of the resolved repo path.
 
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
-`ko-fleet attach`, `ko-fleet logs`, and `ko-fleet dashboard` select by repo
-label/path and then use the selected repo's tmux session, repo-local
-`.kanban-orchestra/orchestrator.log`, and repo-local dashboard metadata.
-`ko-fleet dashboard-open` is an alias for `ko-fleet dashboard`.
+`ko-fleet attach` and `ko-fleet logs` select by repo label/path and then use
+the selected repo's tmux session and repo-local
+`.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
+starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
+that repo's localhost dashboard from repo-local dashboard metadata.
+`ko-fleet dashboard-open` is an explicit open verb that requires a repo
+selector.
 
-The repo dashboard is the supported UI surface: it is read-only, repo-scoped,
-and attached to the matching orchestrator instance. The old process-manager UI
-and its heartbeat/request/response JSON files are removed, not compatibility
-surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
+The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
+The Fleet Dashboard shows one card per configured repo: name, path, branch,
+status, current task, and ready / recently done / icebox counts. Via Tailscale
+appears only when `tailscale serve status --json` has an exact HTTPS proxy to
+that repo dashboard port. Play on a stopped card is equivalent to
+`ko-fleet start <configured-repo-label>`. Each repo dashboard is read-only,
+repo-scoped, and attached to the matching orchestrator instance. The old
+process-manager UI and its heartbeat/request/response JSON files are removed,
+not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
 `ko-task`, and `ko-get-update`; active child process metadata is maintained
 independently in `.kanban-orchestra/active-agent-processes.json`. The old
 `BREAK` control is intentionally removed as a remote operator command: it killed

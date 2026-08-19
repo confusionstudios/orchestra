@@ -223,6 +223,7 @@ Use status commands and repo-local metadata instead of PID hunting:
 "$ORCHESTRA_DIR/bin/ko-fleet" restart <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" attach <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" logs <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
@@ -246,14 +247,21 @@ at the top of the next polling loop after the current task finishes, logs the
 detection, deletes the file, and exits.
 
 Notes:
+- Use `ko-fleet dashboard` to start or open the Fleet Dashboard. Each card
+  shows the repo name, path, branch, status, current task, and ready /
+  recently done / icebox counts. Via Tailscale appears only when
+  `tailscale serve status --json` has an exact HTTPS proxy to that repo
+  dashboard port. Play on a stopped card is equivalent to
+  `ko-fleet start <configured-repo-label>`.
 - Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
 - Use `ko-fleet dashboard-open <repo-label>` when a script wants an explicit
-  open verb; it is an alias for `dashboard`.
-- The dashboard chooses a free port at runtime and records it in
+  open verb; it requires a repo selector.
+- The repo dashboard chooses a free port at runtime and records it in
   `.kanban-orchestra/dashboard.json`.
-- The dashboard is the repo-scoped read-only status surface. For intervention,
-  stop or interrupt the repo instance, inspect with `ko-get-update`, use
-  `ko-task` to record or unblock the affected task, and restart explicitly.
+- The repo dashboard is the repo-scoped read-only status surface. For
+  intervention, stop or interrupt the repo instance, inspect with
+  `ko-get-update`, use `ko-task` to record or unblock the affected task, and
+  restart explicitly.
 - A running orchestrator reassesses blocked tasks natively about once a
   minute. It consults `$ORCHESTRA_DEFAULT_UNBLOCKER` and either continues a
   recoverable task or leaves a durable `smart-unblock` comment. Narration
@@ -351,8 +359,9 @@ First choice: `ko-get-update`.
 "$ORCHESTRA_DIR/bin/ko-get-update"
 ```
 
-Use `ko-fleet dashboard <repo-label>` to open the HTML dashboard for a running
-fleet instance. The dashboard shows orchestrator status, the active task,
+Use `ko-fleet dashboard` to start or open the Fleet Dashboard. Use
+`ko-fleet dashboard <repo-label>` to open the HTML dashboard for a running
+repo instance. The repo dashboard shows orchestrator status, the active task,
 reviewer state, and current orchestrator output.
 
 CLI-level state check via `orchestrator_runtime`:
