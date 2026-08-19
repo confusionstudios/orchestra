@@ -264,7 +264,8 @@ Runtime status values:
   the orchestrator for the current repo without process hunting.
 - `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
 - `.kanban-orchestra/dashboard.json`: repo-scoped metadata for the dashboard
-  owned by the orchestrator instance, including PID, host, port, and URL.
+  owned by the orchestrator instance, including PID, host, port, localhost URL,
+  and optional Tailscale remote URL when Serve publication succeeds.
 - `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts.
   Idle-time maintenance deletes `*.log` transcript files older than seven days
   only for completed (`done`) tasks, then removes empty `task-<id>` directories.
@@ -784,9 +785,16 @@ selector.
 
 The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
 The Fleet Dashboard shows one card per configured repo: name, path, branch,
-status, current task, and ready / recently done / icebox counts. Via Tailscale
-appears only when `tailscale serve status --json` has an exact HTTPS proxy to
-that repo dashboard port. Play on a stopped card is equivalent to
+status, current task, and ready / recently done / icebox counts. Both the
+Fleet Dashboard and each repo dashboard publish an HTTPS Tailscale Serve proxy
+to the chosen localhost port in the background after startup when the
+`tailscale` CLI is available. Existing exact mappings are reused; a same-port
+HTTPS listener is preferred when that port is free; a free alternate HTTPS
+listener is used when it is not; unrelated Serve routes are never overwritten;
+and mappings persist after the dashboard stops. Tailscale
+absence, authentication failure, startup delay, or Serve failure never blocks
+the localhost dashboard and does not emit dashboard UI warnings. Via Tailscale appears only when that
+exact HTTPS proxy exists. Play on a stopped card is equivalent to
 `ko-fleet start <configured-repo-label>`. Each repo dashboard is read-only,
 repo-scoped, and attached to the matching orchestrator instance. The old
 process-manager UI and its heartbeat/request/response JSON files are removed,

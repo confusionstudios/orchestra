@@ -167,9 +167,16 @@ accounts, or billing — install and authenticate each CLI yourself.
    dashboard.
 
    Each Fleet Dashboard card shows the repo name, path, branch, status, current
-   task, and ready / recently done / icebox counts. Via Tailscale appears only
-   when `tailscale serve status --json` has an exact HTTPS proxy to that repo
-   dashboard port. Play on a stopped card starts that configured repo and is
+   task, and ready / recently done / icebox counts. Dashboard startup publishes
+   an HTTPS Tailscale Serve proxy to the chosen localhost port in the background
+   when the `tailscale` CLI is available: existing exact mappings are reused, a
+   same-port HTTPS listener is preferred when that port is free, a free
+   alternate HTTPS listener is used when it is not, and unrelated Serve routes
+   are left untouched. Mappings persist after the dashboard stops
+   so the remote URL stays stable. Tailscale absence, delay, or failure never
+   blocks the localhost dashboard. Via Tailscale appears only when that exact
+   HTTPS proxy exists.
+   Play on a stopped card starts that configured repo and is
    equivalent to `ko-fleet start <configured-repo-label>`.
    Use `ko-get-update` for a concise status snapshot and `ko-task` to inspect,
    comment on, or update individual tasks.

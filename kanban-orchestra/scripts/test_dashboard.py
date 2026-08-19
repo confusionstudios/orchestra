@@ -118,6 +118,7 @@ class TestHelpers(unittest.TestCase):
                 self.assertEqual(payload["host"], "127.0.0.1")
                 self.assertEqual(payload["port"], 8430)
                 self.assertEqual(payload["url"], "http://127.0.0.1:8430")
+                self.assertIsNone(payload["remote_url"])
 
                 dashboard._remove_dashboard_metadata()
                 self.assertFalse(metadata_path.exists())
@@ -2513,6 +2514,15 @@ class TestFindFreePort(unittest.TestCase):
 
 class TestRunDashboard(unittest.TestCase):
     """Tests for _run_dashboard: startup-flow wiring and final-port reporting."""
+
+    def setUp(self):
+        self.publish_patch = patch.object(
+            dashboard.dashboard_tailscale,
+            "schedule_publish_dashboard",
+            return_value=None,
+        )
+        self.publish_mock = self.publish_patch.start()
+        self.addCleanup(self.publish_patch.stop)
 
     def _make_mock_uvicorn(self):
         """Return a minimal mock that stands in for the uvicorn module."""

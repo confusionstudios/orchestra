@@ -16,9 +16,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import config
+import dashboard_tailscale
 
 
 ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -355,63 +355,7 @@ def dashboard_status_url(repo: FleetRepo) -> str:
 
 def tailscale_dashboard_url(local_url: str) -> str | None:
     """Return the HTTPS Serve URL proxying one loopback dashboard, if present."""
-    try:
-        local = urlsplit(local_url)
-        local_port = local.port
-    except (TypeError, ValueError):
-        return None
-    if local.scheme != "http" or local.hostname not in {"127.0.0.1", "localhost", "::1"} or local_port is None:
-        return None
-    if shutil.which("tailscale") is None:
-        return None
-
-    result = run(["tailscale", "serve", "status", "--json"])
-    if result.returncode != 0:
-        return None
-    try:
-        payload = json.loads(result.stdout)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-
-    tcp = payload.get("TCP")
-    web = payload.get("Web")
-    if not isinstance(tcp, dict) or not isinstance(web, dict):
-        return None
-
-    for endpoint, server in sorted(web.items()):
-        if not isinstance(endpoint, str) or not isinstance(server, dict):
-            continue
-        try:
-            endpoint_port = urlsplit(f"//{endpoint}").port or 443
-        except ValueError:
-            continue
-        listener = tcp.get(str(endpoint_port))
-        if not isinstance(listener, dict) or listener.get("HTTPS") is not True:
-            continue
-        handlers = server.get("Handlers")
-        if not isinstance(handlers, dict):
-            continue
-        for path, handler in sorted(handlers.items()):
-            if not isinstance(path, str) or not isinstance(handler, dict):
-                continue
-            proxy = handler.get("Proxy")
-            if not isinstance(proxy, str):
-                continue
-            try:
-                target = urlsplit(proxy)
-                target_port = target.port
-            except ValueError:
-                continue
-            if (
-                target.scheme == "http"
-                and target.hostname in {"127.0.0.1", "localhost", "::1"}
-                and target_port == local_port
-            ):
-                route = path if path.startswith("/") else f"/{path}"
-                return f"https://{endpoint}{route}"
-    return None
+    return dashboard_tailscale.lookup_dashboard_url(local_url)
 
 
 def wait_dashboard_ready(repo: FleetRepo, *, timeout: float = 12.0) -> bool:

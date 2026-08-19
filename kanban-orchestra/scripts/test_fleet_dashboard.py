@@ -286,8 +286,8 @@ class TestCollectCardTailscale(FleetDashboardRepoTest):
             [], 0, stdout=json.dumps(_tailscale_status()), stderr=""
         )
 
-        with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
-             patch.object(fleet, "run", return_value=result):
+        with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value="/usr/bin/tailscale"), \
+             patch.object(fleet.dashboard_tailscale, "_run", return_value=result):
             card = _collect(self.repo)
 
         self.assertEqual(card.dashboard_url, "http://127.0.0.1:8427")
@@ -300,8 +300,8 @@ class TestCollectCardTailscale(FleetDashboardRepoTest):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
-        with patch.object(fleet.shutil, "which", return_value=None), \
-             patch.object(fleet, "run") as run_mock, \
+        with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value=None), \
+             patch.object(fleet.dashboard_tailscale, "_run") as run_mock, \
              redirect_stdout(stdout), \
              redirect_stderr(stderr):
             card = _collect(self.repo)
@@ -331,8 +331,8 @@ class TestCollectCardTailscale(FleetDashboardRepoTest):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
-        with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
-             patch.object(fleet, "run", return_value=result), \
+        with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value="/usr/bin/tailscale"), \
+             patch.object(fleet.dashboard_tailscale, "_run", return_value=result), \
              redirect_stdout(stdout), \
              redirect_stderr(stderr):
             card = _collect(self.repo)
@@ -355,8 +355,8 @@ class TestCollectCardTailscale(FleetDashboardRepoTest):
             with self.subTest(returncode=result.returncode, stdout=result.stdout):
                 stdout = io.StringIO()
                 stderr = io.StringIO()
-                with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
-                     patch.object(fleet, "run", return_value=result), \
+                with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value="/usr/bin/tailscale"), \
+                     patch.object(fleet.dashboard_tailscale, "_run", return_value=result), \
                      redirect_stdout(stdout), \
                      redirect_stderr(stderr):
                     card = _collect(self.repo)
@@ -702,6 +702,15 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
 
 
 class FleetDashboardServerTests(unittest.TestCase):
+    def setUp(self):
+        self.publish_patch = patch.object(
+            fleet_dashboard.dashboard_tailscale,
+            "schedule_publish_dashboard",
+            return_value=None,
+        )
+        self.publish_mock = self.publish_patch.start()
+        self.addCleanup(self.publish_patch.stop)
+
     def test_write_dashboard_metadata_uses_fleet_config_sidecar(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             meta = Path(tmpdir) / "fleet-dashboard.json"
@@ -713,6 +722,7 @@ class FleetDashboardServerTests(unittest.TestCase):
                 self.assertEqual(payload["port"], 8426)
                 self.assertEqual(payload["url"], "http://127.0.0.1:8426")
                 self.assertEqual(payload["pid"], os.getpid())
+                self.assertIsNone(payload["remote_url"])
                 fleet_dashboard._remove_dashboard_metadata()
                 self.assertFalse(meta.exists())
 
@@ -726,7 +736,7 @@ class FleetDashboardServerTests(unittest.TestCase):
             fleet_dashboard._run_dashboard("127.0.0.1", 8426, _uvicorn=uv)
 
         find_mock.assert_called_once_with("127.0.0.1", 8426)
-        write_mock.assert_called_once_with("127.0.0.1", 8426)
+        write_mock.assert_called_once_with("127.0.0.1", 8426, remote_url=None)
         _, kwargs = uv.run.call_args
         self.assertEqual(kwargs["host"], "127.0.0.1")
         self.assertEqual(kwargs["port"], 8426)

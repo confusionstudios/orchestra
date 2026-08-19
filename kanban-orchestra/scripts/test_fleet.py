@@ -65,8 +65,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
         }
         result = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
 
-        with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
-             patch.object(fleet, "run", return_value=result):
+        with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value="/usr/bin/tailscale"), \
+             patch.object(fleet.dashboard_tailscale, "_run", return_value=result):
             remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
 
         self.assertEqual(remote, "https://node.example.ts.net:8427/")
@@ -85,15 +85,15 @@ class TestFleetOperatorFlows(unittest.TestCase):
         }
         result = subprocess.CompletedProcess([], 0, stdout=json.dumps(status), stderr="")
 
-        with patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
-             patch.object(fleet, "run", return_value=result):
+        with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value="/usr/bin/tailscale"), \
+             patch.object(fleet.dashboard_tailscale, "_run", return_value=result):
             remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
 
         self.assertIsNone(remote)
 
     def test_tailscale_dashboard_url_is_absent_without_cli(self):
-        with patch.object(fleet.shutil, "which", return_value=None), \
-             patch.object(fleet, "run") as run_mock:
+        with patch.object(fleet.dashboard_tailscale.shutil, "which", return_value=None), \
+             patch.object(fleet.dashboard_tailscale, "_run") as run_mock:
             remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")
 
         self.assertIsNone(remote)
@@ -102,10 +102,10 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_tailscale_dashboard_url_is_absent_without_serve_config(self):
         for stdout in ("null", "{}"):
             with self.subTest(stdout=stdout), \
-                 patch.object(fleet.shutil, "which", return_value="/usr/bin/tailscale"), \
+                 patch.object(fleet.dashboard_tailscale.shutil, "which", return_value="/usr/bin/tailscale"), \
                  patch.object(
-                     fleet,
-                     "run",
+                     fleet.dashboard_tailscale,
+                     "_run",
                      return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
                  ):
                 remote = fleet.tailscale_dashboard_url("http://127.0.0.1:8427")

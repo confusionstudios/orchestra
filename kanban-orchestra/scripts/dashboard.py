@@ -38,6 +38,7 @@ from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
+import dashboard_tailscale
 import db
 import task as task_cli
 
@@ -2850,7 +2851,17 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
             raise SystemExit(1)
 
     port = _find_free_port(host, preferred_port)
-    _write_dashboard_metadata(host, port)
+    _write_dashboard_metadata(host, port, remote_url=None)
+
+    def _record_remote(remote_url: str | None) -> None:
+        if remote_url:
+            _write_dashboard_metadata(host, port, remote_url=remote_url)
+
+    dashboard_tailscale.schedule_publish_dashboard(
+        host,
+        port,
+        on_resolved=_record_remote,
+    )
     if port != preferred_port:
         print(
             f"Port {preferred_port} is in use; dashboard starting on port {port}.",
@@ -2868,7 +2879,7 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
         pass
 
 
-def _write_dashboard_metadata(host: str, port: int) -> None:
+def _write_dashboard_metadata(host: str, port: int, remote_url: str | None = None) -> None:
     """Write optional repo-local dashboard metadata for orchestrator/fleet status."""
     metadata_path = os.environ.get("KO_DASHBOARD_METADATA_PATH")
     if not metadata_path:
@@ -2882,6 +2893,7 @@ def _write_dashboard_metadata(host: str, port: int) -> None:
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}",
+        "remote_url": remote_url,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     temp = path.with_suffix(path.suffix + ".tmp")
