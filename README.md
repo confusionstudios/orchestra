@@ -41,7 +41,23 @@ heartbeat. Each task carries durable comments — reviewer feedback, validation
 results, commit messages — so you can trace every decision without reading
 agent logs. Run logs capture the full session, and `ko-task` lets you inspect
 or update any task from another terminal or a remote agent session. If something
-stalls or fails, you see it immediately and can intervene.
+stalls or fails, you see it immediately and can intervene. Recently Done places
+review rounds beside runtime and finished time when durable review evidence is
+available.
+
+The Fleet Dashboard presents every configured repo as a card with its branch,
+runtime status, current task, queue counts, dashboard actions, and any known
+reason startup failed. A play button on an eligible stopped card starts that
+repo through the same validated path as `ko-fleet start <repo>`. Repo-dashboard
+links open in a new tab so the Fleet Dashboard remains available.
+
+Repo and Fleet dashboard startup always brings localhost online first, then
+makes a best-effort attempt to start Tailscale and publish an exact HTTPS Serve
+proxy. Existing mappings are reused, unrelated Serve routes stay untouched,
+and Tailscale absence or failure never blocks local access. A locally opened
+Fleet Dashboard offers both local and **Via Tailscale** repo actions when the
+remote mapping exists. A Fleet Dashboard reached through Tailscale shows only
+the remote action because a localhost link would point at the client device.
 
 The repo and Fleet dashboards include an **Accent** picker in their top
 navigation. Its curated colors are readable on both dark dashboard backgrounds;
@@ -167,17 +183,21 @@ accounts, or billing — install and authenticate each CLI yourself.
    dashboard.
 
    Each Fleet Dashboard card shows the repo name, path, branch, status, current
-   task, and ready / recently done / icebox counts. Dashboard startup publishes
-   an HTTPS Tailscale Serve proxy to the chosen localhost port in the background
-   when the `tailscale` CLI is available: existing exact mappings are reused, a
-   same-port HTTPS listener is preferred when that port is free, a free
-   alternate HTTPS listener is used when it is not, and unrelated Serve routes
-   are left untouched. Mappings persist after the dashboard stops
+   task, and ready / recently done / icebox counts. Eligible stopped cards have
+   a play action equivalent to `ko-fleet start <configured-repo-label>`; cards
+   that cannot start show the reason, such as a dirty worktree.
+
+   Dashboard startup publishes an HTTPS Tailscale Serve proxy to the chosen
+   localhost port in the background when the `tailscale` CLI is available. If
+   Tailscale is stopped, startup first makes a bounded `tailscale up` attempt.
+   Existing exact mappings are reused, a same-port HTTPS listener is preferred
+   when free, a free alternate listener is used when needed, and unrelated
+   Serve routes are left untouched. Mappings persist after the dashboard stops
    so the remote URL stays stable. Tailscale absence, delay, or failure never
-   blocks the localhost dashboard. Via Tailscale appears only when that exact
-   HTTPS proxy exists.
-   Play on a stopped card starts that configured repo and is
-   equivalent to `ko-fleet start <configured-repo-label>`.
+   blocks localhost. **Via Tailscale** appears only when that exact HTTPS proxy
+   exists; remote Fleet views omit unusable localhost repo links. Repo-dashboard
+   actions open in a new tab.
+
    Use `ko-get-update` for a concise status snapshot and `ko-task` to inspect,
    comment on, or update individual tasks.
    Use `ko-task continue` to resume blocked tasks after a review-round cap

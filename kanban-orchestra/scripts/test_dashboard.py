@@ -2078,8 +2078,8 @@ class TestTaskEditingRoutes(unittest.TestCase):
             f"/task/{self.tid}/edit",
             data={"title": "Tailscale title", "description": "Proxy origin"},
             headers={
-                "host": "100.123.67.105:8427",
-                "origin": "http://100.123.67.105:8427",
+                "host": "192.0.2.1:8427",
+                "origin": "http://192.0.2.1:8427",
             },
             follow_redirects=False,
         )
@@ -2101,8 +2101,8 @@ class TestTaskEditingRoutes(unittest.TestCase):
             f"/task/{self.tid}/edit",
             data={"title": "Referer title", "description": "Referer origin"},
             headers={
-                "host": "100.123.67.105:8427",
-                "referer": f"http://100.123.67.105:8427/task/{self.tid}",
+                "host": "192.0.2.1:8427",
+                "referer": f"http://192.0.2.1:8427/task/{self.tid}",
             },
             follow_redirects=False,
         )
