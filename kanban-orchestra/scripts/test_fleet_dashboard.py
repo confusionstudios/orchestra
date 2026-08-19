@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Behavioral tests for Fleet Dashboard card-state collection."""
+"""Behavioral tests for Fleet Dashboard card-state collection and HTML page."""
 
 from __future__ import annotations
 
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -363,6 +364,150 @@ class TestCollectCardTailscale(FleetDashboardRepoTest):
                 self.assertIsNone(card.tailscale_url)
                 self.assertEqual(stdout.getvalue(), "")
                 self.assertEqual(stderr.getvalue(), "")
+
+
+def _page_card(**fields) -> fleet_dashboard.FleetCard:
+    payload = {
+        "name": "midi",
+        "path": "~/dans-data/midi",
+        "branch": "feature/device-sync",
+        "status": "idle",
+        "invalid": False,
+        "current_task": None,
+        "ready_count": 0,
+        "recently_done_count": 4,
+        "icebox_count": 7,
+        "dashboard_url": "http://127.0.0.1:8428",
+        "tailscale_url": None,
+        "last_start_failure": None,
+    }
+    payload.update(fields)
+    return fleet_dashboard.FleetCard(**payload)
+
+
+def _get_fleet_page(*cards: fleet_dashboard.FleetCard, config_display: str = "~/.config/orchestra/fleet.repos"):
+    from fastapi.testclient import TestClient
+
+    with patch.object(fleet_dashboard, "collect_cards", return_value=list(cards)), \
+         patch.object(fleet_dashboard, "_config_display", return_value=config_display):
+        return TestClient(fleet_dashboard.app).get("/")
+
+
+def _visible_text(html: str) -> str:
+    return re.sub(r"<[^>]+>", " ", html)
+
+
+class TestFleetDashboardPage(unittest.TestCase):
+    def test_get_index_serves_utf8_html(self):
+        response = _get_fleet_page(_page_card(branch="feature/unicodé-sync"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("charset=utf-8", response.headers["content-type"].lower())
+        self.assertIn('<meta charset="utf-8">', response.text)
+        self.assertIn("feature/unicodé-sync", response.text)
+
+    def test_cards_match_collector_data_and_layout(self):
+        task = fleet_dashboard.FleetCurrentTask(214, "Device synchronization")
+        response = _get_fleet_page(
+            _page_card(
+                name="midi",
+                path="~/dans-data/midi",
+                branch="feature/device-sync",
+                status="running",
+                current_task=task,
+                ready_count=3,
+                recently_done_count=2,
+                icebox_count=5,
+                dashboard_url="http://127.0.0.1:8428",
+            )
+        )
+        html = response.text
+
+        self.assertIn('class="card repo-record"', html)
+        self.assertIn('class="repo-list"', html)
+        self.assertIn("midi", html)
+        self.assertIn("~/dans-data/midi", html)
+        self.assertIn("feature/device-sync", html)
+        self.assertIn("badge-running", html)
+        self.assertIn(">running</span>", html)
+        self.assertIn("#214 Device synchronization", html)
+        self.assertIn(">3</span>", html)
+        self.assertIn(">Ready</span>", html)
+        self.assertIn(">2</span>", html)
+        self.assertIn(">Recently Done</span>", html)
+        self.assertIn(">5</span>", html)
+        self.assertIn(">Icebox</span>", html)
+        self.assertIn(">Dashboard</a>", html)
+        self.assertIn('href="http://127.0.0.1:8428"', html)
+        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", html)
+        self.assertIn("aspect-ratio: 1", html)
+        self.assertIn("@media (max-width: 960px)", html)
+        self.assertIn("@media (max-width: 560px)", html)
+
+    def test_absent_current_task_renders_none(self):
+        html = _get_fleet_page(_page_card(current_task=None)).text
+
+        self.assertIn("Current task", html)
+        self.assertIn(">None</span>", html)
+
+    def test_omits_subtitle_summary_heartbeat_and_raw_dashboard_urls(self):
+        html = _get_fleet_page(
+            _page_card(
+                dashboard_url="http://127.0.0.1:8428",
+                tailscale_url="https://node.example.ts.net:8428/",
+            )
+        ).text
+        visible = _visible_text(html)
+
+        self.assertNotIn('class="lede"', html)
+        self.assertNotIn("subtitle", html.lower())
+        self.assertNotIn("heartbeat-age", html)
+        self.assertNotIn("heartbeat", visible.lower())
+        self.assertNotIn("health-wrap", html)
+        self.assertNotIn("aggregate", html.lower())
+        self.assertNotIn("http://127.0.0.1:8428", visible)
+        self.assertNotIn("https://node.example.ts.net:8428/", visible)
+        self.assertIn(">Dashboard</a>", html)
+        self.assertIn(">Via Tailscale</a>", html)
+
+    def test_via_tailscale_renders_only_when_collector_returned_a_mapping(self):
+        with_mapping = _get_fleet_page(
+            _page_card(tailscale_url="https://node.example.ts.net:8428/")
+        ).text
+        without_mapping = _get_fleet_page(_page_card(tailscale_url=None)).text
+
+        self.assertIn(">Via Tailscale</a>", with_mapping)
+        self.assertIn('href="https://node.example.ts.net:8428/"', with_mapping)
+        self.assertIn("via-tailscale", with_mapping)
+        self.assertNotIn("Via Tailscale", without_mapping)
+        self.assertIn(">Dashboard</a>", without_mapping)
+
+    def test_stopped_card_shows_play_button_and_last_start_reason(self):
+        html = _get_fleet_page(
+            _page_card(
+                name="clip-library",
+                status="stopped",
+                dashboard_url=None,
+                last_start_failure="Worktree dirty",
+            )
+        ).text
+
+        self.assertRegex(
+            html,
+            r'badge-stopped">stopped</span>\s*'
+            r'<button class="start-button" type="button" '
+            r'data-start-repo="clip-library" '
+            r'aria-label="Start clip-library"></button>',
+        )
+        self.assertIn("Last start failed", html)
+        self.assertIn("Worktree dirty", html)
+        self.assertIn(".start-button::before", html)
+        self.assertIn("border-left: 7px solid currentColor", html)
+        self.assertNotIn("▶", html)
+        self.assertNotIn("►", html)
+        running_html = _get_fleet_page(_page_card(status="running")).text
+        self.assertNotIn('class="start-button"', running_html)
+        self.assertNotIn("data-start-repo", running_html)
 
 
 if __name__ == "__main__":

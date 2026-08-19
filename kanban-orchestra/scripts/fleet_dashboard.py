@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect Fleet Dashboard card state from configured fleet repositories."""
+"""Collect Fleet Dashboard card state and serve the fleet-scoped HTML page."""
 
 from __future__ import annotations
 
@@ -7,10 +7,17 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, HTMLResponse
 
 import dashboard
 import db
 import fleet
+
+app = FastAPI(title="Kanban Orchestra Fleet Dashboard")
+_FAVICON = Path(__file__).resolve().parent.parent / "favicon.ico"
 
 
 @dataclass(frozen=True)
@@ -213,3 +220,376 @@ def _repo_branch(repo: fleet.FleetRepo) -> str | None:
         return None
     branch = result.stdout.strip()
     return branch or None
+
+
+FLEET_CSS = """
+.nav-current {
+  color: var(--ink);
+  font-size: 0.84rem;
+}
+
+.repo-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.repo-record {
+  display: flex;
+  min-width: 0;
+  aspect-ratio: 1;
+  margin: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.repo-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.status-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.start-button {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  place-items: center;
+  background: #001707;
+  border: 1px solid var(--accent-dim);
+  border-radius: 2px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.start-button::before {
+  width: 0;
+  height: 0;
+  margin-left: 2px;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 7px solid currentColor;
+  content: "";
+}
+
+.start-button:hover {
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+.start-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.start-button.is-starting::before {
+  width: auto;
+  height: auto;
+  margin: 0;
+  border: 0;
+  content: "...";
+  font-family: inherit;
+  font-size: 0.68rem;
+}
+
+.repo-name {
+  display: block;
+  overflow: hidden;
+  color: var(--accent);
+  font-size: 1.05rem;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-path,
+.branch {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-details {
+  padding: 14px 0;
+}
+
+.detail-label {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.task-detail {
+  margin-top: 2px;
+}
+
+.queue-boxes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.queue-box {
+  min-width: 0;
+  padding: 9px 8px;
+  background: #080808;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+
+.queue-count {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--ink);
+  font-size: 1.18rem;
+  line-height: 1.2;
+}
+
+.queue-label {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.67rem;
+  letter-spacing: 0.03em;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+}
+
+.queue-box-ready .queue-count {
+  color: var(--accent);
+}
+
+.dashboard-links {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.dashboard-links a {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 7px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: var(--bg);
+  font-size: 0.76rem;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.dashboard-links .via-tailscale {
+  grid-column: 3;
+}
+
+.dashboard-links a:hover {
+  background: #33dd66;
+  color: var(--bg);
+  text-decoration: none;
+}
+
+.dashboard-links,
+.unavailable,
+.start-result:last-child {
+  margin-top: auto;
+}
+
+.unavailable,
+.start-result {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.unavailable {
+  color: var(--muted);
+}
+
+.start-reason {
+  color: var(--orange);
+}
+
+@media (max-width: 960px) {
+  .repo-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .repo-list {
+    gap: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .repo-list {
+    grid-template-columns: 1fr;
+  }
+}
+"""
+
+
+def _esc(value) -> str:
+    return dashboard._esc(value)
+
+
+def _config_display() -> str:
+    return fleet.display_path(fleet.config_path())
+
+
+def _current_task_html(card: FleetCard) -> str:
+    if card.current_task is None:
+        return '<span class="muted">None</span>'
+    label = f"#{card.current_task.id} {_esc(card.current_task.title)}"
+    if card.dashboard_url:
+        href = f"{card.dashboard_url.rstrip('/')}/task/{card.current_task.id}"
+        return f'<a href="{_esc(href)}">{label}</a>'
+    return f"<span>{label}</span>"
+
+
+def _status_html(card: FleetCard) -> str:
+    badge_cls = dashboard.STATUS_BADGE_CLASS.get(card.status, "badge-none")
+    badge = f'<span class="badge {badge_cls}">{_esc(card.status)}</span>'
+    if card.status != "stopped":
+        return badge
+    return (
+        '<div class="status-controls">'
+        f"{badge}"
+        f'<button class="start-button" type="button" '
+        f'data-start-repo="{_esc(card.name)}" '
+        f'aria-label="Start {_esc(card.name)}"></button>'
+        "</div>"
+    )
+
+
+def _name_html(card: FleetCard) -> str:
+    name = _esc(card.name)
+    if card.dashboard_url:
+        return f'<a class="repo-name" href="{_esc(card.dashboard_url)}">{name}</a>'
+    return f'<span class="repo-name">{name}</span>'
+
+
+def _branch_html(card: FleetCard) -> str:
+    branch = _esc(card.branch) if card.branch else "-"
+    return f'<div class="branch muted"><code>{branch}</code></div>'
+
+
+def _footer_html(card: FleetCard) -> str:
+    parts: list[str] = []
+    if card.last_start_failure:
+        parts.append(
+            '<div class="start-result" aria-live="polite">'
+            '<span class="detail-label">Last start failed</span>'
+            f'<span class="start-reason">{_esc(card.last_start_failure)}</span>'
+            "</div>"
+        )
+    if card.dashboard_url:
+        links = [
+            f'<a href="{_esc(card.dashboard_url)}">Dashboard</a>',
+        ]
+        if card.tailscale_url:
+            links.append(
+                f'<a class="via-tailscale" href="{_esc(card.tailscale_url)}">'
+                "Via Tailscale</a>"
+            )
+        parts.append(f'<div class="dashboard-links">{"".join(links)}</div>')
+    elif not card.last_start_failure:
+        parts.append('<div class="unavailable">Dashboard unavailable</div>')
+    return "".join(parts)
+
+
+def render_card(card: FleetCard) -> str:
+    """Return HTML for one fleet repository card."""
+    return (
+        '<article class="card repo-record">'
+        '<div class="repo-top">'
+        f"<div>{_name_html(card)}"
+        f'<div class="repo-path muted">{_esc(card.path)}</div>'
+        f"{_branch_html(card)}</div>"
+        f"{_status_html(card)}"
+        "</div>"
+        '<div class="repo-details">'
+        "<div>"
+        '<span class="detail-label">Current task</span>'
+        f"{_current_task_html(card)}"
+        "</div>"
+        "</div>"
+        '<div class="queue-boxes">'
+        '<div class="queue-box queue-box-ready">'
+        f'<span class="queue-count">{card.ready_count}</span>'
+        '<span class="queue-label">Ready</span>'
+        "</div>"
+        '<div class="queue-box">'
+        f'<span class="queue-count">{card.recently_done_count}</span>'
+        '<span class="queue-label">Recently Done</span>'
+        "</div>"
+        '<div class="queue-box">'
+        f'<span class="queue-count">{card.icebox_count}</span>'
+        '<span class="queue-label">Icebox</span>'
+        "</div>"
+        "</div>"
+        f"{_footer_html(card)}"
+        "</article>"
+    )
+
+
+def render_page(cards: list[FleetCard], *, config_display: str | None = None) -> str:
+    """Return the Fleet Dashboard HTML document for *cards*."""
+    if config_display is None:
+        config_display = _config_display()
+    cards_html = "\n".join(render_card(card) for card in cards)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fleet Dashboard</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <style>{dashboard.COMMON_CSS}
+{FLEET_CSS}</style>
+</head>
+<body>
+  <nav aria-label="Orchestra navigation">
+    <a class="nav-title" href="/">Kanban Orchestra</a>
+    <span class="nav-current">Fleet</span>
+    <span class="nav-repo-path" title="{_esc(config_display)}">{_esc(config_display)}</span>
+  </nav>
+  <main>
+    <h1>Fleet Dashboard</h1>
+    <section class="repo-list" aria-label="Fleet repositories">
+      {cards_html}
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return FileResponse(_FAVICON, media_type="image/x-icon")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(render_page(collect_cards()))
