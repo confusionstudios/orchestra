@@ -755,6 +755,54 @@ def precheck(repos: list[FleetRepo]) -> int:
     return exit_code
 
 
+def start_tmux_session(repo: FleetRepo, *, preferred_port: int, orchestrator: Path) -> bool:
+    """Create the fleet tmux session for one stopped repo. Return dashboard-ready."""
+    subprocess.run(
+        [
+            "tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root),
+            str(orchestrator), "--dashboard-port", str(preferred_port),
+        ],
+        check=True,
+    )
+    return wait_dashboard_ready(repo)
+
+
+def try_start_repo(repo: FleetRepo, *, preferred_port: int | None = None) -> str | None:
+    """Start one configured repo without exiting.
+
+    Return None on success, or a concise failure reason. Dirty worktrees are
+    reported as ``Worktree dirty`` instead of being skipped silently.
+    """
+    if preferred_port is None:
+        preferred_port = dashboard_port_for_index(0)
+    if not repo.managed:
+        return "Unmanaged repo"
+    if repo.error or repo.root is None:
+        return "Invalid config"
+
+    status, _, dashboard_pid, session = repo_process_state(repo)
+    if status_is_running(status):
+        if dashboard_pid == "-":
+            request_dashboard_start(repo, preferred_port=preferred_port)
+            wait_dashboard_ready(repo)
+        return None
+    if session != "-":
+        return f"tmux session already exists without a live orchestrator ({session})"
+    if dirty_lines(repo):
+        return "Worktree dirty"
+    if shutil.which("tmux") is None:
+        return "required tool not found on PATH: tmux"
+
+    orchestrator = ORCHESTRA_ROOT / "bin" / "ko-orchestrator"
+    if not orchestrator.exists() or not os.access(orchestrator, os.X_OK):
+        return "orchestrator executable not found"
+    try:
+        start_tmux_session(repo, preferred_port=preferred_port, orchestrator=orchestrator)
+    except (OSError, subprocess.CalledProcessError):
+        return "Start failed"
+    return None
+
+
 def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
     require_tool("tmux")
     orchestrator = orchestra_bin("ko-orchestrator")
@@ -796,14 +844,7 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
             continue
         if repo.root not in startable_roots:
             continue
-        subprocess.run(
-            [
-                "tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root),
-                str(orchestrator), "--dashboard-port", str(preferred_port),
-            ],
-            check=True,
-        )
-        if wait_dashboard_ready(repo):
+        if start_tmux_session(repo, preferred_port=preferred_port, orchestrator=orchestrator):
             print(f"{repo.label}: started ({repo.session})")
         else:
             print(f"{repo.label}: started ({repo.session}); dashboard still pending")

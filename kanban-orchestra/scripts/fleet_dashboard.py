@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import dashboard
 import db
@@ -449,6 +449,60 @@ FLEET_CSS = """
 """
 
 
+FLEET_JS = r"""
+(() => {
+  const list = document.querySelector(".repo-list");
+  if (!list) return;
+
+  function showFailure(card, message) {
+    let result = card.querySelector(".start-result");
+    if (!result) {
+      result = document.createElement("div");
+      result.className = "start-result";
+      result.setAttribute("aria-live", "polite");
+      result.innerHTML =
+        '<span class="detail-label">Last start failed</span>' +
+        '<span class="start-reason"></span>';
+      const unavailable = card.querySelector(".unavailable");
+      if (unavailable) unavailable.replaceWith(result);
+      else card.appendChild(result);
+    }
+    const reason = result.querySelector(".start-reason");
+    if (reason) reason.textContent = message;
+  }
+
+  list.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-start-repo]");
+    if (!button || button.disabled) return;
+    const label = button.dataset.startRepo;
+    const card = button.closest(".repo-record");
+    if (!label || !card) return;
+
+    button.disabled = true;
+    button.classList.add("is-starting");
+    try {
+      const response = await fetch("/repos/" + encodeURIComponent(label) + "/start", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+      });
+      const payload = await response.json();
+      if (payload && payload.html) {
+        card.outerHTML = payload.html;
+        return;
+      }
+      button.classList.remove("is-starting");
+      button.disabled = false;
+      showFailure(card, (payload && payload.error) || "Start failed");
+    } catch (err) {
+      button.classList.remove("is-starting");
+      button.disabled = false;
+      showFailure(card, "Start failed");
+    }
+  });
+})();
+"""
+
+
 def _esc(value) -> str:
     return dashboard._esc(value)
 
@@ -470,7 +524,7 @@ def _current_task_html(card: FleetCard) -> str:
 def _status_html(card: FleetCard) -> str:
     badge_cls = dashboard.STATUS_BADGE_CLASS.get(card.status, "badge-none")
     badge = f'<span class="badge {badge_cls}">{_esc(card.status)}</span>'
-    if card.status != "stopped":
+    if card.invalid or card.status != "stopped":
         return badge
     return (
         '<div class="status-controls">'
@@ -521,7 +575,7 @@ def _footer_html(card: FleetCard) -> str:
 def render_card(card: FleetCard) -> str:
     """Return HTML for one fleet repository card."""
     return (
-        '<article class="card repo-record">'
+        f'<article class="card repo-record" data-repo-label="{_esc(card.name)}">'
         '<div class="repo-top">'
         f"<div>{_name_html(card)}"
         f'<div class="repo-path muted">{_esc(card.path)}</div>'
@@ -580,6 +634,7 @@ def render_page(cards: list[FleetCard], *, config_display: str | None = None) ->
       {cards_html}
     </section>
   </main>
+  <script>{FLEET_JS}</script>
 </body>
 </html>
 """
@@ -593,3 +648,52 @@ def favicon():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(render_page(collect_cards()))
+
+
+def _configured_repo(label: str) -> fleet.FleetRepo | None:
+    for repo in fleet.load_repos():
+        if repo.label == label:
+            return repo
+    return None
+
+
+def _card_payload(card: FleetCard) -> dict:
+    return asdict(card)
+
+
+def _start_payload(*, ok: bool, error: str | None = None, card: FleetCard | None = None) -> dict:
+    payload = {"ok": ok}
+    if error:
+        payload["error"] = error
+    if card is not None:
+        payload["card"] = _card_payload(card)
+        payload["html"] = render_card(card)
+    return payload
+
+
+def _refreshed_card(repo: fleet.FleetRepo, error: str | None = None) -> FleetCard:
+    card = collect_card(repo)
+    if error and card.last_start_failure != error:
+        return replace(card, last_start_failure=error)
+    return card
+
+
+@app.post("/repos/{label}/start")
+def start_repo(label: str):
+    """Start one configured fleet repo and return refreshed collector card state."""
+    repo = _configured_repo(label)
+    if repo is None:
+        return JSONResponse(_start_payload(ok=False, error="Unknown repo"), status_code=404)
+    if not repo.managed:
+        return JSONResponse(_start_payload(ok=False, error="Unmanaged repo"), status_code=400)
+    if repo.error:
+        return JSONResponse(_start_payload(ok=False, error="Invalid config"), status_code=400)
+
+    error = fleet.try_start_repo(repo)
+    card = _refreshed_card(repo, error)
+    if error:
+        return JSONResponse(
+            _start_payload(ok=False, error=error, card=card),
+            status_code=409,
+        )
+    return JSONResponse(_start_payload(ok=True, card=card))

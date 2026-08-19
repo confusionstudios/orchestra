@@ -507,7 +507,174 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertNotIn("►", html)
         running_html = _get_fleet_page(_page_card(status="running")).text
         self.assertNotIn('class="start-button"', running_html)
-        self.assertNotIn("data-start-repo", running_html)
+        self.assertNotIn('data-start-repo="midi"', running_html)
+
+    def test_error_and_invalid_cards_omit_play_button(self):
+        error_html = _get_fleet_page(
+            _page_card(status="error", dashboard_url=None)
+        ).text
+        invalid_html = _get_fleet_page(
+            _page_card(status="error", invalid=True, dashboard_url=None)
+        ).text
+        stopped_invalid_html = _get_fleet_page(
+            _page_card(status="stopped", invalid=True, dashboard_url=None)
+        ).text
+
+        for html in (error_html, invalid_html, stopped_invalid_html):
+            self.assertNotIn('class="start-button"', html)
+            self.assertNotIn('data-start-repo="midi"', html)
+
+    def test_page_exposes_starting_success_and_failure_client_state(self):
+        html = _get_fleet_page(_page_card(status="stopped", dashboard_url=None)).text
+
+        self.assertIn("is-starting", html)
+        self.assertIn('method: "POST"', html)
+        self.assertIn("/repos/", html)
+        self.assertIn("encodeURIComponent", html)
+        self.assertIn("outerHTML", html)
+        self.assertIn("payload.html", html)
+        self.assertIn("showFailure", html)
+        self.assertIn("Last start failed", html)
+        self.assertIn("start-reason", html)
+        self.assertIn("Start failed", html)
+
+
+def _post_start(label: str):
+    from fastapi.testclient import TestClient
+
+    return TestClient(fleet_dashboard.app).post(f"/repos/{label}/start")
+
+
+class TestFleetDashboardStart(FleetDashboardRepoTest):
+    def test_start_accepts_configured_label_only(self):
+        with patch.object(fleet, "load_repos", return_value=[self.repo]) as load_mock, \
+             patch.object(fleet, "try_start_repo", return_value=None) as start_mock, \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            allowed = _post_start("midi")
+            unknown = _post_start("other")
+            path_selector = _post_start(str(self.root))
+
+        load_mock.assert_called()
+        start_mock.assert_called_once_with(self.repo)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertTrue(allowed.json()["ok"])
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.json()["error"], "Unknown repo")
+        self.assertFalse(unknown.json()["ok"])
+        self.assertEqual(path_selector.status_code, 404)
+        self.assertNotIn("card", unknown.json())
+
+    def test_start_rejects_unknown_unmanaged_and_invalid_labels(self):
+        unmanaged = fleet.FleetRepo("shadow", self.root, self.root, managed=False)
+        invalid = fleet.FleetRepo(
+            "missing-repo",
+            self.home / "missing-repo",
+            None,
+            "path does not exist",
+        )
+
+        with patch.object(fleet, "load_repos", return_value=[self.repo, unmanaged, invalid]), \
+             patch.object(fleet, "try_start_repo") as start_mock:
+            unknown = _post_start("not-configured")
+            unmanaged_resp = _post_start("shadow")
+            invalid_resp = _post_start("missing-repo")
+
+        start_mock.assert_not_called()
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.json()["error"], "Unknown repo")
+        self.assertEqual(unmanaged_resp.status_code, 400)
+        self.assertEqual(unmanaged_resp.json()["error"], "Unmanaged repo")
+        self.assertEqual(invalid_resp.status_code, 400)
+        self.assertEqual(invalid_resp.json()["error"], "Invalid config")
+
+    def test_dirty_start_reports_worktree_dirty_without_launching(self):
+        (self.root / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
+
+        with patch.object(fleet, "load_repos", return_value=[self.repo]), \
+             patch.object(fleet, "start_tmux_session") as launch_mock, \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            response = _post_start("midi")
+
+        launch_mock.assert_not_called()
+        self.assertEqual(response.status_code, 409)
+        payload = response.json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "Worktree dirty")
+        self.assertEqual(payload["card"]["status"], "stopped")
+        self.assertEqual(payload["card"]["last_start_failure"], "Worktree dirty")
+        self.assertIn("Worktree dirty", payload["html"])
+        self.assertIn("Last start failed", payload["html"])
+        self.assertIn("data-start-repo", payload["html"])
+
+    def test_successful_start_refreshes_card_from_collector_state(self):
+        task_id = db.add_task(
+            self.conn, "Device synchronization", branch="feature/device-sync"
+        )
+        db.update_task(self.conn, task_id, status="running")
+        _insert_runtime(
+            self.conn,
+            status="running",
+            current_task_id=task_id,
+            current_step="commit-make",
+            active_agents=1,
+        )
+
+        def fake_launch(repo, *, preferred_port, orchestrator):
+            _write_lock(repo.root)
+            _write_dashboard_metadata(repo.root, "http://127.0.0.1:8427")
+            return True
+
+        with patch.object(fleet, "load_repos", return_value=[self.repo]), \
+             patch.object(fleet.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fleet, "start_tmux_session", side_effect=fake_launch) as launch_mock, \
+             patch.object(
+                 fleet,
+                 "tailscale_dashboard_url",
+                 return_value="https://node.example.ts.net:8427/",
+             ), \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            response = _post_start("midi")
+
+        launch_mock.assert_called_once()
+        launched_repo = launch_mock.call_args.args[0]
+        self.assertEqual(launched_repo.label, "midi")
+        self.assertEqual(launch_mock.call_args.kwargs["preferred_port"], 8427)
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        card = payload["card"]
+        self.assertEqual(card["status"], "running")
+        self.assertEqual(card["dashboard_url"], "http://127.0.0.1:8427")
+        self.assertEqual(card["tailscale_url"], "https://node.example.ts.net:8427/")
+        self.assertEqual(card["current_task"]["id"], task_id)
+        self.assertEqual(card["current_task"]["title"], "Device synchronization")
+        self.assertIsNone(card["last_start_failure"])
+        self.assertIn("badge-running", payload["html"])
+        self.assertIn("http://127.0.0.1:8427", payload["html"])
+        self.assertIn("Via Tailscale", payload["html"])
+        self.assertIn("#%s Device synchronization" % task_id, payload["html"])
+        self.assertNotIn("data-start-repo", payload["html"])
+        self.assertNotIn("error", payload)
+
+    def test_start_response_exposes_starting_success_and_failure(self):
+        with patch.object(fleet, "load_repos", return_value=[self.repo]), \
+             patch.object(fleet, "try_start_repo", return_value=None), \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            success = _post_start("midi")
+
+        (self.root / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
+        with patch.object(fleet, "load_repos", return_value=[self.repo]), \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            failure = _post_start("midi")
+
+        page = _get_fleet_page(_page_card(status="stopped", dashboard_url=None)).text
+        self.assertIn('classList.add("is-starting")', page)
+        self.assertTrue(success.json()["ok"])
+        self.assertIn("html", success.json())
+        self.assertIn("card", success.json())
+        self.assertFalse(failure.json()["ok"])
+        self.assertEqual(failure.json()["error"], "Worktree dirty")
+        self.assertIn("html", failure.json())
 
 
 if __name__ == "__main__":
