@@ -14,7 +14,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dashboard
@@ -675,6 +675,55 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
         self.assertFalse(failure.json()["ok"])
         self.assertEqual(failure.json()["error"], "Worktree dirty")
         self.assertIn("html", failure.json())
+
+
+class FleetDashboardServerTests(unittest.TestCase):
+    def test_write_dashboard_metadata_uses_fleet_config_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = Path(tmpdir) / "fleet-dashboard.json"
+            with patch.object(fleet, "fleet_dashboard_metadata_path", return_value=meta):
+                fleet_dashboard._write_dashboard_metadata("127.0.0.1", 8426)
+                payload = json.loads(meta.read_text(encoding="utf-8"))
+                self.assertEqual(payload["role"], "fleet-dashboard")
+                self.assertEqual(payload["host"], "127.0.0.1")
+                self.assertEqual(payload["port"], 8426)
+                self.assertEqual(payload["url"], "http://127.0.0.1:8426")
+                self.assertEqual(payload["pid"], os.getpid())
+                fleet_dashboard._remove_dashboard_metadata()
+                self.assertFalse(meta.exists())
+
+    def test_run_dashboard_uses_free_port_and_fleet_app(self):
+        uv = MagicMock()
+        uv.run = MagicMock()
+
+        with patch.object(dashboard, "_find_free_port", return_value=8426) as find_mock, \
+             patch.object(fleet_dashboard, "_write_dashboard_metadata") as write_mock, \
+             patch("builtins.print") as mock_print:
+            fleet_dashboard._run_dashboard("127.0.0.1", 8426, _uvicorn=uv)
+
+        find_mock.assert_called_once_with("127.0.0.1", 8426)
+        write_mock.assert_called_once_with("127.0.0.1", 8426)
+        _, kwargs = uv.run.call_args
+        self.assertEqual(kwargs["host"], "127.0.0.1")
+        self.assertEqual(kwargs["port"], 8426)
+        self.assertEqual(uv.run.call_args.args[0], "fleet_dashboard:app")
+        for call in mock_print.call_args_list:
+            self.assertFalse(any("in use" in str(arg) for arg in call[0]))
+
+    def test_run_dashboard_reports_fallback_port(self):
+        uv = MagicMock()
+        uv.run = MagicMock()
+
+        with patch.object(dashboard, "_find_free_port", return_value=8419), \
+             patch.object(fleet_dashboard, "_write_dashboard_metadata"), \
+             patch("builtins.print") as mock_print:
+            fleet_dashboard._run_dashboard("127.0.0.1", 8426, _uvicorn=uv)
+
+        _, kwargs = uv.run.call_args
+        self.assertEqual(kwargs["port"], 8419)
+        printed = " ".join(str(arg) for call in mock_print.call_args_list for arg in call[0])
+        self.assertIn("8426", printed)
+        self.assertIn("8419", printed)
 
 
 if __name__ == "__main__":

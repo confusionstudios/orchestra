@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import atexit
+import json
+import os
 import sqlite3
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -697,3 +701,70 @@ def start_repo(label: str):
             status_code=409,
         )
     return JSONResponse(_start_payload(ok=True, card=card))
+
+
+def _write_dashboard_metadata(host: str, port: int) -> None:
+    """Write fleet-scoped dashboard metadata beside fleet.repos."""
+    path = fleet.fleet_dashboard_metadata_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "role": "fleet-dashboard",
+        "pid": os.getpid(),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp.replace(path)
+    atexit.register(_remove_dashboard_metadata)
+
+
+def _remove_dashboard_metadata() -> None:
+    """Remove fleet-scoped dashboard metadata when the process exits."""
+    path = fleet.fleet_dashboard_metadata_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
+    """Find a free port and start the Fleet Dashboard uvicorn server."""
+    if _uvicorn is None:
+        try:
+            import uvicorn as _uvicorn  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            print(
+                "uvicorn is not installed. Run: python3 -m pip install uvicorn",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    port = dashboard._find_free_port(host, preferred_port)
+    _write_dashboard_metadata(host, port)
+    if port != preferred_port:
+        print(
+            f"Port {preferred_port} is in use; fleet dashboard starting on port {port}.",
+            flush=True,
+        )
+    try:
+        _uvicorn.run(
+            "fleet_dashboard:app",
+            host=host,
+            port=port,
+            reload=False,
+            log_level="info",
+        )
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    _run_dashboard(
+        host="127.0.0.1",
+        preferred_port=int(os.environ.get("KO_FLEET_DASH_PORT", str(fleet.FLEET_DASHBOARD_PORT))),
+    )

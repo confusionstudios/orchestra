@@ -798,6 +798,171 @@ class TestFleetOperatorFlows(unittest.TestCase):
         one_repo.assert_called_once_with(["repo"])
         open_dashboard.assert_called_once_with(repo)
 
+    def test_no_arg_dashboard_dispatches_to_fleet_dashboard(self):
+        with patch.object(fleet, "open_or_start_fleet_dashboard") as open_fleet, \
+             patch.object(fleet, "open_dashboard") as open_dashboard:
+            exit_code = fleet.main(["dashboard"])
+
+        self.assertEqual(exit_code, 0)
+        open_fleet.assert_called_once_with()
+        open_dashboard.assert_not_called()
+
+    def test_repo_arg_dashboard_still_opens_repo_dashboard(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+
+        with patch.object(fleet, "one_repo", return_value=repo) as one_repo, \
+             patch.object(fleet, "open_dashboard") as open_dashboard, \
+             patch.object(fleet, "open_or_start_fleet_dashboard") as open_fleet:
+            exit_code = fleet.main(["dashboard", "repo"])
+
+        self.assertEqual(exit_code, 0)
+        one_repo.assert_called_once_with(["repo"])
+        open_dashboard.assert_called_once_with(repo)
+        open_fleet.assert_not_called()
+
+    def test_dashboard_open_without_repo_is_rejected(self):
+        stderr = io.StringIO()
+
+        with patch.object(fleet, "open_dashboard") as open_dashboard, \
+             patch.object(fleet, "open_or_start_fleet_dashboard") as open_fleet, \
+             redirect_stderr(stderr), \
+             self.assertRaises(SystemExit):
+            fleet.main(["dashboard-open"])
+
+        open_dashboard.assert_not_called()
+        open_fleet.assert_not_called()
+        self.assertIn("repo", stderr.getvalue())
+
+    def test_parser_accepts_dashboard_without_repo(self):
+        args = fleet.build_parser().parse_args(["dashboard"])
+
+        self.assertEqual(args.command, "dashboard")
+        self.assertIsNone(args.repo)
+
+    def test_parser_help_exposes_no_arg_fleet_dashboard(self):
+        parser = fleet.build_parser()
+        help_text = parser.format_help()
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout), self.assertRaises(SystemExit):
+            parser.parse_args(["dashboard", "--help"])
+
+        dash_help = stdout.getvalue()
+        self.assertIn("Fleet Dashboard", help_text)
+        self.assertIn("Fleet Dashboard", dash_help)
+        self.assertIn("omit to start or open the Fleet Dashboard", dash_help)
+
+    def test_fleet_dashboard_metadata_path_sits_beside_fleet_repos(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = Path(tmpdir) / "fleet.repos"
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "KO_FLEET_DASHBOARD_METADATA_PATH"
+            }
+            env["ORCHESTRA_FLEET_REPOS"] = str(repos)
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(
+                    fleet.fleet_dashboard_metadata_path(),
+                    repos.with_name("fleet-dashboard.json"),
+                )
+
+    def test_start_fleet_dashboard_uses_port_outside_repo_range(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = Path(tmpdir) / "fleet.repos"
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "KO_FLEET_DASHBOARD_METADATA_PATH"
+            }
+            env["ORCHESTRA_FLEET_REPOS"] = str(repos)
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(fleet.subprocess, "Popen") as popen:
+                fleet.start_fleet_dashboard_process()
+
+        child_env = popen.call_args.kwargs["env"]
+        port = int(child_env["KO_FLEET_DASH_PORT"])
+        self.assertLess(port, fleet.config.DASHBOARD_PORT_BASE)
+        self.assertEqual(
+            Path(child_env["KO_FLEET_DASHBOARD_METADATA_PATH"]),
+            Path(tmpdir) / "fleet-dashboard.json",
+        )
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_open_or_start_fleet_dashboard_reuses_live_url(self):
+        payload = {
+            "role": "fleet-dashboard",
+            "pid": os.getpid(),
+            "host": "127.0.0.1",
+            "port": 8426,
+            "url": "http://127.0.0.1:8426",
+        }
+
+        with patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
+             patch.object(fleet, "start_fleet_dashboard_process") as start, \
+             patch.object(fleet, "_open_localhost_url") as open_url:
+            fleet.open_or_start_fleet_dashboard()
+
+        start.assert_not_called()
+        open_url.assert_called_once_with("http://127.0.0.1:8426")
+
+    def test_open_or_start_fleet_dashboard_starts_when_not_running(self):
+        payload = {"url": "http://127.0.0.1:8426"}
+
+        with patch.object(fleet, "fleet_dashboard_live_payload", return_value=None), \
+             patch.object(fleet, "start_fleet_dashboard_process") as start, \
+             patch.object(fleet, "wait_fleet_dashboard_ready", return_value=payload), \
+             patch.object(fleet, "_open_localhost_url") as open_url:
+            fleet.open_or_start_fleet_dashboard()
+
+        start.assert_called_once_with()
+        open_url.assert_called_once_with("http://127.0.0.1:8426")
+
+    def test_fleet_dashboard_live_payload_requires_live_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = Path(tmpdir) / "fleet-dashboard.json"
+            meta.write_text(
+                json.dumps(
+                    {
+                        "role": "fleet-dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 1,
+                        "url": "http://127.0.0.1:1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(fleet, "fleet_dashboard_metadata_path", return_value=meta), \
+                 patch.object(fleet, "dashboard_endpoint_ready", return_value=False):
+                self.assertIsNone(fleet.fleet_dashboard_live_payload())
+
+    def test_fleet_dashboard_live_payload_returns_ready_metadata(self):
+        payload = {
+            "role": "fleet-dashboard",
+            "pid": os.getpid(),
+            "host": "127.0.0.1",
+            "port": 8426,
+            "url": "http://127.0.0.1:8426",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = Path(tmpdir) / "fleet-dashboard.json"
+            meta.write_text(json.dumps(payload), encoding="utf-8")
+            with patch.object(fleet, "fleet_dashboard_metadata_path", return_value=meta), \
+                 patch.object(fleet, "pid_alive", return_value=True), \
+                 patch.object(fleet, "dashboard_endpoint_ready", return_value=True):
+                self.assertEqual(fleet.fleet_dashboard_live_payload(), payload)
+
+    def test_wait_fleet_dashboard_ready_returns_when_live(self):
+        payload = {"url": "http://127.0.0.1:8426"}
+
+        with patch.object(fleet, "fleet_dashboard_live_payload", side_effect=[None, payload]), \
+             patch.object(fleet.time, "sleep") as sleep:
+            result = fleet.wait_fleet_dashboard_ready(timeout=1)
+
+        self.assertEqual(result, payload)
+        sleep.assert_called_once_with(0.2)
+
     def test_open_dashboard_rejects_metadata_for_a_different_repo_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()

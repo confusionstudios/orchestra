@@ -23,6 +23,8 @@ import config
 
 ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
 DEFAULT_CONFIG_PATH = Path("~/.config/orchestra/fleet.repos").expanduser()
+FLEET_DASHBOARD_PORT = config.DASHBOARD_PORT_BASE - 1
+FLEET_DASHBOARD_METADATA_NAME = "fleet-dashboard.json"
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,14 @@ class FleetRepo:
 
 def config_path() -> Path:
     return Path(os.environ.get("ORCHESTRA_FLEET_REPOS", DEFAULT_CONFIG_PATH)).expanduser()
+
+
+def fleet_dashboard_metadata_path() -> Path:
+    """Return the fleet-scoped dashboard metadata path beside fleet.repos."""
+    override = os.environ.get("KO_FLEET_DASHBOARD_METADATA_PATH")
+    if override:
+        return Path(override).expanduser().resolve()
+    return config_path().with_name(FLEET_DASHBOARD_METADATA_NAME)
 
 
 def run(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -982,6 +992,12 @@ def logs(repo: FleetRepo) -> None:
     os.execvp("tail", ["tail", "-f", str(repo.log_path)])
 
 
+def _open_localhost_url(url: str) -> None:
+    if sys.platform == "darwin" and shutil.which("open"):
+        subprocess.run(["open", url], check=False)
+    print(url)
+
+
 def open_dashboard(repo: FleetRepo) -> None:
     payload = read_key_value_or_json(repo.dashboard_metadata_path)
     url = payload.get("url")
@@ -994,9 +1010,68 @@ def open_dashboard(repo: FleetRepo) -> None:
         die(f"dashboard is not running for {repo.label}")
     if not dashboard_endpoint_ready(payload):
         die(f"dashboard is not accepting connections for {repo.label}: {url}")
-    if sys.platform == "darwin" and shutil.which("open"):
-        subprocess.run(["open", url], check=False)
-    print(url)
+    _open_localhost_url(str(url))
+
+
+def fleet_dashboard_live_payload() -> dict | None:
+    """Return live Fleet Dashboard metadata when the process and endpoint are up."""
+    path = fleet_dashboard_metadata_path()
+    payload = read_key_value_or_json(path)
+    if payload.get("role") != "fleet-dashboard":
+        return None
+    try:
+        pid = int(payload["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not pid_alive(pid):
+        return None
+    url = payload.get("url")
+    if not url or not dashboard_endpoint_ready(payload):
+        return None
+    return payload
+
+
+def wait_fleet_dashboard_ready(*, timeout: float = 12.0) -> dict | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = fleet_dashboard_live_payload()
+        if payload is not None:
+            return payload
+        time.sleep(0.2)
+    return fleet_dashboard_live_payload()
+
+
+def start_fleet_dashboard_process() -> subprocess.Popen:
+    """Spawn the Fleet Dashboard server as a detached background process."""
+    script = Path(__file__).resolve().parent / "fleet_dashboard.py"
+    if not script.exists():
+        die(f"expected script not found: {script}")
+    metadata_path = fleet_dashboard_metadata_path()
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["KO_FLEET_DASHBOARD_METADATA_PATH"] = str(metadata_path)
+    env["KO_FLEET_DASH_PORT"] = str(FLEET_DASHBOARD_PORT)
+    return subprocess.Popen(
+        [sys.executable, str(script)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def open_or_start_fleet_dashboard() -> None:
+    """Open a running Fleet Dashboard, or start one and print its localhost URL."""
+    payload = fleet_dashboard_live_payload()
+    if payload is None:
+        start_fleet_dashboard_process()
+        payload = wait_fleet_dashboard_ready()
+        if payload is None:
+            die("fleet dashboard did not become ready")
+    url = payload.get("url")
+    if not url:
+        die("fleet dashboard metadata is missing a URL")
+    _open_localhost_url(str(url))
 
 
 def init_config() -> None:
@@ -1067,9 +1142,28 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name)
         p.add_argument("repos", nargs="*", help="optional repo labels or paths")
 
-    for name in ("attach", "logs", "dashboard", "dashboard-open"):
+    for name in ("attach", "logs"):
         p = sub.add_parser(name)
         p.add_argument("repo", nargs=1, help="repo label or path")
+
+    p_dash = sub.add_parser(
+        "dashboard",
+        help="start or open the Fleet Dashboard, or a repo dashboard when a selector is given",
+        description=(
+            "With no repo argument, start or open the Fleet Dashboard and print "
+            "its localhost URL. With a repo selector, open that repo's localhost dashboard."
+        ),
+    )
+    p_dash.add_argument(
+        "repo",
+        nargs="?",
+        help="repo label or path; omit to start or open the Fleet Dashboard",
+    )
+    p_open = sub.add_parser(
+        "dashboard-open",
+        help="open a repo dashboard (requires a repo selector)",
+    )
+    p_open.add_argument("repo", nargs=1, help="repo label or path")
 
     sub.add_parser("init")
     p_add = sub.add_parser("add")
@@ -1108,7 +1202,12 @@ def main(argv: list[str] | None = None) -> int:
         attach(one_repo(args.repo))
     elif args.command == "logs":
         logs(one_repo(args.repo))
-    elif args.command in {"dashboard", "dashboard-open"}:
+    elif args.command == "dashboard":
+        if args.repo:
+            open_dashboard(one_repo([args.repo]))
+        else:
+            open_or_start_fleet_dashboard()
+    elif args.command == "dashboard-open":
         open_dashboard(one_repo(args.repo))
     elif args.command == "init":
         init_config()
