@@ -269,7 +269,7 @@ FLEET_CSS = """
   height: 22px;
   padding: 0;
   place-items: center;
-  background: #001707;
+  background: var(--accent-soft);
   border: 1px solid var(--accent-dim);
   border-radius: 2px;
   color: var(--accent);
@@ -376,7 +376,7 @@ FLEET_CSS = """
 }
 
 .queue-box-ready .queue-count {
-  color: var(--accent);
+  color: var(--green);
 }
 
 .dashboard-links {
@@ -408,7 +408,7 @@ FLEET_CSS = """
 }
 
 .dashboard-links a:hover {
-  background: #33dd66;
+  background: var(--accent-hover);
   color: var(--bg);
   text-decoration: none;
 }
@@ -623,6 +623,7 @@ def render_page(cards: list[FleetCard], *, config_display: str | None = None) ->
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fleet Dashboard</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <script>{dashboard.accent_bootstrap_script()}</script>
   <style>{dashboard.COMMON_CSS}
 {FLEET_CSS}</style>
 </head>
@@ -630,6 +631,7 @@ def render_page(cards: list[FleetCard], *, config_display: str | None = None) ->
   <nav aria-label="Orchestra navigation">
     <a class="nav-title" href="/">Kanban Orchestra</a>
     <span class="nav-current">Fleet</span>
+    {dashboard.accent_picker_html()}
     <span class="nav-repo-path" title="{_esc(config_display)}">{_esc(config_display)}</span>
   </nav>
   <main>
@@ -638,6 +640,7 @@ def render_page(cards: list[FleetCard], *, config_display: str | None = None) ->
       {cards_html}
     </section>
   </main>
+  <script>{dashboard.accent_picker_script()}</script>
   <script>{FLEET_JS}</script>
 </body>
 </html>

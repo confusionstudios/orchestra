@@ -218,6 +218,50 @@ class TestPageShell(unittest.TestCase):
         self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', html)
         self.assertNotIn("Running against", html)
 
+    def test_palette_is_allowlisted_and_dark_safe_for_normal_text(self):
+        self.assertEqual(dashboard._validated_accent("violet"), "violet")
+        self.assertEqual(dashboard._validated_accent("green"), dashboard.DEFAULT_ACCENT)
+        self.assertEqual(dashboard._validated_accent("#ffffff"), dashboard.DEFAULT_ACCENT)
+        self.assertEqual(dashboard._validated_accent(None), dashboard.DEFAULT_ACCENT)
+        self.assertGreater(len(dashboard.ACCENT_PALETTE), 1)
+
+        for name, accent in dashboard.ACCENT_PALETTE.items():
+            with self.subTest(accent=name):
+                self.assertGreaterEqual(dashboard._contrast_ratio(accent["color"], "#000000"), 4.5)
+                self.assertGreaterEqual(dashboard._contrast_ratio(accent["color"], "#0c0c0c"), 4.5)
+
+    def test_page_shell_applies_allowlisted_cookie_before_styles_and_renders_accessible_picker(self):
+        html = dashboard._page_shell("Title", "<p>Body</p>")
+
+        self.assertLess(html.index(dashboard.ACCENT_COOKIE_NAME), html.index("<style>"))
+        self.assertIn('Object.prototype.hasOwnProperty.call(palette, requested)', html)
+        self.assertIn(f'? requested : "{dashboard.DEFAULT_ACCENT}"', html)
+        self.assertIn('<label for="orchestra-accent-picker">Accent</label>', html)
+        self.assertIn('<select id="orchestra-accent-picker" name="accent">', html)
+        self.assertNotIn('type="color"', html)
+        for name, accent in dashboard.ACCENT_PALETTE.items():
+            self.assertIn(f'<option value="{name}">{accent["label"]}</option>', html)
+
+    def test_picker_persists_host_only_cross_port_cookie(self):
+        html = dashboard._page_shell("Title", "<p>Body</p>")
+
+        self.assertIn("; Path=/; Max-Age=31536000; SameSite=Lax", html)
+        self.assertNotIn("; Domain=", html)
+        self.assertNotIn("localStorage", html)
+        self.assertIn("window.location.reload()", html)
+
+    def test_generic_accent_and_semantic_status_colors_are_separate(self):
+        self.assertIn("--accent-rgb: 0 204 68", dashboard.COMMON_CSS)
+        self.assertIn("rgb(var(--accent-rgb) / 0.28)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-ready", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--green)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-running", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--blue)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-blocked", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--red)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-pending-subtasks", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--orange)", dashboard.COMMON_CSS)
+
 
 class TestHealthCard(unittest.TestCase):
     """Tests for render_health_card."""
@@ -2390,6 +2434,19 @@ class TestOverviewPage(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
         self.assertNotIn("Running against", resp.text)
+
+    def test_accent_picker_renders_on_overview_and_task_detail(self):
+        from fastapi.testclient import TestClient
+
+        tid = db.add_task(self.conn, "Task with accent picker", branch="feat-accent")
+        client = TestClient(dashboard.app)
+
+        for path in ("/", f"/task/{tid}"):
+            with self.subTest(path=path):
+                resp = client.get(path)
+                self.assertEqual(resp.status_code, 200)
+                self.assertIn('id="orchestra-accent-picker"', resp.text)
+                self.assertIn(dashboard.ACCENT_COOKIE_NAME, resp.text)
 
     def test_overview_timezone_note_moves_to_bottom(self):
         from fastapi.testclient import TestClient

@@ -406,6 +406,30 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn('<meta charset="utf-8">', response.text)
         self.assertIn("feature/unicodé-sync", response.text)
 
+    def test_page_uses_shared_early_accent_preference_and_accessible_picker(self):
+        html = _get_fleet_page(_page_card()).text
+
+        self.assertLess(html.index(dashboard.ACCENT_COOKIE_NAME), html.index("<style>"))
+        self.assertIn('<label for="orchestra-accent-picker">Accent</label>', html)
+        self.assertIn('<select id="orchestra-accent-picker" name="accent">', html)
+        self.assertIn("; Path=/; Max-Age=31536000; SameSite=Lax", html)
+        self.assertNotIn("localStorage", html)
+        self.assertIn("flex-wrap: wrap", html)
+        self.assertIn("var(--accent-soft)", html)
+        self.assertIn("var(--accent-hover)", html)
+
+    def test_fleet_accent_does_not_replace_semantic_status_tokens(self):
+        html = _get_fleet_page(_page_card(status="blocked")).text
+
+        self.assertIn(".badge-blocked", html)
+        self.assertIn("color: var(--red)", html)
+        self.assertIn(".badge-running", html)
+        self.assertIn("color: var(--blue)", html)
+        self.assertIn(".badge-pending-subtasks", html)
+        self.assertIn("color: var(--orange)", html)
+        self.assertIn(".queue-box-ready .queue-count", html)
+        self.assertIn("color: var(--green)", html)
+
     def test_cards_match_collector_data_and_layout(self):
         task = fleet_dashboard.FleetCurrentTask(214, "Device synchronization")
         response = _get_fleet_page(

@@ -52,6 +52,127 @@ STALE_SECONDS = 60  # heartbeat older than this → "stale"
 DONE_RECENCY_CUTOFF = timedelta(days=7)
 _REVIEW_ROUND_DISPLAY_RE = re.compile(r"\b((?:[Rr]eview round)|(?:[Rr]ound)) (\d+)\b")
 
+ACCENT_COOKIE_NAME = "orchestra_accent"
+DEFAULT_ACCENT = "green"
+ACCENT_PALETTE = {
+    "green": {
+        "label": "Green",
+        "color": "#00cc44",
+        "dim": "#007a28",
+        "hover": "#33dd66",
+        "soft": "#001707",
+        "rgb": "0 204 68",
+    },
+    "violet": {
+        "label": "Violet",
+        "color": "#c084fc",
+        "dim": "#744f98",
+        "hover": "#d8b4fe",
+        "soft": "#160d20",
+        "rgb": "192 132 252",
+    },
+    "cyan": {
+        "label": "Cyan",
+        "color": "#22d3ee",
+        "dim": "#147f8f",
+        "hover": "#67e8f9",
+        "soft": "#07191c",
+        "rgb": "34 211 238",
+    },
+    "pink": {
+        "label": "Pink",
+        "color": "#f472b6",
+        "dim": "#93446d",
+        "hover": "#f9a8d4",
+        "soft": "#1e0b15",
+        "rgb": "244 114 182",
+    },
+    "gold": {
+        "label": "Gold",
+        "color": "#e6b450",
+        "dim": "#8a6c30",
+        "hover": "#f2cf7d",
+        "soft": "#1b1407",
+        "rgb": "230 180 80",
+    },
+}
+
+
+def _validated_accent(value: str | None) -> str:
+    """Return an allowlisted accent name, falling back to the default."""
+    return value if value in ACCENT_PALETTE else DEFAULT_ACCENT
+
+
+def _relative_luminance(color: str) -> float:
+    """Return WCAG relative luminance for a six-digit hex color."""
+    channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    """Return the WCAG contrast ratio between two six-digit hex colors."""
+    lighter, darker = sorted((_relative_luminance(first), _relative_luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def accent_bootstrap_script() -> str:
+    """Return the early, shared host-cookie accent bootstrap."""
+    palette_json = json.dumps(ACCENT_PALETTE, separators=(",", ":"))
+    return f"""(() => {{
+  const palette = {palette_json};
+  const match = document.cookie.split("; ").find((row) => row.startsWith("{ACCENT_COOKIE_NAME}="));
+  let requested = "{DEFAULT_ACCENT}";
+  if (match) {{
+    try {{ requested = decodeURIComponent(match.slice(match.indexOf("=") + 1)); }} catch (_) {{}}
+  }}
+  const name = Object.prototype.hasOwnProperty.call(palette, requested) ? requested : "{DEFAULT_ACCENT}";
+  const accent = palette[name];
+  const root = document.documentElement;
+  root.style.setProperty("--accent", accent.color);
+  root.style.setProperty("--accent-dim", accent.dim);
+  root.style.setProperty("--accent-hover", accent.hover);
+  root.style.setProperty("--accent-soft", accent.soft);
+  root.style.setProperty("--accent-rgb", accent.rgb);
+  root.dataset.accent = name;
+  window.__orchestraAccent = {{ name, palette }};
+}})();"""
+
+
+def accent_picker_html() -> str:
+    """Return the shared accessible accent picker markup."""
+    options = "".join(
+        f'<option value="{_esc(name)}">{_esc(values["label"])}</option>'
+        for name, values in ACCENT_PALETTE.items()
+    )
+    return (
+        '<div class="accent-picker">'
+        '<label for="orchestra-accent-picker">Accent</label>'
+        f'<select id="orchestra-accent-picker" name="accent">{options}</select>'
+        '</div>'
+    )
+
+
+def accent_picker_script() -> str:
+    """Return shared picker hydration and host-only cookie persistence."""
+    return f"""(() => {{
+  const picker = document.getElementById("orchestra-accent-picker");
+  const state = window.__orchestraAccent;
+  if (!picker || !state) return;
+  picker.value = state.name;
+  picker.addEventListener("change", () => {{
+    if (!Object.prototype.hasOwnProperty.call(state.palette, picker.value)) {{
+      picker.value = "{DEFAULT_ACCENT}";
+    }}
+    document.cookie = "{ACCENT_COOKIE_NAME}=" + encodeURIComponent(picker.value)
+      + "; Path=/; Max-Age=31536000; SameSite=Lax";
+    window.location.reload();
+  }});
+}})();"""
+
 
 def _esc(v) -> str:
     """Escape a value for HTML; treat None as empty string."""
@@ -1575,6 +1696,9 @@ COMMON_CSS = """
   --muted: #585858;
   --accent: #00cc44;
   --accent-dim: #007a28;
+  --accent-hover: #33dd66;
+  --accent-soft: #001707;
+  --accent-rgb: 0 204 68;
   --border: #222222;
   --green: #00cc44;
   --red: #ff4444;
@@ -1639,7 +1763,31 @@ nav a:hover { color: #ffffff; text-decoration: none; }
   white-space: nowrap;
 }
 
-h1 { margin: 0 0 8px; font-size: 1.6rem; color: var(--accent); text-shadow: 0 0 18px rgba(0,204,68,0.28); }
+.accent-picker {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.accent-picker select {
+  max-width: 8.5rem;
+  border: 1px solid var(--accent-dim);
+  border-radius: 2px;
+  padding: 3px 22px 3px 6px;
+  background: #111111;
+  color: var(--accent);
+  font: inherit;
+}
+
+.accent-picker select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+h1 { margin: 0 0 8px; font-size: 1.6rem; color: var(--accent); text-shadow: 0 0 18px rgb(var(--accent-rgb) / 0.28); }
 h2 { margin: 0 0 12px; font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; color: var(--accent); }
 h3 { margin: 12px 0 6px; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 p  { margin: 4px 0 8px; }
@@ -1685,8 +1833,8 @@ code {
 .inline-edit-display:hover,
 .inline-edit-display:focus,
 .inline-edit-display:focus-within {
-  background: rgba(0, 204, 68, 0.07);
-  box-shadow: inset 0 0 0 1px rgba(0, 204, 68, 0.25);
+  background: rgb(var(--accent-rgb) / 0.07);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.25);
   outline: none;
 }
 
@@ -2010,6 +2158,10 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
     max-width: 100%;
   }
 
+  .accent-picker {
+    margin-left: auto;
+  }
+
   .card {
     padding: 14px 12px;
   }
@@ -2136,18 +2288,21 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_esc(title)}</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <script>{accent_bootstrap_script()}</script>
   <style>{COMMON_CSS}</style>
 </head>
 <body>
   <nav>
     <a class="nav-title" href="/">Kanban Orchestra</a>
     {nav_extra}
+    {accent_picker_html()}
     <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
   </nav>
   <main>
     {body}
   </main>
   <script>
+    {accent_picker_script()}
     (() => {{
       function formatRelativeAge(timestamp) {{
         const then = Date.parse(timestamp);

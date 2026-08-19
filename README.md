@@ -43,6 +43,13 @@ agent logs. Run logs capture the full session, and `ko-task` lets you inspect
 or update any task from another terminal or a remote agent session. If something
 stalls or fails, you see it immediately and can intervene.
 
+The repo and Fleet dashboards include an **Accent** picker in their top
+navigation. Its curated colors are readable on both dark dashboard backgrounds;
+green remains the default, and an unknown saved value safely falls back to it.
+The preference is stored in an allowlisted host-only cookie, so it follows all
+dashboard pages and ports on the same host without changing semantic status
+colors.
+
 ## Supported Agents
 
 Orchestra shells out to local agent CLIs. It ships with built-in support for:
