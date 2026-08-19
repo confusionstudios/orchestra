@@ -12,8 +12,9 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, urlsplit
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import dashboard
@@ -516,13 +517,76 @@ def _config_display() -> str:
     return fleet.display_path(fleet.config_path())
 
 
-def _current_task_html(card: FleetCard) -> str:
+def _hostname_is_loopback(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    return hostname.strip("[]").lower() in dashboard_tailscale.LOOPBACK_HOSTS
+
+
+def _host_header_is_loopback(value: str | None) -> bool:
+    if not value:
+        return False
+    parsed = urlsplit("//" + value.split(",", 1)[0].strip())
+    return _hostname_is_loopback(parsed.hostname)
+
+
+def _origin_url_is_loopback(value: str) -> bool | None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return _hostname_is_loopback(parsed.hostname)
+
+
+def _is_local_access(request: Request) -> bool:
+    """Return True when the Fleet Dashboard is viewed from loopback.
+
+    The process binds to loopback, so client IP cannot distinguish a local
+    browser from Tailscale Serve. Origin, Referer, Host, and Serve's
+    X-Forwarded-Host / X-Forwarded-Proto headers can. Non-loopback or HTTPS
+    forwarded views never offer localhost dashboard links.
+    """
+    forwarded_host = request.headers.get("x-forwarded-host")
+    if forwarded_host and not _host_header_is_loopback(forwarded_host):
+        return False
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto:
+        proto = forwarded_proto.split(",", 1)[0].strip().lower()
+        if proto == "https":
+            return False
+    for header in ("origin", "referer"):
+        value = request.headers.get(header)
+        if value:
+            loopback = _origin_url_is_loopback(value)
+            if loopback is not None:
+                return loopback
+    host = request.headers.get("host")
+    if host:
+        return _host_header_is_loopback(host)
+    return False
+
+
+def _repo_action_url(card: FleetCard, *, local_access: bool) -> str | None:
+    if local_access:
+        return card.dashboard_url
+    return card.tailscale_url
+
+
+def _new_tab_link(href: str, label: str, *, class_name: str | None = None) -> str:
+    cls = f' class="{class_name}"' if class_name else ""
+    return (
+        f'<a{cls} href="{_esc(href)}" target="_blank" '
+        f'rel="noopener noreferrer">{label}</a>'
+    )
+
+
+def _current_task_html(card: FleetCard, *, local_access: bool) -> str:
     if card.current_task is None:
         return '<span class="muted">None</span>'
     label = f"#{card.current_task.id} {_esc(card.current_task.title)}"
-    if card.dashboard_url:
-        href = f"{card.dashboard_url.rstrip('/')}/task/{card.current_task.id}"
-        return f'<a href="{_esc(href)}">{label}</a>'
+    href = _repo_action_url(card, local_access=local_access)
+    if href:
+        task_href = f"{href.rstrip('/')}/task/{card.current_task.id}"
+        return _new_tab_link(task_href, label)
     return f"<span>{label}</span>"
 
 
@@ -541,10 +605,11 @@ def _status_html(card: FleetCard) -> str:
     )
 
 
-def _name_html(card: FleetCard) -> str:
+def _name_html(card: FleetCard, *, local_access: bool) -> str:
     name = _esc(card.name)
-    if card.dashboard_url:
-        return f'<a class="repo-name" href="{_esc(card.dashboard_url)}">{name}</a>'
+    href = _repo_action_url(card, local_access=local_access)
+    if href:
+        return _new_tab_link(href, name, class_name="repo-name")
     return f'<span class="repo-name">{name}</span>'
 
 
@@ -553,7 +618,7 @@ def _branch_html(card: FleetCard) -> str:
     return f'<div class="branch muted"><code>{branch}</code></div>'
 
 
-def _footer_html(card: FleetCard) -> str:
+def _footer_html(card: FleetCard, *, local_access: bool) -> str:
     parts: list[str] = []
     if card.last_start_failure:
         parts.append(
@@ -562,27 +627,26 @@ def _footer_html(card: FleetCard) -> str:
             f'<span class="start-reason">{_esc(card.last_start_failure)}</span>'
             "</div>"
         )
-    if card.dashboard_url:
-        links = [
-            f'<a href="{_esc(card.dashboard_url)}">Dashboard</a>',
-        ]
-        if card.tailscale_url:
-            links.append(
-                f'<a class="via-tailscale" href="{_esc(card.tailscale_url)}">'
-                "Via Tailscale</a>"
-            )
+    links: list[str] = []
+    if local_access and card.dashboard_url:
+        links.append(_new_tab_link(card.dashboard_url, "Dashboard"))
+    if card.tailscale_url:
+        links.append(
+            _new_tab_link(card.tailscale_url, "Via Tailscale", class_name="via-tailscale")
+        )
+    if links:
         parts.append(f'<div class="dashboard-links">{"".join(links)}</div>')
-    elif not card.last_start_failure:
+    elif not card.dashboard_url and not card.last_start_failure:
         parts.append('<div class="unavailable">Dashboard unavailable</div>')
     return "".join(parts)
 
 
-def render_card(card: FleetCard) -> str:
+def render_card(card: FleetCard, *, local_access: bool = True) -> str:
     """Return HTML for one fleet repository card."""
     return (
         f'<article class="card repo-record" data-repo-label="{_esc(card.name)}">'
         '<div class="repo-top">'
-        f"<div>{_name_html(card)}"
+        f"<div>{_name_html(card, local_access=local_access)}"
         f'<div class="repo-path muted">{_esc(card.path)}</div>'
         f"{_branch_html(card)}</div>"
         f"{_status_html(card)}"
@@ -590,7 +654,7 @@ def render_card(card: FleetCard) -> str:
         '<div class="repo-details">'
         "<div>"
         '<span class="detail-label">Current task</span>'
-        f"{_current_task_html(card)}"
+        f"{_current_task_html(card, local_access=local_access)}"
         "</div>"
         "</div>"
         '<div class="queue-boxes">'
@@ -607,16 +671,23 @@ def render_card(card: FleetCard) -> str:
         '<span class="queue-label">Icebox</span>'
         "</div>"
         "</div>"
-        f"{_footer_html(card)}"
+        f"{_footer_html(card, local_access=local_access)}"
         "</article>"
     )
 
 
-def render_page(cards: list[FleetCard], *, config_display: str | None = None) -> str:
+def render_page(
+    cards: list[FleetCard],
+    *,
+    config_display: str | None = None,
+    local_access: bool = True,
+) -> str:
     """Return the Fleet Dashboard HTML document for *cards*."""
     if config_display is None:
         config_display = _config_display()
-    cards_html = "\n".join(render_card(card) for card in cards)
+    cards_html = "\n".join(
+        render_card(card, local_access=local_access) for card in cards
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -654,8 +725,10 @@ def favicon():
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return HTMLResponse(render_page(collect_cards()))
+def index(request: Request):
+    return HTMLResponse(
+        render_page(collect_cards(), local_access=_is_local_access(request))
+    )
 
 
 def _configured_repo(label: str) -> fleet.FleetRepo | None:
@@ -669,13 +742,19 @@ def _card_payload(card: FleetCard) -> dict:
     return asdict(card)
 
 
-def _start_payload(*, ok: bool, error: str | None = None, card: FleetCard | None = None) -> dict:
+def _start_payload(
+    *,
+    ok: bool,
+    error: str | None = None,
+    card: FleetCard | None = None,
+    local_access: bool = True,
+) -> dict:
     payload = {"ok": ok}
     if error:
         payload["error"] = error
     if card is not None:
         payload["card"] = _card_payload(card)
-        payload["html"] = render_card(card)
+        payload["html"] = render_card(card, local_access=local_access)
     return payload
 
 
@@ -687,24 +766,34 @@ def _refreshed_card(repo: fleet.FleetRepo, error: str | None = None) -> FleetCar
 
 
 @app.post("/repos/{label}/start")
-def start_repo(label: str):
+def start_repo(label: str, request: Request):
     """Start one configured fleet repo and return refreshed collector card state."""
+    local_access = _is_local_access(request)
     repo = _configured_repo(label)
     if repo is None:
-        return JSONResponse(_start_payload(ok=False, error="Unknown repo"), status_code=404)
+        return JSONResponse(
+            _start_payload(ok=False, error="Unknown repo", local_access=local_access),
+            status_code=404,
+        )
     if not repo.managed:
-        return JSONResponse(_start_payload(ok=False, error="Unmanaged repo"), status_code=400)
+        return JSONResponse(
+            _start_payload(ok=False, error="Unmanaged repo", local_access=local_access),
+            status_code=400,
+        )
     if repo.error:
-        return JSONResponse(_start_payload(ok=False, error="Invalid config"), status_code=400)
+        return JSONResponse(
+            _start_payload(ok=False, error="Invalid config", local_access=local_access),
+            status_code=400,
+        )
 
     error = fleet.try_start_repo(repo)
     card = _refreshed_card(repo, error)
     if error:
         return JSONResponse(
-            _start_payload(ok=False, error=error, card=card),
+            _start_payload(ok=False, error=error, card=card, local_access=local_access),
             status_code=409,
         )
-    return JSONResponse(_start_payload(ok=True, card=card))
+    return JSONResponse(_start_payload(ok=True, card=card, local_access=local_access))
 
 
 def _write_dashboard_metadata(host: str, port: int, remote_url: str | None = None) -> None:

@@ -385,12 +385,29 @@ def _page_card(**fields) -> fleet_dashboard.FleetCard:
     return fleet_dashboard.FleetCard(**payload)
 
 
-def _get_fleet_page(*cards: fleet_dashboard.FleetCard, config_display: str = "~/.config/orchestra/fleet.repos"):
+_LOCAL_VIEW_HEADERS = {
+    "host": "127.0.0.1:8426",
+    "origin": "http://127.0.0.1:8426",
+}
+_TAILSCALE_VIEW_HEADERS = {
+    "host": "node.example.ts.net:8426",
+    "origin": "https://node.example.ts.net:8426",
+    "x-forwarded-host": "node.example.ts.net:8426",
+    "x-forwarded-proto": "https",
+}
+
+
+def _get_fleet_page(
+    *cards: fleet_dashboard.FleetCard,
+    config_display: str = "~/.config/orchestra/fleet.repos",
+    headers: dict[str, str] | None = None,
+):
     from fastapi.testclient import TestClient
 
+    request_headers = dict(_LOCAL_VIEW_HEADERS if headers is None else headers)
     with patch.object(fleet_dashboard, "collect_cards", return_value=list(cards)), \
          patch.object(fleet_dashboard, "_config_display", return_value=config_display):
-        return TestClient(fleet_dashboard.app).get("/")
+        return TestClient(fleet_dashboard.app).get("/", headers=request_headers)
 
 
 def _visible_text(html: str) -> str:
@@ -562,11 +579,135 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn("start-reason", html)
         self.assertIn("Start failed", html)
 
+    def test_local_origin_shows_dashboard_and_via_tailscale_when_mapped(self):
+        html = _get_fleet_page(
+            _page_card(
+                dashboard_url="http://127.0.0.1:8428",
+                tailscale_url="https://node.example.ts.net:8428/",
+            )
+        ).text
 
-def _post_start(label: str):
+        self.assertIn(">Dashboard</a>", html)
+        self.assertIn('href="http://127.0.0.1:8428"', html)
+        self.assertIn(">Via Tailscale</a>", html)
+        self.assertIn('href="https://node.example.ts.net:8428/"', html)
+
+    def test_local_origin_without_mapping_omits_via_tailscale(self):
+        html = _get_fleet_page(_page_card(tailscale_url=None)).text
+
+        self.assertIn(">Dashboard</a>", html)
+        self.assertIn('href="http://127.0.0.1:8428"', html)
+        self.assertNotIn("Via Tailscale", html)
+
+    def test_loopback_host_without_origin_is_treated_as_local(self):
+        html = _get_fleet_page(
+            _page_card(tailscale_url="https://node.example.ts.net:8428/"),
+            headers={"host": "127.0.0.1:8426"},
+        ).text
+
+        self.assertIn(">Dashboard</a>", html)
+        self.assertIn(">Via Tailscale</a>", html)
+
+    def test_tailscale_origin_hides_localhost_dashboard_and_shows_via_tailscale(self):
+        html = _get_fleet_page(
+            _page_card(
+                current_task=fleet_dashboard.FleetCurrentTask(214, "Device synchronization"),
+                dashboard_url="http://127.0.0.1:8428",
+                tailscale_url="https://node.example.ts.net:8428/",
+            ),
+            headers=_TAILSCALE_VIEW_HEADERS,
+        ).text
+
+        self.assertNotIn(">Dashboard</a>", html)
+        self.assertNotIn('href="http://127.0.0.1:8428"', html)
+        self.assertNotIn("http://127.0.0.1:8428/task/214", html)
+        self.assertIn(">Via Tailscale</a>", html)
+        self.assertIn('href="https://node.example.ts.net:8428/"', html)
+        self.assertIn('href="https://node.example.ts.net:8428/task/214"', html)
+        self.assertIn('class="repo-name"', html)
+        self.assertNotIn("Dashboard unavailable", html)
+
+    def test_tailscale_origin_without_mapping_is_quiet(self):
+        html = _get_fleet_page(
+            _page_card(
+                current_task=fleet_dashboard.FleetCurrentTask(214, "Device synchronization"),
+                tailscale_url=None,
+            ),
+            headers=_TAILSCALE_VIEW_HEADERS,
+        ).text
+
+        self.assertNotIn(">Dashboard</a>", html)
+        self.assertNotIn("Via Tailscale", html)
+        self.assertNotIn("Dashboard unavailable", html)
+        self.assertNotIn("http://127.0.0.1:8428", html)
+        self.assertIn('<span class="repo-name">midi</span>', html)
+        self.assertIn("<span>#214 Device synchronization</span>", html)
+
+    def test_tailscale_stopped_card_still_reports_unavailable(self):
+        html = _get_fleet_page(
+            _page_card(status="stopped", dashboard_url=None, tailscale_url=None),
+            headers=_TAILSCALE_VIEW_HEADERS,
+        ).text
+
+        self.assertIn("Dashboard unavailable", html)
+        self.assertNotIn(">Dashboard</a>", html)
+        self.assertNotIn("Via Tailscale", html)
+
+    def test_forwarded_https_on_loopback_host_is_treated_as_proxied(self):
+        html = _get_fleet_page(
+            _page_card(tailscale_url="https://node.example.ts.net:8428/"),
+            headers={
+                "host": "127.0.0.1:8426",
+                "origin": "http://127.0.0.1:8426",
+                "x-forwarded-host": "node.example.ts.net:8426",
+                "x-forwarded-proto": "https",
+            },
+        ).text
+
+        self.assertNotIn(">Dashboard</a>", html)
+        self.assertIn(">Via Tailscale</a>", html)
+
+    def test_repo_dashboard_actions_open_in_a_new_tab(self):
+        html = fleet_dashboard.render_card(
+            _page_card(
+                current_task=fleet_dashboard.FleetCurrentTask(214, "Device synchronization"),
+                tailscale_url="https://node.example.ts.net:8428/",
+            )
+        )
+
+        for href in (
+            "http://127.0.0.1:8428",
+            "http://127.0.0.1:8428/task/214",
+            "https://node.example.ts.net:8428/",
+        ):
+            self.assertRegex(
+                html,
+                rf'<a[^>]*href="{re.escape(href)}"[^>]*target="_blank"[^>]*rel="noopener noreferrer"',
+            )
+        self.assertEqual(html.count('target="_blank"'), 4)
+        self.assertEqual(html.count('rel="noopener noreferrer"'), 4)
+        self.assertNotIn('target="_blank"', _get_fleet_page(_page_card()).text.split("<main>")[0])
+
+    def test_play_start_action_stays_in_place(self):
+        html = _get_fleet_page(
+            _page_card(status="stopped", dashboard_url=None)
+        ).text
+        match = re.search(r'<button class="start-button"[^>]*>', html)
+
+        self.assertIsNotNone(match)
+        self.assertIn('data-start-repo="midi"', match.group(0))
+        self.assertNotIn("target=", match.group(0))
+        self.assertNotIn("window.open", html)
+
+
+def _post_start(label: str, headers: dict[str, str] | None = None):
     from fastapi.testclient import TestClient
 
-    return TestClient(fleet_dashboard.app).post(f"/repos/{label}/start")
+    request_headers = dict(_LOCAL_VIEW_HEADERS if headers is None else headers)
+    return TestClient(fleet_dashboard.app).post(
+        f"/repos/{label}/start",
+        headers=request_headers,
+    )
 
 
 class TestFleetDashboardStart(FleetDashboardRepoTest):
@@ -679,6 +820,31 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
         self.assertIn("#%s Device synchronization" % task_id, payload["html"])
         self.assertNotIn("data-start-repo", payload["html"])
         self.assertNotIn("error", payload)
+
+    def test_start_html_follows_tailscale_origin(self):
+        def fake_launch(repo, *, preferred_port, orchestrator):
+            _write_lock(repo.root)
+            _write_dashboard_metadata(repo.root, "http://127.0.0.1:8427")
+            return True
+
+        with patch.object(fleet, "load_repos", return_value=[self.repo]), \
+             patch.object(fleet.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fleet, "start_tmux_session", side_effect=fake_launch), \
+             patch.object(
+                 fleet,
+                 "tailscale_dashboard_url",
+                 return_value="https://node.example.ts.net:8427/",
+             ), \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            response = _post_start("midi", headers=_TAILSCALE_VIEW_HEADERS)
+
+        html = response.json()["html"]
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(">Dashboard</a>", html)
+        self.assertNotIn("http://127.0.0.1:8427", html)
+        self.assertIn("Via Tailscale", html)
+        self.assertIn('target="_blank"', html)
+        self.assertIn('rel="noopener noreferrer"', html)
 
     def test_start_response_exposes_starting_success_and_failure(self):
         with patch.object(fleet, "load_repos", return_value=[self.repo]), \
