@@ -89,6 +89,19 @@ def _display_review_round_text(text: str | None) -> str:
     return _REVIEW_ROUND_DISPLAY_RE.sub(repl, text)
 
 
+def _display_review_round_count(review_round) -> int | None:
+    """Return the 1-based review-round count for UI, or None when not applicable."""
+    if review_round is None:
+        return None
+    try:
+        stored = int(review_round)
+    except (TypeError, ValueError):
+        return None
+    if stored < 0:
+        return None
+    return stored + 1
+
+
 def _age(dt_str: str | None) -> str:
     """Return a human-readable age string for a UTC datetime string."""
     if not dt_str:
@@ -374,6 +387,20 @@ def _branch_meta_html(branch: str | None, commit_hash: str | None = None) -> str
     else:
         body = f'<code class="task-record-hash">{_esc(short)}</code>'
     return _task_record_meta_item(body, css_class="task-record-branch")
+
+
+def _review_rounds_meta_html(review_round, *, reviewed: bool) -> str:
+    """Compact 1-based review-round count, omitted unless a review occurred."""
+    if not reviewed:
+        return ""
+    count = _display_review_round_count(review_round)
+    if count is None:
+        return ""
+    noun = "review round" if count == 1 else "review rounds"
+    return _task_record_meta_item(
+        f"{_esc(count)} {noun}",
+        css_class="task-record-review-rounds",
+    )
 
 
 def _labeled_meta_html(label: str, value_html: str, *, css_class: str = "", muted: bool = False) -> str:
@@ -1119,7 +1146,7 @@ def render_recently_done(conn) -> str:
         return '<div class="card" id="recently-done"><h2>Recently Done</h2><p class="muted">Database not available.</p></div>'
     rows_raw = [dict(r) for r in conn.execute(
         "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent, "
-        "ready_at, last_ready_at, done_at FROM tasks "
+        "review_round, ready_at, last_ready_at, done_at FROM tasks "
         "WHERE status = 'done' ORDER BY updated_at DESC, id DESC"
     ).fetchall()]
     for row in rows_raw:
@@ -1134,9 +1161,11 @@ def render_recently_done(conn) -> str:
     for idx, r in enumerate(rows_raw):
         rejection_count = int(r.get("rejection_count", 0) or 0)
         runtime = _done_elapsed_runtime(r)
+        reviewed = bool(r.get("approvers")) or rejection_count > 0
         meta = [
             _agents_meta_html(r.get("coder_agent"), _task_done_reviewer(r)),
             _branch_meta_html(r.get("branch"), r.get("commit_hash")),
+            _review_rounds_meta_html(r.get("review_round"), reviewed=reviewed),
         ]
         if rejection_count > 0:
             label = "rejection" if rejection_count == 1 else "rejections"

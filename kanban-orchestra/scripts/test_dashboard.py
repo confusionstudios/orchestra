@@ -190,6 +190,12 @@ class TestHelpers(unittest.TestCase):
             "Round 1: antigravity reviewing; Review round 3 approved.",
         )
 
+    def test_display_review_round_count_converts_stored_zero_based_values(self):
+        self.assertEqual(dashboard._display_review_round_count(0), 1)
+        self.assertEqual(dashboard._display_review_round_count(2), 3)
+        self.assertIsNone(dashboard._display_review_round_count(None))
+        self.assertIsNone(dashboard._display_review_round_count("legacy"))
+
 
 class TestPageShell(unittest.TestCase):
     """Tests for shared page shell timestamp formatting."""
@@ -773,6 +779,87 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertNotIn("Configured Reviewer", html)
         self.assertNotIn("Approver", html)
 
+    def test_recently_done_shows_first_review_as_one_round(self):
+        tid = db.add_task(self.conn, "First-round approval", branch="feat-round-one")
+        db.update_task(
+            self.conn,
+            tid,
+            status="done",
+            review_round=0,
+            coder_agent="grok",
+            reviewer_agent="codex",
+        )
+        db.add_comment(
+            self.conn, tid, "LGTM", kind="approval", author="codex", review_round=0
+        )
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("task-record-review-rounds", html)
+        self.assertIn("1 review round", html)
+        self.assertNotIn("0 review round", html)
+        self.assertNotIn("task-record-rejections", html)
+
+    def test_recently_done_shows_multiple_review_rounds_apart_from_rejections(self):
+        tid = db.add_task(self.conn, "Multi-round task", branch="feat-round-multi")
+        db.update_task(
+            self.conn,
+            tid,
+            status="done",
+            review_round=2,
+            coder_agent="grok",
+            reviewer_agent="codex",
+        )
+        db.add_comment(
+            self.conn, tid, "Fix this", kind="rejection", author="codex", review_round=0
+        )
+        db.add_comment(
+            self.conn, tid, "Still failing", kind="rejection", author="codex", review_round=1
+        )
+        db.add_comment(
+            self.conn, tid, "LGTM", kind="approval", author="codex", review_round=2
+        )
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("task-record-review-rounds", html)
+        self.assertIn("3 review rounds", html)
+        self.assertIn("task-record-rejections", html)
+        self.assertIn("2 rejections", html)
+        self.assertNotIn("3 rejections", html)
+        self.assertNotIn("2 review rounds", html)
+
+    def test_recently_done_omits_review_rounds_when_not_applicable(self):
+        other_id = db.add_task(
+            self.conn, "Legacy other task", branch="feat-other", kind="other"
+        )
+        db.update_task(self.conn, other_id, status="done", review_round=None)
+        pr_id = db.add_task(
+            self.conn, "Legacy pull request", branch="feat-pr", kind="pull_request"
+        )
+        db.update_task(self.conn, pr_id, status="done")
+        self.conn.execute("UPDATE tasks SET review_round = NULL WHERE id = ?", (pr_id,))
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("Legacy other task", html)
+        self.assertIn("Legacy pull request", html)
+        self.assertNotIn("task-record-review-rounds", html)
+        self.assertNotIn("review round", html)
+
+    def test_recently_done_omits_review_rounds_for_default_round_without_decision(self):
+        tid = db.add_task(self.conn, "Skipped review task", branch="feat-skip")
+        db.update_task(self.conn, tid, status="done")
+        task = db.get_task(self.conn, tid)
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertEqual(task["review_round"], 0)
+        self.assertIn("Skipped review task", html)
+        self.assertNotIn("task-record-review-rounds", html)
+        self.assertNotIn("review round", html)
+
     def test_recently_done_shows_elapsed_runtime(self):
         tid = db.add_task(self.conn, "Runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="done")
@@ -1014,6 +1101,7 @@ class TestTaskRecordLists(unittest.TestCase):
         self.assertIn("cursor:grok-4.5-high", html)
         self.assertIn("(reviewed by codex)", html)
         self.assertIn("task-record-hash", html)
+        self.assertIn("1 review round", html)
         self.assertIn("1 rejection", html)
         self.assertIn("00:05:00", html)
         self.assertIn("task-record-finished", html)
