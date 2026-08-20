@@ -69,9 +69,11 @@ using `--reset`.
 A Fleet card exposes one **Dashboard** action. A locally opened Fleet Dashboard
 links it to localhost; a Fleet Dashboard reached through Tailscale links it to
 the exact remote mapping and omits the action when that mapping is unavailable.
-`ko-get-update` and the current-repo summary from
-`ko-fleet status` print the matching **Remote:** URL only when that exact proxy
-exists; the fleet table remains compact.
+Operator commands present one **Dashboard:** URL: the exact HTTPS Tailscale
+mapping when it exists, otherwise the localhost URL. The fleet table remains
+compact and still shows localhost. `ko-fleet dashboard` and
+`ko-fleet dashboard-open` open that preferred URL; pass `--local` to open
+localhost for debugging.
 
 Both dashboards also include a dark-safe **Accent** picker. The allowlisted
 host-only cookie follows dashboard pages and ports on the same host while
@@ -188,8 +190,9 @@ accounts, or billing — install and authenticate each CLI yourself.
    separate, one-time `ko-install-global-skills` step. `ko-fleet stop`,
    `restart`, `attach`, and `logs` accept a repo label or path. Use
    `ko-fleet dashboard <repo>` or `ko-fleet dashboard-open <repo>` to open one
-   repo instead of the Fleet Dashboard. See [Dashboards](#dashboards) for the
-   local, Tailscale, and card-action behavior.
+   repo instead of the Fleet Dashboard. Pass `--local` on those commands to
+   open localhost instead of the preferred Tailscale URL. See
+   [Dashboards](#dashboards) for the local, Tailscale, and card-action behavior.
 
    Use `ko-get-update` for a concise status snapshot and `ko-task` to inspect,
    comment on, or update individual tasks.

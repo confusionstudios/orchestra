@@ -885,6 +885,13 @@ class FleetDashboardServerTests(unittest.TestCase):
         )
         self.publish_mock = self.publish_patch.start()
         self.addCleanup(self.publish_patch.stop)
+        self.fallback_patch = patch.object(
+            fleet_dashboard.dashboard_tailscale,
+            "schedule_startup_dashboard_fallback",
+            return_value=None,
+        )
+        self.fallback_mock = self.fallback_patch.start()
+        self.addCleanup(self.fallback_patch.stop)
 
     def test_write_dashboard_metadata_uses_fleet_config_sidecar(self):
         with tempfile.TemporaryDirectory() as tmpdir:

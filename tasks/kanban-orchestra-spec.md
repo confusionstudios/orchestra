@@ -779,9 +779,10 @@ repo-scoped orchestrator lock metadata to clear, and starts them again.
 the selected repo's tmux session and repo-local
 `.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
 starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
-that repo's localhost dashboard from repo-local dashboard metadata.
+that repo's preferred dashboard from repo-local dashboard metadata.
 `ko-fleet dashboard-open` is an explicit open verb that requires a repo
-selector.
+selector. Both open commands accept `--local` to open the localhost URL
+instead of the preferred Tailscale mapping.
 
 The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
 The Fleet Dashboard shows one card per configured repo: name, path, branch,
@@ -793,7 +794,9 @@ HTTPS listener is preferred when that port is free; a free alternate HTTPS
 listener is used when it is not; unrelated Serve routes are never overwritten;
 and mappings persist after the dashboard stops. Tailscale
 absence, authentication failure, startup delay, or Serve failure never blocks
-the localhost dashboard and does not emit dashboard UI warnings. Each Fleet
+the localhost dashboard and does not emit dashboard UI warnings. Operator UX
+presents one `Dashboard:` URL: the exact HTTPS mapping when it exists,
+otherwise the localhost URL. The fleet table remains localhost. Each Fleet
 card has one Dashboard action: local Fleet views use localhost and Tailscale
 Fleet views use the exact remote mapping, omitting the action when that mapping
 is unavailable. Play on a stopped card is equivalent to

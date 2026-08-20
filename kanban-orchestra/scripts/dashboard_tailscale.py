@@ -3,9 +3,12 @@
 
 Used by repo and Fleet dashboard startup after each process has chosen its
 localhost port. Publication is scheduled in the background so Tailscale waits
-cannot delay the localhost bind. Lookup stays read-only so Fleet cards and
+cannot delay the localhost bind. Startup prints exactly one ``Dashboard:``
+URL: the HTTPS mapping when publication resolves in time, otherwise localhost
+from a background fallback timer. Lookup stays read-only so Fleet cards and
 status commands can surface an existing exact HTTPS proxy without mutating
-Serve config.
+Serve config. Operator UX prefers that exact mapping through
+``preferred_dashboard_url`` and falls back to localhost when it is absent.
 """
 
 from __future__ import annotations
@@ -34,6 +37,11 @@ LOCK_WAIT_SECONDS = PUBLISH_SEQUENCE_SECONDS
 LOCK_ATTEMPTS = 8
 AUTH_BLOCKED_STATES = {"NeedsLogin", "NeedsMachineAuth"}
 DEFAULT_LOCK_PATH = Path("~/.config/orchestra/dashboard-serve.lock")
+# Bound how long a background timer waits for an in-flight Serve publication
+# before announcing localhost. Shorter than up/serve/lock timeouts. The wait
+# does not run on the server-starting thread, so a slow or hung Tailscale CLI
+# cannot delay the localhost bind.
+STARTUP_ANNOUNCE_WAIT_SECONDS = 1.0
 
 
 def lookup_dashboard_url(local_url: str) -> str | None:
@@ -45,6 +53,56 @@ def lookup_dashboard_url(local_url: str) -> str | None:
     if not payload:
         return None
     return lookup_in_payload(payload, local_port)
+
+
+def preferred_dashboard_url(local_url: str, *, prefer_local: bool = False) -> str:
+    """Return the operator-facing URL for one localhost dashboard.
+
+    Prefers the exact HTTPS Tailscale Serve mapping when one exists. Falls
+    back to *local_url* when lookup is skipped, unavailable, or unmapped.
+    """
+    if prefer_local:
+        return local_url
+    return lookup_dashboard_url(local_url) or local_url
+
+
+def format_dashboard_line(url: str) -> str:
+    """Return the canonical operator label for one dashboard URL."""
+    return f"Dashboard: {url}"
+
+
+def announce_startup_dashboard_url(local_url: str):
+    """Return a one-shot callback that prints exactly one Dashboard URL.
+
+    Call with a remote URL to announce it. Call with ``None`` or no argument to
+    announce *local_url* when nothing has been printed yet. Later calls are
+    ignored, so a late Serve mapping cannot add a second line.
+    """
+    state = {"printed": False}
+    lock = threading.Lock()
+
+    def announce(remote_url: str | None = None) -> None:
+        with lock:
+            if state["printed"]:
+                return
+            print(format_dashboard_line(remote_url or local_url), flush=True)
+            state["printed"] = True
+
+    return announce
+
+
+def schedule_startup_dashboard_fallback(announce) -> threading.Timer:
+    """Announce localhost after ``STARTUP_ANNOUNCE_WAIT_SECONDS`` if still needed.
+
+    Returns immediately so the localhost server can bind without waiting for
+    Tailscale. A remote callback that wins the one-shot race suppresses this
+    fallback. A later mapping must not print a second Dashboard line.
+    """
+    timer = threading.Timer(STARTUP_ANNOUNCE_WAIT_SECONDS, announce)
+    timer.daemon = True
+    timer.name = "dashboard-startup-announce"
+    timer.start()
+    return timer
 
 
 def lookup_in_payload(payload: dict, local_port: int) -> str | None:

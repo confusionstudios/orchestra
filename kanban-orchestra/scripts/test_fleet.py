@@ -217,16 +217,18 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
             with patch.object(fleet, "tmux_has_session", return_value=False), \
                  patch.object(fleet, "current_repo_root", return_value=root), \
-                 patch.object(fleet, "tailscale_dashboard_url", return_value=None), \
+                 patch.object(fleet, "preferred_dashboard_url", side_effect=lambda url, **kwargs: url), \
                  redirect_stdout(out):
                 fleet.print_status([repo])
 
             self.assertIn(
-                "This repo (repo) is running/idle. Dash: http://127.0.0.1:8427",
+                "This repo (repo) is running/idle. Dashboard: http://127.0.0.1:8427",
                 out.getvalue(),
             )
+            self.assertNotIn("Remote:", out.getvalue())
+            self.assertNotIn("Dash:", out.getvalue())
 
-    def test_status_summarizes_current_repo_remote_dashboard_below_table(self):
+    def test_status_summarizes_current_repo_preferred_dashboard_below_table(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
             (root / "kanban-orchestra.lock").write_text(
@@ -254,7 +256,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
                  patch.object(fleet, "current_repo_root", return_value=root), \
                  patch.object(
                      fleet,
-                     "tailscale_dashboard_url",
+                     "preferred_dashboard_url",
                      return_value="https://node.example.ts.net:8427/",
                  ), \
                  redirect_stdout(out):
@@ -263,7 +265,12 @@ class TestFleetOperatorFlows(unittest.TestCase):
             lines = out.getvalue().splitlines()
             self.assertNotIn("Remote", lines[0])
             self.assertIn("http://127.0.0.1:8427", lines[2])
-            self.assertIn("Remote: https://node.example.ts.net:8427/", lines)
+            self.assertIn(
+                "This repo (repo) is running/idle. Dashboard: https://node.example.ts.net:8427/",
+                out.getvalue(),
+            )
+            self.assertNotIn("Remote:", out.getvalue())
+            self.assertNotIn("Dash:", out.getvalue())
 
     def test_status_does_not_summarize_an_unmanaged_current_repo(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -796,7 +803,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         one_repo.assert_called_once_with(["repo"])
-        open_dashboard.assert_called_once_with(repo)
+        open_dashboard.assert_called_once_with(repo, prefer_local=False)
 
     def test_no_arg_dashboard_dispatches_to_fleet_dashboard(self):
         with patch.object(fleet, "open_or_start_fleet_dashboard") as open_fleet, \
@@ -804,7 +811,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
             exit_code = fleet.main(["dashboard"])
 
         self.assertEqual(exit_code, 0)
-        open_fleet.assert_called_once_with()
+        open_fleet.assert_called_once_with(prefer_local=False)
         open_dashboard.assert_not_called()
 
     def test_repo_arg_dashboard_still_opens_repo_dashboard(self):
@@ -817,7 +824,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         one_repo.assert_called_once_with(["repo"])
-        open_dashboard.assert_called_once_with(repo)
+        open_dashboard.assert_called_once_with(repo, prefer_local=False)
         open_fleet.assert_not_called()
 
     def test_dashboard_open_without_repo_is_rejected(self):
@@ -838,6 +845,43 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         self.assertEqual(args.command, "dashboard")
         self.assertIsNone(args.repo)
+        self.assertFalse(args.local)
+
+    def test_parser_accepts_dashboard_local_flag(self):
+        parser = fleet.build_parser()
+
+        fleet_args = parser.parse_args(["dashboard", "--local"])
+        self.assertTrue(fleet_args.local)
+        self.assertIsNone(fleet_args.repo)
+
+        repo_args = parser.parse_args(["dashboard", "repo", "--local"])
+        self.assertTrue(repo_args.local)
+        self.assertEqual(repo_args.repo, "repo")
+
+        open_args = parser.parse_args(["dashboard-open", "--local", "repo"])
+        self.assertTrue(open_args.local)
+        self.assertEqual(open_args.repo, ["repo"])
+
+    def test_dashboard_local_flag_dispatches_to_openers(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+
+        with patch.object(fleet, "open_or_start_fleet_dashboard") as open_fleet, \
+             patch.object(fleet, "open_dashboard") as open_dashboard:
+            self.assertEqual(fleet.main(["dashboard", "--local"]), 0)
+        open_fleet.assert_called_once_with(prefer_local=True)
+        open_dashboard.assert_not_called()
+
+        with patch.object(fleet, "one_repo", return_value=repo), \
+             patch.object(fleet, "open_dashboard") as open_dashboard, \
+             patch.object(fleet, "open_or_start_fleet_dashboard") as open_fleet:
+            self.assertEqual(fleet.main(["dashboard", "--local", "repo"]), 0)
+        open_dashboard.assert_called_once_with(repo, prefer_local=True)
+        open_fleet.assert_not_called()
+
+        with patch.object(fleet, "one_repo", return_value=repo), \
+             patch.object(fleet, "open_dashboard") as open_dashboard:
+            self.assertEqual(fleet.main(["dashboard-open", "repo", "--local"]), 0)
+        open_dashboard.assert_called_once_with(repo, prefer_local=True)
 
     def test_parser_help_exposes_no_arg_fleet_dashboard(self):
         parser = fleet.build_parser()
@@ -900,11 +944,17 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         with patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
              patch.object(fleet, "start_fleet_dashboard_process") as start, \
-             patch.object(fleet, "_open_localhost_url") as open_url:
+             patch.object(
+                 fleet,
+                 "preferred_dashboard_url",
+                 return_value="https://node.example.ts.net:8426/",
+             ) as preferred, \
+             patch.object(fleet, "_open_dashboard_url") as open_url:
             fleet.open_or_start_fleet_dashboard()
 
         start.assert_not_called()
-        open_url.assert_called_once_with("http://127.0.0.1:8426")
+        preferred.assert_called_once_with("http://127.0.0.1:8426", prefer_local=False)
+        open_url.assert_called_once_with("https://node.example.ts.net:8426/")
 
     def test_open_or_start_fleet_dashboard_starts_when_not_running(self):
         payload = {"url": "http://127.0.0.1:8426"}
@@ -912,10 +962,31 @@ class TestFleetOperatorFlows(unittest.TestCase):
         with patch.object(fleet, "fleet_dashboard_live_payload", return_value=None), \
              patch.object(fleet, "start_fleet_dashboard_process") as start, \
              patch.object(fleet, "wait_fleet_dashboard_ready", return_value=payload), \
-             patch.object(fleet, "_open_localhost_url") as open_url:
+             patch.object(
+                 fleet,
+                 "preferred_dashboard_url",
+                 side_effect=lambda url, **kwargs: url,
+             ) as preferred, \
+             patch.object(fleet, "_open_dashboard_url") as open_url:
             fleet.open_or_start_fleet_dashboard()
 
         start.assert_called_once_with()
+        preferred.assert_called_once_with("http://127.0.0.1:8426", prefer_local=False)
+        open_url.assert_called_once_with("http://127.0.0.1:8426")
+
+    def test_open_or_start_fleet_dashboard_local_flag_skips_preferred_lookup(self):
+        payload = {"url": "http://127.0.0.1:8426"}
+
+        with patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
+             patch.object(
+                 fleet,
+                 "preferred_dashboard_url",
+                 return_value="http://127.0.0.1:8426",
+             ) as preferred, \
+             patch.object(fleet, "_open_dashboard_url") as open_url:
+            fleet.open_or_start_fleet_dashboard(prefer_local=True)
+
+        preferred.assert_called_once_with("http://127.0.0.1:8426", prefer_local=True)
         open_url.assert_called_once_with("http://127.0.0.1:8426")
 
     def test_fleet_dashboard_live_payload_requires_live_endpoint(self):

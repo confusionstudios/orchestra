@@ -190,6 +190,140 @@ class TestLookupDashboardUrl(unittest.TestCase):
             self.assertIsNone(remote)
 
 
+class TestPreferredDashboardUrl(unittest.TestCase):
+    def test_mapped_url_prefers_exact_https_proxy(self):
+        with patch.object(
+            dashboard_tailscale,
+            "lookup_dashboard_url",
+            return_value="https://node.example.ts.net:8427/",
+        ) as lookup_mock:
+            preferred = dashboard_tailscale.preferred_dashboard_url("http://127.0.0.1:8427")
+        self.assertEqual(preferred, "https://node.example.ts.net:8427/")
+        lookup_mock.assert_called_once_with("http://127.0.0.1:8427")
+
+    def test_unmapped_url_falls_back_to_localhost(self):
+        with patch.object(dashboard_tailscale, "lookup_dashboard_url", return_value=None):
+            preferred = dashboard_tailscale.preferred_dashboard_url("http://127.0.0.1:8427")
+        self.assertEqual(preferred, "http://127.0.0.1:8427")
+
+    def test_unavailable_lookup_falls_back_to_localhost(self):
+        with patch.object(dashboard_tailscale.shutil, "which", return_value=None), \
+             patch.object(dashboard_tailscale, "_run") as run_mock:
+            preferred = dashboard_tailscale.preferred_dashboard_url("http://127.0.0.1:8427")
+        self.assertEqual(preferred, "http://127.0.0.1:8427")
+        run_mock.assert_not_called()
+
+    def test_prefer_local_skips_lookup(self):
+        with patch.object(dashboard_tailscale, "lookup_dashboard_url") as lookup_mock:
+            preferred = dashboard_tailscale.preferred_dashboard_url(
+                "http://127.0.0.1:8427",
+                prefer_local=True,
+            )
+        self.assertEqual(preferred, "http://127.0.0.1:8427")
+        lookup_mock.assert_not_called()
+
+    def test_fleet_wrapper_uses_shared_preferred_resolver(self):
+        with patch.object(
+            dashboard_tailscale,
+            "preferred_dashboard_url",
+            return_value="https://node.example.ts.net:8427/",
+        ) as preferred_mock:
+            preferred = fleet.preferred_dashboard_url(
+                "http://127.0.0.1:8427",
+                prefer_local=False,
+            )
+        self.assertEqual(preferred, "https://node.example.ts.net:8427/")
+        preferred_mock.assert_called_once_with(
+            "http://127.0.0.1:8427",
+            prefer_local=False,
+        )
+
+
+def _dashboard_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("Dashboard:")]
+
+
+class TestAnnounceStartupDashboardUrl(unittest.TestCase):
+    def test_prints_remote_once_when_resolved_before_fallback(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            announce = dashboard_tailscale.announce_startup_dashboard_url(
+                "http://127.0.0.1:8427"
+            )
+            self.assertEqual(stdout.getvalue(), "")
+            announce("https://node.example.ts.net:8427/")
+            announce("https://node.example.ts.net:8427/")
+            announce(None)
+        self.assertEqual(
+            stdout.getvalue(),
+            "Dashboard: https://node.example.ts.net:8427/\n",
+        )
+        self.assertNotIn("http://127.0.0.1:8427", stdout.getvalue())
+        self.assertNotIn("Remote:", stdout.getvalue())
+        self.assertNotIn("Local:", stdout.getvalue())
+
+    def test_late_remote_after_localhost_does_not_print_second_url(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            announce = dashboard_tailscale.announce_startup_dashboard_url(
+                "http://127.0.0.1:8427"
+            )
+            announce()
+            announce("https://node.example.ts.net:8427/")
+        self.assertEqual(stdout.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
+        self.assertEqual(_dashboard_lines(stdout.getvalue()), ["Dashboard: http://127.0.0.1:8427"])
+        self.assertNotIn("https://", stdout.getvalue())
+        self.assertNotIn("Remote:", stdout.getvalue())
+
+    def test_fallback_returns_before_announcing_localhost(self):
+        stdout = io.StringIO()
+        with patch.object(dashboard_tailscale, "STARTUP_ANNOUNCE_WAIT_SECONDS", 0.2), \
+             redirect_stdout(stdout):
+            announce = dashboard_tailscale.announce_startup_dashboard_url(
+                "http://127.0.0.1:8427"
+            )
+            started = time.monotonic()
+            timer = dashboard_tailscale.schedule_startup_dashboard_fallback(announce)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.1)
+            self.assertEqual(stdout.getvalue(), "")
+            timer.join(timeout=2)
+        self.assertFalse(timer.is_alive())
+        self.assertEqual(stdout.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
+        self.assertNotIn("https://", stdout.getvalue())
+
+    def test_fallback_keeps_remote_url_when_publish_already_resolved(self):
+        stdout = io.StringIO()
+        with patch.object(dashboard_tailscale, "STARTUP_ANNOUNCE_WAIT_SECONDS", 0.05), \
+             redirect_stdout(stdout):
+            announce = dashboard_tailscale.announce_startup_dashboard_url(
+                "http://127.0.0.1:8427"
+            )
+            announce("https://node.example.ts.net:8427/")
+            timer = dashboard_tailscale.schedule_startup_dashboard_fallback(announce)
+            timer.join(timeout=2)
+        self.assertFalse(timer.is_alive())
+        self.assertEqual(
+            stdout.getvalue(),
+            "Dashboard: https://node.example.ts.net:8427/\n",
+        )
+        self.assertNotIn("http://127.0.0.1:8427", stdout.getvalue())
+
+    def test_fallback_announces_localhost_when_publish_never_resolves(self):
+        stdout = io.StringIO()
+        with patch.object(dashboard_tailscale, "STARTUP_ANNOUNCE_WAIT_SECONDS", 0.05), \
+             redirect_stdout(stdout):
+            announce = dashboard_tailscale.announce_startup_dashboard_url(
+                "http://127.0.0.1:8427"
+            )
+            timer = dashboard_tailscale.schedule_startup_dashboard_fallback(announce)
+            self.assertEqual(stdout.getvalue(), "")
+            timer.join(timeout=2)
+        self.assertFalse(timer.is_alive())
+        self.assertEqual(stdout.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
+        self.assertNotIn("https://", stdout.getvalue())
+
+
 class TestPublishDashboard(unittest.TestCase):
     def test_cli_absence_is_silent(self):
         stdout = io.StringIO()
@@ -443,13 +577,18 @@ class TestPublishDashboard(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 8.0)
 
 
-def _join_publish_threads(timeout: float = 2.0) -> None:
+def _join_named_threads(*names: str, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
+    wanted = set(names)
     for thread in threading.enumerate():
-        if thread.name != "dashboard-tailscale-publish":
+        if thread.name not in wanted:
             continue
         remaining = max(0.0, deadline - time.monotonic())
         thread.join(timeout=remaining)
+
+
+def _join_publish_threads(timeout: float = 2.0) -> None:
+    _join_named_threads("dashboard-tailscale-publish", timeout=timeout)
 
 
 class TestSchedulePublishDashboard(unittest.TestCase):
@@ -505,6 +644,7 @@ class TestDashboardStartupIntegration(unittest.TestCase):
             "runtime_root": "/tmp/repo/.kanban-orchestra",
             "lock_path": "/tmp/repo/kanban-orchestra.lock",
         }
+        stdout = io.StringIO()
         with tempfile.TemporaryDirectory() as tmpdir:
             metadata_path = Path(tmpdir) / "dashboard.json"
             with patch.object(dashboard, "_find_free_port", return_value=8431), \
@@ -514,7 +654,8 @@ class TestDashboardStartupIntegration(unittest.TestCase):
                      return_value="https://node.example.ts.net:8431/",
                  ) as publish_mock, \
                  patch.dict(os.environ, {"KO_DASHBOARD_METADATA_PATH": str(metadata_path)}), \
-                 patch.object(dashboard.db, "get_instance_identity", return_value=identity):
+                 patch.object(dashboard.db, "get_instance_identity", return_value=identity), \
+                 redirect_stdout(stdout):
                 dashboard._run_dashboard("127.0.0.1", 8427, _uvicorn=uv)
                 _join_publish_threads()
 
@@ -523,25 +664,141 @@ class TestDashboardStartupIntegration(unittest.TestCase):
             self.assertEqual(payload["url"], "http://127.0.0.1:8431")
             self.assertEqual(payload["remote_url"], "https://node.example.ts.net:8431/")
             self.assertEqual(uv.run.call_args.kwargs["port"], 8431)
+        text = stdout.getvalue()
+        self.assertEqual(
+            _dashboard_lines(text),
+            ["Dashboard: https://node.example.ts.net:8431/"],
+        )
+        self.assertNotIn("http://127.0.0.1:8431", text)
+        self.assertNotIn("Remote:", text)
+        self.assertNotIn("Local:", text)
 
     def test_repo_dashboard_starts_when_publish_raises(self):
+        seen = {}
+
+        def fake_run(*args, **kwargs):
+            seen["elapsed"] = time.monotonic() - seen["started_at"]
+
         uv = MagicMock()
-        uv.run = MagicMock()
+        uv.run = MagicMock(side_effect=fake_run)
+        stdout = io.StringIO()
         with patch.object(dashboard, "_find_free_port", return_value=8427), \
              patch.object(
                  dashboard.dashboard_tailscale,
                  "publish_dashboard",
                  side_effect=RuntimeError("serve exploded"),
              ), \
-             patch.object(dashboard, "_write_dashboard_metadata") as write_mock:
+             patch.object(
+                 dashboard.dashboard_tailscale,
+                 "STARTUP_ANNOUNCE_WAIT_SECONDS",
+                 0.3,
+             ), \
+             patch.object(dashboard, "_write_dashboard_metadata") as write_mock, \
+             redirect_stdout(stdout):
+            seen["started_at"] = time.monotonic()
             dashboard._run_dashboard("127.0.0.1", 8427, _uvicorn=uv)
             _join_publish_threads()
+        self.assertLess(seen["elapsed"], 0.15)
         uv.run.assert_called_once()
         write_mock.assert_called_once_with("127.0.0.1", 8427, remote_url=None)
+        text = stdout.getvalue()
+        self.assertEqual(_dashboard_lines(text), ["Dashboard: http://127.0.0.1:8427"])
+        self.assertNotIn("https://", text)
+        self.assertNotIn("Remote:", text)
+
+    def test_repo_dashboard_announces_localhost_when_unmapped(self):
+        seen = {}
+
+        def fake_run(*args, **kwargs):
+            seen["elapsed"] = time.monotonic() - seen["started_at"]
+
+        uv = MagicMock()
+        uv.run = MagicMock(side_effect=fake_run)
+        stdout = io.StringIO()
+        with patch.object(dashboard, "_find_free_port", return_value=8427), \
+             patch.object(
+                 dashboard.dashboard_tailscale,
+                 "publish_dashboard",
+                 return_value=None,
+             ), \
+             patch.object(
+                 dashboard.dashboard_tailscale,
+                 "STARTUP_ANNOUNCE_WAIT_SECONDS",
+                 0.3,
+             ), \
+             patch.object(dashboard, "_write_dashboard_metadata") as write_mock, \
+             redirect_stdout(stdout):
+            seen["started_at"] = time.monotonic()
+            dashboard._run_dashboard("127.0.0.1", 8427, _uvicorn=uv)
+            _join_publish_threads()
+        self.assertLess(seen["elapsed"], 0.15)
+        uv.run.assert_called_once()
+        write_mock.assert_called_once_with("127.0.0.1", 8427, remote_url=None)
+        text = stdout.getvalue()
+        self.assertEqual(_dashboard_lines(text), ["Dashboard: http://127.0.0.1:8427"])
+        self.assertNotIn("https://", text)
+        self.assertNotIn("Remote:", text)
+
+    def test_repo_dashboard_announces_localhost_while_publication_hangs(self):
+        started = threading.Event()
+        hang = threading.Event()
+        seen = {}
+
+        def hanging_publish(host, port):
+            started.set()
+            hang.wait(timeout=5)
+            return "https://node.example.ts.net:8427/"
+
+        def fake_run(*args, **kwargs):
+            try:
+                seen["elapsed"] = time.monotonic() - seen["started_at"]
+                self.assertTrue(started.wait(timeout=1))
+                seen["during"] = stdout.getvalue()
+                _join_named_threads("dashboard-startup-announce", timeout=1.0)
+                seen["after_window"] = stdout.getvalue()
+            finally:
+                hang.set()
+
+        uv = MagicMock()
+        uv.run = MagicMock(side_effect=fake_run)
+        stdout = io.StringIO()
+        with patch.object(dashboard, "_find_free_port", return_value=8427), \
+             patch.object(
+                 dashboard.dashboard_tailscale,
+                 "publish_dashboard",
+                 side_effect=hanging_publish,
+             ), \
+             patch.object(
+                 dashboard.dashboard_tailscale,
+                 "STARTUP_ANNOUNCE_WAIT_SECONDS",
+                 0.3,
+             ), \
+             patch.object(dashboard, "_write_dashboard_metadata"), \
+             redirect_stdout(stdout):
+            seen["started_at"] = time.monotonic()
+            dashboard._run_dashboard("127.0.0.1", 8427, _uvicorn=uv)
+            _join_publish_threads()
+
+        self.assertLess(seen["elapsed"], 0.15)
+        self.assertEqual(_dashboard_lines(seen["during"]), [])
+        self.assertNotIn("https://node.example.ts.net", seen["during"])
+        self.assertEqual(
+            _dashboard_lines(seen["after_window"]),
+            ["Dashboard: http://127.0.0.1:8427"],
+        )
+        self.assertNotIn("https://node.example.ts.net", seen["after_window"])
+        self.assertNotIn("Remote:", seen["after_window"])
+        self.assertEqual(
+            _dashboard_lines(stdout.getvalue()),
+            ["Dashboard: http://127.0.0.1:8427"],
+        )
+        self.assertNotIn("https://node.example.ts.net", stdout.getvalue())
+        uv.run.assert_called_once()
 
     def test_fleet_dashboard_publishes_selected_port_and_records_remote_url(self):
         uv = MagicMock()
         uv.run = MagicMock()
+        stdout = io.StringIO()
         with tempfile.TemporaryDirectory() as tmpdir:
             metadata_path = Path(tmpdir) / "fleet-dashboard.json"
             with patch.object(dashboard, "_find_free_port", return_value=8426), \
@@ -550,20 +807,30 @@ class TestDashboardStartupIntegration(unittest.TestCase):
                      "publish_dashboard",
                      return_value="https://node.example.ts.net:8426/",
                  ) as publish_mock, \
-                 patch.object(fleet, "fleet_dashboard_metadata_path", return_value=metadata_path):
+                 patch.object(fleet, "fleet_dashboard_metadata_path", return_value=metadata_path), \
+                 redirect_stdout(stdout):
                 fleet_dashboard._run_dashboard("127.0.0.1", 8426, _uvicorn=uv)
                 _join_publish_threads()
 
             publish_mock.assert_called_once_with("127.0.0.1", 8426)
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["role"], "fleet-dashboard")
+            self.assertEqual(payload["url"], "http://127.0.0.1:8426")
             self.assertEqual(payload["remote_url"], "https://node.example.ts.net:8426/")
             self.assertEqual(uv.run.call_args.kwargs["port"], 8426)
+        text = stdout.getvalue()
+        self.assertEqual(
+            _dashboard_lines(text),
+            ["Dashboard: https://node.example.ts.net:8426/"],
+        )
+        self.assertNotIn("http://127.0.0.1:8426", text)
+        self.assertNotIn("Remote:", text)
 
     def test_fleet_dashboard_ready_while_publication_hangs(self):
         started = threading.Event()
         hang = threading.Event()
         ready: dict[str, dict | None] = {}
+        seen = {}
 
         def hanging_publish(host, port):
             started.set()
@@ -572,15 +839,20 @@ class TestDashboardStartupIntegration(unittest.TestCase):
 
         def fake_run(*args, **kwargs):
             try:
+                seen["elapsed"] = time.monotonic() - seen["started_at"]
                 self.assertTrue(started.wait(timeout=1))
+                seen["during"] = stdout.getvalue()
                 with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
                      patch.object(fleet, "pid_alive", return_value=True):
                     ready["payload"] = fleet.wait_fleet_dashboard_ready(timeout=1.0)
+                _join_named_threads("dashboard-startup-announce", timeout=1.0)
+                seen["after_window"] = stdout.getvalue()
             finally:
                 hang.set()
 
         uv = MagicMock()
         uv.run = MagicMock(side_effect=fake_run)
+        stdout = io.StringIO()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             metadata_path = Path(tmpdir) / "fleet-dashboard.json"
@@ -590,7 +862,14 @@ class TestDashboardStartupIntegration(unittest.TestCase):
                      "publish_dashboard",
                      side_effect=hanging_publish,
                  ), \
-                 patch.object(fleet, "fleet_dashboard_metadata_path", return_value=metadata_path):
+                 patch.object(
+                     fleet_dashboard.dashboard_tailscale,
+                     "STARTUP_ANNOUNCE_WAIT_SECONDS",
+                     0.3,
+                 ), \
+                 patch.object(fleet, "fleet_dashboard_metadata_path", return_value=metadata_path), \
+                 redirect_stdout(stdout):
+                seen["started_at"] = time.monotonic()
                 fleet_dashboard._run_dashboard("127.0.0.1", 8426, _uvicorn=uv)
                 _join_publish_threads()
 
@@ -598,6 +877,19 @@ class TestDashboardStartupIntegration(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["url"], "http://127.0.0.1:8426")
         self.assertIsNone(payload.get("remote_url"))
+        self.assertLess(seen["elapsed"], 0.15)
+        self.assertEqual(_dashboard_lines(seen["during"]), [])
+        self.assertNotIn("https://node.example.ts.net", seen["during"])
+        self.assertEqual(
+            _dashboard_lines(seen["after_window"]),
+            ["Dashboard: http://127.0.0.1:8426"],
+        )
+        self.assertNotIn("https://node.example.ts.net", seen["after_window"])
+        self.assertEqual(
+            _dashboard_lines(stdout.getvalue()),
+            ["Dashboard: http://127.0.0.1:8426"],
+        )
+        self.assertNotIn("https://node.example.ts.net", stdout.getvalue())
         uv.run.assert_called_once()
 
     def test_fleet_wrapper_uses_shared_lookup(self):

@@ -834,21 +834,26 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
 
     port = dashboard._find_free_port(host, preferred_port)
     _write_dashboard_metadata(host, port, remote_url=None)
+    if port != preferred_port:
+        print(
+            f"Port {preferred_port} is in use; fleet dashboard starting on port {port}.",
+            flush=True,
+        )
+    announce = dashboard_tailscale.announce_startup_dashboard_url(
+        f"http://{host}:{port}"
+    )
 
     def _record_remote(remote_url: str | None) -> None:
         if remote_url:
             _write_dashboard_metadata(host, port, remote_url=remote_url)
+        announce(remote_url)
 
     dashboard_tailscale.schedule_publish_dashboard(
         host,
         port,
         on_resolved=_record_remote,
     )
-    if port != preferred_port:
-        print(
-            f"Port {preferred_port} is in use; fleet dashboard starting on port {port}.",
-            flush=True,
-        )
+    dashboard_tailscale.schedule_startup_dashboard_fallback(announce)
     try:
         _uvicorn.run(
             "fleet_dashboard:app",

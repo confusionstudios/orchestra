@@ -256,13 +256,19 @@ Notes:
   alternate HTTPS listener is used when it is not, and unrelated Serve routes
   are left untouched. Mappings persist after the dashboard stops.
   Tailscale absence, delay, or failure never blocks the localhost dashboard.
+  Startup output, `ko-get-update`, and the current-repo summary from
+  `ko-fleet status` present one **Dashboard:** URL: the exact HTTPS mapping
+  when it exists, otherwise localhost. The fleet table still shows localhost.
   Each card has one Dashboard action: local Fleet views use localhost and
   Tailscale Fleet views use the exact remote mapping, omitting the action when
   that mapping is unavailable. Play on a stopped card is equivalent to
   `ko-fleet start <configured-repo-label>`.
 - Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
+  It opens the preferred Tailscale URL when an exact mapping exists.
 - Use `ko-fleet dashboard-open <repo-label>` when a script wants an explicit
   open verb; it requires a repo selector.
+- Pass `--local` on `ko-fleet dashboard` or `ko-fleet dashboard-open` to open
+  the localhost URL for debugging.
 - The repo dashboard chooses a free port at runtime and records it in
   `.kanban-orchestra/dashboard.json`.
 - The repo dashboard is the repo-scoped read-only status surface. For

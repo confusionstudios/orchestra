@@ -358,6 +358,14 @@ def tailscale_dashboard_url(local_url: str) -> str | None:
     return dashboard_tailscale.lookup_dashboard_url(local_url)
 
 
+def preferred_dashboard_url(local_url: str, *, prefer_local: bool = False) -> str:
+    """Return the operator-facing URL for one localhost dashboard."""
+    return dashboard_tailscale.preferred_dashboard_url(
+        local_url,
+        prefer_local=prefer_local,
+    )
+
+
 def wait_dashboard_ready(repo: FleetRepo, *, timeout: float = 12.0) -> bool:
     """Wait for Fleet-visible dashboard metadata for one running repo."""
     deadline = time.monotonic() + timeout
@@ -662,13 +670,15 @@ def print_status(repos: list[FleetRepo]) -> None:
     if current_repo is not None:
         status, _, _, _ = repo_process_state(current_repo)
         dashboard_url = dashboard_status_url(current_repo) if not current_repo.error else "-"
-        dashboard_display = dashboard_url if dashboard_url != "-" else "not running"
-        print()
-        print(f"This repo ({current_repo.label}) is {status}. Dash: {dashboard_display}")
         if dashboard_url != "-":
-            remote_url = tailscale_dashboard_url(dashboard_url)
-            if remote_url:
-                print(f"Remote: {remote_url}")
+            dashboard_display = preferred_dashboard_url(dashboard_url)
+        else:
+            dashboard_display = "not running"
+        print()
+        print(
+            f"This repo ({current_repo.label}) is {status}. "
+            f"{dashboard_tailscale.format_dashboard_line(dashboard_display)}"
+        )
 
 
 def precheck(repos: list[FleetRepo]) -> int:
@@ -936,13 +946,13 @@ def logs(repo: FleetRepo) -> None:
     os.execvp("tail", ["tail", "-f", str(repo.log_path)])
 
 
-def _open_localhost_url(url: str) -> None:
+def _open_dashboard_url(url: str) -> None:
     if sys.platform == "darwin" and shutil.which("open"):
         subprocess.run(["open", url], check=False)
-    print(url)
+    print(dashboard_tailscale.format_dashboard_line(url))
 
 
-def open_dashboard(repo: FleetRepo) -> None:
+def open_dashboard(repo: FleetRepo, *, prefer_local: bool = False) -> None:
     payload = read_key_value_or_json(repo.dashboard_metadata_path)
     url = payload.get("url")
     if not url:
@@ -954,7 +964,7 @@ def open_dashboard(repo: FleetRepo) -> None:
         die(f"dashboard is not running for {repo.label}")
     if not dashboard_endpoint_ready(payload):
         die(f"dashboard is not accepting connections for {repo.label}: {url}")
-    _open_localhost_url(str(url))
+    _open_dashboard_url(preferred_dashboard_url(str(url), prefer_local=prefer_local))
 
 
 def fleet_dashboard_live_payload() -> dict | None:
@@ -1004,8 +1014,8 @@ def start_fleet_dashboard_process() -> subprocess.Popen:
     )
 
 
-def open_or_start_fleet_dashboard() -> None:
-    """Open a running Fleet Dashboard, or start one and print its localhost URL."""
+def open_or_start_fleet_dashboard(*, prefer_local: bool = False) -> None:
+    """Open a running Fleet Dashboard, or start one and print its preferred URL."""
     payload = fleet_dashboard_live_payload()
     if payload is None:
         start_fleet_dashboard_process()
@@ -1015,7 +1025,7 @@ def open_or_start_fleet_dashboard() -> None:
     url = payload.get("url")
     if not url:
         die("fleet dashboard metadata is missing a URL")
-    _open_localhost_url(str(url))
+    _open_dashboard_url(preferred_dashboard_url(str(url), prefer_local=prefer_local))
 
 
 def init_config() -> None:
@@ -1090,12 +1100,16 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name)
         p.add_argument("repo", nargs=1, help="repo label or path")
 
+    local_help = (
+        "open the localhost dashboard URL instead of the preferred Tailscale URL"
+    )
     p_dash = sub.add_parser(
         "dashboard",
         help="start or open the Fleet Dashboard, or a repo dashboard when a selector is given",
         description=(
             "With no repo argument, start or open the Fleet Dashboard and print "
-            "its localhost URL. With a repo selector, open that repo's localhost dashboard."
+            "its preferred Dashboard URL. With a repo selector, open that repo's "
+            "preferred dashboard. Pass --local to open localhost."
         ),
     )
     p_dash.add_argument(
@@ -1103,11 +1117,13 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="repo label or path; omit to start or open the Fleet Dashboard",
     )
+    p_dash.add_argument("--local", action="store_true", help=local_help)
     p_open = sub.add_parser(
         "dashboard-open",
         help="open a repo dashboard (requires a repo selector)",
     )
     p_open.add_argument("repo", nargs=1, help="repo label or path")
+    p_open.add_argument("--local", action="store_true", help=local_help)
 
     sub.add_parser("init")
     p_add = sub.add_parser("add")
@@ -1148,11 +1164,11 @@ def main(argv: list[str] | None = None) -> int:
         logs(one_repo(args.repo))
     elif args.command == "dashboard":
         if args.repo:
-            open_dashboard(one_repo([args.repo]))
+            open_dashboard(one_repo([args.repo]), prefer_local=args.local)
         else:
-            open_or_start_fleet_dashboard()
+            open_or_start_fleet_dashboard(prefer_local=args.local)
     elif args.command == "dashboard-open":
-        open_dashboard(one_repo(args.repo))
+        open_dashboard(one_repo(args.repo), prefer_local=args.local)
     elif args.command == "init":
         init_config()
     elif args.command == "add":
