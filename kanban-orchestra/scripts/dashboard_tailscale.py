@@ -13,6 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -176,8 +177,55 @@ def _ensure_tailscale_running() -> bool:
     timeout = f"{int(UP_TIMEOUT_SECONDS)}s"
     result = _run(["tailscale", "up", f"--timeout={timeout}"], timeout=UP_TIMEOUT_SECONDS + 2.0)
     if result is None or result.returncode != 0:
-        return False
+        retry_args = _suggested_up_args(result, timeout) if result is not None else None
+        if retry_args is None:
+            return False
+        result = _run(retry_args, timeout=UP_TIMEOUT_SECONDS + 2.0)
+        if result is None or result.returncode != 0:
+            return False
     return _backend_state() == "Running"
+
+
+def _suggested_up_args(
+    result: subprocess.CompletedProcess[str],
+    timeout: str,
+) -> list[str] | None:
+    """Return the CLI-suggested up command with Orchestra's bounded timeout.
+
+    Tailscale requires every non-default preference to be repeated when an
+    existing profile is brought up. The CLI prints a complete safe argv for
+    that case. Parse it without a shell, retain those preferences, and reject
+    suggestions that would reset the profile.
+    """
+    for raw_line in result.stderr.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("tailscale up "):
+            continue
+        try:
+            suggested = shlex.split(line)
+        except ValueError:
+            continue
+        if suggested[:2] != ["tailscale", "up"]:
+            continue
+
+        preferences: list[str] = []
+        skip_timeout_value = False
+        for arg in suggested[2:]:
+            if skip_timeout_value:
+                skip_timeout_value = False
+                continue
+            if arg == "--timeout":
+                skip_timeout_value = True
+                continue
+            if arg.startswith("--timeout="):
+                continue
+            if arg == "--reset":
+                return None
+            preferences.append(arg)
+        if skip_timeout_value or not preferences:
+            return None
+        return ["tailscale", "up", f"--timeout={timeout}", *preferences]
+    return None
 
 
 def _backend_state() -> str | None:

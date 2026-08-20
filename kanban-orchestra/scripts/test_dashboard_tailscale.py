@@ -62,12 +62,14 @@ class FakeTailscale:
         backend: str | None = "Running",
         serve: dict | str | None = None,
         up_backend: str = "Running",
+        required_up_flags: list[str] | None = None,
         fail: set[str] | None = None,
         timeout: set[str] | None = None,
     ):
         self.backend = backend
         self.serve = {} if serve is None else serve
         self.up_backend = up_backend
+        self.required_up_flags = required_up_flags
         self.fail = fail or set()
         self.timeout = timeout or set()
         self.commands: list[list[str]] = []
@@ -84,6 +86,18 @@ class FakeTailscale:
                 return _completed(returncode=1, stderr="tailscaled not running")
             return _completed(json.dumps(_status(self.backend)))
         if name == "up":
+            if self.required_up_flags is not None:
+                expected = ["tailscale", "up", "--timeout=15s", *self.required_up_flags]
+                if args != expected:
+                    suggested = " ".join(expected)
+                    return _completed(
+                        returncode=1,
+                        stderr=(
+                            "Error: changing settings via 'tailscale up' requires mentioning all\n"
+                            "non-default flags. Use the command below:\n\n"
+                            f"\t{suggested}\n"
+                        ),
+                    )
             self.backend = self.up_backend
             return _completed()
         if name == "serve-status":
@@ -202,6 +216,29 @@ class TestPublishDashboard(unittest.TestCase):
         self.assertTrue(all(cmd[0] == "tailscale" for cmd in fake.commands))
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "")
+
+    def test_stopped_retries_up_with_cli_suggested_preferences(self):
+        fake = FakeTailscale(backend="Stopped", serve={}, required_up_flags=["--accept-routes"])
+        remote, stdout, stderr = _publish(fake)
+        self.assertEqual(remote, "https://node.example.ts.net:8427/")
+        self.assertEqual(
+            [cmd for cmd in fake.commands if fake._name(cmd) == "up"],
+            [
+                ["tailscale", "up", "--timeout=15s"],
+                ["tailscale", "up", "--timeout=15s", "--accept-routes"],
+            ],
+        )
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "")
+
+    def test_stopped_does_not_accept_cli_reset_suggestion(self):
+        fake = FakeTailscale(backend="Stopped", serve={}, required_up_flags=["--reset"])
+        remote, _, _ = _publish(fake)
+        self.assertIsNone(remote)
+        self.assertEqual(
+            [cmd for cmd in fake.commands if fake._name(cmd) == "up"],
+            [["tailscale", "up", "--timeout=15s"]],
+        )
 
     def test_already_running_skips_up(self):
         fake = FakeTailscale(backend="Running", serve={})
