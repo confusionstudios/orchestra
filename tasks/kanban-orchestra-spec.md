@@ -793,8 +793,10 @@ HTTPS listener is preferred when that port is free; a free alternate HTTPS
 listener is used when it is not; unrelated Serve routes are never overwritten;
 and mappings persist after the dashboard stops. Tailscale
 absence, authentication failure, startup delay, or Serve failure never blocks
-the localhost dashboard and does not emit dashboard UI warnings. Via Tailscale appears only when that
-exact HTTPS proxy exists. Play on a stopped card is equivalent to
+the localhost dashboard and does not emit dashboard UI warnings. Each Fleet
+card has one Dashboard action: local Fleet views use localhost and Tailscale
+Fleet views use the exact remote mapping, omitting the action when that mapping
+is unavailable. Play on a stopped card is equivalent to
 `ko-fleet start <configured-repo-label>`. Each repo dashboard is read-only,
 repo-scoped, and attached to the matching orchestrator instance. The old
 process-manager UI and its heartbeat/request/response JSON files are removed,

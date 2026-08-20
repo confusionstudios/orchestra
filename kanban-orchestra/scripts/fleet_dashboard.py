@@ -383,7 +383,7 @@ FLEET_CSS = """
 
 .dashboard-links {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 8px;
   margin-top: auto;
   padding-top: 12px;
@@ -403,10 +403,6 @@ FLEET_CSS = """
   font-size: 0.76rem;
   line-height: 1.2;
   text-align: center;
-}
-
-.dashboard-links .via-tailscale {
-  grid-column: 3;
 }
 
 .dashboard-links a:hover {
@@ -627,15 +623,13 @@ def _footer_html(card: FleetCard, *, local_access: bool) -> str:
             f'<span class="start-reason">{_esc(card.last_start_failure)}</span>'
             "</div>"
         )
-    links: list[str] = []
-    if local_access and card.dashboard_url:
-        links.append(_new_tab_link(card.dashboard_url, "Dashboard"))
-    if card.tailscale_url:
-        links.append(
-            _new_tab_link(card.tailscale_url, "Via Tailscale", class_name="via-tailscale")
+    dashboard_url = _repo_action_url(card, local_access=local_access)
+    if dashboard_url:
+        parts.append(
+            '<div class="dashboard-links">'
+            f'{_new_tab_link(dashboard_url, "Dashboard")}'
+            "</div>"
         )
-    if links:
-        parts.append(f'<div class="dashboard-links">{"".join(links)}</div>')
     elif not card.dashboard_url and not card.last_start_failure:
         parts.append('<div class="unavailable">Dashboard unavailable</div>')
     return "".join(parts)

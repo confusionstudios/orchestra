@@ -66,10 +66,10 @@ failure never blocks local access. If `tailscale up` requires existing
 non-default preferences, Orchestra repeats the CLI-provided values without
 using `--reset`.
 
-A locally opened Fleet Dashboard offers both local and **Via Tailscale** repo
-actions when the remote mapping exists. A Fleet Dashboard reached through
-Tailscale shows only the remote action because localhost would point at the
-client device. `ko-get-update` and the current-repo summary from
+A Fleet card exposes one **Dashboard** action. A locally opened Fleet Dashboard
+links it to localhost; a Fleet Dashboard reached through Tailscale links it to
+the exact remote mapping and omits the action when that mapping is unavailable.
+`ko-get-update` and the current-repo summary from
 `ko-fleet status` print the matching **Remote:** URL only when that exact proxy
 exists; the fleet table remains compact.
 

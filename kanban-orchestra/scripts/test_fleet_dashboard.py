@@ -481,6 +481,7 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn(">Dashboard</a>", html)
         self.assertIn('href="http://127.0.0.1:8428"', html)
         self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", html)
+        self.assertIn(".dashboard-links {\n  display: grid;\n  grid-template-columns: 1fr", html)
         self.assertIn("aspect-ratio: 1", html)
         self.assertIn("@media (max-width: 960px)", html)
         self.assertIn("@media (max-width: 560px)", html)
@@ -509,19 +510,20 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertNotIn("http://127.0.0.1:8428", visible)
         self.assertNotIn("https://node.example.ts.net:8428/", visible)
         self.assertIn(">Dashboard</a>", html)
-        self.assertIn(">Via Tailscale</a>", html)
+        self.assertNotIn("Via Tailscale", html)
+        self.assertEqual(html.count('<div class="dashboard-links">'), 1)
 
-    def test_via_tailscale_renders_only_when_collector_returned_a_mapping(self):
+    def test_local_dashboard_action_uses_local_url_with_or_without_mapping(self):
         with_mapping = _get_fleet_page(
             _page_card(tailscale_url="https://node.example.ts.net:8428/")
         ).text
         without_mapping = _get_fleet_page(_page_card(tailscale_url=None)).text
 
-        self.assertIn(">Via Tailscale</a>", with_mapping)
-        self.assertIn('href="https://node.example.ts.net:8428/"', with_mapping)
-        self.assertIn("via-tailscale", with_mapping)
-        self.assertNotIn("Via Tailscale", without_mapping)
-        self.assertIn(">Dashboard</a>", without_mapping)
+        for html in (with_mapping, without_mapping):
+            self.assertIn(">Dashboard</a>", html)
+            self.assertIn('href="http://127.0.0.1:8428"', html)
+            self.assertNotIn("Via Tailscale", html)
+        self.assertNotIn('href="https://node.example.ts.net:8428/"', with_mapping)
 
     def test_stopped_card_shows_play_button_and_last_start_reason(self):
         html = _get_fleet_page(
@@ -579,7 +581,7 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn("start-reason", html)
         self.assertIn("Start failed", html)
 
-    def test_local_origin_shows_dashboard_and_via_tailscale_when_mapped(self):
+    def test_local_origin_shows_one_local_dashboard_action_when_mapped(self):
         html = _get_fleet_page(
             _page_card(
                 dashboard_url="http://127.0.0.1:8428",
@@ -589,10 +591,11 @@ class TestFleetDashboardPage(unittest.TestCase):
 
         self.assertIn(">Dashboard</a>", html)
         self.assertIn('href="http://127.0.0.1:8428"', html)
-        self.assertIn(">Via Tailscale</a>", html)
-        self.assertIn('href="https://node.example.ts.net:8428/"', html)
+        self.assertNotIn("Via Tailscale", html)
+        self.assertNotIn('href="https://node.example.ts.net:8428/"', html)
+        self.assertEqual(html.count('<div class="dashboard-links">'), 1)
 
-    def test_local_origin_without_mapping_omits_via_tailscale(self):
+    def test_local_origin_without_mapping_shows_local_dashboard_action(self):
         html = _get_fleet_page(_page_card(tailscale_url=None)).text
 
         self.assertIn(">Dashboard</a>", html)
@@ -606,9 +609,10 @@ class TestFleetDashboardPage(unittest.TestCase):
         ).text
 
         self.assertIn(">Dashboard</a>", html)
-        self.assertIn(">Via Tailscale</a>", html)
+        self.assertIn('href="http://127.0.0.1:8428"', html)
+        self.assertNotIn("Via Tailscale", html)
 
-    def test_tailscale_origin_hides_localhost_dashboard_and_shows_via_tailscale(self):
+    def test_tailscale_origin_shows_one_remote_dashboard_action(self):
         html = _get_fleet_page(
             _page_card(
                 current_task=fleet_dashboard.FleetCurrentTask(214, "Device synchronization"),
@@ -618,12 +622,13 @@ class TestFleetDashboardPage(unittest.TestCase):
             headers=_TAILSCALE_VIEW_HEADERS,
         ).text
 
-        self.assertNotIn(">Dashboard</a>", html)
         self.assertNotIn('href="http://127.0.0.1:8428"', html)
         self.assertNotIn("http://127.0.0.1:8428/task/214", html)
-        self.assertIn(">Via Tailscale</a>", html)
+        self.assertIn(">Dashboard</a>", html)
+        self.assertNotIn("Via Tailscale", html)
         self.assertIn('href="https://node.example.ts.net:8428/"', html)
         self.assertIn('href="https://node.example.ts.net:8428/task/214"', html)
+        self.assertEqual(html.count('<div class="dashboard-links">'), 1)
         self.assertIn('class="repo-name"', html)
         self.assertNotIn("Dashboard unavailable", html)
 
@@ -664,8 +669,9 @@ class TestFleetDashboardPage(unittest.TestCase):
             },
         ).text
 
-        self.assertNotIn(">Dashboard</a>", html)
-        self.assertIn(">Via Tailscale</a>", html)
+        self.assertIn(">Dashboard</a>", html)
+        self.assertNotIn("Via Tailscale", html)
+        self.assertIn('href="https://node.example.ts.net:8428/"', html)
 
     def test_repo_dashboard_actions_open_in_a_new_tab(self):
         html = fleet_dashboard.render_card(
@@ -678,14 +684,14 @@ class TestFleetDashboardPage(unittest.TestCase):
         for href in (
             "http://127.0.0.1:8428",
             "http://127.0.0.1:8428/task/214",
-            "https://node.example.ts.net:8428/",
         ):
             self.assertRegex(
                 html,
                 rf'<a[^>]*href="{re.escape(href)}"[^>]*target="_blank"[^>]*rel="noopener noreferrer"',
             )
-        self.assertEqual(html.count('target="_blank"'), 4)
-        self.assertEqual(html.count('rel="noopener noreferrer"'), 4)
+        self.assertNotIn("https://node.example.ts.net:8428/", html)
+        self.assertEqual(html.count('target="_blank"'), 3)
+        self.assertEqual(html.count('rel="noopener noreferrer"'), 3)
         self.assertNotIn('target="_blank"', _get_fleet_page(_page_card()).text.split("<main>")[0])
 
     def test_play_start_action_stays_in_place(self):
@@ -816,7 +822,9 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
         self.assertIsNone(card["last_start_failure"])
         self.assertIn("badge-running", payload["html"])
         self.assertIn("http://127.0.0.1:8427", payload["html"])
-        self.assertIn("Via Tailscale", payload["html"])
+        self.assertIn(">Dashboard</a>", payload["html"])
+        self.assertNotIn("Via Tailscale", payload["html"])
+        self.assertNotIn("https://node.example.ts.net:8427/", payload["html"])
         self.assertIn("#%s Device synchronization" % task_id, payload["html"])
         self.assertNotIn("data-start-repo", payload["html"])
         self.assertNotIn("error", payload)
@@ -840,9 +848,10 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
 
         html = response.json()["html"]
         self.assertEqual(response.status_code, 200)
-        self.assertNotIn(">Dashboard</a>", html)
         self.assertNotIn("http://127.0.0.1:8427", html)
-        self.assertIn("Via Tailscale", html)
+        self.assertIn(">Dashboard</a>", html)
+        self.assertNotIn("Via Tailscale", html)
+        self.assertIn('href="https://node.example.ts.net:8427/"', html)
         self.assertIn('target="_blank"', html)
         self.assertIn('rel="noopener noreferrer"', html)
 

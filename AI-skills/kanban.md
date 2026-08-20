@@ -256,8 +256,10 @@ Notes:
   alternate HTTPS listener is used when it is not, and unrelated Serve routes
   are left untouched. Mappings persist after the dashboard stops.
   Tailscale absence, delay, or failure never blocks the localhost dashboard.
-  Via Tailscale appears only when that exact HTTPS proxy exists. Play on a
-  stopped card is equivalent to `ko-fleet start <configured-repo-label>`.
+  Each card has one Dashboard action: local Fleet views use localhost and
+  Tailscale Fleet views use the exact remote mapping, omitting the action when
+  that mapping is unavailable. Play on a stopped card is equivalent to
+  `ko-fleet start <configured-repo-label>`.
 - Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
 - Use `ko-fleet dashboard-open <repo-label>` when a script wants an explicit
   open verb; it requires a repo selector.
