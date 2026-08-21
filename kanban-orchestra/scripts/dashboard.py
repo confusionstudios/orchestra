@@ -38,6 +38,7 @@ from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
+import dashboard_tailscale
 import db
 import task as task_cli
 
@@ -51,6 +52,127 @@ _FAVICON = Path(__file__).resolve().parent.parent / "favicon.ico"
 STALE_SECONDS = 60  # heartbeat older than this → "stale"
 DONE_RECENCY_CUTOFF = timedelta(days=7)
 _REVIEW_ROUND_DISPLAY_RE = re.compile(r"\b((?:[Rr]eview round)|(?:[Rr]ound)) (\d+)\b")
+
+ACCENT_COOKIE_NAME = "orchestra_accent"
+DEFAULT_ACCENT = "green"
+ACCENT_PALETTE = {
+    "green": {
+        "label": "Green",
+        "color": "#00cc44",
+        "dim": "#007a28",
+        "hover": "#33dd66",
+        "soft": "#001707",
+        "rgb": "0 204 68",
+    },
+    "violet": {
+        "label": "Violet",
+        "color": "#c084fc",
+        "dim": "#744f98",
+        "hover": "#d8b4fe",
+        "soft": "#160d20",
+        "rgb": "192 132 252",
+    },
+    "cyan": {
+        "label": "Cyan",
+        "color": "#22d3ee",
+        "dim": "#147f8f",
+        "hover": "#67e8f9",
+        "soft": "#07191c",
+        "rgb": "34 211 238",
+    },
+    "pink": {
+        "label": "Pink",
+        "color": "#f472b6",
+        "dim": "#93446d",
+        "hover": "#f9a8d4",
+        "soft": "#1e0b15",
+        "rgb": "244 114 182",
+    },
+    "gold": {
+        "label": "Gold",
+        "color": "#e6b450",
+        "dim": "#8a6c30",
+        "hover": "#f2cf7d",
+        "soft": "#1b1407",
+        "rgb": "230 180 80",
+    },
+}
+
+
+def _validated_accent(value: str | None) -> str:
+    """Return an allowlisted accent name, falling back to the default."""
+    return value if value in ACCENT_PALETTE else DEFAULT_ACCENT
+
+
+def _relative_luminance(color: str) -> float:
+    """Return WCAG relative luminance for a six-digit hex color."""
+    channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    """Return the WCAG contrast ratio between two six-digit hex colors."""
+    lighter, darker = sorted((_relative_luminance(first), _relative_luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def accent_bootstrap_script() -> str:
+    """Return the early, shared host-cookie accent bootstrap."""
+    palette_json = json.dumps(ACCENT_PALETTE, separators=(",", ":"))
+    return f"""(() => {{
+  const palette = {palette_json};
+  const match = document.cookie.split("; ").find((row) => row.startsWith("{ACCENT_COOKIE_NAME}="));
+  let requested = "{DEFAULT_ACCENT}";
+  if (match) {{
+    try {{ requested = decodeURIComponent(match.slice(match.indexOf("=") + 1)); }} catch (_) {{}}
+  }}
+  const name = Object.prototype.hasOwnProperty.call(palette, requested) ? requested : "{DEFAULT_ACCENT}";
+  const accent = palette[name];
+  const root = document.documentElement;
+  root.style.setProperty("--accent", accent.color);
+  root.style.setProperty("--accent-dim", accent.dim);
+  root.style.setProperty("--accent-hover", accent.hover);
+  root.style.setProperty("--accent-soft", accent.soft);
+  root.style.setProperty("--accent-rgb", accent.rgb);
+  root.dataset.accent = name;
+  window.__orchestraAccent = {{ name, palette }};
+}})();"""
+
+
+def accent_picker_html() -> str:
+    """Return the shared accessible accent picker markup."""
+    options = "".join(
+        f'<option value="{_esc(name)}">{_esc(values["label"])}</option>'
+        for name, values in ACCENT_PALETTE.items()
+    )
+    return (
+        '<div class="accent-picker">'
+        '<label for="orchestra-accent-picker">Accent</label>'
+        f'<select id="orchestra-accent-picker" name="accent">{options}</select>'
+        '</div>'
+    )
+
+
+def accent_picker_script() -> str:
+    """Return shared picker hydration and host-only cookie persistence."""
+    return f"""(() => {{
+  const picker = document.getElementById("orchestra-accent-picker");
+  const state = window.__orchestraAccent;
+  if (!picker || !state) return;
+  picker.value = state.name;
+  picker.addEventListener("change", () => {{
+    if (!Object.prototype.hasOwnProperty.call(state.palette, picker.value)) {{
+      picker.value = "{DEFAULT_ACCENT}";
+    }}
+    document.cookie = "{ACCENT_COOKIE_NAME}=" + encodeURIComponent(picker.value)
+      + "; Path=/; Max-Age=31536000; SameSite=Lax";
+    window.location.reload();
+  }});
+}})();"""
 
 
 def _esc(v) -> str:
@@ -87,6 +209,19 @@ def _display_review_round_text(text: str | None) -> str:
         return f"{match.group(1)} {int(match.group(2)) + 1}"
 
     return _REVIEW_ROUND_DISPLAY_RE.sub(repl, text)
+
+
+def _display_review_round_count(review_round) -> int | None:
+    """Return the 1-based review-round count for UI, or None when not applicable."""
+    if review_round is None:
+        return None
+    try:
+        stored = int(review_round)
+    except (TypeError, ValueError):
+        return None
+    if stored < 0:
+        return None
+    return stored + 1
 
 
 def _age(dt_str: str | None) -> str:
@@ -374,6 +509,20 @@ def _branch_meta_html(branch: str | None, commit_hash: str | None = None) -> str
     else:
         body = f'<code class="task-record-hash">{_esc(short)}</code>'
     return _task_record_meta_item(body, css_class="task-record-branch")
+
+
+def _review_rounds_meta_html(review_round, *, reviewed: bool) -> str:
+    """Labeled 1-based review-round count, omitted unless a review occurred."""
+    if not reviewed:
+        return ""
+    count = _display_review_round_count(review_round)
+    if count is None:
+        return ""
+    return _labeled_meta_html(
+        "review rounds",
+        _esc(count),
+        css_class="task-record-review-rounds",
+    )
 
 
 def _labeled_meta_html(label: str, value_html: str, *, css_class: str = "", muted: bool = False) -> str:
@@ -1119,7 +1268,7 @@ def render_recently_done(conn) -> str:
         return '<div class="card" id="recently-done"><h2>Recently Done</h2><p class="muted">Database not available.</p></div>'
     rows_raw = [dict(r) for r in conn.execute(
         "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent, "
-        "ready_at, last_ready_at, done_at FROM tasks "
+        "review_round, ready_at, last_ready_at, done_at FROM tasks "
         "WHERE status = 'done' ORDER BY updated_at DESC, id DESC"
     ).fetchall()]
     for row in rows_raw:
@@ -1134,18 +1283,12 @@ def render_recently_done(conn) -> str:
     for idx, r in enumerate(rows_raw):
         rejection_count = int(r.get("rejection_count", 0) or 0)
         runtime = _done_elapsed_runtime(r)
+        reviewed = bool(r.get("approvers")) or rejection_count > 0
         meta = [
             _agents_meta_html(r.get("coder_agent"), _task_done_reviewer(r)),
             _branch_meta_html(r.get("branch"), r.get("commit_hash")),
+            _review_rounds_meta_html(r.get("review_round"), reviewed=reviewed),
         ]
-        if rejection_count > 0:
-            label = "rejection" if rejection_count == 1 else "rejections"
-            meta.append(
-                _task_record_meta_item(
-                    f"{_esc(rejection_count)} {label}",
-                    css_class="task-record-rejections",
-                )
-            )
         if runtime != "unknown":
             meta.append(
                 _labeled_meta_html(
@@ -1546,6 +1689,9 @@ COMMON_CSS = """
   --muted: #585858;
   --accent: #00cc44;
   --accent-dim: #007a28;
+  --accent-hover: #33dd66;
+  --accent-soft: #001707;
+  --accent-rgb: 0 204 68;
   --border: #222222;
   --green: #00cc44;
   --red: #ff4444;
@@ -1610,7 +1756,31 @@ nav a:hover { color: #ffffff; text-decoration: none; }
   white-space: nowrap;
 }
 
-h1 { margin: 0 0 8px; font-size: 1.6rem; color: var(--accent); text-shadow: 0 0 18px rgba(0,204,68,0.28); }
+.accent-picker {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.accent-picker select {
+  max-width: 8.5rem;
+  border: 1px solid var(--accent-dim);
+  border-radius: 2px;
+  padding: 3px 22px 3px 6px;
+  background: #111111;
+  color: var(--accent);
+  font: inherit;
+}
+
+.accent-picker select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+h1 { margin: 0 0 8px; font-size: 1.6rem; color: var(--accent); text-shadow: 0 0 18px rgb(var(--accent-rgb) / 0.28); }
 h2 { margin: 0 0 12px; font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; color: var(--accent); }
 h3 { margin: 12px 0 6px; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 p  { margin: 4px 0 8px; }
@@ -1656,8 +1826,8 @@ code {
 .inline-edit-display:hover,
 .inline-edit-display:focus,
 .inline-edit-display:focus-within {
-  background: rgba(0, 204, 68, 0.07);
-  box-shadow: inset 0 0 0 1px rgba(0, 204, 68, 0.25);
+  background: rgb(var(--accent-rgb) / 0.07);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.25);
   outline: none;
 }
 
@@ -1981,6 +2151,10 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
     max-width: 100%;
   }
 
+  .accent-picker {
+    margin-left: auto;
+  }
+
   .card {
     padding: 14px 12px;
   }
@@ -2107,18 +2281,21 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_esc(title)}</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <script>{accent_bootstrap_script()}</script>
   <style>{COMMON_CSS}</style>
 </head>
 <body>
   <nav>
     <a class="nav-title" href="/">Kanban Orchestra</a>
     {nav_extra}
+    {accent_picker_html()}
     <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
   </nav>
   <main>
     {body}
   </main>
   <script>
+    {accent_picker_script()}
     (() => {{
       function formatRelativeAge(timestamp) {{
         const then = Date.parse(timestamp);
@@ -2666,12 +2843,27 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
             raise SystemExit(1)
 
     port = _find_free_port(host, preferred_port)
-    _write_dashboard_metadata(host, port)
+    _write_dashboard_metadata(host, port, remote_url=None)
     if port != preferred_port:
         print(
             f"Port {preferred_port} is in use; dashboard starting on port {port}.",
             flush=True,
         )
+    announce = dashboard_tailscale.announce_startup_dashboard_url(
+        f"http://{host}:{port}"
+    )
+
+    def _record_remote(remote_url: str | None) -> None:
+        if remote_url:
+            _write_dashboard_metadata(host, port, remote_url=remote_url)
+        announce(remote_url)
+
+    dashboard_tailscale.schedule_publish_dashboard(
+        host,
+        port,
+        on_resolved=_record_remote,
+    )
+    dashboard_tailscale.schedule_startup_dashboard_fallback(announce)
     try:
         _uvicorn.run(
             "dashboard:app",
@@ -2684,7 +2876,7 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
         pass
 
 
-def _write_dashboard_metadata(host: str, port: int) -> None:
+def _write_dashboard_metadata(host: str, port: int, remote_url: str | None = None) -> None:
     """Write optional repo-local dashboard metadata for orchestrator/fleet status."""
     metadata_path = os.environ.get("KO_DASHBOARD_METADATA_PATH")
     if not metadata_path:
@@ -2698,6 +2890,7 @@ def _write_dashboard_metadata(host: str, port: int) -> None:
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}",
+        "remote_url": remote_url,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     temp = path.with_suffix(path.suffix + ".tmp")

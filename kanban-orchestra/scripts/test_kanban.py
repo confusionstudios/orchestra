@@ -6797,10 +6797,89 @@ class TestFleetConfig(unittest.TestCase):
 
             with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
                  patch.object(fleet.shutil, "which", return_value=None), \
+                 patch.object(
+                     fleet,
+                     "preferred_dashboard_url",
+                     side_effect=lambda url, **kwargs: url,
+                 ), \
                  redirect_stdout(out):
                 fleet.open_dashboard(repo)
 
-            self.assertIn("http://127.0.0.1:8427", out.getvalue())
+            self.assertEqual(out.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
+            self.assertNotIn("Remote:", out.getvalue())
+
+    def test_open_dashboard_prints_preferred_tailscale_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
+                 patch.object(fleet.shutil, "which", return_value=None), \
+                 patch.object(
+                     fleet,
+                     "preferred_dashboard_url",
+                     return_value="https://node.example.ts.net:8427/",
+                 ) as preferred, \
+                 redirect_stdout(out):
+                fleet.open_dashboard(repo)
+
+            preferred.assert_called_once_with(
+                "http://127.0.0.1:8427",
+                prefer_local=False,
+            )
+            self.assertEqual(out.getvalue(), "Dashboard: https://node.example.ts.net:8427/\n")
+            self.assertNotIn("http://127.0.0.1:8427", out.getvalue())
+
+    def test_open_dashboard_local_flag_prints_localhost_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
+                 patch.object(fleet.shutil, "which", return_value=None), \
+                 patch.object(
+                     fleet,
+                     "preferred_dashboard_url",
+                     return_value="http://127.0.0.1:8427",
+                 ) as preferred, \
+                 redirect_stdout(out):
+                fleet.open_dashboard(repo, prefer_local=True)
+
+            preferred.assert_called_once_with(
+                "http://127.0.0.1:8427",
+                prefer_local=True,
+            )
+            self.assertEqual(out.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
 
     def test_wait_stopped_polls_until_orchestrator_pid_exits(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))

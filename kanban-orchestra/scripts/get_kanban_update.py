@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
+import dashboard_tailscale
 import db
 import fleet
 
@@ -198,8 +199,14 @@ def _fleet_status_line(identity: dict) -> str | None:
     fleet_status, _, _, _ = fleet.repo_process_state(repo)
     running_status = "running" if fleet.status_is_running(fleet_status) else "stopped"
     dashboard_url = fleet.dashboard_status_url(repo)
-    dashboard = dashboard_url if dashboard_url != "-" else "dashboard not running"
-    return f"This repo ({repo.label}) is {running_status}. Dash: {dashboard}"
+    if dashboard_url != "-":
+        dashboard = fleet.preferred_dashboard_url(dashboard_url)
+    else:
+        dashboard = "not running"
+    return (
+        f"This repo ({repo.label}) is {running_status}. "
+        f"{dashboard_tailscale.format_dashboard_line(dashboard)}"
+    )
 
 
 def _format_skips(skips: list[str] | None) -> str:
@@ -242,12 +249,10 @@ def build_update(conn) -> str:
             lines.append("  processes: none found")
         dashboard_url = _dashboard_status_url(identity)
         if dashboard_url:
-            lines.append(f"  dashboard: {dashboard_url}")
-            remote_url = fleet.tailscale_dashboard_url(dashboard_url)
-            if remote_url:
-                lines.append(f"  Remote: {remote_url}")
+            preferred = fleet.preferred_dashboard_url(dashboard_url)
+            lines.append(f"  {dashboard_tailscale.format_dashboard_line(preferred)}")
         else:
-            lines.append("  dashboard: not running")
+            lines.append(f"  {dashboard_tailscale.format_dashboard_line('not running')}")
 
         # ── Active task ──────────────────────────────────────────────────
         tid = runtime.get("current_task_id")

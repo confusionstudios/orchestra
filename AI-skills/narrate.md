@@ -32,11 +32,13 @@ Immediately sample state and give one short plain-language summary:
   because the orchestrator is stopped
 - Dashboard URL for this repo instance
 
-Take the dashboard URL from the current `ko-get-update` `dashboard:` line, or
+Take the dashboard URL from the current `ko-get-update` `Dashboard:` line, or
 from this repo's runtime metadata (`.kanban-orchestra/dashboard.json` `url`)
-when that metadata matches the monitored instance. Do not hard-code a host or
-port. If the dashboard is not running, say so. Include the URL in this first
-visible update only; later samples stay concise and omit it.
+when that metadata matches the monitored instance. Prefer the exact Tailscale
+Serve HTTPS mapping when one exists; otherwise use the localhost URL. Do not
+hard-code a host, Tailnet name, suffix, or dashboard URL. If the dashboard is
+not running, say so. Include the URL in this first visible update only; later
+samples stay concise and omit it.
 
 Use the update prefix below. Do not paste raw update output, JSON, logs,
 transcript dumps, or tables. Do not start a background recovery service.

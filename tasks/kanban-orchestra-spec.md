@@ -264,7 +264,8 @@ Runtime status values:
   the orchestrator for the current repo without process hunting.
 - `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
 - `.kanban-orchestra/dashboard.json`: repo-scoped metadata for the dashboard
-  owned by the orchestrator instance, including PID, host, port, and URL.
+  owned by the orchestrator instance, including PID, host, port, localhost URL,
+  and optional Tailscale remote URL when Serve publication succeeds.
 - `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts.
   Idle-time maintenance deletes `*.log` transcript files older than seven days
   only for completed (`done`) tasks, then removes empty `task-<id>` directories.
@@ -758,13 +759,15 @@ names are derived from the basename of the resolved repo path.
 "$ORCHESTRA_DIR/bin/ko-fleet" restart <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" attach <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" logs <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
 `ko-fleet start`:
 - starts the orchestrator/dashboard pair for every selected configured repo
 - refuses duplicates when the repo singleton lock is already live
-- refuses all selected starts when any selected repo is dirty or invalid
+- skips dirty selected repos while continuing to start clean selected repos
+- refuses selected starts when any selected repo configuration is invalid
 - keeps process-supervision details behind the fleet command
 
 `ko-fleet stop`:
@@ -773,15 +776,35 @@ names are derived from the basename of the resolved repo path.
 
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
-`ko-fleet attach`, `ko-fleet logs`, and `ko-fleet dashboard` select by repo
-label/path and then use the selected repo's tmux session, repo-local
-`.kanban-orchestra/orchestrator.log`, and repo-local dashboard metadata.
-`ko-fleet dashboard-open` is an alias for `ko-fleet dashboard`.
+`ko-fleet attach` and `ko-fleet logs` select by repo label/path and then use
+the selected repo's tmux session and repo-local
+`.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
+starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
+that repo's preferred dashboard from repo-local dashboard metadata.
+`ko-fleet dashboard-open` is an explicit open verb that requires a repo
+selector. Both open commands accept `--local` to open the localhost URL
+instead of the preferred Tailscale mapping.
 
-The repo dashboard is the supported UI surface: it is read-only, repo-scoped,
-and attached to the matching orchestrator instance. The old process-manager UI
-and its heartbeat/request/response JSON files are removed, not compatibility
-surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
+The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
+The Fleet Dashboard shows one card per configured repo: name, path, branch,
+status, current task, and ready / recently done / icebox counts. Both the
+Fleet Dashboard and each repo dashboard publish an HTTPS Tailscale Serve proxy
+to the chosen localhost port in the background after startup when the
+`tailscale` CLI is available. Existing exact mappings are reused; a same-port
+HTTPS listener is preferred when that port is free; a free alternate HTTPS
+listener is used when it is not; unrelated Serve routes are never overwritten;
+and mappings persist after the dashboard stops. Tailscale
+absence, authentication failure, startup delay, or Serve failure never blocks
+the localhost dashboard and does not emit dashboard UI warnings. Operator UX
+presents one `Dashboard:` URL: the exact HTTPS mapping when it exists,
+otherwise the localhost URL. The fleet table remains localhost. Each Fleet
+card has one Dashboard action: local Fleet views use localhost and Tailscale
+Fleet views use the exact remote mapping, omitting the action when that mapping
+is unavailable. Play on a stopped card is equivalent to
+`ko-fleet start <configured-repo-label>`. Each repo dashboard is read-only,
+repo-scoped, and attached to the matching orchestrator instance. The old
+process-manager UI and its heartbeat/request/response JSON files are removed,
+not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
 `ko-task`, and `ko-get-update`; active child process metadata is maintained
 independently in `.kanban-orchestra/active-agent-processes.json`. The old
 `BREAK` control is intentionally removed as a remote operator command: it killed

@@ -9,16 +9,9 @@ Orchestra queues them, assigns one CLI to code and another to review, runs
 rejection cycles on the staged diffs, and lands approved commits — while you
 do something else.
 
-<table>
-  <tr>
-    <td width="50%">
-      <img src="docs/dashboard1.jpg" alt="Kanban dashboard task overview" width="100%" />
-    </td>
-    <td width="50%">
-      <img src="docs/dashboard2.jpg" alt="Kanban dashboard task detail" width="100%" />
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/fleet-dashboard.png" alt="Fleet Dashboard showing six repositories and their Orchestra status" width="100%" />
+</p>
 
 ## How It Works
 
@@ -33,15 +26,58 @@ by hand. You install the skill into your agent, then talk to it: *"Queue a
 task to fix X."* The skill handles bootstrapping, task creation, status
 checks, and all wrapper commands.
 
-## Operator Visibility
+## Dashboards
 
-Everything the orchestrator does is visible. The live dashboard shows active
-tasks, ready and blocked queues, recent completions, and the orchestrator's own
-heartbeat. Each task carries durable comments — reviewer feedback, validation
-results, commit messages — so you can trace every decision without reading
-agent logs. Run logs capture the full session, and `ko-task` lets you inspect
-or update any task from another terminal or a remote agent session. If something
-stalls or fails, you see it immediately and can intervene.
+### One Fleet View
+
+The Fleet Dashboard turns every repo in your private fleet config into a status
+card. Each card shows its branch, runtime state, current task, Ready, Recently
+Done, and Icebox counts, plus dashboard actions and any known startup failure.
+An eligible stopped repo gets a play action that uses the same validation and
+startup path as `ko-fleet start <repo>`. Repo dashboards open in a new tab, so
+the fleet view stays put.
+
+### Every Task, End to End
+
+The repo dashboard exposes the active task, work queues, recent completions,
+durable reviewer comments, and run history. Recently Done places review rounds
+beside runtime and finished time when review evidence is available. The task
+view keeps the goal, acceptance criteria, orchestration state, comments, and
+run log together, so the full decision trail is available without reading raw
+agent logs.
+
+<table>
+  <tr>
+    <th width="50%">Repo overview</th>
+    <th width="50%">Task detail</th>
+  </tr>
+  <tr>
+    <td><img src="docs/dashboard-overview.png" alt="Repo dashboard overview with active, queued, blocked, and completed work" width="100%" /></td>
+    <td><img src="docs/dashboard-task.png" alt="Task dashboard with acceptance criteria, review state, comments, and run history" width="100%" /></td>
+  </tr>
+</table>
+
+### Local First, Remote Ready
+
+Repo and Fleet dashboard startup brings localhost online first, then makes a
+best-effort attempt to start Tailscale and publish an exact HTTPS Serve proxy.
+Existing mappings are reused, unrelated routes stay untouched, and a Tailscale
+failure never blocks local access. If `tailscale up` requires existing
+non-default preferences, Orchestra repeats the CLI-provided values without
+using `--reset`.
+
+A Fleet card exposes one **Dashboard** action. A locally opened Fleet Dashboard
+links it to localhost; a Fleet Dashboard reached through Tailscale links it to
+the exact remote mapping and omits the action when that mapping is unavailable.
+Operator commands present one **Dashboard:** URL: the exact HTTPS Tailscale
+mapping when it exists, otherwise the localhost URL. The fleet table remains
+compact and still shows localhost. `ko-fleet dashboard` and
+`ko-fleet dashboard-open` open that preferred URL; pass `--local` to open
+localhost for debugging.
+
+Both dashboards also include a dark-safe **Accent** picker. The allowlisted
+host-only cookie follows dashboard pages and ports on the same host while
+semantic status colors remain unchanged.
 
 ## Supported Agents
 
@@ -145,20 +181,25 @@ accounts, or billing — install and authenticate each CLI yourself.
    "$ORCHESTRA_DIR/bin/ko-fleet" add .
    "$ORCHESTRA_DIR/bin/ko-fleet" status
    "$ORCHESTRA_DIR/bin/ko-fleet" start
+   "$ORCHESTRA_DIR/bin/ko-fleet" dashboard
    ```
 
    The fleet config is `~/.config/orchestra/fleet.repos`: one git repo root per
-   line, with blank lines and `#` comments allowed. Fleet only manages running
-   orchestrators and dashboards for those repos — it does not install, sync, or
-   distribute skills. Skills come from the one-time
-   `ko-install-global-skills` step above.
-   `ko-fleet stop`, `restart`, `attach`, `logs`, and `dashboard` operate on the
-   selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
-   for opening the repo dashboard. Use `ko-get-update` for a concise status
-   snapshot and `ko-task` to inspect, comment on, or update individual tasks.
+   line, with blank lines and `#` comments allowed. Fleet manages the
+   orchestrators and dashboards for those repos; skill installation remains a
+   separate, one-time `ko-install-global-skills` step. `ko-fleet stop`,
+   `restart`, `attach`, and `logs` accept a repo label or path. Use
+   `ko-fleet dashboard <repo>` or `ko-fleet dashboard-open <repo>` to open one
+   repo instead of the Fleet Dashboard. Pass `--local` on those commands to
+   open localhost instead of the preferred Tailscale URL. See
+   [Dashboards](#dashboards) for the local, Tailscale, and card-action behavior.
+
+   Use `ko-get-update` for a concise status snapshot and `ko-task` to inspect,
+   comment on, or update individual tasks.
    Use `ko-task continue` to resume blocked tasks after a review-round cap
    (`--add-review-rounds N`) or with an explicit recovery step (`--next-step`).
-   Legacy pre-schema review-cap blocks: `--add-review-rounds N --next-step <maker-step>`.
+   For legacy pre-schema review-cap blocks, combine `--add-review-rounds N`
+   with `--next-step <maker-step>`.
    While the orchestrator is running, native smart unblocking also reassesses
    blocked tasks about once a minute. It asks the configured unblocker agent
    (`ORCHESTRA_DEFAULT_UNBLOCKER`) to continue a recoverable task or leave a
@@ -224,6 +265,8 @@ one repo root per line. It derives display names from each path and only
 manages orchestrator/dashboard processes for those repos — not skill
 installation or distribution. `start` skips dirty stopped repos and keeps
 launching clean stopped repos; invalid repo config remains a hard failure.
+`ko-fleet dashboard` starts or opens the Fleet Dashboard;
+`ko-fleet dashboard <repo>` still opens that repo dashboard.
 
 ### YOLO Mode and Hardening
 
