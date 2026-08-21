@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -910,6 +910,10 @@ class TestFleetOperatorFlows(unittest.TestCase):
                     fleet.fleet_dashboard_metadata_path(),
                     repos.with_name("fleet-dashboard.json"),
                 )
+                self.assertEqual(
+                    fleet.fleet_dashboard_start_lock_path(),
+                    repos.with_name("fleet-dashboard.start.lock"),
+                )
 
     def test_start_fleet_dashboard_uses_port_outside_repo_range(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -942,7 +946,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
             "url": "http://127.0.0.1:8426",
         }
 
-        with patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
+        with patch.object(fleet, "_fleet_dashboard_start_lock", return_value=nullcontext()), \
+             patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
              patch.object(fleet, "start_fleet_dashboard_process") as start, \
              patch.object(
                  fleet,
@@ -959,7 +964,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_open_or_start_fleet_dashboard_starts_when_not_running(self):
         payload = {"url": "http://127.0.0.1:8426"}
 
-        with patch.object(fleet, "fleet_dashboard_live_payload", return_value=None), \
+        with patch.object(fleet, "_fleet_dashboard_start_lock", return_value=nullcontext()), \
+             patch.object(fleet, "fleet_dashboard_live_payload", return_value=None), \
              patch.object(fleet, "start_fleet_dashboard_process") as start, \
              patch.object(fleet, "wait_fleet_dashboard_ready", return_value=payload), \
              patch.object(
@@ -977,7 +983,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_open_or_start_fleet_dashboard_local_flag_skips_preferred_lookup(self):
         payload = {"url": "http://127.0.0.1:8426"}
 
-        with patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
+        with patch.object(fleet, "_fleet_dashboard_start_lock", return_value=nullcontext()), \
+             patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload), \
              patch.object(
                  fleet,
                  "preferred_dashboard_url",
@@ -988,6 +995,37 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         preferred.assert_called_once_with("http://127.0.0.1:8426", prefer_local=True)
         open_url.assert_called_once_with("http://127.0.0.1:8426")
+
+    def test_open_or_start_holds_start_lock_until_dashboard_is_ready(self):
+        state = {"held": False}
+
+        class TrackingLock:
+            def __enter__(self):
+                state["held"] = True
+
+            def __exit__(self, exc_type, exc, tb):
+                state["held"] = False
+
+        def start():
+            self.assertTrue(state["held"])
+
+        def ready():
+            self.assertTrue(state["held"])
+            return {"url": "http://127.0.0.1:8426"}
+
+        with patch.object(fleet, "_fleet_dashboard_start_lock", return_value=TrackingLock()), \
+             patch.object(fleet, "fleet_dashboard_live_payload", return_value=None), \
+             patch.object(fleet, "start_fleet_dashboard_process", side_effect=start), \
+             patch.object(fleet, "wait_fleet_dashboard_ready", side_effect=ready), \
+             patch.object(
+                 fleet,
+                 "preferred_dashboard_url",
+                 side_effect=lambda url, **kwargs: url,
+             ), \
+             patch.object(fleet, "_open_dashboard_url"):
+            fleet.open_or_start_fleet_dashboard()
+
+        self.assertFalse(state["held"])
 
     def test_fleet_dashboard_live_payload_requires_live_endpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:

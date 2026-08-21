@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import atexit
+import fcntl
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +27,7 @@ import fleet
 
 app = FastAPI(title="Kanban Orchestra Fleet Dashboard")
 _FAVICON = Path(__file__).resolve().parent.parent / "favicon.ico"
+_METADATA_OWNER = f"{os.getpid()}-{uuid.uuid4().hex}"
 
 
 @dataclass(frozen=True)
@@ -759,9 +763,37 @@ def _refreshed_card(repo: fleet.FleetRepo, error: str | None = None) -> FleetCar
     return card
 
 
+def _is_same_origin_request(request: Request) -> bool:
+    """Return True when a state-changing request came from this dashboard."""
+    authorities = {
+        value.split(",", 1)[0].strip().lower()
+        for value in (
+            request.headers.get("host"),
+            request.headers.get("x-forwarded-host"),
+        )
+        if value and value.split(",", 1)[0].strip()
+    }
+    for header in ("origin", "referer"):
+        value = request.headers.get(header)
+        if not value:
+            continue
+        parsed = urlparse(value)
+        return (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.netloc)
+            and parsed.netloc.lower() in authorities
+        )
+    return False
+
+
 @app.post("/repos/{label}/start")
 def start_repo(label: str, request: Request):
     """Start one configured fleet repo and return refreshed collector card state."""
+    if not _is_same_origin_request(request):
+        return JSONResponse(
+            _start_payload(ok=False, error="Forbidden: cross-origin request"),
+            status_code=403,
+        )
     local_access = _is_local_access(request)
     repo = _configured_repo(label)
     if repo is None:
@@ -790,6 +822,20 @@ def start_repo(label: str, request: Request):
     return JSONResponse(_start_payload(ok=True, card=card, local_access=local_access))
 
 
+@contextmanager
+def _dashboard_metadata_lock(path: Path | None = None):
+    """Serialize fleet-dashboard metadata replacement and ownership cleanup."""
+    metadata_path = path or fleet.fleet_dashboard_metadata_path()
+    lock_path = metadata_path.with_suffix(metadata_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _write_dashboard_metadata(host: str, port: int, remote_url: str | None = None) -> None:
     """Write fleet-scoped dashboard metadata beside fleet.repos."""
     path = fleet.fleet_dashboard_metadata_path()
@@ -797,27 +843,35 @@ def _write_dashboard_metadata(host: str, port: int, remote_url: str | None = Non
     payload = {
         "role": "fleet-dashboard",
         "pid": os.getpid(),
+        "owner": _METADATA_OWNER,
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}",
         "remote_url": remote_url,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temp.replace(path)
-    atexit.register(_remove_dashboard_metadata)
+    with _dashboard_metadata_lock(path):
+        temp = path.with_suffix(path.suffix + ".tmp")
+        temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temp.replace(path)
 
 
 def _remove_dashboard_metadata() -> None:
-    """Remove fleet-scoped dashboard metadata when the process exits."""
+    """Remove metadata only when it still belongs to this server process."""
     path = fleet.fleet_dashboard_metadata_path()
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+    with _dashboard_metadata_lock(path):
+        payload = fleet.read_key_value_or_json(path)
+        if payload.get("owner") != _METADATA_OWNER or payload.get("pid") != os.getpid():
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+atexit.register(_remove_dashboard_metadata)
 
 
 def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:

@@ -162,6 +162,21 @@ class TestLookupDashboardUrl(unittest.TestCase):
             remote = dashboard_tailscale.lookup_dashboard_url("http://127.0.0.1:8427")
         self.assertEqual(remote, "https://node.example.ts.net:8427/")
 
+    def test_matches_existing_https_proxy_with_root_backend_path(self):
+        status = _serve_mapping()
+        handler = status["Web"]["node.example.ts.net:8427"]["Handlers"]["/"]
+        handler["Proxy"] += "/"
+        result = _completed(json.dumps(status))
+        with patch.object(
+            dashboard_tailscale.shutil,
+            "which",
+            return_value="/usr/bin/tailscale",
+        ), patch.object(dashboard_tailscale, "_run", return_value=result):
+            remote = dashboard_tailscale.lookup_dashboard_url(
+                "http://127.0.0.1:8427"
+            )
+        self.assertEqual(remote, "https://node.example.ts.net:8427/")
+
     def test_requires_matching_https_proxy(self):
         status = _serve_mapping(https_port=8427, proxy_port=9000)
         status["TCP"]["8428"] = {"HTTPS": False}
@@ -173,6 +188,29 @@ class TestLookupDashboardUrl(unittest.TestCase):
              patch.object(dashboard_tailscale, "_run", return_value=result):
             remote = dashboard_tailscale.lookup_dashboard_url("http://127.0.0.1:8427")
         self.assertIsNone(remote)
+
+    def test_rejects_non_root_or_decorated_proxy_targets(self):
+        proxies = (
+            "http://127.0.0.1:8427/admin",
+            "http://127.0.0.1:8427?view=admin",
+            "http://127.0.0.1:8427/#anchor",
+            "http://user@127.0.0.1:8427/",
+        )
+        for proxy in proxies:
+            status = _serve_mapping()
+            status["Web"]["node.example.ts.net:8427"]["Handlers"]["/"]["Proxy"] = proxy
+            result = _completed(json.dumps(status))
+            with self.subTest(proxy=proxy), \
+                 patch.object(
+                     dashboard_tailscale.shutil,
+                     "which",
+                     return_value="/usr/bin/tailscale",
+                 ), \
+                 patch.object(dashboard_tailscale, "_run", return_value=result):
+                remote = dashboard_tailscale.lookup_dashboard_url(
+                    "http://127.0.0.1:8427"
+                )
+            self.assertIsNone(remote)
 
     def test_absent_without_cli(self):
         with patch.object(dashboard_tailscale.shutil, "which", return_value=None), \

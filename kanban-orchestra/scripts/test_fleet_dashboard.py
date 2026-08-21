@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -717,6 +718,35 @@ def _post_start(label: str, headers: dict[str, str] | None = None):
 
 
 class TestFleetDashboardStart(FleetDashboardRepoTest):
+    def test_start_rejects_cross_origin_and_missing_origin_before_lookup(self):
+        cases = (
+            {"host": "127.0.0.1:8426"},
+            {
+                "host": "127.0.0.1:8426",
+                "origin": "https://attacker.example",
+            },
+            {
+                "host": "127.0.0.1:8426",
+                "origin": "https://attacker.example",
+                "x-forwarded-host": "node.example.ts.net:8426",
+                "x-forwarded-proto": "https",
+            },
+        )
+        for headers in cases:
+            with self.subTest(headers=headers), \
+                 patch.object(fleet, "load_repos") as load_mock, \
+                 patch.object(fleet, "try_start_repo") as start_mock:
+                response = _post_start("midi", headers=headers)
+
+            self.assertEqual(response.status_code, 403)
+            self.assertFalse(response.json()["ok"])
+            self.assertEqual(
+                response.json()["error"],
+                "Forbidden: cross-origin request",
+            )
+            load_mock.assert_not_called()
+            start_mock.assert_not_called()
+
     def test_start_accepts_configured_label_only(self):
         with patch.object(fleet, "load_repos", return_value=[self.repo]) as load_mock, \
              patch.object(fleet, "try_start_repo", return_value=None) as start_mock, \
@@ -844,7 +874,15 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
                  return_value="https://node.example.ts.net:8427/",
              ), \
              patch.object(fleet, "tmux_has_session", return_value=False):
-            response = _post_start("midi", headers=_TAILSCALE_VIEW_HEADERS)
+            response = _post_start(
+                "midi",
+                headers={
+                    "host": "127.0.0.1:8426",
+                    "origin": "https://node.example.ts.net:8426",
+                    "x-forwarded-host": "node.example.ts.net:8426",
+                    "x-forwarded-proto": "https",
+                },
+            )
 
         html = response.json()["html"]
         self.assertEqual(response.status_code, 200)
@@ -904,9 +942,70 @@ class FleetDashboardServerTests(unittest.TestCase):
                 self.assertEqual(payload["port"], 8426)
                 self.assertEqual(payload["url"], "http://127.0.0.1:8426")
                 self.assertEqual(payload["pid"], os.getpid())
+                self.assertEqual(payload["owner"], fleet_dashboard._METADATA_OWNER)
                 self.assertIsNone(payload["remote_url"])
                 fleet_dashboard._remove_dashboard_metadata()
                 self.assertFalse(meta.exists())
+
+    def test_remove_dashboard_metadata_preserves_new_owner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = Path(tmpdir) / "fleet-dashboard.json"
+            meta.write_text(
+                json.dumps(
+                    {
+                        "role": "fleet-dashboard",
+                        "pid": os.getpid(),
+                        "owner": "newer-process-owner",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(fleet, "fleet_dashboard_metadata_path", return_value=meta):
+                fleet_dashboard._remove_dashboard_metadata()
+
+            self.assertTrue(meta.exists())
+
+    def test_remove_dashboard_metadata_serializes_owner_check_and_delete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = Path(tmpdir) / "fleet-dashboard.json"
+            owned_payload = {
+                "role": "fleet-dashboard",
+                "pid": os.getpid(),
+                "owner": fleet_dashboard._METADATA_OWNER,
+            }
+            newer_payload = {
+                "role": "fleet-dashboard",
+                "pid": os.getpid() + 1,
+                "owner": "newer-process-owner",
+            }
+            meta.write_text(json.dumps(owned_payload), encoding="utf-8")
+            replacement_attempted = threading.Event()
+            replacement_finished = threading.Event()
+
+            def replace_metadata():
+                replacement_attempted.set()
+                with fleet_dashboard._dashboard_metadata_lock(meta):
+                    meta.write_text(json.dumps(newer_payload), encoding="utf-8")
+                replacement_finished.set()
+
+            replacement_thread = None
+
+            def read_while_replacement_waits(_path):
+                nonlocal replacement_thread
+                replacement_thread = threading.Thread(target=replace_metadata)
+                replacement_thread.start()
+                self.assertTrue(replacement_attempted.wait(timeout=1))
+                self.assertFalse(replacement_finished.wait(timeout=0.1))
+                return owned_payload
+
+            with patch.object(fleet, "fleet_dashboard_metadata_path", return_value=meta), \
+                 patch.object(fleet, "read_key_value_or_json", side_effect=read_while_replacement_waits):
+                fleet_dashboard._remove_dashboard_metadata()
+                self.assertIsNotNone(replacement_thread)
+                replacement_thread.join(timeout=1)
+
+            self.assertFalse(replacement_thread.is_alive())
+            self.assertEqual(json.loads(meta.read_text(encoding="utf-8")), newer_payload)
 
     def test_run_dashboard_uses_free_port_and_fleet_app(self):
         uv = MagicMock()

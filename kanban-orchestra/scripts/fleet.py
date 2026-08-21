@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +76,23 @@ def fleet_dashboard_metadata_path() -> Path:
     if override:
         return Path(override).expanduser().resolve()
     return config_path().with_name(FLEET_DASHBOARD_METADATA_NAME)
+
+
+def fleet_dashboard_start_lock_path() -> Path:
+    """Return the user-scoped lock serializing Fleet Dashboard launches."""
+    return fleet_dashboard_metadata_path().with_suffix(".start.lock")
+
+
+@contextmanager
+def _fleet_dashboard_start_lock():
+    path = fleet_dashboard_start_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def run(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -1016,12 +1035,13 @@ def start_fleet_dashboard_process() -> subprocess.Popen:
 
 def open_or_start_fleet_dashboard(*, prefer_local: bool = False) -> None:
     """Open a running Fleet Dashboard, or start one and print its preferred URL."""
-    payload = fleet_dashboard_live_payload()
-    if payload is None:
-        start_fleet_dashboard_process()
-        payload = wait_fleet_dashboard_ready()
+    with _fleet_dashboard_start_lock():
+        payload = fleet_dashboard_live_payload()
         if payload is None:
-            die("fleet dashboard did not become ready")
+            start_fleet_dashboard_process()
+            payload = wait_fleet_dashboard_ready()
+            if payload is None:
+                die("fleet dashboard did not become ready")
     url = payload.get("url")
     if not url:
         die("fleet dashboard metadata is missing a URL")

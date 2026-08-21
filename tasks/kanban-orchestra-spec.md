@@ -766,7 +766,8 @@ names are derived from the basename of the resolved repo path.
 `ko-fleet start`:
 - starts the orchestrator/dashboard pair for every selected configured repo
 - refuses duplicates when the repo singleton lock is already live
-- refuses all selected starts when any selected repo is dirty or invalid
+- skips dirty selected repos while continuing to start clean selected repos
+- refuses selected starts when any selected repo configuration is invalid
 - keeps process-supervision details behind the fleet command
 
 `ko-fleet stop`:

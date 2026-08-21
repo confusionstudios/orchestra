@@ -413,6 +413,11 @@ def _proxy_matches_local_port(proxy: str, local_port: int) -> bool:
         target.scheme == "http"
         and target.hostname in LOOPBACK_HOSTS
         and target_port == local_port
+        and target.username is None
+        and target.password is None
+        and target.path in {"", "/"}
+        and not target.query
+        and not target.fragment
     )
 
 
