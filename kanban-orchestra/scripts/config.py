@@ -72,6 +72,11 @@ DEFAULT_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_REVIEWER", "codex")
 DEFAULT_UNBLOCKER = _agent_default("ORCHESTRA_DEFAULT_UNBLOCKER", "sonnet")
 
 MAX_REVIEW_ROUNDS = 5
+# Bounded retries for reviewer transport, tool-host, and no-decision failures.
+# These do not consume content-review rounds. After this many consecutive
+# failures the task blocks as reviewer_unavailable and resumes at review.
+REVIEWER_INFRA_ATTEMPTS = 5
+REVIEWER_INFRA_BACKOFF_SECONDS = (2, 4, 8, 16)
 MAX_PRIOR_COMMENTS = 10
 POLL_INTERVAL = 5
 HEARTBEAT_INTERVAL = 10

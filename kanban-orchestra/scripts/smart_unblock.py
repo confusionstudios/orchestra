@@ -660,6 +660,11 @@ def invoke_unblock_agent(
 
 _RESUME_PATTERN = re.compile(r"^RESUME\b\s*(?:\+(\d+)\s*)?(.*)$", re.IGNORECASE | re.DOTALL)
 _BLOCKED_PATTERN = re.compile(r"^BLOCKED\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_HUMAN_CONTINUE_PATTERN = re.compile(
+    r"^\s*(?:CONTINUE|RESUME)\b\s*(?:\+(\d+)\s*)?(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_ORCHESTRATOR_AUTHOR = "orchestrator"
 
 
 def _decision_pattern(agent: str) -> "re.Pattern[str]":
@@ -704,6 +709,46 @@ def find_decision_comment(comments: list[dict], agent: str) -> dict | None:
         if comment.get("author") == WATCHER_AUTHOR and parse_decision(comment.get("message") or "", agent):
             return comment
     return None
+
+
+def parse_human_continue_decision(message: str) -> dict | None:
+    """Parse a human continue comment into a resume decision.
+
+    Humans record CONTINUE or RESUME on the task instead of mutating status
+    directly. Optional `+N` grants additional review rounds for review-cap
+    blocks. Returns `{"add_review_rounds": int | None, "reason": str}` or None.
+    """
+    match = _HUMAN_CONTINUE_PATTERN.match(message or "")
+    if not match:
+        return None
+    rounds = int(match.group(1)) if match.group(1) else None
+    return {"add_review_rounds": rounds, "reason": (match.group(2) or "").strip()}
+
+
+def find_human_continue_since_block(comments: list[dict]) -> dict | None:
+    """Return the newest human continue decision recorded after the current block.
+
+    Orchestrator and watcher comments are ignored so a later human CONTINUE is
+    observed without racing `task continue` / `task set`, and so the watcher's
+    own BLOCKED/RESUME notes cannot be mistaken for a human decision.
+    """
+    block_id = 0
+    for comment in comments:
+        if comment.get("author") != _ORCHESTRATOR_AUTHOR:
+            continue
+        message = comment.get("message") or ""
+        if message.startswith("Blocked:") or "blocked with task WIP" in message:
+            block_id = max(block_id, comment.get("id") or 0)
+    newest = None
+    for comment in comments:
+        if (comment.get("id") or 0) <= block_id:
+            continue
+        if comment.get("author") in (WATCHER_AUTHOR, _ORCHESTRATOR_AUTHOR):
+            continue
+        parsed = parse_human_continue_decision(comment.get("message") or "")
+        if parsed is not None:
+            newest = {"comment": comment, **parsed}
+    return newest
 
 
 def _apply_resume_decision(conn, task_id: int, decision: dict) -> str | None:
@@ -773,6 +818,65 @@ def poll_once(
         evidence = collect_block_evidence(conn, task_id, db_path)
         fingerprint = evidence_fingerprint(evidence)
         key = str(task_id)
+
+        # A durable human CONTINUE/RESUME is applied by the watcher itself so
+        # operators do not race `task continue` / `task set` against dispatch.
+        human_continue = find_human_continue_since_block(db.get_comments(conn, task_id))
+        if human_continue is not None:
+            blocked_snapshot = dict(db.get_task(conn, task_id) or row)
+            resume_error = _apply_resume_decision(
+                conn,
+                task_id,
+                {"add_review_rounds": human_continue.get("add_review_rounds")},
+            )
+            if resume_error is None:
+                db.add_run_log(
+                    conn,
+                    task_id,
+                    (
+                        "smart-unblock observed a durable human continue decision "
+                        f"and resumed the task -- {human_continue.get('reason') or 'continue'}"
+                    ),
+                    verb=WATCHER_VERB,
+                    author=WATCHER_AUTHOR,
+                )
+                state.pop(key, None)
+                results.append({
+                    "task_id": task_id,
+                    "action": "recovered-human-continue",
+                    "decision_comment_id": (human_continue.get("comment") or {}).get("id"),
+                })
+                continue
+            db.add_run_log(
+                conn,
+                task_id,
+                (
+                    "smart-unblock observed a durable human continue decision but "
+                    f"could not resume the task: {resume_error} -- will reconsider"
+                ),
+                verb=WATCHER_VERB,
+                author=WATCHER_AUTHOR,
+            )
+            if _reject_agent_originated_continuation(conn, task_id, blocked_snapshot):
+                db.add_run_log(
+                    conn,
+                    task_id,
+                    (
+                        "smart-unblock rejected agent-originated status change after "
+                        "a human continue decision failed to apply"
+                    ),
+                    verb=WATCHER_VERB,
+                    author=WATCHER_AUTHOR,
+                )
+            state.pop(key, None)
+            results.append({
+                "task_id": task_id,
+                "action": "human-continue-failed",
+                "decision_comment_id": (human_continue.get("comment") or {}).get("id"),
+                "error": resume_error,
+            })
+            continue
+
         if state.get(key, {}).get("fingerprint") == fingerprint:
             results.append({"task_id": task_id, "action": "skipped-unchanged"})
             continue

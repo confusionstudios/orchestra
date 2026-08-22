@@ -106,6 +106,7 @@ hard-coded default is used.
 - Initial value: `0`
 - Incremented after a rejection
 - Also incremented when a review round is abandoned due to interruption or stale recovery
+- Not incremented for reviewer infrastructure or agent-execution failures (nonzero exit, empty or malformed output, missing durable approval/rejection, tool-host/transport failure). Those retries and the eventual `reviewer_unavailable` block leave `review_round` unchanged.
 
 ## System Invariants
 
@@ -178,6 +179,8 @@ Important columns:
 - `sequence_index`
 - `commit_plan`
 - `allow_when_blocked`
+- `block_reason`
+- `resume_next_step`
 
 #### `task_skips`
 
@@ -550,7 +553,8 @@ Required behavior:
 Review aggregation rules:
 
 - The orchestrator looks only at reviewer comments for the current round.
-- A missing reviewer decision after a successful reviewer process is treated as rejection.
+- A missing reviewer decision after a reviewer run — including a nonzero exit, empty or malformed output, or a tool-host/transport failure — is a reviewer infrastructure failure, not a content rejection. `review_round` is left unchanged and the coder is not sent through rework. The orchestrator retries the same review step under `REVIEWER_INFRA_ATTEMPTS` / `REVIEWER_INFRA_BACKOFF_SECONDS`. After those retries are exhausted the task is blocked with `block_reason=reviewer_unavailable` and `resume_next_step` equal to the review step that failed.
+- Explicit reviewer rejections still advance `review_round`, return to the maker step, and count toward `max_review_rounds`.
 - The reviewer comment itself does not set `last_review_decision`; the orchestrator does.
 
 ### Commit Task State Transitions
@@ -573,6 +577,17 @@ Review aggregation rules:
 - `next_step -> commit-make`
 - `review_round += 1`
 - `last_review_decision -> reject`
+
+#### On reviewer infrastructure failure after bounded retries
+
+- `status -> blocked`
+- `next_step -> none`
+- `review_round` unchanged
+- `block_reason -> reviewer_unavailable`
+- `resume_next_step -> commit-review` (or the review step that failed)
+- Staged/WIP state is preserved (`stash_ref` when `commit-review` left a dirty tree)
+
+A later healthy reviewer, smart-unblock recovery, reviewer switch, or explicit human continuation (`task continue` or a durable `CONTINUE`/`RESUME` comment) resumes that review step without granting artificial content-review rounds. `task set --status ready` is refused for this structured reason. When `commit-review` resumes with a recorded `stash_ref`, the orchestrator restores that stash (including the index) before the reviewer runs so `git diff --cached` shows the candidate.
 
 #### On successful Path B finalization
 
@@ -632,6 +647,9 @@ Task planning is distinct from commit review:
 
 - `status -> blocked`
 - `next_step -> none`
+- `block_reason -> reviewer_unavailable`
+- `resume_next_step -> commit-plan-review`
+- `review_round` unchanged
 
 ### Recovery
 
@@ -726,10 +744,14 @@ default `sonnet`) whether recovery is safe.
 
 The agent records exactly one durable comment authored as `smart-unblock`,
 starting with either `RESUME` or `BLOCKED`. The orchestrator then either
-continues the task or leaves that explanation for the operator. Unchanged
-evidence is not reconsidered until something in the task's evidence changes.
-Stopping the orchestrator stops this recovery loop. There is no separate
-unblock process or command.
+continues the task or leaves that explanation for the operator. Before
+consulting, the watcher looks for a durable human `CONTINUE`/`RESUME` comment
+recorded after the orchestrator `Blocked:` comment and applies that decision
+itself so operators do not race `task continue` / `task set` against dispatch.
+Unchanged evidence is not reconsidered until something in the task's evidence
+changes, and the watcher does not write another explanatory comment for the
+same fingerprint. Stopping the orchestrator stops this recovery loop. There is
+no separate unblock process or command.
 
 ### Instance and Fleet Control
 
@@ -824,11 +846,12 @@ between `commit-make` and `commit-review`.
 Before running any non-skipped agent-driven step, the orchestrator performs a
 pre-flight ping for the assigned agent.
 
-- Ping prompt: `This is a ping. Respond with ACK.`
-- Any text response counts as a successful acknowledgment.
-- A successful acknowledgment is cached per `(task_id, agent_name)` for the life of the current orchestrator process.
-- On a cache miss with no response, the orchestrator keeps the task pinned, sets runtime `status_message` to a stalled wait message, and retries every `60` seconds.
-- While the orchestrator is stalled on this gate, no other tasks run.
+- Ping prompt for ordinary run steps: `This is a ping. Respond with ACK.`
+- Any text response counts as a successful acknowledgment for ordinary run pings.
+- Reviewer readiness uses a non-self-matching probe: the expected evidence is a SHA-256 of `git diff --cached` recorded in a durable task comment written during the probe. Echoing the probe prompt, a shallow CLI banner, or a bare ACK token cannot satisfy it. A prior run ping does not satisfy a later review probe.
+- A successful acknowledgment is cached per `(task_id, agent_name, purpose)` (`purpose` is `"run"` or `"review"`) for the life of the current orchestrator process.
+- On a cache miss with no response for an ordinary run ping, the orchestrator keeps the task pinned, sets runtime `status_message` to a stalled wait message, and retries every `60` seconds. While stalled on that gate, no other tasks run.
+- A failed reviewer readiness probe does not stall forever. It is an infrastructure failure: the review handler returns `error` into `REVIEWER_INFRA_ATTEMPTS` / `REVIEWER_INFRA_BACKOFF_SECONDS`. Exhausting that bound blocks as `reviewer_unavailable`.
 
 ### Branch Handling
 
@@ -841,8 +864,9 @@ Before non-supertask steps:
 
 ### Review Round Limits
 
-- Maximum review rounds: `5`
-- Reaching the limit blocks the task instead of requeueing it
+- Maximum content-review rounds: `5`
+- Reaching the limit on an explicit rejection blocks the task as `review_cap` instead of requeueing it
+- Reviewer infrastructure failures use a separate bound (`REVIEWER_INFRA_ATTEMPTS`, default 5) and do not consume content-review rounds. Exhausting that bound blocks as `reviewer_unavailable` with `resume_next_step` set to the review step.
 
 ## Recovery and Failure Handling
 
@@ -1030,10 +1054,13 @@ To intervene by hand:
 
 ```bash
 cat <<'EOF' | python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py comment <task-id> --message-stdin --comment
+CONTINUE
 Here is the missing decision or context
 EOF
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py set <task-id> --status ready --next-step commit-make
+python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py continue <task-id>
 ```
+
+For a `review_cap` block, grant extra rounds with `task continue <id> --add-review-rounds N` instead of a bare continue. `task set --status ready` is refused for `review_cap` and `reviewer_unavailable` blocks so `resume_next_step` is restored without racing dispatch. A durable `CONTINUE`/`RESUME` comment is also observed by smart-unblock.
 
 Rules:
 

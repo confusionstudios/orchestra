@@ -521,6 +521,16 @@ def cmd_set(args, conn):
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            if task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE:
+                print(
+                    f"Error: task {args.task_id} has reviewer-unavailable block "
+                    f"metadata (block_reason={db.BLOCK_REASON_REVIEWER_UNAVAILABLE}). "
+                    f"Use `task continue {args.task_id}` (or a durable CONTINUE "
+                    f"comment) instead of `task set --status ready` so "
+                    f"resume_next_step is restored without racing dispatch.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             _validate_next_step_for_type(task_type, fields.get("next_step") or task.get("next_step"))
             if task_type != "other":
                 branch = _resolve_branch_for_ready(conn, task, fields.get("branch"))
@@ -586,6 +596,14 @@ def is_structured_review_cap_block(task: dict) -> bool:
     """True when a task has structured review-cap resume metadata."""
     return (
         task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP
+        and bool(task.get("resume_next_step"))
+    )
+
+
+def is_structured_reviewer_unavailable_block(task: dict) -> bool:
+    """True when the task is blocked because the reviewer could not produce a decision."""
+    return (
+        task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE
         and bool(task.get("resume_next_step"))
     )
 

@@ -2042,6 +2042,23 @@ class TestReadyActionHelpers(unittest.TestCase):
         self.assertFalse(state["available"])
         self.assertIn("Continue with additional", state["error"])
 
+    def test_reviewer_unavailable_prefers_resume_next_step(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "none",
+            "kind": "commit",
+            "branch": "feat-ready",
+            "block_reason": db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+            "resume_next_step": "commit-review",
+        }
+        self.assertEqual(dashboard._infer_ready_next_step(task), "commit-review")
+        fields = dashboard._ready_update_fields(self.conn, task)
+        self.assertEqual(fields["status"], "ready")
+        self.assertEqual(fields["next_step"], "commit-review")
+        self.assertIsNone(fields["block_reason"])
+        self.assertIsNone(fields["resume_next_step"])
+
 
 class TestTaskDetailLiveHeader(unittest.TestCase):
     """Tests that task detail keeps the header live over SSE."""

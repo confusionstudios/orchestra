@@ -7,6 +7,7 @@ comment aggregation.
 """
 
 import json
+import hashlib
 import importlib.util
 import io
 import os
@@ -2171,8 +2172,8 @@ class TestReviewAggregation(unittest.TestCase):
 
         self.assertEqual(outcome, "error")
 
-    def test_reviewer_no_comment_returns_reject(self):
-        """Reviewer exits 0 but leaves no comment — treated as reject."""
+    def test_reviewer_no_comment_returns_error(self):
+        """Reviewer exits 0 but leaves no comment — treated as infrastructure failure."""
         tid = db.add_task(self.conn, "No comment", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-review")
         task = db.get_task(self.conn, tid)
@@ -2181,7 +2182,221 @@ class TestReviewAggregation(unittest.TestCase):
              patch.object(orchestrator, "run_agent", return_value=0):
             outcome = orchestrator.handle_commit_review(task, self.conn)
 
-        self.assertEqual(outcome, "reject")
+        self.assertEqual(outcome, "error")
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(
+            any("infrastructure failure" in c["message"] for c in comments),
+        )
+
+
+class TestReviewerInfrastructureFailures(unittest.TestCase):
+    """Lifecycle coverage for no-decision / transport failures vs content rejections."""
+
+    def setUp(self):
+        self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
+        self._ack_patcher.start()
+        self._sleep_patcher = patch.object(orchestrator.time, "sleep")
+        self._sleep_patcher.start()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.conn = db.connect(self.tmp.name)
+
+    def tearDown(self):
+        self._sleep_patcher.stop()
+        self._ack_patcher.stop()
+        self.conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_five_infra_failures_consume_zero_content_review_rounds(self):
+        """Five consecutive no-decision failures never invoke coder rework."""
+        tid = db.add_task(self.conn, "Infra failures", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review", review_round=0,
+        )
+        task = db.get_task(self.conn, tid)
+        attempts = {"n": 0}
+
+        def fake_review(review_task, conn):
+            attempts["n"] += 1
+            self.assertEqual(db.get_task(conn, tid)["review_round"], 0)
+            self.assertEqual(review_task["review_round"], 0)
+            return "error"
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", side_effect=fake_review), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "stash_task_wip") as mock_stash, \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertFalse(result)
+        self.assertEqual(attempts["n"], orchestrator.REVIEWER_INFRA_ATTEMPTS)
+        mock_make.assert_not_called()
+        mock_stash.assert_not_called()
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], 0)
+        self.assertEqual(updated["last_review_decision"], "none")
+
+    def test_explicit_rejection_still_consumes_one_review_round(self):
+        tid = db.add_task(self.conn, "Content reject", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review", review_round=0,
+        )
+        task = db.get_task(self.conn, tid)
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", return_value="reject") as mock_review, \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        mock_review.assert_called_once()
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "ready")
+        self.assertEqual(updated["next_step"], "commit-make")
+        self.assertEqual(updated["review_round"], 1)
+        self.assertEqual(updated["last_review_decision"], "reject")
+        self.assertIsNone(updated["block_reason"])
+
+    def test_reviewer_ack_failure_exhausts_infra_retries_without_coder_rework(self):
+        """A missing reviewer/tool ACK returns into the bounded retry policy."""
+        tid = db.add_task(self.conn, "Ack fail", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review", review_round=0,
+        )
+        task = db.get_task(self.conn, tid)
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "ensure_agent_acked", return_value=False) as mock_ack, \
+             patch.object(orchestrator, "run_agent") as mock_run, \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertFalse(result)
+        self.assertEqual(mock_ack.call_count, orchestrator.REVIEWER_INFRA_ATTEMPTS)
+        mock_run.assert_not_called()
+        mock_make.assert_not_called()
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], 0)
+        self.assertEqual(updated["last_review_decision"], "none")
+
+    def test_resumed_commit_review_restores_stash_before_reviewer(self):
+        """Direct commit-review resumption restores recorded WIP before the reviewer runs."""
+        tid = db.add_task(self.conn, "Restore then review", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review",
+            review_round=0, stash_ref="stash@{0}",
+        )
+        task = db.get_task(self.conn, tid)
+        order = []
+
+        def fake_restore(restore_task, conn):
+            order.append("restore")
+            self.assertEqual(restore_task["stash_ref"], "stash@{0}")
+            db.update_task(conn, restore_task["id"], stash_ref=None)
+            return True
+
+        def fake_review(review_task, conn):
+            order.append("review")
+            self.assertIsNone(db.get_task(conn, tid)["stash_ref"])
+            return "approve"
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "restore_task_wip", side_effect=fake_restore) as mock_restore, \
+             patch.object(orchestrator, "handle_commit_review", side_effect=fake_review), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        mock_restore.assert_called_once()
+        self.assertEqual(order, ["restore", "review"])
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["next_step"], "commit-make")
+        self.assertEqual(updated["last_review_decision"], "approve")
+        self.assertIsNone(updated["stash_ref"])
+
+    def test_resumed_reviewer_sees_restored_cached_diff(self):
+        """The resumed reviewer inspects the restored candidate via git diff --cached."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "init"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            (repo / "candidate.py").write_text("print('candidate')\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "candidate.py"], cwd=repo, check=True, capture_output=True,
+            )
+
+            tid = db.add_task(self.conn, "See candidate", coder_agent="claude")
+            db.update_task(
+                self.conn, tid,
+                status="running", branch="b", next_step="commit-review", review_round=0,
+            )
+            seen = {}
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(repo)
+                stash_ref = orchestrator.stash_task_wip(tid, self.conn)
+                self.assertTrue(stash_ref)
+                cached_before = subprocess.run(
+                    ["git", "diff", "--cached", "--name-only"],
+                    capture_output=True, text=True, check=True,
+                ).stdout
+                self.assertNotIn("candidate.py", cached_before)
+
+                task = db.get_task(self.conn, tid)
+                self.assertEqual(task["stash_ref"], stash_ref)
+
+                def fake_reviewer(name, prompt, task_id, conn, step, **kwargs):
+                    cached = subprocess.run(
+                        ["git", "diff", "--cached", "--name-only"],
+                        capture_output=True, text=True, check=True,
+                    ).stdout
+                    seen["cached"] = cached
+                    db.add_comment(
+                        conn, task_id, "LGTM",
+                        kind="approval", author=name, review_round=0,
+                    )
+                    return 0
+
+                with patch.object(orchestrator, "ensure_branch", return_value=True), \
+                     patch.object(orchestrator, "run_agent", side_effect=fake_reviewer):
+                    result = orchestrator.advance(task, self.conn)
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertTrue(result)
+            self.assertIn("candidate.py", seen.get("cached", ""))
+            updated = db.get_task(self.conn, tid)
+            self.assertIsNone(updated["stash_ref"])
+            self.assertEqual(updated["last_review_decision"], "approve")
+            comments = db.get_comments(self.conn, tid)
+            self.assertTrue(
+                any("Restored task WIP" in (c["message"] or "") for c in comments),
+            )
 
 
 class TestStateMachine(unittest.TestCase):
@@ -2190,11 +2405,14 @@ class TestStateMachine(unittest.TestCase):
     def setUp(self):
         self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
         self._ack_patcher.start()
+        self._sleep_patcher = patch.object(orchestrator.time, "sleep")
+        self._sleep_patcher.start()
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.conn = db.connect(self.tmp.name)
 
     def tearDown(self):
+        self._sleep_patcher.stop()
         self._ack_patcher.stop()
         self.conn.close()
         os.unlink(self.tmp.name)
@@ -2763,20 +2981,28 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["status"], "blocked")
         self.assertEqual(updated["next_step"], "none")
 
-    def test_reviewer_error_blocks_immediately(self):
-        """Reviewer error immediately blocks the task."""
+    def test_reviewer_error_blocks_as_reviewer_unavailable(self):
+        """Reviewer infrastructure errors retry then block as reviewer_unavailable."""
         tid = db.add_task(self.conn, "Review error block", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-review")
         task = db.get_task(self.conn, tid)
 
         with patch.object(orchestrator, "ensure_branch", return_value=True), \
-             patch.object(orchestrator, "handle_commit_review", return_value="error"):
+             patch.object(orchestrator, "handle_commit_review", return_value="error"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "stash_task_wip") as mock_stash, \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
             result = orchestrator.advance(task, self.conn)
 
         self.assertFalse(result)
+        mock_make.assert_not_called()
+        mock_stash.assert_not_called()
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
         self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], 0)
 
     def test_branch_failure_blocks(self):
         """If branch can't be checked out, task is blocked."""
@@ -2881,8 +3107,8 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["status"], "blocked")
         self.assertIsNone(updated["stash_ref"])
 
-    def test_max_review_errors_block(self):
-        """Reviewer error blocks the task immediately."""
+    def test_max_review_errors_block_as_reviewer_unavailable(self):
+        """Reviewer infrastructure errors do not spend content-review rounds or block as review_cap."""
         tid = db.add_task(self.conn, "Too many review errors", coder_agent="claude")
         round_num = orchestrator.MAX_REVIEW_ROUNDS - 1
         db.update_task(self.conn, tid, status="running", branch="b",
@@ -2890,12 +3116,20 @@ class TestStateMachine(unittest.TestCase):
         task = db.get_task(self.conn, tid)
 
         with patch.object(orchestrator, "ensure_branch", return_value=True), \
-             patch.object(orchestrator, "handle_commit_review", return_value="error"):
+             patch.object(orchestrator, "handle_commit_review", return_value="error"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "stash_task_wip"), \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
             orchestrator.advance(task, self.conn)
 
+        mock_make.assert_not_called()
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
         self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], round_num)
+        self.assertNotEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
 
     def test_dirty_at_pickup_blocks_without_starting_agent(self):
         """If the worktree is dirty before commit-make starts, block without running the agent."""
@@ -3001,6 +3235,30 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(ref, "stash@{0}")
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["stash_ref"], "stash@{0}")
+
+    def test_restore_task_wip_pops_index_and_clears_stash_ref(self):
+        """restore_task_wip pops with --index so git diff --cached sees the candidate."""
+        tid = db.add_task(self.conn, "Restore WIP index", coder_agent="claude")
+        db.update_task(self.conn, tid, status="running", branch="b", stash_ref="stash@{0}")
+        task = db.get_task(self.conn, tid)
+        commands = []
+
+        def fake_run(cmd, **kw):
+            commands.append(list(cmd))
+            mock = MagicMock()
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+            return mock
+
+        with patch.object(orchestrator.subprocess, "run", side_effect=fake_run):
+            ok = orchestrator.restore_task_wip(task, self.conn)
+
+        self.assertTrue(ok)
+        self.assertEqual(commands[0][:4], ["git", "stash", "pop", "--index"])
+        self.assertEqual(commands[0][4], "stash@{0}")
+        updated = db.get_task(self.conn, tid)
+        self.assertIsNone(updated["stash_ref"])
 
     def test_stash_ref_restore_flow(self):
         """Blocked task with recorded stash_ref advances through commit-make when coder succeeds.
@@ -7930,6 +8188,51 @@ class TestContinueBlockedTask(unittest.TestCase):
         self.assertEqual(task["max_review_rounds"], cap)
         self.assertEqual(task["stash_ref"], "stash@{0}")
 
+    def _block_reviewer_unavailable(self, *, review_round=0, stash_ref="stash@{0}"):
+        tid = db.add_task(
+            self.conn, "Reviewer unavailable", branch="feat-unavailable", coder_agent="claude",
+        )
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            review_round=review_round,
+            last_review_decision="none",
+            stash_ref=stash_ref,
+            block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+            resume_next_step="commit-review",
+        )
+        return tid
+
+    def test_continue_reviewer_unavailable_resumes_at_review(self):
+        tid = self._block_reviewer_unavailable()
+        r = self._run("continue", str(tid))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-review")
+        self.assertEqual(task["review_round"], 0)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_set_status_ready_rejects_reviewer_unavailable_bypass(self):
+        tid = self._block_reviewer_unavailable()
+        r = self._run(
+            "set", str(tid),
+            "--status", "ready", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("reviewer-unavailable", r.stderr.lower())
+        self.assertIn("task continue", r.stderr.lower())
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(task["resume_next_step"], "commit-review")
+        self.assertEqual(task["review_round"], 0)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
     def test_set_status_ready_rejects_two_step_review_cap_bypass(self):
         """Clearing status alone must not open a set --status ready bypass."""
         tid, review_round = self._block_at_review_cap()
@@ -8516,11 +8819,14 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
     def setUp(self):
         self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
         self._ack_patcher.start()
+        self._sleep_patcher = patch.object(orchestrator.time, "sleep")
+        self._sleep_patcher.start()
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.conn = db.connect(self.tmp.name)
 
     def tearDown(self):
+        self._sleep_patcher.stop()
         self._ack_patcher.stop()
         self.conn.close()
         os.unlink(self.tmp.name)
@@ -8667,7 +8973,7 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertIsNone(task["commit_plan"])
 
     def test_plan_reviewer_error_blocks_task(self):
-        """Reviewer error during commit-plan-review blocks the task."""
+        """Reviewer error during commit-plan-review blocks as reviewer_unavailable."""
         tid = db.add_task(self.conn, "Plan review error", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b",
                        next_step="commit-plan-review", commit_plan="Draft plan")
@@ -8679,6 +8985,9 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertFalse(result)
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(task["resume_next_step"], "commit-plan-review")
+        self.assertEqual(task["review_round"], 0)
 
     def test_plan_review_decision_without_review_round_filtering(self):
         """Plan approval uses plan-approval kind, independent of review_round."""
@@ -11177,8 +11486,123 @@ class TestAgentPingACKGate(unittest.TestCase):
         """Cache key is present after a successful ping so subsequent calls hit it."""
         with patch.object(agent_runner, "ping_agent", return_value=True):
             agent_runner.ensure_agent_acked("sonnet", 30, self.conn)
-        self.assertIn(("sonnet", 30) if False else (30, "sonnet"),
-                      agent_runner._agent_ack_cache)
+        self.assertIn((30, "sonnet", "run"), agent_runner._agent_ack_cache)
+
+    def test_run_ack_does_not_satisfy_review_purpose(self):
+        """A prior run ping does not prove the review/tool path is usable."""
+        with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
+            agent_runner.ensure_agent_acked("sonnet", 70, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 70, self.conn, purpose="review")
+        self.assertEqual(mock_ping.call_count, 2)
+        self.assertEqual(mock_ping.call_args_list[0].args, ("sonnet", 70))
+        self.assertEqual(mock_ping.call_args_list[1].kwargs.get("purpose"), "review")
+        self.assertIn((70, "sonnet", "run"), agent_runner._agent_ack_cache)
+        self.assertIn((70, "sonnet", "review"), agent_runner._agent_ack_cache)
+
+    def test_review_ack_failure_returns_false_without_retry_loop(self):
+        """A failed reviewer probe returns False instead of stalling forever."""
+        with (
+            patch.object(agent_runner, "ping_agent", return_value=False) as mock_ping,
+            patch.object(agent_runner, "time") as mock_time,
+            patch.object(agent_runner.db, "update_runtime") as mock_runtime,
+        ):
+            result = agent_runner.ensure_agent_acked(
+                "codex", 80, self.conn, purpose="review",
+            )
+
+        self.assertFalse(result)
+        mock_ping.assert_called_once()
+        mock_time.sleep.assert_not_called()
+        mock_runtime.assert_not_called()
+        self.assertNotIn((80, "codex", "review"), agent_runner._agent_ack_cache)
+
+    def _ping_review(self, task_id, *, digest, chunks=None, read_side_effect=None):
+        """Run a reviewer probe with mocked subprocess I/O and a fixed digest."""
+        mock_proc = MagicMock()
+        stdout = MagicMock()
+        stdout.fileno.return_value = 3
+        mock_proc.stdout = stdout
+        mock_proc.pid = 99
+        if read_side_effect is None:
+            remaining = list(chunks or [b""])
+            read_side_effect = lambda *_a: remaining.pop(0) if remaining else b""
+
+        with patch.object(agent_runner.subprocess, "Popen", return_value=mock_proc), \
+             patch.object(agent_runner.select, "select", return_value=([stdout], [], [])), \
+             patch.object(agent_runner.os, "read", side_effect=read_side_effect), \
+             patch.object(agent_runner.active_agent_processes, "register_active_agent", return_value=1), \
+             patch.object(agent_runner.active_agent_processes, "clear_active_agent"), \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.tmp.name), \
+             patch.object(agent_runner, "_resolve_command_template", return_value=["echo", "{prompt}"]), \
+             patch.object(agent_runner, "cached_diff_digest", return_value=digest), \
+             patch.object(agent_runner.time, "sleep"):
+            return agent_runner.ping_agent(
+                "codex", task_id, purpose="review", conn=self.conn,
+            )
+
+    def test_review_ping_requires_ack_token_not_banner_text(self):
+        """Shallow CLI banner text is not enough to ACK a reviewer probe."""
+        tid = db.add_task(self.conn, "Banner probe")
+        result = self._ping_review(
+            tid, digest="aa" * 32, chunks=[b"Welcome to Codex CLI\nready.\n", b""],
+        )
+        self.assertFalse(result)
+
+    def test_review_ping_echoed_prompt_does_not_ack(self):
+        """Stdout that echoes the full probe prompt cannot satisfy readiness."""
+        tid = db.add_task(self.conn, "Echo probe")
+        digest = "ab" * 32
+        prompt = agent_runner.review_ping_prompt(tid)
+        token = agent_runner.review_ready_token(digest)
+        self.assertNotIn(digest, prompt)
+        self.assertNotIn(token, prompt)
+        result = self._ping_review(tid, digest=digest, chunks=[prompt.encode(), b""])
+        self.assertFalse(result)
+
+    def test_review_ping_stdout_digest_without_comment_does_not_ack(self):
+        """Printing the cached-diff token without a durable comment is not enough."""
+        tid = db.add_task(self.conn, "Stdout token probe")
+        digest = "cd" * 32
+        token = agent_runner.review_ready_token(digest)
+        result = self._ping_review(
+            tid, digest=digest, chunks=[f"{token}\nACK\n".encode(), b""],
+        )
+        self.assertFalse(result)
+
+    def test_review_ping_accepts_new_comment_with_cached_diff_digest(self):
+        """A new durable comment carrying the cached-diff digest proves the tool path."""
+        tid = db.add_task(self.conn, "Comment probe")
+        digest = "ef" * 32
+        token = agent_runner.review_ready_token(digest)
+        reads = {"n": 0}
+
+        def fake_read(_fd, _n):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                db.add_comment(self.conn, tid, f"reviewer probe {token}")
+                return b"running git diff --cached\n"
+            return b""
+
+        result = self._ping_review(tid, digest=digest, read_side_effect=fake_read)
+        self.assertTrue(result)
+
+    def test_review_ping_ignores_ready_token_comment_from_before_probe(self):
+        """Leftover comments with the same digest cannot false-ACK a later probe."""
+        tid = db.add_task(self.conn, "Stale probe")
+        digest = "12" * 32
+        token = agent_runner.review_ready_token(digest)
+        db.add_comment(self.conn, tid, f"old probe {token}")
+        result = self._ping_review(tid, digest=digest, chunks=[b"ACK\n", b""])
+        self.assertFalse(result)
+
+    def test_cached_diff_digest_hashes_git_stdout(self):
+        payload = b"diff --git a/f b/f\n"
+        with patch.object(agent_runner.subprocess, "run") as mock_run:
+            mock_run.return_value = SimpleNamespace(stdout=payload)
+            digest = agent_runner.cached_diff_digest(cwd="/tmp")
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args.args[0], ["git", "diff", "--cached"])
 
     # ── retry loop ───────────────────────────────────────────────────
 
@@ -11299,7 +11723,7 @@ class TestAgentPingACKGate(unittest.TestCase):
 
     def test_no_status_update_when_cache_hit(self):
         """Cache hit path never calls update_runtime (no unnecessary DB writes)."""
-        agent_runner._agent_ack_cache.add((60, "sonnet"))
+        agent_runner._agent_ack_cache.add((60, "sonnet", "run"))
 
         with patch.object(agent_runner.db, "update_runtime") as mock_update:
             agent_runner.ensure_agent_acked("sonnet", 60, self.conn)

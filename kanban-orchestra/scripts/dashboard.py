@@ -688,6 +688,9 @@ def _normalize_task_type_for_ready(task: dict) -> str:
 
 
 def _infer_ready_next_step(task: dict) -> str:
+    resume = (task.get("resume_next_step") or "").strip()
+    if _meaningful_next_step(resume):
+        return resume
     task_type = _normalize_task_type_for_ready(task)
     return READY_ACTION_DEFAULT_NEXT_STEP[task_type]
 
@@ -723,8 +726,13 @@ def _ready_update_fields(
 
     task_type = _normalize_task_type_for_ready(task)
     fields = {}
+    used_resume = False
     if _meaningful_next_step(task.get("next_step")):
         next_step = task["next_step"].strip()
+    elif _meaningful_next_step(task.get("resume_next_step")):
+        next_step = task["resume_next_step"].strip()
+        fields["next_step"] = next_step
+        used_resume = True
     else:
         next_step = _infer_ready_next_step(task)
         if confirmed_next_step != next_step:
@@ -749,6 +757,9 @@ def _ready_update_fields(
     except task_cli.TaskValidationError as exc:
         raise ReadyActionError(str(exc)) from exc
     fields["status"] = "ready"
+    if used_resume or task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE:
+        fields["block_reason"] = None
+        fields["resume_next_step"] = None
     return fields
 
 
@@ -2756,6 +2767,21 @@ async def task_set_ready(task_id: int, request: Request):
 
         form_data = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         confirmed_next_step = form_data.get("confirmed_next_step", [""])[0].strip() or None
+
+        if (
+            task.get("status") == "blocked"
+            and task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE
+        ):
+            try:
+                task_cli.continue_blocked_task(conn, task_id)
+            except task_cli.ContinueTaskError as exc:
+                return _task_detail_response(
+                    task_id,
+                    conn,
+                    ready_error=str(exc),
+                    status_code=400,
+                )
+            return RedirectResponse(url=f"/task/{task_id}", status_code=303)
 
         try:
             fields = _ready_update_fields(

@@ -44,6 +44,8 @@ DEFAULT_PLAN_REVIEWER = config.DEFAULT_PLAN_REVIEWER
 DEFAULT_REVIEWER = config.DEFAULT_REVIEWER
 DEFAULT_SUPER_REVIEWER = config.DEFAULT_SUPER_REVIEWER
 MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
+REVIEWER_INFRA_ATTEMPTS = config.REVIEWER_INFRA_ATTEMPTS
+REVIEWER_INFRA_BACKOFF_SECONDS = config.REVIEWER_INFRA_BACKOFF_SECONDS
 MAX_PRIOR_COMMENTS = config.MAX_PRIOR_COMMENTS
 POLL_INTERVAL = config.POLL_INTERVAL
 HEARTBEAT_INTERVAL = config.HEARTBEAT_INTERVAL
@@ -543,6 +545,59 @@ def stash_task_wip(task_id, conn):
         return None
 
 
+def restore_task_wip(task, conn):
+    """
+    Restore orchestrator-preserved task WIP, including the index.
+
+    Reviewers inspect `git diff --cached`. A stash pop without --index would
+    leave the candidate unstaged. Returns True when there is nothing to
+    restore or the stash was applied and stash_ref cleared.
+    """
+    stash_ref = task.get("stash_ref")
+    if not stash_ref:
+        return True
+    task_id = task["id"]
+    try:
+        result = subprocess.run(
+            ["git", "stash", "pop", "--index", stash_ref],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            # --index can fail for untracked-bearing stashes; pop then restage.
+            result = subprocess.run(
+                ["git", "stash", "pop", stash_ref],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "git stash pop produced no output").strip()
+                log(f"Failed to restore stashed candidate {stash_ref}: {detail}", task_id)
+                db.add_comment(
+                    conn, task_id,
+                    f"Could not restore stashed candidate {stash_ref} before review:\n\n{detail}",
+                    kind="comment", author="orchestrator",
+                )
+                return False
+            subprocess.run(["git", "add", "."], check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        log(f"Failed to restore stashed candidate {stash_ref}: {exc}", task_id)
+        db.add_comment(
+            conn, task_id,
+            f"Could not restore stashed candidate {stash_ref} before review.",
+            kind="comment", author="orchestrator",
+        )
+        return False
+    db.update_task(conn, task_id, stash_ref=None)
+    db.add_comment(
+        conn, task_id,
+        f"Restored task WIP from {stash_ref} for review; candidate is staged "
+        "for git diff --cached.",
+        kind="comment", author="orchestrator",
+    )
+    return True
+
+
 def mark_blocked(
     task_id,
     conn,
@@ -597,6 +652,119 @@ def task_max_review_rounds(task):
     if cap is None:
         return MAX_REVIEW_ROUNDS
     return int(cap)
+
+
+def _reviewer_infra_backoff(attempt):
+    """Return the sleep before retrying after a 1-based failed attempt."""
+    index = attempt - 1
+    if index < 0 or index >= len(REVIEWER_INFRA_BACKOFF_SECONDS):
+        return REVIEWER_INFRA_BACKOFF_SECONDS[-1] if REVIEWER_INFRA_BACKOFF_SECONDS else 0
+    return REVIEWER_INFRA_BACKOFF_SECONDS[index]
+
+
+def _run_review_with_infra_retries(task, conn, handler, *, step, reviewer):
+    """Run one review handler, retrying infrastructure failures without advancing rounds.
+
+    A missing durable approval/rejection, nonzero exit, or transport/tool-host
+    failure is not a content rejection. Keep review_round unchanged, do not send
+    the maker through rework, and retry the same review step until the bound is
+    exhausted. Returns the handler's final 'approve'/'reject'/'error' outcome.
+    """
+    last_outcome = "error"
+    for attempt in range(1, REVIEWER_INFRA_ATTEMPTS + 1):
+        last_outcome = handler(task, conn)
+        if last_outcome != "error":
+            return last_outcome
+        log(
+            f"Reviewer '{reviewer}' infrastructure failure on {step} "
+            f"attempt {attempt}/{REVIEWER_INFRA_ATTEMPTS}; "
+            f"review_round={task['review_round']} unchanged",
+            task["id"],
+        )
+        if attempt >= REVIEWER_INFRA_ATTEMPTS:
+            break
+        delay = _reviewer_infra_backoff(attempt)
+        db.update_runtime(
+            conn,
+            status_message=(
+                f"Reviewer '{reviewer}' unavailable; retrying {step} in {delay}s "
+                f"(attempt {attempt}/{REVIEWER_INFRA_ATTEMPTS})"
+            ),
+        )
+        time.sleep(delay)
+    return last_outcome
+
+
+def _block_reviewer_unavailable(task, conn, *, step, reviewer, preserve_wip):
+    """Block after exhausting reviewer infrastructure retries.
+
+    Resume stays on the review step so a later healthy reviewer, smart-unblock,
+    reviewer switch, or explicit continue does not grant extra content-review
+    rounds or send the maker through rework.
+    """
+    mark_blocked(
+        task["id"],
+        conn,
+        (
+            f"Blocked: reviewer '{reviewer}' unavailable after "
+            f"{REVIEWER_INFRA_ATTEMPTS} infrastructure failures on {step} "
+            f"(review_round={task['review_round']} unchanged). "
+            f"Resume at {step} when a healthy reviewer is available."
+        ),
+        f"Blocked: reviewer unavailable on task {task['id']}",
+        log_message=f"Blocked: reviewer unavailable on {step}",
+        preserve_wip=preserve_wip,
+        block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+        resume_next_step=step,
+    )
+
+
+def _ensure_reviewer_acked(task, conn, reviewer, *, step):
+    """Return True when the reviewer ACK probe succeeded.
+
+    A failed review/tool-path probe is an infrastructure failure, not a
+    content rejection. Callers return 'error' so `_run_review_with_infra_retries`
+    can apply the bounded retry policy instead of stalling forever.
+    """
+    if ensure_agent_acked(reviewer, task["id"], conn, purpose="review"):
+        return True
+    log(
+        f"Reviewer '{reviewer}' did not acknowledge the review/tool path before {step}",
+        task["id"],
+    )
+    db.add_comment(
+        conn,
+        task["id"],
+        (
+            f"Reviewer '{reviewer}' did not acknowledge the review/tool path "
+            f"before {step}; treating as an infrastructure failure, not a "
+            "content rejection."
+        ),
+        kind="comment",
+        author="orchestrator",
+    )
+    return False
+
+
+def _missing_review_decision(task, conn, reviewer, *, step, round_label=None):
+    """Record a no-decision infrastructure failure and return 'error'."""
+    round_note = f" for round {round_label}" if round_label is not None else ""
+    log(
+        f"Reviewer '{reviewer}' exited 0 but left no durable decision{round_note}",
+        task["id"],
+    )
+    db.add_comment(
+        conn,
+        task["id"],
+        (
+            f"Reviewer '{reviewer}' completed {step}{round_note} without a durable "
+            "approval/rejection; treating as an infrastructure failure, not a "
+            "content rejection."
+        ),
+        kind="comment",
+        author="orchestrator",
+    )
+    return "error"
 
 
 # Review steps that advance review_round on interrupt/recovery, mapped to the
@@ -860,7 +1028,8 @@ def handle_commit_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -898,11 +1067,9 @@ def handle_commit_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(
-            f"Reviewer '{reviewer}' exited 0 but left no decision for round {current_round}",
-            task["id"],
+        return _missing_review_decision(
+            task, conn, reviewer, step="commit-review", round_label=current_round,
         )
-        return "reject"
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -972,7 +1139,8 @@ def handle_pull_request_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="pull-request-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1014,11 +1182,9 @@ def handle_pull_request_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(
-            f"Reviewer '{reviewer}' exited 0 but left no PR review decision for round {current_round}",
-            task["id"],
+        return _missing_review_decision(
+            task, conn, reviewer, step="pull-request-review", round_label=current_round,
         )
-        return "reject"
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -1096,7 +1262,8 @@ def handle_other_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="other-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1138,11 +1305,9 @@ def handle_other_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(
-            f"Reviewer '{reviewer}' exited 0 but left no other-review decision for round {current_round}",
-            task["id"],
+        return _missing_review_decision(
+            task, conn, reviewer, step="other-review", round_label=current_round,
         )
-        return "reject"
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -1208,7 +1373,8 @@ def handle_commit_review_supertask(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-review-supertask"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
     children = db.get_child_tasks(conn, task["id"])
     follow_up_sources = {
@@ -1272,8 +1438,9 @@ def handle_commit_review_supertask(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(f"Reviewer '{reviewer}' exited 0 but left no decision for round {current_round}", task["id"])
-        return "reject"
+        return _missing_review_decision(
+            task, conn, reviewer, step="commit-review-supertask", round_label=current_round,
+        )
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -1353,7 +1520,8 @@ def handle_commit_plan_review(task, conn):
     is not incremented for planning rejections.
     """
     reviewer = DEFAULT_PLAN_REVIEWER
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-plan-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1394,8 +1562,9 @@ def handle_commit_plan_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(f"Reviewer '{reviewer}' exited 0 but left no plan decision", task["id"])
-        return "reject"
+        return _missing_review_decision(
+            task, conn, reviewer, step="commit-plan-review",
+        )
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "plan-approval":
@@ -1945,17 +2114,17 @@ def advance(task, conn):
             _complete_supertask(task, conn, review_skipped=True)
             return True
 
-        outcome = handle_commit_review_supertask(task, conn)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_commit_review_supertask,
+            step="commit-review-supertask", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{_task_reviewer(task)}' failed supertask review round "
-                f"{task['review_round']}; "
-                "task blocked for human triage.",
-                f"Blocked: reviewer failed on supertask {task_id}",
-                log_message="Blocked: reviewer failed on supertask",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="commit-review-supertask",
+                reviewer=reviewer,
                 preserve_wip=False,
             )
             return False
@@ -2023,15 +2192,16 @@ def advance(task, conn):
             _approve_plan(task, conn)
             return True
 
-        outcome = handle_commit_plan_review(task, conn)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_commit_plan_review,
+            step="commit-plan-review", reviewer=DEFAULT_PLAN_REVIEWER,
+        )
 
         if outcome == "error":
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{DEFAULT_PLAN_REVIEWER}' failed commit-plan-review; task blocked for human triage.",
-                f"Blocked: plan reviewer failed on task {task_id}",
-                log_message="Blocked: plan reviewer failed",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="commit-plan-review",
+                reviewer=DEFAULT_PLAN_REVIEWER,
                 preserve_wip=False,
             )
             return False
@@ -2079,17 +2249,17 @@ def advance(task, conn):
         return True
 
     elif step == "pull-request-review":
-        outcome = handle_pull_request_review(task, conn)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_pull_request_review,
+            step="pull-request-review", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            reviewer = _task_reviewer(task)
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{reviewer}' failed pull-request-review round {task['review_round']}; "
-                "task blocked for human triage.",
-                f"Blocked: PR reviewer failed on task {task_id}",
-                log_message="Blocked: PR reviewer failed",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="pull-request-review",
+                reviewer=reviewer,
                 preserve_wip=False,
             )
             return False
@@ -2165,17 +2335,17 @@ def advance(task, conn):
         return True
 
     elif step == "other-review":
-        outcome = handle_other_review(task, conn)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_other_review,
+            step="other-review", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            reviewer = _task_reviewer(task)
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{reviewer}' failed other-review round {task['review_round']}; "
-                "task blocked for human triage.",
-                f"Blocked: other reviewer failed on task {task_id}",
-                log_message="Blocked: other reviewer failed",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="other-review",
+                reviewer=reviewer,
                 preserve_wip=False,
             )
             return False
@@ -2298,17 +2468,36 @@ def advance(task, conn):
             log("Commit built, queued for review", task_id)
         return True
     elif step == "commit-review":
-        outcome = handle_commit_review(task, conn)
+        if task.get("stash_ref"):
+            if not restore_task_wip(task, conn):
+                mark_blocked(
+                    task_id,
+                    conn,
+                    (
+                        f"Blocked: could not restore stashed candidate "
+                        f"{task.get('stash_ref')} before commit-review. "
+                        "Resume at commit-review when the stash is recoverable."
+                    ),
+                    f"Blocked: stash restore failed for task {task_id}",
+                    log_message="Blocked: could not restore stashed candidate before commit-review",
+                    preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+                    resume_next_step="commit-review",
+                )
+                return False
+            task = db.get_task(conn, task_id)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_commit_review,
+            step="commit-review", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            reviewer = _task_reviewer(task)
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{reviewer}' failed review round {task['review_round']}; task blocked for human triage.",
-                f"Blocked: reviewer failed on task {task_id}",
-                log_message="Blocked: reviewer failed",
-                preserve_wip=False,
+            _block_reviewer_unavailable(
+                task, conn,
+                step="commit-review",
+                reviewer=reviewer,
+                preserve_wip=True,
             )
             return False
 

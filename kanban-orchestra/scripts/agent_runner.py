@@ -62,13 +62,76 @@ def _repo_root_for_subprocess():
     return repo_root
 
 
-# Process-local ACK cache: (task_id, agent_name) entries mean the agent has
-# already responded to a ping for this task in the current process lifetime.
-# Not persisted — after an orchestrator restart all tasks may ping again.
+# Process-local ACK cache: (task_id, agent_name, purpose) entries mean the agent
+# has already responded to that probe for this task in the current process
+# lifetime. "run" and "review" are distinct — a shallow run ping cannot prove
+# the review/tool path is usable. Not persisted: after an orchestrator restart
+# all tasks may ping again.
 _agent_ack_cache: set = set()
 
 PING_PROMPT = "This is a ping. Respond with ACK."
+REVIEW_READY_PREFIX = "KO-REVIEW-READY:"
 PING_RETRY_INTERVAL = 60  # seconds between retries when agent does not respond
+_REVIEW_PROBE_GRACE_SECONDS = 0.05
+
+
+def review_ping_prompt(task_id):
+    """Build a reviewer probe whose expected digest is not in the prompt text."""
+    return (
+        f"This is a reviewer readiness probe for task {task_id}. "
+        "Inspect git diff --cached in this worktree. "
+        "Compute the lowercase SHA-256 hex digest of that command's exact stdout. "
+        "Record a durable task comment on this task via the task CLI whose message "
+        f"contains {REVIEW_READY_PREFIX} immediately followed by that digest. "
+        "Echoing this prompt or printing a capability claim does not satisfy the probe."
+    )
+
+
+def cached_diff_digest(cwd=None):
+    """Return the SHA-256 hex digest of `git diff --cached` stdout."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached"],
+            capture_output=True,
+            cwd=cwd or _repo_root_for_subprocess(),
+        )
+        payload = result.stdout or b""
+    except Exception:
+        payload = b""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def review_ready_token(digest=None, *, cwd=None):
+    """Return the expected reviewer-ready token for the current cached diff."""
+    if digest is None:
+        digest = cached_diff_digest(cwd=cwd)
+    return f"{REVIEW_READY_PREFIX}{digest}"
+
+
+def _comment_watermark(conn, task_id):
+    row = conn.execute(
+        "SELECT MAX(id) FROM comments WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return row[0] or 0
+
+
+def _new_comment_has_ready_token(conn, task_id, token, after_id):
+    """True when a comment newer than after_id contains the ready token."""
+    conn.commit()
+    row = conn.execute(
+        """SELECT 1 FROM comments
+           WHERE task_id = ? AND id > ? AND instr(message, ?) > 0
+           LIMIT 1""",
+        (task_id, after_id, token),
+    ).fetchone()
+    return row is not None
+
+
+def _probe_comment_conn(conn):
+    if conn is not None:
+        return conn, False
+    return db.connect(db.get_db_path()), True
 
 
 def _resolve_command_template(agent_name, *, use_review_command=False):
@@ -77,16 +140,43 @@ def _resolve_command_template(agent_name, *, use_review_command=False):
     return config.resolve_agent_command(agent_name)
 
 
-def ping_agent(agent_name, task_id, *, use_review_command=False):
-    """Send a lightweight ping prompt. Returns True if any text response received."""
+def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, conn=None):
+    """Send a ping prompt. Returns True if the agent produced a usable response.
+
+    A shallow CLI banner or any-text response is enough for ordinary run pings.
+    Reviewer readiness requires a durable task comment that contains a token
+    derived from `git diff --cached`. Echoed prompt text, a bare ACK, or a
+    prior run-ping cache hit cannot prove that review/tool path is usable.
+    """
+    purpose = purpose or ("review" if use_review_command else "run")
     cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command)
     if cmd_template is None:
         log(f"Unknown agent '{agent_name}', cannot ping", task_id)
         return False
 
-    cmd = [part.replace("{prompt}", PING_PROMPT) for part in cmd_template]
+    prompt = review_ping_prompt(task_id) if purpose == "review" else PING_PROMPT
+    cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
+    expected_token = None
+    comment_conn = None
+    close_comment_conn = False
+    watermark = 0
+    if purpose == "review":
+        expected_token = review_ready_token()
+        try:
+            comment_conn, close_comment_conn = _probe_comment_conn(conn)
+            watermark = _comment_watermark(comment_conn, task_id)
+        except Exception:
+            comment_conn = None
+            close_comment_conn = False
 
-    log(f"Pre-flight ping: checking {agent_name} is responsive (task {task_id})", task_id)
+    if purpose == "review":
+        log(
+            f"Pre-flight reviewer probe: checking {agent_name} review/tool path "
+            f"(task {task_id})",
+            task_id,
+        )
+    else:
+        log(f"Pre-flight ping: checking {agent_name} is responsive (task {task_id})", task_id)
     active_record_id = None
     try:
         proc_cwd = _repo_root_for_subprocess()
@@ -103,25 +193,57 @@ def ping_agent(agent_name, task_id, *, use_review_command=False):
         )
     except FileNotFoundError:
         log(f"Agent binary not found for '{agent_name}' during ping", task_id)
+        if close_comment_conn and comment_conn is not None:
+            comment_conn.close()
         return False
 
-    # Read bytes with select so we ACK on the first available characters,
-    # not on a newline boundary (line-iteration stalls without a newline).
+    def _review_comment_ready():
+        if comment_conn is None or expected_token is None:
+            return False
+        try:
+            return _new_comment_has_ready_token(
+                comment_conn, task_id, expected_token, watermark,
+            )
+        except Exception:
+            return False
+
+    # Drain stdout so the child cannot block on a full pipe. Run pings ACK on
+    # the first available characters (not a newline). Reviewer readiness never
+    # treats stdout as evidence — echoed prompt text can contain instructions.
     acked = False
-    if proc.stdout:
-        fd = proc.stdout.fileno()
-        deadline = time.monotonic() + PING_RETRY_INTERVAL
+    eof = False
+    deadline = time.monotonic() + PING_RETRY_INTERVAL
+    stdout = proc.stdout
+    fd = stdout.fileno() if stdout else None
+    try:
         while time.monotonic() < deadline:
+            if purpose == "review" and _review_comment_ready():
+                acked = True
+                break
+            if eof:
+                if purpose == "review":
+                    time.sleep(_REVIEW_PROBE_GRACE_SECONDS)
+                    acked = _review_comment_ready()
+                break
+            if fd is None:
+                eof = True
+                continue
             remaining = deadline - time.monotonic()
-            readable, _, _ = select.select([proc.stdout], [], [], min(remaining, 5.0))
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([stdout], [], [], min(remaining, 1.0))
             if not readable:
                 continue
             chunk = os.read(fd, 4096)
-            if not chunk:  # EOF with no output
-                break
-            if chunk.strip():
+            if not chunk:
+                eof = True
+                continue
+            if purpose != "review" and chunk.strip():
                 acked = True
                 break
+    finally:
+        if close_comment_conn and comment_conn is not None:
+            comment_conn.close()
     # Terminate the ping subprocess as soon as we have a verdict.
     try:
         proc.kill()
@@ -132,37 +254,65 @@ def ping_agent(agent_name, task_id, *, use_review_command=False):
         active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
 
     if acked:
-        log(f"Pre-flight ping: {agent_name} responded — proceeding with task {task_id}", task_id)
+        if purpose == "review":
+            log(
+                f"Pre-flight reviewer probe: {agent_name} acknowledged the review/tool path "
+                f"— proceeding with task {task_id}",
+                task_id,
+            )
+        else:
+            log(f"Pre-flight ping: {agent_name} responded — proceeding with task {task_id}", task_id)
     else:
-        log(
-            f"Pre-flight ping: {agent_name} produced no output — "
-            f"agent may be out of tokens or unavailable (task {task_id})",
-            task_id,
-        )
+        if purpose == "review":
+            log(
+                f"Pre-flight reviewer probe: {agent_name} did not acknowledge the review/tool path "
+                f"— agent may be out of tokens, missing tools, or unavailable (task {task_id})",
+                task_id,
+            )
+        else:
+            log(
+                f"Pre-flight ping: {agent_name} produced no output — "
+                f"agent may be out of tokens or unavailable (task {task_id})",
+                task_id,
+            )
     return acked
 
 
-def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False):
+def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, purpose=None):
     """
     Ensure the agent has ACKed for this task before running a real step.
 
-    Cached process-locally per (task_id, agent_name). On cache hit, returns
-    immediately. On miss, pings and retries every minute until ACK is received.
-    The task stays pinned and running throughout the retry loop. Do not call
-    for steps that will be skipped.
+    Cached process-locally per (task_id, agent_name, purpose). Reviewer
+    readiness is a distinct purpose from an ordinary run ping: a shallow CLI
+    ping, echoed probe text, or a bare ACK cannot by itself prove the
+    review/tool path is usable. Do not call for steps that will be skipped.
+
+    Returns True when the agent has acknowledged. Ordinary run pings retry
+    every minute until ACK is received and keep the task pinned. Reviewer
+    readiness is single-shot: a failed probe returns False immediately so
+    the caller can apply the bounded review-infrastructure retry policy
+    instead of stalling forever.
     """
-    cache_key = (task_id, agent_name, "review") if use_review_command else (task_id, agent_name)
+    purpose = purpose or ("review" if use_review_command else "run")
+    cache_key = (task_id, agent_name, purpose)
     if cache_key in _agent_ack_cache:
-        return
+        return True
 
     while True:
-        if use_review_command:
-            acked = ping_agent(agent_name, task_id, use_review_command=True)
+        if purpose == "review" or use_review_command:
+            acked = ping_agent(
+                agent_name, task_id,
+                use_review_command=use_review_command,
+                purpose="review",
+                conn=conn,
+            )
         else:
             acked = ping_agent(agent_name, task_id)
         if acked:
             _agent_ack_cache.add(cache_key)
-            return
+            return True
+        if purpose == "review" or use_review_command:
+            return False
 
         log(
             f"STALLED — {agent_name} did not respond to pre-flight ping for task {task_id}. "
@@ -178,6 +328,7 @@ def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False):
             ),
         )
         time.sleep(PING_RETRY_INTERVAL)
+
 
 
 def _summarize_transcript_tail(lines, max_chars=240):

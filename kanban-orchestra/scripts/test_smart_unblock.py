@@ -47,14 +47,13 @@ class SmartUnblockTestCase(unittest.TestCase):
 
     def _blocked_task(self, title="Blocked task", **fields):
         task_id = db.add_task(self.conn, title, branch="feat-x")
-        db.update_task(
-            self.conn,
-            task_id,
-            status="blocked",
-            block_reason="review_cap",
-            resume_next_step="commit-make",
-            **fields,
-        )
+        payload = {
+            "status": "blocked",
+            "block_reason": "review_cap",
+            "resume_next_step": "commit-make",
+        }
+        payload.update(fields)
+        db.update_task(self.conn, task_id, **payload)
         return task_id
 
 
@@ -155,6 +154,78 @@ class TestRepeatedBlockSuppression(SmartUnblockTestCase):
         self.assertEqual(invoke.call_count, 1)
         self.assertEqual(first[0]["action"], "explained")
         self.assertEqual(second[0]["action"], "skipped-unchanged")
+
+
+class TestHumanContinueAndRepeatSuppression(TestRepeatedBlockSuppression):
+    def test_parse_human_continue_and_resume(self):
+        self.assertEqual(
+            smart_unblock.parse_human_continue_decision("CONTINUE reviewer is healthy"),
+            {"add_review_rounds": None, "reason": "reviewer is healthy"},
+        )
+        self.assertEqual(
+            smart_unblock.parse_human_continue_decision("RESUME +2 grant more rounds"),
+            {"add_review_rounds": 2, "reason": "grant more rounds"},
+        )
+        self.assertIsNone(smart_unblock.parse_human_continue_decision("please unblock"))
+
+    def test_human_continue_resumes_reviewer_unavailable_without_llm(self):
+        task_id = self._blocked_task(
+            block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+            resume_next_step="commit-review",
+        )
+        db.add_comment(
+            self.conn, task_id, "Blocked: reviewer unavailable", author="orchestrator",
+        )
+        db.add_comment(
+            self.conn, task_id, "CONTINUE reviewer is healthy again", author="operator",
+        )
+
+        with patch.object(smart_unblock, "invoke_unblock_agent") as invoke:
+            results = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        invoke.assert_not_called()
+        self.assertEqual(results[0]["action"], "recovered-human-continue")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-review")
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_human_continue_is_observed_after_unchanged_skip(self):
+        task_id = self._blocked_task(
+            block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+            resume_next_step="commit-review",
+        )
+        db.add_comment(
+            self.conn, task_id, "Blocked: reviewer unavailable", author="orchestrator",
+        )
+
+        def identifying_invoke(agent, prompt, tid, db_path=None, **kwargs):
+            db.add_comment(
+                self.conn,
+                tid,
+                f"smart-unblock ({agent}): BLOCKED needs a human decision: reviewer down.",
+                author=smart_unblock.WATCHER_AUTHOR,
+            )
+            return {"agent": agent, "returncode": 0}
+
+        with patch.object(smart_unblock, "invoke_unblock_agent", side_effect=identifying_invoke):
+            first = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+            second = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        self.assertEqual(first[0]["action"], "explained")
+        self.assertEqual(second[0]["action"], "skipped-unchanged")
+
+        db.add_comment(
+            self.conn, task_id, "CONTINUE retry review now", author="operator",
+        )
+        with patch.object(smart_unblock, "invoke_unblock_agent") as invoke:
+            third = smart_unblock.poll_once(self.conn, self.db_path, agent="sonnet")
+
+        invoke.assert_not_called()
+        self.assertEqual(third[0]["action"], "recovered-human-continue")
+        self.assertEqual(db.get_task(self.conn, task_id)["status"], "ready")
+        self.assertEqual(db.get_task(self.conn, task_id)["next_step"], "commit-review")
 
     def test_changed_evidence_is_reconsidered(self):
         task_id = self._blocked_task()
