@@ -424,13 +424,20 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn('<meta charset="utf-8">', response.text)
         self.assertIn("feature/unicodé-sync", response.text)
 
-    def test_page_uses_shared_early_accent_preference_and_accessible_picker(self):
+    def test_page_uses_early_accent_preference_and_accessible_picker(self):
         html = _get_fleet_page(_page_card()).text
+        cookie = dashboard.accent_cookie_name(dashboard.fleet_accent_identity())
+        repo_cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
 
-        self.assertLess(html.index(dashboard.ACCENT_COOKIE_NAME), html.index("<style>"))
+        self.assertNotEqual(cookie, repo_cookie)
+        self.assertLess(html.index(cookie), html.index("<style>"))
+        self.assertIn(f"{cookie}=", html)
+        self.assertNotIn(f"{repo_cookie}=", html)
+        self.assertNotIn("orchestra_accent=", html)
         self.assertIn('<label for="orchestra-accent-picker">Accent</label>', html)
         self.assertIn('<select id="orchestra-accent-picker" name="accent">', html)
         self.assertIn("; Path=/; Max-Age=31536000; SameSite=Lax", html)
+        self.assertNotIn("; Domain=", html)
         self.assertNotIn("localStorage", html)
         self.assertIn("flex-wrap: wrap", html)
         self.assertIn("var(--accent-soft)", html)

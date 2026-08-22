@@ -731,6 +731,7 @@ def render_page(
     cards_html = "\n".join(
         render_card(card, local_access=local_access) for card in cards
     )
+    identity = dashboard.fleet_accent_identity()
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -738,7 +739,7 @@ def render_page(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fleet Dashboard</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
-  <script>{dashboard.accent_bootstrap_script()}</script>
+  <script>{dashboard.accent_bootstrap_script(identity)}</script>
   <style>{dashboard.COMMON_CSS}
 {FLEET_CSS}</style>
 </head>
@@ -755,7 +756,7 @@ def render_page(
       {cards_html}
     </section>
   </main>
-  <script>{dashboard.accent_picker_script()}</script>
+  <script>{dashboard.accent_picker_script(identity)}</script>
   <script>{FLEET_JS}</script>
 </body>
 </html>

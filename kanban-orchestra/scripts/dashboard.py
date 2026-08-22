@@ -19,6 +19,7 @@ Routes:
 
 import atexit
 import errno
+import hashlib
 import json
 import os
 import re
@@ -53,7 +54,9 @@ STALE_SECONDS = 60  # heartbeat older than this → "stale"
 DONE_RECENCY_CUTOFF = timedelta(days=7)
 _REVIEW_ROUND_DISPLAY_RE = re.compile(r"\b((?:[Rr]eview round)|(?:[Rr]ound)) (\d+)\b")
 
-ACCENT_COOKIE_NAME = "orchestra_accent"
+ACCENT_COOKIE_PREFIX = "orchestra_accent_"
+FLEET_ACCENT_SCOPE = "fleet"
+_ACCENT_IDENTITY_RE = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_ACCENT = "green"
 ACCENT_PALETTE = {
     "green": {
@@ -99,6 +102,30 @@ ACCENT_PALETTE = {
 }
 
 
+def accent_storage_identity(scope: str) -> str:
+    """Return a stable non-PII identity for dashboard-scoped accent storage."""
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+
+def repo_accent_identity(repo_root: str | Path | None = None) -> str:
+    """Return the accent-storage identity for a repo dashboard."""
+    if repo_root is None:
+        repo_root = db.get_instance_identity()["repo_root"]
+    return accent_storage_identity(f"repo:{Path(repo_root).expanduser().resolve()}")
+
+
+def fleet_accent_identity() -> str:
+    """Return the distinct accent-storage identity for the Fleet Dashboard."""
+    return accent_storage_identity(FLEET_ACCENT_SCOPE)
+
+
+def accent_cookie_name(identity: str) -> str:
+    """Return the host-only cookie name for a hashed dashboard identity."""
+    if not _ACCENT_IDENTITY_RE.fullmatch(identity):
+        raise ValueError("accent identity must be a SHA-256 hex digest")
+    return f"{ACCENT_COOKIE_PREFIX}{identity}"
+
+
 def _validated_accent(value: str | None) -> str:
     """Return an allowlisted accent name, falling back to the default."""
     return value if value in ACCENT_PALETTE else DEFAULT_ACCENT
@@ -120,12 +147,13 @@ def _contrast_ratio(first: str, second: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
-def accent_bootstrap_script() -> str:
-    """Return the early, shared host-cookie accent bootstrap."""
+def accent_bootstrap_script(identity: str) -> str:
+    """Return the early, identity-scoped host-cookie accent bootstrap."""
     palette_json = json.dumps(ACCENT_PALETTE, separators=(",", ":"))
+    cookie_name = accent_cookie_name(identity)
     return f"""(() => {{
   const palette = {palette_json};
-  const match = document.cookie.split("; ").find((row) => row.startsWith("{ACCENT_COOKIE_NAME}="));
+  const match = document.cookie.split("; ").find((row) => row.startsWith("{cookie_name}="));
   let requested = "{DEFAULT_ACCENT}";
   if (match) {{
     try {{ requested = decodeURIComponent(match.slice(match.indexOf("=") + 1)); }} catch (_) {{}}
@@ -157,8 +185,9 @@ def accent_picker_html() -> str:
     )
 
 
-def accent_picker_script() -> str:
-    """Return shared picker hydration and host-only cookie persistence."""
+def accent_picker_script(identity: str) -> str:
+    """Return picker hydration and identity-scoped host-only cookie persistence."""
+    cookie_name = accent_cookie_name(identity)
     return f"""(() => {{
   const picker = document.getElementById("orchestra-accent-picker");
   const state = window.__orchestraAccent;
@@ -168,7 +197,7 @@ def accent_picker_script() -> str:
     if (!Object.prototype.hasOwnProperty.call(state.palette, picker.value)) {{
       picker.value = "{DEFAULT_ACCENT}";
     }}
-    document.cookie = "{ACCENT_COOKIE_NAME}=" + encodeURIComponent(picker.value)
+    document.cookie = "{cookie_name}=" + encodeURIComponent(picker.value)
       + "; Path=/; Max-Age=31536000; SameSite=Lax";
     window.location.reload();
   }});
@@ -2338,6 +2367,7 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 
 def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
     running_directory = _running_directory_display()
+    identity = repo_accent_identity()
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2345,7 +2375,7 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_esc(title)}</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
-  <script>{accent_bootstrap_script()}</script>
+  <script>{accent_bootstrap_script(identity)}</script>
   <style>{COMMON_CSS}</style>
 </head>
 <body>
@@ -2359,7 +2389,7 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
     {body}
   </main>
   <script>
-    {accent_picker_script()}
+    {accent_picker_script(identity)}
     (() => {{
       function formatRelativeAge(timestamp) {{
         const then = Date.parse(timestamp);

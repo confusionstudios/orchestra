@@ -231,25 +231,91 @@ class TestPageShell(unittest.TestCase):
                 self.assertGreaterEqual(dashboard._contrast_ratio(accent["color"], "#000000"), 4.5)
                 self.assertGreaterEqual(dashboard._contrast_ratio(accent["color"], "#0c0c0c"), 4.5)
 
+    def test_accent_identities_are_stable_hashed_and_distinct(self):
+        repo_a = Path.home() / "accent-repo-a"
+        repo_b = Path.home() / "accent-repo-b"
+        identity_a = dashboard.repo_accent_identity(repo_a)
+        identity_b = dashboard.repo_accent_identity(repo_b)
+        fleet_identity = dashboard.fleet_accent_identity()
+
+        self.assertEqual(identity_a, dashboard.repo_accent_identity(str(repo_a)))
+        self.assertNotEqual(identity_a, identity_b)
+        self.assertNotEqual(identity_a, fleet_identity)
+        self.assertNotEqual(identity_b, fleet_identity)
+        self.assertEqual(fleet_identity, dashboard.fleet_accent_identity())
+        self.assertRegex(identity_a, r"^[0-9a-f]{64}$")
+        self.assertRegex(fleet_identity, r"^[0-9a-f]{64}$")
+
+        cookie_a = dashboard.accent_cookie_name(identity_a)
+        self.assertTrue(cookie_a.startswith(dashboard.ACCENT_COOKIE_PREFIX))
+        self.assertNotIn(str(repo_a), cookie_a)
+        self.assertNotIn(str(repo_a.resolve()), cookie_a)
+        self.assertNotIn("/", cookie_a)
+        self.assertNotIn(":", cookie_a)
+        with self.assertRaises(ValueError):
+            dashboard.accent_cookie_name(str(repo_a))
+        with self.assertRaises(ValueError):
+            dashboard.accent_cookie_name("orchestra_accent")
+
     def test_page_shell_applies_allowlisted_cookie_before_styles_and_renders_accessible_picker(self):
         html = dashboard._page_shell("Title", "<p>Body</p>")
+        cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
 
-        self.assertLess(html.index(dashboard.ACCENT_COOKIE_NAME), html.index("<style>"))
+        self.assertLess(html.index(cookie), html.index("<style>"))
         self.assertIn('Object.prototype.hasOwnProperty.call(palette, requested)', html)
         self.assertIn(f'? requested : "{dashboard.DEFAULT_ACCENT}"', html)
         self.assertIn('<label for="orchestra-accent-picker">Accent</label>', html)
         self.assertIn('<select id="orchestra-accent-picker" name="accent">', html)
         self.assertNotIn('type="color"', html)
+        self.assertNotIn("orchestra_accent=", html)
         for name, accent in dashboard.ACCENT_PALETTE.items():
             self.assertIn(f'<option value="{name}">{accent["label"]}</option>', html)
 
     def test_picker_persists_host_only_cross_port_cookie(self):
         html = dashboard._page_shell("Title", "<p>Body</p>")
+        cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
 
+        self.assertIn(f"{cookie}=", html)
         self.assertIn("; Path=/; Max-Age=31536000; SameSite=Lax", html)
         self.assertNotIn("; Domain=", html)
         self.assertNotIn("localStorage", html)
         self.assertIn("window.location.reload()", html)
+
+    def test_page_shell_scopes_accent_cookie_to_repo_identity(self):
+        repo_a = Path.home() / "accent-scope-a"
+        repo_b = Path.home() / "accent-scope-b"
+        cookie_a = dashboard.accent_cookie_name(dashboard.repo_accent_identity(repo_a))
+        cookie_b = dashboard.accent_cookie_name(dashboard.repo_accent_identity(repo_b))
+        fleet_cookie = dashboard.accent_cookie_name(dashboard.fleet_accent_identity())
+        identity_a = {
+            "repo_root": str(repo_a.resolve()),
+            "repo_label": repo_a.name,
+            "db_path": str(repo_a / "kanban-orchestra.db"),
+            "runtime_root": str(repo_a / ".kanban-orchestra"),
+            "lock_path": str(repo_a / "kanban-orchestra.lock"),
+        }
+        identity_b = {
+            **identity_a,
+            "repo_root": str(repo_b.resolve()),
+            "repo_label": repo_b.name,
+            "db_path": str(repo_b / "kanban-orchestra.db"),
+            "runtime_root": str(repo_b / ".kanban-orchestra"),
+            "lock_path": str(repo_b / "kanban-orchestra.lock"),
+        }
+
+        with patch.object(dashboard.db, "get_instance_identity", return_value=identity_a):
+            html_a = dashboard._page_shell("Title", "<p>Body</p>")
+        with patch.object(dashboard.db, "get_instance_identity", return_value=identity_b):
+            html_b = dashboard._page_shell("Title", "<p>Body</p>")
+
+        self.assertNotEqual(cookie_a, cookie_b)
+        self.assertIn(f"{cookie_a}=", html_a)
+        self.assertNotIn(f"{cookie_b}=", html_a)
+        self.assertIn(f"{cookie_b}=", html_b)
+        self.assertNotIn(f"{cookie_a}=", html_b)
+        self.assertNotIn(f"{fleet_cookie}=", html_a)
+        self.assertNotIn("orchestra_accent=", html_a)
+        self.assertNotIn(str(repo_a.resolve()), cookie_a)
 
     def test_generic_accent_and_semantic_status_colors_are_separate(self):
         self.assertIn("--accent-rgb: 0 204 68", dashboard.COMMON_CSS)
@@ -2472,12 +2538,14 @@ class TestOverviewPage(unittest.TestCase):
         tid = db.add_task(self.conn, "Task with accent picker", branch="feat-accent")
         client = TestClient(dashboard.app)
 
+        cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
         for path in ("/", f"/task/{tid}"):
             with self.subTest(path=path):
                 resp = client.get(path)
                 self.assertEqual(resp.status_code, 200)
                 self.assertIn('id="orchestra-accent-picker"', resp.text)
-                self.assertIn(dashboard.ACCENT_COOKIE_NAME, resp.text)
+                self.assertIn(f"{cookie}=", resp.text)
+                self.assertNotIn("orchestra_accent=", resp.text)
 
     def test_overview_timezone_note_moves_to_bottom(self):
         from fastapi.testclient import TestClient

@@ -75,9 +75,12 @@ compact and still shows localhost. `ko-fleet dashboard` and
 `ko-fleet dashboard-open` open that preferred URL; pass `--local` to open
 localhost for debugging.
 
-Both dashboards also include a dark-safe **Accent** picker. The allowlisted
-host-only cookie follows dashboard pages and ports on the same host while
-semantic status colors remain unchanged.
+Both dashboards also include a dark-safe **Accent** picker. Each repo dashboard
+and the Fleet Dashboard persist their own allowlisted tint in a host-only
+cookie scoped by a stable dashboard identity, so a choice follows that
+dashboard across pages, reloads, restarts, and port changes without recoloring
+other dashboards on the same host. Localhost and Tailscale origins keep
+separate browser-local values. Semantic status colors remain unchanged.
 
 ## Supported Agents
 
