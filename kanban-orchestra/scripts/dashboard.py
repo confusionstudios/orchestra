@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 import dashboard_tailscale
 import db
+import fleet
 import task as task_cli
 
 
@@ -1778,10 +1779,65 @@ nav {
   display: flex;
   align-items: center;
   gap: 16px;
+  min-width: 0;
+  width: 100%;
+}
+
+.nav-start,
+.nav-end {
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.nav-start {
+  overflow: hidden;
+}
+
+.nav-end {
+  justify-content: flex-end;
 }
 
 .nav-title {
   flex: 0 0 auto;
+}
+
+.nav-fleet-dashboard {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 12rem;
+}
+
+.nav-fleet-dashboard-link {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 5px 7px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1.2;
+  text-align: center;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.nav-fleet-dashboard-link:hover,
+.nav-fleet-dashboard-link:focus-visible {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--bg);
+  text-decoration: none;
 }
 
 .nav-title::before {
@@ -1801,7 +1857,6 @@ nav a:hover { color: #ffffff; text-decoration: none; }
 .nav-repo-path {
   color: var(--muted);
   font-size: 0.82rem;
-  margin-left: auto;
   max-width: min(64vw, 760px);
   min-width: 0;
   overflow: hidden;
@@ -2216,6 +2271,14 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
     flex-wrap: wrap;
   }
 
+  .nav-end {
+    display: contents;
+  }
+
+  .nav-fleet-dashboard {
+    max-width: min(12rem, 100%);
+  }
+
   .nav-repo-path {
     flex-basis: 100%;
     max-width: 100%;
@@ -2376,6 +2439,41 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 """
 
 
+FLEET_DASHBOARD_LABEL = "Fleet Dashboard"
+
+
+def live_fleet_dashboard_url() -> str | None:
+    """Return the preferred live Fleet Dashboard URL, or None if unavailable."""
+    try:
+        payload = fleet.fleet_dashboard_live_payload()
+    except Exception:
+        return None
+    if not payload:
+        return None
+    url = payload.get("url")
+    if not url:
+        return None
+    try:
+        preferred = fleet.preferred_dashboard_url(str(url))
+    except Exception:
+        return None
+    return preferred or None
+
+
+def fleet_dashboard_nav_html() -> str:
+    """Return the centered Fleet Dashboard nav control, or an empty slot."""
+    url = live_fleet_dashboard_url()
+    if not url:
+        return '<div class="nav-fleet-dashboard"></div>'
+    label = FLEET_DASHBOARD_LABEL
+    return (
+        '<div class="nav-fleet-dashboard">'
+        f'<a class="nav-fleet-dashboard-link" href="{_esc(url)}" '
+        f'title="{_esc(label)}">{_esc(label)}</a>'
+        "</div>"
+    )
+
+
 def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
     running_directory = _running_directory_display()
     identity = repo_accent_identity()
@@ -2391,10 +2489,15 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
 </head>
 <body>
   <nav>
-    <a class="nav-title" href="/">Kanban Orchestra</a>
-    {nav_extra}
-    {accent_picker_html()}
-    <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
+    <div class="nav-start">
+      <a class="nav-title" href="/">Kanban Orchestra</a>
+      {nav_extra}
+    </div>
+    {fleet_dashboard_nav_html()}
+    <div class="nav-end">
+      {accent_picker_html()}
+      <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
+    </div>
   </nav>
   <main>
     {body}

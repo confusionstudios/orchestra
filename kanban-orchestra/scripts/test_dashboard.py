@@ -22,6 +22,19 @@ import db
 import dashboard
 
 
+def setUpModule():
+    """Keep dashboard page tests from probing a live Fleet Dashboard."""
+    global _fleet_live_payload_patcher
+    _fleet_live_payload_patcher = patch.object(
+        dashboard.fleet, "fleet_dashboard_live_payload", return_value=None
+    )
+    _fleet_live_payload_patcher.start()
+
+
+def tearDownModule():
+    _fleet_live_payload_patcher.stop()
+
+
 def _fresh_conn():
     """Return a connection to a fresh in-memory-ish temp DB."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -328,6 +341,80 @@ class TestPageShell(unittest.TestCase):
         self.assertIn("color: var(--red)", dashboard.COMMON_CSS)
         self.assertIn(".badge-pending-subtasks", dashboard.COMMON_CSS)
         self.assertIn("color: var(--orange)", dashboard.COMMON_CSS)
+
+
+class TestLiveFleetDashboardUrl(unittest.TestCase):
+    """URL-resolution for the repo-dashboard Fleet Dashboard action."""
+
+    def test_prefers_live_tailscale_url(self):
+        payload = {"role": "fleet-dashboard", "url": "http://127.0.0.1:8426"}
+        preferred = "https://node.example.ts.net:8426/"
+        with patch.object(dashboard.fleet, "fleet_dashboard_live_payload", return_value=payload), \
+             patch.object(
+                 dashboard.fleet,
+                 "preferred_dashboard_url",
+                 return_value=preferred,
+             ) as lookup:
+            self.assertEqual(dashboard.live_fleet_dashboard_url(), preferred)
+            lookup.assert_called_once_with("http://127.0.0.1:8426")
+            html = dashboard.fleet_dashboard_nav_html()
+
+        self.assertIn(f'href="{preferred}"', html)
+        self.assertIn(dashboard.FLEET_DASHBOARD_LABEL, html)
+        self.assertIn(f'title="{dashboard.FLEET_DASHBOARD_LABEL}"', html)
+        self.assertNotIn("target=", html)
+
+    def test_falls_back_to_live_localhost_url(self):
+        payload = {"role": "fleet-dashboard", "url": "http://127.0.0.1:8426"}
+        with patch.object(dashboard.fleet, "fleet_dashboard_live_payload", return_value=payload), \
+             patch.object(
+                 dashboard.fleet,
+                 "preferred_dashboard_url",
+                 side_effect=lambda url, **kwargs: url,
+             ) as lookup:
+            self.assertEqual(
+                dashboard.live_fleet_dashboard_url(),
+                "http://127.0.0.1:8426",
+            )
+            lookup.assert_called_once_with("http://127.0.0.1:8426")
+            html = dashboard.fleet_dashboard_nav_html()
+
+        self.assertIn('href="http://127.0.0.1:8426"', html)
+        self.assertNotIn("target=", html)
+
+    def test_omits_action_when_fleet_is_unavailable(self):
+        with patch.object(dashboard.fleet, "fleet_dashboard_live_payload", return_value=None), \
+             patch.object(dashboard.fleet, "preferred_dashboard_url") as lookup:
+            self.assertIsNone(dashboard.live_fleet_dashboard_url())
+            html = dashboard.fleet_dashboard_nav_html()
+
+        lookup.assert_not_called()
+        self.assertNotIn("nav-fleet-dashboard-link", html)
+        self.assertNotIn("href=", html)
+
+    def test_omits_action_when_live_payload_lacks_url(self):
+        with patch.object(
+            dashboard.fleet,
+            "fleet_dashboard_live_payload",
+            return_value={"role": "fleet-dashboard"},
+        ), patch.object(dashboard.fleet, "preferred_dashboard_url") as lookup:
+            self.assertIsNone(dashboard.live_fleet_dashboard_url())
+            html = dashboard.fleet_dashboard_nav_html()
+
+        lookup.assert_not_called()
+        self.assertNotIn("nav-fleet-dashboard-link", html)
+
+    def test_omits_action_when_metadata_lookup_raises(self):
+        with patch.object(
+            dashboard.fleet,
+            "fleet_dashboard_live_payload",
+            side_effect=OSError("stale metadata"),
+        ), patch.object(dashboard.fleet, "preferred_dashboard_url") as lookup:
+            self.assertIsNone(dashboard.live_fleet_dashboard_url())
+            html = dashboard.fleet_dashboard_nav_html()
+
+        lookup.assert_not_called()
+        self.assertNotIn("nav-fleet-dashboard-link", html)
 
 
 class TestHealthCard(unittest.TestCase):

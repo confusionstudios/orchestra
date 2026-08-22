@@ -69,9 +69,11 @@ using `--reset`.
 A Fleet card exposes one **Dashboard** action. A locally opened Fleet Dashboard
 links it to localhost; a Fleet Dashboard reached through Tailscale links it to
 the exact remote mapping and omits the action when that mapping is unavailable.
-Operator commands present one **Dashboard:** URL: the exact HTTPS Tailscale
-mapping when it exists, otherwise the localhost URL. The fleet table remains
-compact and still shows localhost. `ko-fleet dashboard` and
+When a live Fleet Dashboard is discoverable, each repo dashboard shows a compact
+**Fleet Dashboard** action in the top bar that opens that same preferred URL in
+the current tab. Operator commands present one **Dashboard:** URL: the exact HTTPS
+Tailscale mapping when it exists, otherwise the localhost URL. The fleet table
+remains compact and still shows localhost. `ko-fleet dashboard` and
 `ko-fleet dashboard-open` open that preferred URL; pass `--local` to open
 localhost for debugging.
 
