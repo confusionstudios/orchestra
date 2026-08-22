@@ -483,7 +483,8 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn('href="http://127.0.0.1:8428"', html)
         self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", html)
         self.assertIn(".dashboard-links {\n  display: grid;\n  grid-template-columns: 1fr", html)
-        self.assertIn("aspect-ratio: 1", html)
+        self.assertNotIn("aspect-ratio", html)
+        self.assertIn("min-height: 232px", html)
         self.assertIn("@media (max-width: 960px)", html)
         self.assertIn("@media (max-width: 560px)", html)
 

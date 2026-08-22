@@ -244,13 +244,22 @@ FLEET_CSS = """
   gap: 16px;
 }
 
+/* Cards size to their content; the grid row equalizes heights so a fleet of
+   mixed-length repo names still reads as a tidy matrix. */
 .repo-record {
   display: flex;
   min-width: 0;
-  aspect-ratio: 1;
+  min-height: 232px;
   margin: 0;
   flex-direction: column;
   overflow: hidden;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.repo-record:hover {
+  border-color: var(--border-bright);
+  border-left-color: var(--accent);
+  box-shadow: var(--shadow), inset 0 0 0 1px rgb(var(--accent-rgb) / 0.06);
 }
 
 .repo-top {
@@ -258,7 +267,7 @@ FLEET_CSS = """
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
-  padding-bottom: 10px;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -316,10 +325,18 @@ FLEET_CSS = """
   display: block;
   overflow: hidden;
   color: var(--accent);
-  font-size: 1.05rem;
-  font-weight: 500;
+  font-size: 1.02rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  text-decoration: none;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+a.repo-name:hover {
+  color: #ffffff;
+  text-decoration: underline;
+  text-decoration-color: currentColor;
 }
 
 .repo-path,
@@ -330,8 +347,12 @@ FLEET_CSS = """
   white-space: nowrap;
 }
 
+.repo-path {
+  font-size: 0.8rem;
+}
+
 .repo-details {
-  padding: 14px 0;
+  padding: 12px 0 14px;
 }
 
 .detail-label {
@@ -355,18 +376,22 @@ FLEET_CSS = """
 }
 
 .queue-box {
+  display: flex;
   min-width: 0;
-  padding: 9px 8px;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 8px 9px 7px;
   background: #080808;
   border: 1px solid var(--border);
-  border-radius: 2px;
+  border-radius: 3px;
 }
 
 .queue-count {
   display: block;
   margin-bottom: 2px;
   color: var(--ink);
-  font-size: 1.18rem;
+  font-size: 1.24rem;
+  font-weight: 700;
   line-height: 1.2;
 }
 
@@ -374,15 +399,21 @@ FLEET_CSS = """
   display: block;
   overflow: hidden;
   color: var(--muted);
-  font-size: 0.67rem;
-  letter-spacing: 0.03em;
-  line-height: 1.25;
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  line-height: 1.3;
   text-overflow: ellipsis;
   text-transform: uppercase;
 }
 
 .queue-box-ready .queue-count {
   color: var(--green);
+}
+
+/* An empty queue should recede; only real counts earn full contrast. */
+.queue-box-empty .queue-count {
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .dashboard-links {
@@ -394,23 +425,32 @@ FLEET_CSS = """
   border-top: 1px solid var(--border);
 }
 
+/* Ghost button: the card's accent bar already carries the colour, so the
+   call to action reads as a target rather than a slab of green. */
 .dashboard-links a {
   display: flex;
   min-height: 30px;
   align-items: center;
   justify-content: center;
   padding: 5px 7px;
-  background: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: 2px;
-  color: var(--bg);
-  font-size: 0.76rem;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
   line-height: 1.2;
   text-align: center;
+  text-decoration: none;
+  text-transform: uppercase;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
-.dashboard-links a:hover {
+.dashboard-links a:hover,
+.dashboard-links a:focus-visible {
   background: var(--accent-hover);
+  border-color: var(--accent-hover);
   color: var(--bg);
   text-decoration: none;
 }
@@ -639,6 +679,20 @@ def _footer_html(card: FleetCard, *, local_access: bool) -> str:
     return "".join(parts)
 
 
+def _queue_box_html(count: int, label: str, extra_class: str = "") -> str:
+    classes = ["queue-box"]
+    if extra_class:
+        classes.append(extra_class)
+    if not count:
+        classes.append("queue-box-empty")
+    return (
+        f'<div class="{" ".join(classes)}">'
+        f'<span class="queue-count">{count}</span>'
+        f'<span class="queue-label">{_esc(label)}</span>'
+        "</div>"
+    )
+
+
 def render_card(card: FleetCard, *, local_access: bool = True) -> str:
     """Return HTML for one fleet repository card."""
     return (
@@ -656,18 +710,9 @@ def render_card(card: FleetCard, *, local_access: bool = True) -> str:
         "</div>"
         "</div>"
         '<div class="queue-boxes">'
-        '<div class="queue-box queue-box-ready">'
-        f'<span class="queue-count">{card.ready_count}</span>'
-        '<span class="queue-label">Ready</span>'
-        "</div>"
-        '<div class="queue-box">'
-        f'<span class="queue-count">{card.recently_done_count}</span>'
-        '<span class="queue-label">Recently Done</span>'
-        "</div>"
-        '<div class="queue-box">'
-        f'<span class="queue-count">{card.icebox_count}</span>'
-        '<span class="queue-label">Icebox</span>'
-        "</div>"
+        f'{_queue_box_html(card.ready_count, "Ready", "queue-box-ready")}'
+        f'{_queue_box_html(card.recently_done_count, "Recently Done")}'
+        f'{_queue_box_html(card.icebox_count, "Icebox")}'
         "</div>"
         f"{_footer_html(card, local_access=local_access)}"
         "</article>"
