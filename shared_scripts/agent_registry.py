@@ -43,10 +43,27 @@ def _validate_command(command: Any, *, subject: str, require_model: bool = False
     return command
 
 
+def _reject_codex_review_uncommitted_with_prompt(command: list[str], *, subject: str) -> None:
+    """Current Codex CLI treats `review --uncommitted` and `[PROMPT]` as exclusive."""
+    if not command or command[0] != "codex":
+        return
+    if "review" not in command:
+        return
+    has_uncommitted = "--uncommitted" in command
+    has_prompt = any("{prompt}" in part for part in command)
+    if has_uncommitted and has_prompt:
+        raise ValueError(
+            f"{subject} cannot combine --uncommitted with {{prompt}}: "
+            "current Codex CLI treats those arguments as mutually exclusive"
+        )
+
+
 def _validate_optional_review_command(command: Any, *, subject: str, require_model: bool = False) -> list[str] | None:
     if command is None:
         return None
-    return _validate_command(command, subject=subject, require_model=require_model)
+    command = _validate_command(command, subject=subject, require_model=require_model)
+    _reject_codex_review_uncommitted_with_prompt(command, subject=subject)
+    return command
 
 
 def _validate_agent(entry: Any, seen: set[str]) -> tuple[str, list[str], str, list[str] | None]:

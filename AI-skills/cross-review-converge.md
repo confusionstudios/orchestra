@@ -46,9 +46,12 @@ Run only the review command for the selected `$reviewer`.
 Resolve the command through
 `agent_registry.resolve_review_agent_command(reviewer)`, then replace the
 single `{prompt}` placeholder with the review prompt. The shared resolver uses
-review-specific forms only when they are known to be sufficiently permissive,
-such as Codex `exec review --uncommitted`, and falls back to the normal agent
-command for providers without a review-specific template. Do not use restrictive
+review-specific forms only when they are known to be sufficiently permissive.
+Codex uses `exec review {prompt}`: current Codex treats `--uncommitted` and
+`[PROMPT]` as mutually exclusive, so the template keeps the prompt (required
+for the `OUTCOME:` contract). The review prompt tells the reviewer to inspect
+staged, unstaged, and untracked files. Providers without a review-specific
+template fall back to the normal agent command. Do not use restrictive
 ASK/read-only modes for agent CLIs; they tend to block necessary tool access.
 
 ```bash
@@ -84,7 +87,12 @@ substitute a different reviewer unless the user explicitly approves.
 
 The command example assumes a macOS/Linux shell with `perl`. If it is unavailable, use an equivalent shell-level timeout. Use a longer timeout when the diff is broad, schema-sensitive, or otherwise likely to require deeper context.
 
-The Codex review subcommand gathers staged, unstaged, and untracked changes.
+Codex `exec review "<prompt>"` is a custom-instruction review, not
+`--uncommitted`. The Orchestra review prompt, plus the explicit untracked-file
+list, is what scopes that review to staged, unstaged, and untracked changes.
+Do not add `--uncommitted` to a prompted Codex review; current Codex rejects
+that combination.
+
 Neither Codex, Claude, Cursor, Kilo, nor Antigravity is mechanically prevented from
 editing files in every environment, so the prompt must explicitly say `Do not
 edit files`. Do not compensate with restrictive ASK/read-only modes for agent

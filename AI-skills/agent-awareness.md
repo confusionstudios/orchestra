@@ -89,8 +89,10 @@ consume inherited stdin as additional prompt content. Use `python -c`, a
 script file, or another invocation that leaves the child process stdin clean.
 
 Skill-specific instructions override the generic registry command. In
-particular, `cross-review-converge` uses `codex exec review --uncommitted` for
-Codex review so the reviewer receives staged, unstaged, and untracked changes.
+particular, `cross-review-converge` uses `codex exec review {prompt}` for Codex
+review. Current Codex cannot combine `--uncommitted` with a custom prompt; the
+prompt (including an explicit untracked-file list) is what scopes the review to
+staged, unstaged, and untracked changes.
 
 For reviews, explicitly say:
 

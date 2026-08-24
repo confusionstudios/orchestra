@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -10928,6 +10929,24 @@ aliases:
             agent_registry.load_agent_aliases(path)
         self.assertIn("alias grok target not found: nope", str(raised.exception))
 
+    def test_codex_review_command_rejects_uncommitted_plus_prompt(self):
+        path = self._write_registry(
+            """
+providers: {}
+agents:
+  - key: codex
+    label: Codex
+    command: ["codex", "exec", "{prompt}"]
+    review_command: ["codex", "exec", "review", "--uncommitted", "{prompt}"]
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_review_commands(path)
+        self.assertIn(
+            "cannot combine --uncommitted with {prompt}",
+            str(raised.exception),
+        )
+
     def test_unknown_provider_target_is_rejected(self):
         path = self._write_registry(
             self._MINIMAL_REGISTRY
@@ -11067,8 +11086,40 @@ class TestCommitFooter(unittest.TestCase):
             [
                 "codex", "exec", "--model", "gpt-5.6-sol",
                 "-c", 'model_reasoning_effort="medium"',
-                "review", "--uncommitted", "{prompt}",
+                "review", "{prompt}",
             ],
+        )
+        self.assertNotIn(
+            "--uncommitted",
+            agent_registry.resolve_review_agent_command("codex"),
+        )
+
+    def test_codex_review_command_parses_against_installed_cli(self):
+        if shutil.which("codex") is None:
+            self.skipTest("codex CLI not installed")
+        template = agent_registry.resolve_review_agent_command("codex")
+        self.assertIsNotNone(template)
+        prompt_cmd = [
+            part.replace("{prompt}", "orchestra-parse-probe") for part in template
+        ]
+        probe = subprocess.run(
+            prompt_cmd + ["--___orchestra_parse_probe"],
+            capture_output=True,
+            text=True,
+        )
+        probe_text = f"{probe.stdout}\n{probe.stderr}"
+        self.assertNotIn("cannot be used with", probe_text)
+        self.assertIn("unexpected argument", probe_text.lower())
+
+        review_at = prompt_cmd.index("review")
+        conflict = subprocess.run(
+            prompt_cmd[: review_at + 1] + ["--uncommitted"] + prompt_cmd[review_at + 1 :],
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn(
+            "cannot be used with",
+            f"{conflict.stdout}\n{conflict.stderr}",
         )
 
     def test_codex_run_command_explicitly_sets_model_effort_and_preserves_yolo(self):
