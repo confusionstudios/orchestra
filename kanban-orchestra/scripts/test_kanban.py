@@ -10984,6 +10984,35 @@ aliases:
             agent_registry.load_agent_aliases(path)
         self.assertIn("alias cycle: grok -> grok", str(raised.exception))
 
+    def test_direct_claude_adhoc_commands_do_not_persist_sessions(self):
+        expected_models = {
+            "haiku": "haiku",
+            "sonnet": "sonnet",
+            "opus": "opus",
+            "fable": "fable",
+            "claude": "sonnet",
+        }
+        for key, model in expected_models.items():
+            with self.subTest(agent=key):
+                command = agent_registry.resolve_agent_command(key)
+                self.assertEqual(
+                    command,
+                    [
+                        "claude",
+                        "--model",
+                        model,
+                        "-p",
+                        "{prompt}",
+                        "--dangerously-skip-permissions",
+                        "--output-format",
+                        "text",
+                        "--no-session-persistence",
+                    ],
+                )
+                self.assertIn("--no-session-persistence", command)
+                self.assertNotIn("--remote-control", command)
+                self.assertNotIn("--cloud", command)
+
 
 class TestCommitFooter(unittest.TestCase):
     """Tests for get_agent_display_name() and task get-commit-footer subcommand."""
