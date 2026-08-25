@@ -1,4 +1,4 @@
-Use Kanban Orchestra in the current working repo.
+Use Kanban Orchestra in the current working repo. The Kanban Orchestra is a SERIAL task executor. You can queue many tasks in "ready" state: the Orchestra will execute them in order.
 
 ## Role check — read this first
 
