@@ -284,12 +284,12 @@ def _format_duration_hhmmss(seconds: int) -> str:
 
 
 def _done_elapsed_runtime(task: dict) -> str:
-    """Return done-task runtime from latest ready time to done, or a placeholder."""
-    ready_dt = _parse_utc_datetime(task.get("last_ready_at") or task.get("ready_at"))
+    """Return done-task runtime from first pickup through completion, or a placeholder."""
+    start_dt = _parse_utc_datetime(task.get("first_started_at"))
     done_dt = _parse_utc_datetime(task.get("done_at"))
-    if ready_dt is None or done_dt is None:
+    if start_dt is None or done_dt is None:
         return "unknown"
-    elapsed = int((done_dt - ready_dt).total_seconds())
+    elapsed = int((done_dt - start_dt).total_seconds())
     if elapsed < 0:
         return "unknown"
     return _format_duration_hhmmss(elapsed)
@@ -1309,7 +1309,7 @@ def render_recently_done(conn) -> str:
         return '<div class="card" id="recently-done"><h2>Recently Done</h2><p class="muted">Database not available.</p></div>'
     rows_raw = [dict(r) for r in conn.execute(
         "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent, "
-        "review_round, ready_at, last_ready_at, done_at FROM tasks "
+        "review_round, ready_at, last_ready_at, first_started_at, done_at FROM tasks "
         "WHERE status = 'done' ORDER BY updated_at DESC, id DESC"
     ).fetchall()]
     for row in rows_raw:

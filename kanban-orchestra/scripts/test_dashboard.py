@@ -1078,8 +1078,8 @@ class TestRecentlyDone(unittest.TestCase):
         tid = db.add_task(self.conn, "Runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="done")
         self.conn.execute(
-            "UPDATE tasks SET last_ready_at = ?, done_at = ? WHERE id = ?",
-            ("2026-05-31 10:00:00", "2026-05-31 12:03:04", tid),
+            "UPDATE tasks SET first_started_at = ?, last_ready_at = ?, done_at = ? WHERE id = ?",
+            ("2026-05-31 10:00:00", "2026-05-31 11:00:00", "2026-05-31 12:03:04", tid),
         )
         self.conn.commit()
 
@@ -1087,26 +1087,47 @@ class TestRecentlyDone(unittest.TestCase):
 
         self.assertIn("task-record-runtime", html)
         self.assertIn("02:03:04", html)
+        self.assertNotIn("01:03:04", html)
 
-    def test_recently_done_elapsed_runtime_uses_latest_ready_time(self):
+    def test_recently_done_elapsed_runtime_uses_first_pickup_time(self):
         tid = db.add_task(self.conn, "Requeued runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="ready")
         self.conn.execute(
             "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
-            ("2026-05-31 08:00:00", "2026-05-31 08:00:00", tid),
+            ("2026-08-25 03:00:00", "2026-08-25 03:00:00", tid),
         )
         self.conn.commit()
         db.update_task(self.conn, tid, status="running")
         db.update_task(self.conn, tid, status="ready")
         self.conn.execute(
-            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
-            ("2026-05-31 10:00:00", "2026-05-31 10:00:00", tid),
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ?, first_started_at = ? WHERE id = ?",
+            (
+                "2026-08-25 03:43:10",
+                "2026-08-25 03:43:10",
+                "2026-08-25 03:05:57",
+                tid,
+            ),
         )
         self.conn.commit()
         db.update_task(self.conn, tid, status="done")
         self.conn.execute(
             "UPDATE tasks SET done_at = ? WHERE id = ?",
-            ("2026-05-31 10:10:05", tid),
+            ("2026-08-25 03:44:18", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("00:38:21", html)
+        self.assertNotIn("00:01:08", html)
+        self.assertNotIn("00:44:18", html)
+
+    def test_recently_done_elapsed_runtime_excludes_initial_queue_wait(self):
+        tid = db.add_task(self.conn, "Queued runtime task", branch="feat-runtime")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET ready_at = NULL, last_ready_at = ?, first_started_at = ?, done_at = ? WHERE id = ?",
+            ("2026-05-31 08:00:00", "2026-05-31 10:00:00", "2026-05-31 10:10:05", tid),
         )
         self.conn.commit()
 
@@ -1115,12 +1136,13 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("00:10:05", html)
         self.assertNotIn("02:10:05", html)
 
-    def test_recently_done_elapsed_runtime_missing_timestamp_fallback(self):
+    def test_recently_done_elapsed_runtime_omits_queue_time_without_first_start(self):
         tid = db.add_task(self.conn, "Missing runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="done")
         self.conn.execute(
-            "UPDATE tasks SET last_ready_at = NULL WHERE id = ?",
-            (tid,),
+            "UPDATE tasks SET ready_at = NULL, last_ready_at = ?, first_started_at = NULL, "
+            "done_at = ? WHERE id = ?",
+            ("2026-05-31 10:00:00", "2026-05-31 10:10:00", tid),
         )
         self.conn.commit()
 
@@ -1128,6 +1150,7 @@ class TestRecentlyDone(unittest.TestCase):
 
         self.assertIn("Missing runtime task", html)
         self.assertNotIn("task-record-runtime", html)
+        self.assertNotIn("00:10:00", html)
         self.assertNotIn(">unknown<", html)
 
     def test_recently_done_shows_finished_after_runtime_from_done_at(self):
@@ -1137,8 +1160,8 @@ class TestRecentlyDone(unittest.TestCase):
             "%Y-%m-%d %H:%M:%S"
         )
         self.conn.execute(
-            "UPDATE tasks SET last_ready_at = ?, done_at = ?, updated_at = ? WHERE id = ?",
-            ("2026-01-01 00:00:00", done_at, "2026-01-01 00:00:00", tid),
+            "UPDATE tasks SET first_started_at = ?, last_ready_at = ?, done_at = ?, updated_at = ? WHERE id = ?",
+            ("2026-01-01 00:00:00", "2026-01-01 00:00:00", done_at, "2026-01-01 00:00:00", tid),
         )
         self.conn.commit()
 
@@ -1301,8 +1324,8 @@ class TestTaskRecordLists(unittest.TestCase):
                 commit_hash=f"{i:08x}deadbeef",
             )
             self.conn.execute(
-                "UPDATE tasks SET last_ready_at = ?, done_at = ? WHERE id = ?",
-                ("2026-05-31 10:00:00", "2026-05-31 10:05:00", tid),
+                "UPDATE tasks SET first_started_at = ?, last_ready_at = ?, done_at = ? WHERE id = ?",
+                ("2026-05-31 10:00:00", "2026-05-31 10:00:00", "2026-05-31 10:05:00", tid),
             )
         self.conn.commit()
         first_id = 1

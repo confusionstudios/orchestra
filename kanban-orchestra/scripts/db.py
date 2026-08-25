@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     ready_at                DATETIME DEFAULT NULL,
     last_ready_at           DATETIME DEFAULT NULL,
+    first_started_at        DATETIME DEFAULT NULL,
     done_at                 DATETIME DEFAULT NULL,
     updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     kind                    TEXT NOT NULL DEFAULT 'commit'
@@ -434,6 +435,7 @@ def _tasks_value_expr(task_cols: set[str]) -> dict[str, str]:
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
         "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
+        "first_started_at": "first_started_at" if "first_started_at" in task_cols else "NULL",
         "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
         "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
         "kind": "kind" if "kind" in task_cols else "'commit'",
@@ -475,6 +477,7 @@ def _tasks_create_table_sql(table_name: str = "tasks_migrated") -> str:
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 ready_at                DATETIME DEFAULT NULL,
                 last_ready_at           DATETIME DEFAULT NULL,
+                first_started_at        DATETIME DEFAULT NULL,
                 done_at                 DATETIME DEFAULT NULL,
                 updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 kind                    TEXT NOT NULL DEFAULT 'commit'
@@ -632,6 +635,9 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
     if not task_cols:
         return  # Fresh DB — no tables yet
 
+    # Capture before table-recreation migrations that introduce the column.
+    needs_first_started_at_legacy_fallback = "first_started_at" not in task_cols
+
     if "skip_commit_plan" in task_cols:
         _migrate_skip_commit_plan_tasks(conn, task_cols)
         task_cols = {
@@ -701,6 +707,20 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN done_at DATETIME DEFAULT NULL")
         conn.execute("UPDATE tasks SET done_at = updated_at WHERE status = 'done'")
         conn.commit()
+        task_cols.add("done_at")
+    if "first_started_at" not in task_cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN first_started_at DATETIME DEFAULT NULL"
+        )
+        conn.commit()
+        task_cols.add("first_started_at")
+
+    # Refresh after ALTER TABLE so later table-recreation migrations copy
+    # newly added timestamp columns instead of inserting NULL placeholders.
+    task_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
 
     # The task_skips table must exist and its step CHECK constraint must be current.
     skips_schema = conn.execute(
@@ -817,6 +837,67 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
                 ALTER TABLE comments_migrated RENAME TO comments;
                 COMMIT;
             """)
+
+    _backfill_first_started_at(
+        conn, use_legacy_fallback=needs_first_started_at_legacy_fallback
+    )
+    conn.commit()
+
+
+def _backfill_first_started_at(conn, *, use_legacy_fallback=False, task_ids=None):
+    """Fill missing first_started_at from run_log, optionally with a legacy fallback.
+
+    Prefer the earliest retained task run_log row (first actual pickup). The
+    last_ready_at/ready_at fallback is only for the one-time missing-column
+    migration and legacy-source import. Current-schema reconnects must not
+    treat queue timestamps as a start time, including blocked tasks that have
+    not yet transitioned to running.
+    """
+    task_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    if "first_started_at" not in task_cols:
+        return
+    id_clause = ""
+    id_params = []
+    if task_ids is not None:
+        if not task_ids:
+            return
+        id_clause = f" AND tasks.id IN ({', '.join('?' for _ in task_ids)})"
+        id_params = list(task_ids)
+    tables = set(_list_user_tables(conn))
+    if "run_log" in tables:
+        conn.execute(
+            f"""
+            UPDATE tasks
+            SET first_started_at = (
+                SELECT MIN(created_at) FROM run_log WHERE run_log.task_id = tasks.id
+            )
+            WHERE first_started_at IS NULL
+              AND EXISTS (SELECT 1 FROM run_log WHERE run_log.task_id = tasks.id)
+              {id_clause}
+            """,
+            id_params,
+        )
+    if not use_legacy_fallback:
+        return
+    fallback_cols = [
+        column
+        for column in ("last_ready_at", "ready_at")
+        if column in task_cols
+    ]
+    if fallback_cols:
+        conn.execute(
+            f"""
+            UPDATE tasks
+            SET first_started_at = COALESCE({", ".join(fallback_cols)})
+            WHERE first_started_at IS NULL
+              AND status IN ('running', 'blocked', 'done', 'pending_subtasks')
+              {id_clause}
+            """,
+            id_params,
+        )
 
 
 def _row_to_task(row):
@@ -963,7 +1044,7 @@ def list_tasks(
 ):
     query = (
         "SELECT id, title, status, next_step, branch, coder_agent, reviewer_agent, "
-        "review_round, created_at, ready_at, last_ready_at, done_at, updated_at, "
+        "review_round, created_at, ready_at, last_ready_at, first_started_at, done_at, updated_at, "
         "kind, parent_task_id, sequence_index, allow_when_blocked "
         "FROM tasks WHERE 1=1"
     )
@@ -1004,7 +1085,7 @@ def update_task(conn, task_id, **fields):
         "title", "description", "status", "next_step", "branch",
         "commit_hash", "stash_ref", "coder_agent", "reviewer_agent",
         "review_round", "max_review_rounds", "last_review_decision", "ready_at",
-        "last_ready_at", "done_at",
+        "last_ready_at", "first_started_at", "done_at",
         "sequence_index", "commit_plan", "follow_up_task_id",
         "allow_when_blocked", "block_reason", "resume_next_step",
     }
@@ -1013,7 +1094,7 @@ def update_task(conn, task_id, **fields):
         raise ValueError(f"Cannot update fields: {bad}")
     if "status" in fields:
         current = conn.execute(
-            "SELECT status, ready_at, done_at FROM tasks WHERE id = ?",
+            "SELECT status, ready_at, done_at, first_started_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if current:
@@ -1030,6 +1111,12 @@ def update_task(conn, task_id, **fields):
                         fields["done_at"] = "CURRENT_TIMESTAMP"
                 else:
                     fields["done_at"] = None
+            if (
+                new_status == "running"
+                and current["first_started_at"] is None
+                and "first_started_at" not in fields
+            ):
+                fields["first_started_at"] = "CURRENT_TIMESTAMP"
     fields["updated_at"] = "CURRENT_TIMESTAMP"
     sets = []
     params = []
@@ -1779,6 +1866,7 @@ _IMPORT_TASK_COLUMNS = (
     "created_at",
     "ready_at",
     "last_ready_at",
+    "first_started_at",
     "done_at",
     "updated_at",
     "kind",
@@ -1826,7 +1914,10 @@ def _validate_import_source(conn: sqlite3.Connection) -> None:
     task_cols = {
         row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
     }
-    required = {"id", *_IMPORT_TASK_COLUMNS, "parent_task_id", "follow_up_task_id"}
+    required = (
+        {"id", *_IMPORT_TASK_COLUMNS, "parent_task_id", "follow_up_task_id"}
+        - {"first_started_at"}
+    )
     missing_cols = sorted(required - task_cols)
     if missing_cols:
         raise ValueError(
@@ -1837,7 +1928,8 @@ def _validate_import_source(conn: sqlite3.Connection) -> None:
 
 def _normalize_imported_task_fields(row: sqlite3.Row) -> tuple[dict, str | None]:
     """Copy task fields and normalize unfinished tasks to status none."""
-    data = {col: row[col] for col in _IMPORT_TASK_COLUMNS}
+    source_keys = set(row.keys())
+    data = {col: row[col] for col in _IMPORT_TASK_COLUMNS if col in source_keys}
     source_branch = data.get("branch")
     if data.get("status") != "done":
         data["status"] = "none"
@@ -2000,6 +2092,15 @@ def import_worktree_database(
             if source_db.stat().st_mtime_ns != source_mtime_ns:
                 raise RuntimeError("Source database was modified during import")
 
+            source_has_first_started_at = "first_started_at" in {
+                row["name"]
+                for row in source_conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            _backfill_first_started_at(
+                target_conn,
+                use_legacy_fallback=not source_has_first_started_at,
+                task_ids=list(id_map.values()),
+            )
             target_conn.commit()
         except Exception:
             target_conn.rollback()

@@ -199,6 +199,9 @@ class TestDB(unittest.TestCase):
         self.assertEqual(task["stash_ref"], "stash@{0}")
         self.assertIsNotNone(task["ready_at"])
         self.assertEqual(task["last_ready_at"], task["ready_at"])
+        self.assertIsNone(task["first_started_at"])
+        listed = db.list_tasks(self.conn)[0]
+        self.assertIsNone(listed["first_started_at"])
 
     def test_update_task_status_transitions_manage_ready_at(self):
         tid = db.add_task(self.conn, "Queue transitions", branch="feat-q")
@@ -213,23 +216,36 @@ class TestDB(unittest.TestCase):
         db.update_task(self.conn, tid, coder_agent="codex")
         still_ready = db.get_task(self.conn, tid)
         self.assertEqual(still_ready["ready_at"], "2000-01-01 00:00:00")
+        self.assertIsNone(still_ready["first_started_at"])
 
         db.update_task(self.conn, tid, status="running")
         running = db.get_task(self.conn, tid)
         self.assertIsNone(running["ready_at"])
         self.assertEqual(running["last_ready_at"], still_ready["last_ready_at"])
+        self.assertIsNotNone(running["first_started_at"])
         self.assertIsNone(running["done_at"])
+        first_started_at = running["first_started_at"]
 
         db.update_task(self.conn, tid, status="ready")
         requeued = db.get_task(self.conn, tid)
         self.assertIsNotNone(requeued["ready_at"])
         self.assertNotEqual(requeued["ready_at"], "2000-01-01 00:00:00")
         self.assertEqual(requeued["last_ready_at"], requeued["ready_at"])
+        self.assertEqual(requeued["first_started_at"], first_started_at)
 
+        db.update_task(self.conn, tid, status="running")
+        rerunning = db.get_task(self.conn, tid)
+        self.assertEqual(rerunning["first_started_at"], first_started_at)
+
+        db.update_task(self.conn, tid, status="blocked")
+        blocked = db.get_task(self.conn, tid)
+        self.assertEqual(blocked["first_started_at"], first_started_at)
+
+        db.update_task(self.conn, tid, status="ready")
         db.update_task(self.conn, tid, status="done")
         done = db.get_task(self.conn, tid)
         self.assertIsNone(done["ready_at"])
-        self.assertEqual(done["last_ready_at"], requeued["last_ready_at"])
+        self.assertEqual(done["first_started_at"], first_started_at)
         self.assertIsNotNone(done["done_at"])
 
     def test_orchestrator_log_path_lives_under_repo_runtime_dir(self):
@@ -615,8 +631,10 @@ class TestDB(unittest.TestCase):
                 complete = db.get_task(migrated, 2)
                 self.assertEqual(queued["last_ready_at"], "2026-05-31 10:00:00")
                 self.assertIsNone(queued["done_at"])
+                self.assertIsNone(queued["first_started_at"])
                 self.assertIsNone(complete["last_ready_at"])
                 self.assertEqual(complete["done_at"], "2026-05-31 11:00:00")
+                self.assertIsNone(complete["first_started_at"])
             finally:
                 migrated.close()
         finally:
@@ -624,6 +642,167 @@ class TestDB(unittest.TestCase):
                 path = tmp.name + suffix
                 if os.path.exists(path):
                     os.unlink(path)
+
+    def test_missing_first_started_at_is_backfilled_from_run_log(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            legacy = sqlite3.connect(tmp.name)
+            legacy.execute(
+                """CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT NOT NULL DEFAULT 'none'
+                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
+                    next_step TEXT NOT NULL DEFAULT 'commit-make'
+                        CHECK(next_step IN ('commit-make', 'commit-review',
+                                            'commit-make-supertask', 'commit-review-supertask',
+                                            'commit-plan', 'commit-plan-review',
+                                            'pull-request-make', 'pull-request-review',
+                                            'other-make', 'other-review', 'none')),
+                    branch TEXT,
+                    commit_hash TEXT,
+                    stash_ref TEXT,
+                    coder_agent TEXT,
+                    reviewer_agent TEXT,
+                    review_round INTEGER DEFAULT 0,
+                    last_review_decision TEXT DEFAULT 'none',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ready_at DATETIME DEFAULT NULL,
+                    last_ready_at DATETIME DEFAULT NULL,
+                    done_at DATETIME DEFAULT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL DEFAULT 'commit'
+                        CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
+                    parent_task_id INTEGER REFERENCES tasks(id),
+                    sequence_index INTEGER,
+                    commit_plan TEXT,
+                    follow_up_task_id INTEGER REFERENCES tasks(id),
+                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE task_skips (
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    step TEXT NOT NULL
+                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
+                                       'commit-review-supertask','pull-request-review','other-review')),
+                    PRIMARY KEY (task_id, step)
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE run_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER REFERENCES tasks(id),
+                    verb TEXT,
+                    author TEXT,
+                    message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, last_ready_at, done_at) "
+                "VALUES ('multi-round', 'done', 'none', "
+                "'2026-08-25 03:43:10', '2026-08-25 03:44:18')"
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, last_ready_at, done_at) "
+                "VALUES ('legacy-no-log', 'done', 'none', "
+                "'2026-05-31 10:00:00', '2026-05-31 10:10:00')"
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, ready_at, last_ready_at) "
+                "VALUES ('still-queued', 'ready', 'commit-make', "
+                "'2026-05-31 08:00:00', '2026-05-31 08:00:00')"
+            )
+            legacy.execute(
+                "INSERT INTO run_log (task_id, verb, author, message, created_at) "
+                "VALUES (1, 'commit-make', 'orchestrator', 'Starting commit-make', "
+                "'2026-08-25 03:05:57')"
+            )
+            legacy.execute(
+                "INSERT INTO run_log (task_id, verb, author, message, created_at) "
+                "VALUES (1, 'commit-make', 'orchestrator', 'Starting commit-make', "
+                "'2026-08-25 03:43:10')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            migrated = db.connect(tmp.name)
+            try:
+                multi = db.get_task(migrated, 1)
+                legacy_done = db.get_task(migrated, 2)
+                queued = db.get_task(migrated, 3)
+                self.assertEqual(multi["first_started_at"], "2026-08-25 03:05:57")
+                self.assertEqual(legacy_done["first_started_at"], "2026-05-31 10:00:00")
+                self.assertIsNone(queued["first_started_at"])
+            finally:
+                migrated.close()
+        finally:
+            for suffix in ("", "-shm", "-wal"):
+                path = tmp.name + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_current_schema_blocked_before_running_does_not_inherit_queue_time_on_reconnect(self):
+        """Ready → blocked (never running) must not treat last_ready_at as a start.
+
+        process_pinned_task can block a ready task before the pickup update.
+        Reconnect must leave first_started_at NULL so the later running
+        transition records the real start instead of initial queue wait.
+        """
+        tid = db.add_task(self.conn, "Blocked before pickup", branch="master")
+        db.update_task(self.conn, tid, status="ready")
+        queue_time = "2026-05-31 08:00:00"
+        self.conn.execute(
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
+            (queue_time, queue_time, tid),
+        )
+        self.conn.commit()
+        db.update_task(self.conn, tid, status="blocked")
+        blocked = db.get_task(self.conn, tid)
+        self.assertIsNone(blocked["first_started_at"])
+        self.assertEqual(blocked["last_ready_at"], queue_time)
+
+        self.conn.close()
+        self.conn = db.connect(self.tmp.name)
+        after_reconnect = db.get_task(self.conn, tid)
+        self.assertEqual(after_reconnect["status"], "blocked")
+        self.assertIsNone(after_reconnect["first_started_at"])
+        self.assertEqual(after_reconnect["last_ready_at"], queue_time)
+
+        db.update_task(self.conn, tid, status="ready")
+        db.update_task(self.conn, tid, status="running")
+        running = db.get_task(self.conn, tid)
+        self.assertIsNotNone(running["first_started_at"])
+        self.assertNotEqual(running["first_started_at"], queue_time)
+
+    def test_current_schema_reconnect_still_backfills_first_started_at_from_run_log(self):
+        tid = db.add_task(self.conn, "Needs run-log recovery", branch="feat-rt")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET first_started_at = NULL, last_ready_at = ?, done_at = ? "
+            "WHERE id = ?",
+            ("2026-08-25 03:43:10", "2026-08-25 03:44:18", tid),
+        )
+        db.add_run_log(
+            self.conn,
+            tid,
+            "Starting commit-make",
+            verb="commit-make",
+            author="orchestrator",
+        )
+        self.conn.execute(
+            "UPDATE run_log SET created_at = ? WHERE task_id = ?",
+            ("2026-08-25 03:05:57", tid),
+        )
+        self.conn.commit()
+
+        self.conn.close()
+        self.conn = db.connect(self.tmp.name)
+        recovered = db.get_task(self.conn, tid)
+        self.assertEqual(recovered["first_started_at"], "2026-08-25 03:05:57")
 
     def test_skip_commit_plan_column_migrates_to_task_skips(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -3996,6 +4175,7 @@ class TestImportWorktree(unittest.TestCase):
             done_id,
             status="done",
             commit_hash="abc123",
+            first_started_at="2026-01-02 11:00:00",
             done_at="2026-01-02 12:00:00",
         )
         db.add_comment(
@@ -4061,10 +4241,12 @@ class TestImportWorktree(unittest.TestCase):
         self.assertEqual(child["status"], "none")
         self.assertIsNone(child["ready_at"])
         self.assertIsNone(child["stash_ref"])
+        self.assertIsNotNone(child["first_started_at"])
         self.assertEqual(parent["status"], "none")
         self.assertEqual(follow["status"], "none")
         self.assertEqual(done["status"], "done")
         self.assertEqual(done["commit_hash"], "abc123")
+        self.assertEqual(done["first_started_at"], "2026-01-02 11:00:00")
         self.assertEqual(child["skips"], ["commit-plan"])
 
         comments = db.get_comments(self.target_conn, new_child)
@@ -4084,6 +4266,28 @@ class TestImportWorktree(unittest.TestCase):
         after = Path(self.source_db).stat()
         self.assertEqual(after.st_mtime_ns, source_stat.st_mtime_ns)
         self.assertEqual(db.get_task(self.source_conn, ids["child_id"])["status"], "ready")
+
+    def test_import_does_not_backfill_target_blocked_never_started_from_queue_time(self):
+        tid = db.add_task(
+            self.target_conn, "Blocked before pickup", branch="master"
+        )
+        db.update_task(self.target_conn, tid, status="ready")
+        queue_time = "2026-05-31 08:00:00"
+        self.target_conn.execute(
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
+            (queue_time, queue_time, tid),
+        )
+        self.target_conn.commit()
+        db.update_task(self.target_conn, tid, status="blocked")
+        self.assertIsNone(db.get_task(self.target_conn, tid)["first_started_at"])
+
+        self._seed_source_graph()
+        db.import_worktree_database(self.target_conn, self.source_root)
+
+        blocked = db.get_task(self.target_conn, tid)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIsNone(blocked["first_started_at"])
+        self.assertEqual(blocked["last_ready_at"], queue_time)
 
     def test_import_cli_prints_id_map(self):
         db.add_task(self.target_conn, "Keep me")
@@ -9473,6 +9677,7 @@ class TestPickupRuntimeStep(unittest.TestCase):
         blocked = db.get_task(self.conn, tid)
         self.assertEqual(blocked["status"], "blocked")
         self.assertEqual(blocked["next_step"], "none")
+        self.assertIsNone(blocked["first_started_at"])
         comments = db.get_comments(self.conn, tid)
         self.assertEqual(len(comments), 1)
         self.assertIn("Tasks on master/main are disabled by default", comments[0]["message"])

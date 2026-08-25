@@ -173,6 +173,7 @@ Important columns:
 - `last_review_decision`
 - `ready_at`
 - `last_ready_at`
+- `first_started_at`
 - `done_at`
 - `kind`
 - `parent_task_id`
@@ -181,6 +182,17 @@ Important columns:
 - `allow_when_blocked`
 - `block_reason`
 - `resume_next_step`
+
+Task timestamps:
+
+- `created_at`: row creation time.
+- `ready_at`: time the task entered the current ready-queue wait. Cleared when the task leaves `ready`.
+- `last_ready_at`: most recent time the task entered `ready`, including internal requeues between build, review, rework, and finalization.
+- `first_started_at`: first status transition to `running` (first actual pickup). This is the durable wall-clock runtime start. It is not set while the task is waiting in the initial ready queue, and later requeues or blocked/resumed lifecycle steps do not reset it. Missing values are recovered from the earliest retained `run_log` row when one exists. The `last_ready_at`/`ready_at` fallback applies only during the one-time missing-column migration and when importing a legacy source that lacks `first_started_at`.
+- `done_at`: terminal completion time.
+- `updated_at`: last task-row mutation.
+
+Dashboard elapsed runtime for a done task is `done_at - first_started_at`. That span excludes initial queue wait and includes internal requeues and blocked time through completion.
 
 #### `task_skips`
 
