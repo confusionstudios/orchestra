@@ -174,15 +174,21 @@ def accent_bootstrap_script(identity: str) -> str:
 
 def accent_picker_html() -> str:
     """Return the shared accessible accent picker markup."""
-    options = "".join(
-        f'<option value="{_esc(name)}">{_esc(values["label"])}</option>'
-        for name, values in ACCENT_PALETTE.items()
-    )
+    chits = []
+    for name, values in ACCENT_PALETTE.items():
+        label = _esc(values["label"])
+        color = _esc(values["color"])
+        chits.append(
+            f'<label class="accent-chit" title="{label}" style="--chit-color: {color}">'
+            f'<input type="radio" name="accent" value="{_esc(name)}" aria-label="{label}">'
+            '<span class="accent-chit-swatch" aria-hidden="true"></span>'
+            "</label>"
+        )
     return (
-        '<div class="accent-picker">'
-        '<label for="orchestra-accent-picker">Accent</label>'
-        f'<select id="orchestra-accent-picker" name="accent">{options}</select>'
-        '</div>'
+        '<div class="accent-picker" id="orchestra-accent-picker" '
+        'role="radiogroup" aria-label="Accent">'
+        + "".join(chits)
+        + "</div>"
     )
 
 
@@ -193,12 +199,18 @@ def accent_picker_script(identity: str) -> str:
   const picker = document.getElementById("orchestra-accent-picker");
   const state = window.__orchestraAccent;
   if (!picker || !state) return;
-  picker.value = state.name;
-  picker.addEventListener("change", () => {{
-    if (!Object.prototype.hasOwnProperty.call(state.palette, picker.value)) {{
-      picker.value = "{DEFAULT_ACCENT}";
-    }}
-    document.cookie = "{cookie_name}=" + encodeURIComponent(picker.value)
+  const inputs = picker.querySelectorAll('input[name="accent"]');
+  const apply = (requested) => {{
+    const name = Object.prototype.hasOwnProperty.call(state.palette, requested)
+      ? requested : "{DEFAULT_ACCENT}";
+    inputs.forEach((input) => {{ input.checked = input.value === name; }});
+    return name;
+  }};
+  apply(state.name);
+  picker.addEventListener("change", (event) => {{
+    if (!event.target || event.target.name !== "accent") return;
+    const name = apply(event.target.value);
+    document.cookie = "{cookie_name}=" + encodeURIComponent(name)
       + "; Path=/; Max-Age=31536000; SameSite=Lax";
     window.location.reload();
   }});
@@ -1868,25 +1880,65 @@ nav a:hover { color: #ffffff; text-decoration: none; }
 .accent-picker {
   display: flex;
   flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  color: var(--muted);
-  font-size: 0.78rem;
+  max-width: 100%;
 }
 
-.accent-picker select {
-  max-width: 8.5rem;
-  border: 1px solid var(--accent-dim);
-  border-radius: 2px;
-  padding: 3px 22px 3px 6px;
-  background: #111111;
-  color: var(--accent);
-  font: inherit;
+.accent-chit {
+  position: relative;
+  display: block;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  cursor: pointer;
 }
 
-.accent-picker select:focus-visible {
+.accent-chit input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.accent-chit-swatch {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--chit-color);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.18);
+}
+
+.accent-chit input:checked + .accent-chit-swatch {
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.18),
+    0 0 0 2px #050505,
+    0 0 0 4px #f5f5f5;
+}
+
+.accent-chit input:checked + .accent-chit-swatch::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: 5px;
+  height: 8px;
+  border: solid #0c0c0c;
+  border-width: 0 2px 2px 0;
+  transform: translate(-50%, -55%) rotate(45deg);
+}
+
+.accent-chit input:focus-visible + .accent-chit-swatch {
   outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline-offset: 3px;
 }
 
 h1 {

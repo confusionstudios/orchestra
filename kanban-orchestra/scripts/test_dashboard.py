@@ -273,16 +273,38 @@ class TestPageShell(unittest.TestCase):
     def test_page_shell_applies_allowlisted_cookie_before_styles_and_renders_accessible_picker(self):
         html = dashboard._page_shell("Title", "<p>Body</p>")
         cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
+        picker_html = dashboard.accent_picker_html()
 
         self.assertLess(html.index(cookie), html.index("<style>"))
         self.assertIn('Object.prototype.hasOwnProperty.call(palette, requested)', html)
         self.assertIn(f'? requested : "{dashboard.DEFAULT_ACCENT}"', html)
-        self.assertIn('<label for="orchestra-accent-picker">Accent</label>', html)
-        self.assertIn('<select id="orchestra-accent-picker" name="accent">', html)
+        self.assertIn(picker_html, html)
+        self.assertIn(
+            'id="orchestra-accent-picker" role="radiogroup" aria-label="Accent"',
+            html,
+        )
+        self.assertNotIn("<select", html)
+        self.assertNotIn("<option", html)
         self.assertNotIn('type="color"', html)
         self.assertNotIn("orchestra_accent=", html)
+        self.assertIn(".accent-chit input:checked + .accent-chit-swatch", html)
+        self.assertIn(".accent-chit input:checked + .accent-chit-swatch::after", html)
+        self.assertIn(".accent-chit input:focus-visible + .accent-chit-swatch", html)
+        self.assertIn("input.checked = input.value === name", html)
+        self.assertEqual(html.count('class="accent-chit"'), len(dashboard.ACCENT_PALETTE))
         for name, accent in dashboard.ACCENT_PALETTE.items():
-            self.assertIn(f'<option value="{name}">{accent["label"]}</option>', html)
+            with self.subTest(accent=name):
+                self.assertIn(
+                    f'<label class="accent-chit" title="{accent["label"]}" '
+                    f'style="--chit-color: {accent["color"]}">',
+                    html,
+                )
+                self.assertIn(
+                    f'<input type="radio" name="accent" value="{name}" '
+                    f'aria-label="{accent["label"]}">',
+                    html,
+                )
+                self.assertNotIn(f'>{accent["label"]}<', html)
 
     def test_picker_persists_host_only_cross_port_cookie(self):
         html = dashboard._page_shell("Title", "<p>Body</p>")
@@ -2671,8 +2693,16 @@ class TestOverviewPage(unittest.TestCase):
                 resp = client.get(path)
                 self.assertEqual(resp.status_code, 200)
                 self.assertIn('id="orchestra-accent-picker"', resp.text)
+                self.assertIn('role="radiogroup"', resp.text)
+                self.assertIn('class="accent-chit"', resp.text)
+                self.assertNotIn("<select", resp.text)
                 self.assertIn(f"{cookie}=", resp.text)
                 self.assertNotIn("orchestra_accent=", resp.text)
+                for name, accent in dashboard.ACCENT_PALETTE.items():
+                    self.assertIn(f'value="{name}"', resp.text)
+                    self.assertIn(f'aria-label="{accent["label"]}"', resp.text)
+                    self.assertIn(f'title="{accent["label"]}"', resp.text)
+                    self.assertIn(f"--chit-color: {accent['color']}", resp.text)
 
     def test_overview_timezone_note_moves_to_bottom(self):
         from fastapi.testclient import TestClient

@@ -434,14 +434,37 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn(f"{cookie}=", html)
         self.assertNotIn(f"{repo_cookie}=", html)
         self.assertNotIn("orchestra_accent=", html)
-        self.assertIn('<label for="orchestra-accent-picker">Accent</label>', html)
-        self.assertIn('<select id="orchestra-accent-picker" name="accent">', html)
+        self.assertIn(dashboard.accent_picker_html(), html)
+        self.assertIn(
+            'id="orchestra-accent-picker" role="radiogroup" aria-label="Accent"',
+            html,
+        )
+        self.assertNotIn("<select", html)
+        self.assertNotIn("<option", html)
         self.assertIn("; Path=/; Max-Age=31536000; SameSite=Lax", html)
         self.assertNotIn("; Domain=", html)
         self.assertNotIn("localStorage", html)
         self.assertIn("flex-wrap: wrap", html)
         self.assertIn("var(--accent-soft)", html)
         self.assertIn("var(--accent-hover)", html)
+        self.assertIn(".accent-chit input:checked + .accent-chit-swatch", html)
+        self.assertIn(".accent-chit input:checked + .accent-chit-swatch::after", html)
+        self.assertIn(".accent-chit input:focus-visible + .accent-chit-swatch", html)
+        self.assertIn("input.checked = input.value === name", html)
+        self.assertEqual(html.count('class="accent-chit"'), len(dashboard.ACCENT_PALETTE))
+        for name, accent in dashboard.ACCENT_PALETTE.items():
+            with self.subTest(accent=name):
+                self.assertIn(
+                    f'<label class="accent-chit" title="{accent["label"]}" '
+                    f'style="--chit-color: {accent["color"]}">',
+                    html,
+                )
+                self.assertIn(
+                    f'<input type="radio" name="accent" value="{name}" '
+                    f'aria-label="{accent["label"]}">',
+                    html,
+                )
+                self.assertNotIn(f'>{accent["label"]}<', html)
 
     def test_fleet_accent_does_not_replace_semantic_status_tokens(self):
         html = _get_fleet_page(_page_card(status="blocked")).text
