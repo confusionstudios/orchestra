@@ -11810,7 +11810,9 @@ class TestAgentPingACKGate(unittest.TestCase):
         mock_proc.pid = 99
         if read_side_effect is None:
             remaining = list(chunks or [b""])
-            read_side_effect = lambda *_a: remaining.pop(0) if remaining else b""
+
+            def read_side_effect(*_args):
+                return remaining.pop(0) if remaining else b""
 
         with patch.object(agent_runner.subprocess, "Popen", return_value=mock_proc), \
              patch.object(agent_runner.select, "select", return_value=([stdout], [], [])), \
