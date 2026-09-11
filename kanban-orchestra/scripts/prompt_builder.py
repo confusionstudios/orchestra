@@ -10,6 +10,8 @@ import repo_policy
 
 DEFAULT_CODER = config.DEFAULT_CODER
 DEFAULT_REVIEWER = config.DEFAULT_REVIEWER
+DEFAULT_SUPER_PLANNER = config.DEFAULT_SUPER_PLANNER
+DEFAULT_SUPER_REVIEWER = config.DEFAULT_SUPER_REVIEWER
 MAX_PRIOR_COMMENTS = config.MAX_PRIOR_COMMENTS
 MASTER_BRANCHES = {"master", "main"}
 GITHUB_PR_URL_RE = re.compile(r"https://github\.com/[^\s/]+/[^\s/]+/pull/\d+")
@@ -30,9 +32,16 @@ def _repo_root():
         return "(unknown — run: git rev-parse --show-toplevel)"
 
 
+def _task_coder(task):
+    """Return the maker/planner agent configured for a task."""
+    fallback = DEFAULT_SUPER_PLANNER if task.get("kind") == "supertask" else DEFAULT_CODER
+    return task.get("coder_agent") or fallback
+
+
 def _task_reviewer(task):
-    """Return the code-review agent configured for a task."""
-    return task.get("reviewer_agent") or DEFAULT_REVIEWER
+    """Return the reviewer agent configured for a task."""
+    fallback = DEFAULT_SUPER_REVIEWER if task.get("kind") == "supertask" else DEFAULT_REVIEWER
+    return task.get("reviewer_agent") or fallback
 
 
 def _build_reviewer_handoff(task, comments, skip_build_policy=False):
@@ -44,8 +53,9 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
     complete context and do not need to rediscover the environment or rerun
     the maker's validation steps.
 
-    skip_build_policy: when True, the repo has SKIP_BUILD_UNTIL_APPROVED enabled,
-    so a deferred validation result is expected and normal.
+    skip_build_policy: when True, the repo has the
+    CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER policy enabled, so a
+    deferred validation result is expected and normal.
     """
     repo_root = _repo_root()
     # Extract the most recent commit-message comment (the maker's summary)
@@ -71,8 +81,9 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
         )
     elif skip_build_policy:
         validation_summary = (
-            "*(no full-build validation recorded — this repo has `SKIP_BUILD_UNTIL_APPROVED: true` "
-            "in `AGENTS.md`, so the full build is intentionally deferred to "
+            "*(no full-build validation recorded — this repo has the standalone "
+            "`CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` marker in "
+            "`AGENTS.md`, so the full build is intentionally deferred to "
             "`commit-make` finalization. The missing full-build result (e.g. test suite output) "
             "is expected here. The maker is still required to have recorded a deferred-validation "
             "comment explicitly stating that the full build was intentionally skipped — if that "
@@ -82,7 +93,7 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
         validation_summary = "*(no validation comment recorded — maker may not have run the build)*"
 
     policy_note = (
-        "\n> **Repo policy:** `SKIP_BUILD_UNTIL_APPROVED: true` — full-build validation is "
+        "\n> **Repo policy:** `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` — full-build validation is "
         "deferred to post-approval `commit-make` finalization. You are reviewing the diff without "
         "a full-build result. If the maker recorded a deferred-validation comment, that is "
         "expected and correct per repo policy.\n"
@@ -102,6 +113,57 @@ def _build_reviewer_handoff(task, comments, skip_build_policy=False):
 Do **not** rerun the maker's validation by default. Only run additional commands if the
 diff or reported results give a specific reason to verify something — and prefer targeted
 checks (e.g. `grep`, reading a single file) over full test reruns.
+"""
+
+
+def _build_supertask_reviewer_handoff(task, comments, child_evidence):
+    """Build the aggregate implementation handoff for final supertask review."""
+    summaries = [c for c in comments if c.get("kind") == "commit-message"]
+    if summaries:
+        summary = (
+            "**Planner's current plan summary:**\n"
+            f"```\n{summaries[-1]['message']}\n```"
+        )
+    else:
+        summary = "*(no plan summary recorded yet)*"
+
+    child_lines = []
+    for child in child_evidence or []:
+        relationship = (
+            f"; follow-up of task {child['follow_up_of']}"
+            if child.get("follow_up_of") is not None
+            else ""
+        )
+        child_lines.append(
+            f"### Task {child['id']}: {child['title']}\n"
+            f"- Status: {child['status']}{relationship}\n"
+            f"- Commit: {child.get('commit_hash') or '(none)'}"
+        )
+        history = child.get("review_history") or []
+        if history:
+            child_lines.append("- Review history:")
+            for decision in history:
+                message = " ".join((decision.get("message") or "").split())
+                child_lines.append(
+                    f"  - Round {decision.get('review_round', 0)} "
+                    f"{decision['kind']} by {decision.get('author') or 'unknown'}: {message}"
+                )
+        else:
+            child_lines.append("- Review history: (none recorded)")
+
+    children_text = "\n".join(child_lines) or "*(no child tasks found)*"
+
+    return f"""## Supertask Final Review Handoff
+
+{summary}
+
+### Completed Child Evidence
+
+{children_text}
+
+Verify the combined implementation against the supertask goal. Inspect each
+recorded commit and the live child comments when needed. Every child and
+descendant-created follow-up must be complete before this review runs.
 """
 
 
@@ -172,7 +234,7 @@ def _filter_comments_for_prompt(comments, verb, task=None):
     Filtering rules:
     - For reviewer verbs (commit-review, commit-review-supertask): exclude
       commit-message and validation kinds — both are already surfaced in the
-      ## Reviewer Handoff section, so including them again would be redundant.
+      reviewer handoff section, so including them again would be redundant.
     - For commit-make: exclude commit-message and validation kinds. The build
       prompt must create fresh versions, and the finalization prompt explicitly
       reads the canonical commit-message from `task show-comments`, so inlining
@@ -183,7 +245,7 @@ def _filter_comments_for_prompt(comments, verb, task=None):
     truncation note when comments were dropped.
     """
     is_reviewer = verb in ("commit-review", "commit-review-supertask", "commit-plan-review")
-    if is_reviewer or verb == "commit-make":
+    if is_reviewer or verb in ("commit-make", "commit-make-supertask"):
         filtered = [c for c in comments if c.get("kind") not in ("commit-message", "validation")]
     else:
         filtered = list(comments)
@@ -211,7 +273,7 @@ def _prompt_path_for_verb(verb, task):
     return _prompts_dir() / f"{prompt_name}.md"
 
 
-def build_prompt(task, verb, agent_name, comments):
+def build_prompt(task, verb, agent_name, comments, *, supertask_children=None):
     """Assemble the full prompt from shared context + verb-specific prompt."""
     shared_path = _prompts_dir() / "shared-task-context.md"
     verb_path = _prompt_path_for_verb(verb, task)
@@ -243,7 +305,10 @@ def build_prompt(task, verb, agent_name, comments):
     is_supertask_verb = verb in ("commit-make-supertask", "commit-review-supertask")
     is_pull_request_verb = verb in ("pull-request-make", "pull-request-review")
     is_other_verb = verb in ("other-make", "other-review")
-    role = "coder" if is_coder else "reviewer"
+    if verb == "commit-make-supertask":
+        role = "planner"
+    else:
+        role = "coder" if is_coder else "reviewer"
 
     description = task["description"] or "(none)"
 
@@ -258,7 +323,7 @@ def build_prompt(task, verb, agent_name, comments):
         *[f"  {line}" for line in description.splitlines()],
         "  ```",
         f"- branch: {task['branch']}",
-        f"- coder_agent: {task.get('coder_agent') or DEFAULT_CODER}",
+        f"- coder_agent: {_task_coder(task)}",
         f"- reviewer_agent: {_task_reviewer(task)}",
         f"- review_round: {task['review_round']}",
     ]
@@ -289,10 +354,11 @@ def build_prompt(task, verb, agent_name, comments):
         skip_build_policy = repo_policy.read_skip_build_until_approved(_repo_root())
     except Exception:
         skip_build_policy = False
-    if skip_build_policy:
+    if skip_build_policy and not is_supertask_verb:
         context_lines.append(
             "- skip_build_until_approved: yes "
-            "(SKIP_BUILD_UNTIL_APPROVED marker detected in repo AGENTS.md — "
+            "(standalone CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER "
+            "marker detected in repo AGENTS.md — "
             "see the commit-make build/finalization guidance below)"
         )
 
@@ -318,7 +384,32 @@ def build_prompt(task, verb, agent_name, comments):
     ])
 
     _t = 'task'
-    if verb in ("pull-request-make", "other-make"):
+    if verb == "commit-make-supertask":
+        context_lines.extend([
+            f"- {_t} show {task['id']}",
+            f"- {_t} show-comments {task['id']}",
+            f"- {_t} log {task['id']} \"<message>\"",
+            f"- {_t} list --parent {task['id']} [--page <n>]",
+            f"- {_t} show <child-id>",
+            f"- {_t} add \"<child title>\" --description \"<markdown>\" --parent {task['id']} [--sequence-index <n>]",
+            f"- {_t} set <child-id> [--title \"<title>\"] [--description \"<markdown>\"] [--sequence-index <n>]",
+            f"- {_t} set <child-id> --status none",
+            f"- {_t} delete <child-id>",
+            f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --comment",
+            f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --commit-message",
+        ])
+    elif verb == "commit-review-supertask":
+        context_lines.extend([
+            f"- {_t} show {task['id']}",
+            f"- {_t} show-comments {task['id']}",
+            f"- {_t} list --parent {task['id']} [--page <n>]",
+            f"- {_t} show <child-id>",
+            f"- {_t} show-comments <child-id>",
+            "- git show <commit-hash>",
+            f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --approval --author {agent_name} --review-round {task['review_round']}",
+            f"- cat <<'EOF' | {_t} comment {task['id']} --message-stdin --rejection --author {agent_name} --review-round {task['review_round']}",
+        ])
+    elif verb in ("pull-request-make", "other-make"):
         context_lines.extend([
             f"- {_t} show {task['id']}",
             f"- {_t} show-comments {task['id']}",
@@ -366,7 +457,15 @@ def build_prompt(task, verb, agent_name, comments):
         reviewer_handoff = _build_other_reviewer_handoff(task, comments)
         return f"{shared_text}\n\n{task_context}\n\n{reviewer_handoff}\n\n{verb_text}"
 
-    if verb in ("commit-review", "commit-review-supertask"):
+    if verb == "commit-review-supertask":
+        reviewer_handoff = _build_supertask_reviewer_handoff(
+            task,
+            comments,
+            supertask_children,
+        )
+        return f"{shared_text}\n\n{task_context}\n\n{reviewer_handoff}\n\n{verb_text}"
+
+    if verb == "commit-review":
         reviewer_handoff = _build_reviewer_handoff(task, comments, skip_build_policy=skip_build_policy)
         return f"{shared_text}\n\n{task_context}\n\n{reviewer_handoff}\n\n{verb_text}"
 

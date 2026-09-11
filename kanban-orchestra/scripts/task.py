@@ -6,7 +6,9 @@ Usage:
     task add "<title>" [--type <commit|pull_request|supertask|other>] [--description "<markdown>"] [--branch <branch>] [--coder-agent <agent>] [--reviewer-agent <agent>] [--allow-when-blocked]
     task set <id> [--title ".."] [--status ..] [--next-step ..] [--branch ..]
                   [--description "<markdown>"] [--stash-ref <ref>] [--allow-when-blocked <bool>] ...
-    task list [--status ..] [--next-step ..] [--branch ..] [--page N]
+    task continue <id> (--add-review-rounds N | --next-step <step>)
+    task continue <id> --add-review-rounds N --next-step <step>   # legacy review-cap only
+    task list [--status ..] [--next-step ..] [--branch ..] [--parent ID] [--page N]
     task show <id>
     task show-comments <id>
     task show-run-log <id>
@@ -17,6 +19,7 @@ Usage:
     task delete <id>
     task dump                       # dump DB to kanban-orchestra.sql
     task restore
+    task import-worktree <path>     # import another worktree's Kanban DB
 
 Policy:
     Branches master/main are disabled for tasks by default. Use a feature
@@ -24,6 +27,7 @@ Policy:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -37,6 +41,7 @@ import repo_policy
 
 
 AGENTS = config.AGENTS
+AGENT_ALIASES = config.AGENT_ALIASES
 AGENT_PROVIDERS = config.AGENT_PROVIDERS
 VALID_SKIPS = {
     "commit-plan",
@@ -245,7 +250,7 @@ def _validate_next_step_for_type(task_type, next_step):
 
 
 def _agent_error(role):
-    aliases = ", ".join(AGENTS)
+    aliases = ", ".join(list(AGENTS) + list(AGENT_ALIASES))
     providers = ", ".join(AGENT_PROVIDERS)
     provider_text = f" (providers: {providers})" if providers else ""
     return (
@@ -294,12 +299,18 @@ def validate_ready_worktree(conn):
 # ── Subcommands ────────────────────────────────────────────────────────
 
 def cmd_add(args, conn):
-    agent = args.coder_agent or config.DEFAULT_CODER
+    kind = _resolve_add_task_type(args)
+    default_coder = (
+        config.DEFAULT_SUPER_PLANNER if kind == "supertask" else config.DEFAULT_CODER
+    )
+    default_reviewer = (
+        config.DEFAULT_SUPER_REVIEWER if kind == "supertask" else config.DEFAULT_REVIEWER
+    )
+    agent = args.coder_agent or default_coder
     _validate_agent_arg("coder-agent", agent)
-    reviewer_agent = args.reviewer_agent or config.DEFAULT_REVIEWER
+    reviewer_agent = args.reviewer_agent or default_reviewer
     _validate_agent_arg("reviewer-agent", reviewer_agent)
 
-    kind = _resolve_add_task_type(args)
     parent_task_id = args.parent
     sequence_index = args.sequence_index
     branch = args.branch
@@ -364,7 +375,80 @@ def cmd_add(args, conn):
     _json_out(db.get_task(conn, task_id))
 
 
+# Set on the environment of a smart-unblock consultation subprocess (see
+# smart_unblock.invoke_unblock_agent) so that no shell command it runs -- or
+# any grandchild it spawns -- can mutate task status. The agent is asked to
+# record a decision comment instead of touching status directly, but it is an
+# external LLM with real shell access; nothing in the prompt can be trusted to
+# stop it from ignoring that instruction. Refusing here, in the CLI itself,
+# makes "the agent cannot make the task runnable" true structurally rather
+# than by policing timing afterward: even a rogue `ko-task continue` (or
+# `set`) run from inside a consultation simply errors out and leaves the task
+# untouched, regardless of how the orchestrator's own task loop is scheduled.
+SMART_UNBLOCK_CONSULTATION_ENV_VAR = "ORCHESTRA_SMART_UNBLOCK_CONSULTATION"
+
+# Kept in sync with smart_unblock.LOCK_FILE_NAME. Read here without importing
+# smart_unblock so a consultation subprocess can enforce the shared gate even
+# if it unsets the env flag above.
+_SMART_UNBLOCK_LOCK_NAME = "smart-unblock.lock"
+
+
+def _consultation_task_id_from_lock() -> int | None:
+    """Return the task id under a live smart-unblock consultation, if any.
+
+    The watcher publishes `consultation_task_id` in its flock'd lock metadata
+    for the whole consultation plus validation/rollback window. That metadata
+    is authoritative only while the flock is actually held: abrupt exits
+    (including SIGKILL) can leave stale key=value bytes behind, and those must
+    not permanently refuse continue/set. Probe with a non-blocking exclusive
+    lock — acquire means no live watcher (ignore metadata); BlockingIOError
+    means the watcher holds the flock (trust metadata).
+    """
+    try:
+        lock_path = db.get_runtime_root() / _SMART_UNBLOCK_LOCK_NAME
+        handle = lock_path.open("a+", encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                lines = lock_path.read_text(encoding="utf-8").splitlines()
+            except (FileNotFoundError, OSError):
+                return None
+            for line in lines:
+                key, sep, value = line.partition("=")
+                if sep and key == "consultation_task_id" and value.isdigit():
+                    return int(value)
+            return None
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return None
+    finally:
+        handle.close()
+
+
+def _reject_if_smart_unblock_consultation(command: str, task_id: int | None = None) -> None:
+    blocked_by_env = bool(os.environ.get(SMART_UNBLOCK_CONSULTATION_ENV_VAR))
+    blocked_by_lock = (
+        task_id is not None and _consultation_task_id_from_lock() == task_id
+    )
+    if not blocked_by_env and not blocked_by_lock:
+        return
+    print(
+        f"Error: '{command}' is disabled during a smart-unblock consultation. "
+        "Record a decision comment instead; the watcher applies it after "
+        "verifying it from durable state.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_set(args, conn):
+    _reject_if_smart_unblock_consultation("set", args.task_id)
     task = db.get_task(conn, args.task_id)
     if not task:
         print(f"Error: task {args.task_id} not found", file=sys.stderr)
@@ -426,6 +510,27 @@ def cmd_set(args, conn):
     # Handle branch resolution when setting status to ready
     if args.status is not None:
         if args.status == "ready":
+            # Reject while review-cap metadata remains, regardless of status.
+            # Clearing status alone must not open a set --status ready bypass.
+            if task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP:
+                print(
+                    f"Error: task {args.task_id} has review cap block metadata "
+                    f"(block_reason={db.BLOCK_REASON_REVIEW_CAP}). "
+                    f"Use `task continue {args.task_id} --add-review-rounds N` "
+                    f"instead of `task set --status ready`.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE:
+                print(
+                    f"Error: task {args.task_id} has reviewer-unavailable block "
+                    f"metadata (block_reason={db.BLOCK_REASON_REVIEWER_UNAVAILABLE}). "
+                    f"Use `task continue {args.task_id}` (or a durable CONTINUE "
+                    f"comment) instead of `task set --status ready` so "
+                    f"resume_next_step is restored without racing dispatch.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             _validate_next_step_for_type(task_type, fields.get("next_step") or task.get("next_step"))
             if task_type != "other":
                 branch = _resolve_branch_for_ready(conn, task, fields.get("branch"))
@@ -464,24 +569,258 @@ def cmd_set(args, conn):
     # When a child is set back to ready, restore parent to pending_subtasks
     # if the parent is blocked and no other children are still blocked.
     if args.status == "ready" and task.get("parent_task_id") is not None:
-        parent_id = task["parent_task_id"]
-        parent = db.get_task(conn, parent_id)
-        if parent and parent["status"] == "blocked":
-            siblings = db.get_child_tasks(conn, parent_id)
-            blocked_siblings = [
-                s for s in siblings
-                if s["status"] == "blocked" and s["id"] != args.task_id
-            ]
-            if not blocked_siblings:
-                db.update_task(conn, parent_id, status="pending_subtasks")
+        _maybe_restore_parent_after_child_ready(conn, args.task_id, task["parent_task_id"])
 
     _json_out(db.get_task(conn, args.task_id))
+
+
+def _maybe_restore_parent_after_child_ready(conn, child_id, parent_id):
+    """Restore a blocked parent to pending_subtasks when no siblings remain blocked."""
+    parent = db.get_task(conn, parent_id)
+    if not parent or parent["status"] != "blocked":
+        return
+    siblings = db.get_child_tasks(conn, parent_id)
+    blocked_siblings = [
+        s for s in siblings
+        if s["status"] == "blocked" and s["id"] != child_id
+    ]
+    if not blocked_siblings:
+        db.update_task(conn, parent_id, status="pending_subtasks")
+
+
+class ContinueTaskError(ValueError):
+    """Raised when continue_blocked_task cannot proceed safely."""
+
+
+def is_structured_review_cap_block(task: dict) -> bool:
+    """True when a task has structured review-cap resume metadata."""
+    return (
+        task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP
+        and bool(task.get("resume_next_step"))
+    )
+
+
+def is_structured_reviewer_unavailable_block(task: dict) -> bool:
+    """True when the task is blocked because the reviewer could not produce a decision."""
+    return (
+        task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE
+        and bool(task.get("resume_next_step"))
+    )
+
+
+def _continue_error(message: str) -> ContinueTaskError:
+    if message.startswith("Error:"):
+        return ContinueTaskError(message)
+    return ContinueTaskError(f"Error: {message}")
+
+
+def _resolve_branch_for_continue(conn, task):
+    """Resolve branch for continue; raises ContinueTaskError instead of exiting."""
+    if task.get("branch"):
+        return task["branch"]
+    if _is_interactive():
+        current = _current_branch()
+        if current and current not in ("master", "main"):
+            answer = input(f"Use current branch '{current}'? [Y/n] ").strip().lower()
+            if answer in ("", "y", "yes"):
+                return current
+        name = input("Enter branch name for this task: ").strip()
+        if name:
+            return name
+    raise _continue_error(
+        "task has no branch and none was provided. "
+        "Agents must specify --branch or operate on a task that already has one."
+    )
+
+
+def _prepare_task_for_ready(conn, task, next_step):
+    """Validate and resolve fields needed to move a blocked task to ready.
+
+    Raises ContinueTaskError on validation or policy failure. May prompt for a
+    missing branch when stdin is a TTY (CLI interactive use).
+    """
+    task_type = _normalize_task_type(task.get("kind", "commit"))
+    try:
+        validate_next_step_for_type(task_type, next_step)
+    except TaskValidationError as exc:
+        raise _continue_error(str(exc)) from exc
+    fields = {"status": "ready", "next_step": next_step}
+    if task_type != "other":
+        branch = _resolve_branch_for_continue(conn, task)
+        try:
+            validate_branch_name(branch)
+            validate_master_branch_policy(branch)
+        except TaskValidationError as exc:
+            raise _continue_error(str(exc)) from exc
+        fields["branch"] = branch
+    try:
+        validate_ready_worktree(conn)
+    except TaskValidationError as exc:
+        raise _continue_error(str(exc)) from exc
+    return fields
+
+
+def continue_blocked_task(conn, task_id, *, add_review_rounds=None, next_step=None):
+    """Resume a blocked task via review-cap extension or an explicit next step.
+
+    Shared core used by the CLI and dashboard. Raises ContinueTaskError on
+    validation or policy failure. Returns the updated task row.
+    """
+    task = db.get_task(conn, task_id)
+    if not task:
+        raise _continue_error(f"task {task_id} not found")
+
+    if task["status"] != "blocked":
+        raise _continue_error(
+            f"continue requires status=blocked (got '{task['status']}')."
+        )
+
+    add_rounds = add_review_rounds
+    resume_next = next_step
+    legacy_recovery = False
+
+    if add_rounds is not None and resume_next is not None:
+        # Legacy pre-schema review-cap: no structured block_reason / resume step.
+        # Operator must declare both the round grant and the maker step.
+        if task.get("block_reason") or task.get("resume_next_step"):
+            if task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP:
+                raise _continue_error(
+                    "structured review-cap blocks must use --add-review-rounds N "
+                    "alone (the resume step is stored); do not pass --next-step."
+                )
+            raise _continue_error(
+                "use either --add-review-rounds or --next-step, not both."
+            )
+        legacy_recovery = True
+    elif add_rounds is None and resume_next is None:
+        if is_structured_review_cap_block(task):
+            raise _continue_error(
+                "this task was blocked at its review cap; "
+                "use --add-review-rounds N to grant more rounds and resume."
+            )
+        if task.get("resume_next_step"):
+            resume_next = task["resume_next_step"]
+        else:
+            raise _continue_error(
+                "continue requires --next-step <step> unless the task has "
+                "structured resume metadata (or --add-review-rounds for a review-cap block)."
+            )
+
+    if add_rounds is not None:
+        if add_rounds <= 0:
+            raise _continue_error("--add-review-rounds must be a positive integer.")
+
+        if legacy_recovery:
+            resume_step = resume_next
+        else:
+            if task.get("block_reason") != db.BLOCK_REASON_REVIEW_CAP:
+                raise _continue_error(
+                    "--add-review-rounds is only valid for tasks blocked at "
+                    "their review cap (or legacy recovery with --next-step)."
+                )
+            resume_step = task.get("resume_next_step")
+            if not resume_step:
+                raise _continue_error(
+                    "task is missing structured resume_next_step metadata "
+                    "for review-cap continuation."
+                )
+
+        old_cap = task.get("max_review_rounds")
+        if old_cap is None:
+            old_cap = config.MAX_REVIEW_ROUNDS
+        new_cap = int(old_cap) + add_rounds
+        preserved_round = task.get("review_round")
+        preserved_stash = task.get("stash_ref")
+
+        fields = _prepare_task_for_ready(conn, task, resume_step)
+        fields.update(
+            {
+                "max_review_rounds": new_cap,
+                "block_reason": None,
+                "resume_next_step": None,
+            }
+        )
+        db.update_task(conn, task_id, **fields)
+        stash_note = (
+            f" Preserved stash_ref={preserved_stash}."
+            if preserved_stash
+            else " No stash_ref was present."
+        )
+        if legacy_recovery:
+            comment = (
+                f"Operator continued via legacy/manual review-cap recovery: "
+                f"granted {add_rounds} additional review round(s) "
+                f"(max_review_rounds {old_cap} -> {new_cap}); "
+                f"requeued at {resume_step} with review_round={preserved_round} unchanged."
+                f"{stash_note}"
+            )
+        else:
+            comment = (
+                f"Operator continued review-cap block: granted {add_rounds} additional "
+                f"review round(s) (max_review_rounds {old_cap} -> {new_cap}); "
+                f"requeued at {resume_step} with review_round={preserved_round} unchanged."
+                f"{stash_note}"
+            )
+        db.add_comment(
+            conn,
+            task_id,
+            comment,
+            kind="comment",
+            author="operator",
+        )
+    else:
+        if task.get("block_reason") == db.BLOCK_REASON_REVIEW_CAP:
+            raise _continue_error(
+                "review-cap blocks require --add-review-rounds N "
+                "(do not use --next-step alone; that would resume without raising the cap)."
+            )
+
+        fields = _prepare_task_for_ready(conn, task, resume_next)
+        fields.update(
+            {
+                "block_reason": None,
+                "resume_next_step": None,
+            }
+        )
+        db.update_task(conn, task_id, **fields)
+        db.add_comment(
+            conn,
+            task_id,
+            (
+                f"Operator continued blocked task: requeued at next_step={resume_next}. "
+                f"review_round={task.get('review_round')} and stash_ref={task.get('stash_ref')!r} "
+                "were left unchanged."
+            ),
+            kind="comment",
+            author="operator",
+        )
+
+    if task.get("parent_task_id") is not None:
+        _maybe_restore_parent_after_child_ready(conn, task_id, task["parent_task_id"])
+
+    return db.get_task(conn, task_id)
+
+
+def cmd_continue(args, conn):
+    """Resume a blocked task via review-cap extension or an explicit next step."""
+    _reject_if_smart_unblock_consultation("continue", args.task_id)
+    try:
+        updated = continue_blocked_task(
+            conn,
+            args.task_id,
+            add_review_rounds=args.add_review_rounds,
+            next_step=args.next_step,
+        )
+    except ContinueTaskError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    _json_out(updated)
 
 
 def cmd_list(args, conn):
     tasks = db.list_tasks(
         conn, status=args.status, next_step=args.next_step,
-        branch=args.branch, page=args.page,
+        branch=args.branch, parent=args.parent, page=args.page,
     )
     _json_out(tasks)
 
@@ -593,6 +932,13 @@ def cmd_follow_up(args, conn):
 
     follow_up_title = f"{base_title} {n + 1}/x"
 
+    parent_task_id = task.get("parent_task_id")
+    sequence_index = None
+    if parent_task_id is not None:
+        db.renumber_siblings(conn, parent_task_id)
+        task = db.get_task(conn, args.task_id)
+        sequence_index = (task.get("sequence_index") or 0) + 1
+
     follow_up_id = db.add_task(
         conn,
         follow_up_title,
@@ -600,8 +946,14 @@ def cmd_follow_up(args, conn):
         branch=task["branch"],
         coder_agent=task["coder_agent"],
         reviewer_agent=task.get("reviewer_agent") or config.DEFAULT_REVIEWER,
+        parent_task_id=parent_task_id,
+        sequence_index=sequence_index,
         skips=["commit-plan"],
     )
+
+    if parent_task_id is not None:
+        db.renumber_siblings(conn, parent_task_id)
+        conn.commit()
 
     db.update_task(conn, args.task_id, follow_up_task_id=follow_up_id)
 
@@ -623,8 +975,13 @@ def cmd_requeue(args, conn):
 
 
 def cmd_purge(args, conn):
-    db.purge_run_log(conn, before_date=args.before, days=args.days)
-    print("OK")
+    result = db.purge_run_log(
+        conn,
+        before_date=args.before,
+        days=args.days,
+        compact=True,
+    )
+    print(db.format_purge_summary(result))
 
 
 def cmd_delete(args, conn):
@@ -652,18 +1009,18 @@ def get_commit_footer(task_id, conn):
     if not task:
         return None
     agent = task.get("coder_agent") or config.DEFAULT_CODER
-    coder_label = config.get_agent_display_label(agent)
+    coder_attribution = config.get_agent_attribution(agent)
 
     comments = db.get_comments(conn, task_id)
     approval_comments = [c for c in comments if c.get("kind") == "approval"]
     final_approval = approval_comments[-1] if approval_comments else None
     reviewer = final_approval.get("author") if final_approval else None
-    reviewer_label = config.get_agent_display_label(reviewer) if reviewer else "pending"
+    reviewer_attribution = config.get_agent_attribution(reviewer, review=True) if reviewer else "pending"
     rejection_count = sum(1 for c in comments if c.get("kind") == "rejection")
 
     attribution = (
-        f"coder: {coder_label}; "
-        f"reviewer: {reviewer_label}; "
+        f"coder: {coder_attribution}; "
+        f"reviewer: {reviewer_attribution}; "
         f"review rejections: {rejection_count}"
     )
     return f"Task {task_id} ({attribution})"
@@ -710,6 +1067,16 @@ def cmd_restore(args):
         sys.exit(1)
 
     print(f"Restored to {result['db_path']} from {result['sql_path']}")
+
+
+def cmd_import_worktree(args, conn):
+    """Import tasks and task-owned history from another worktree's Kanban DB."""
+    try:
+        result = db.import_worktree_database(conn, args.path)
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    _json_out(result)
 
 
 def _resolve_message_arg(args, command_name):
@@ -797,11 +1164,40 @@ def build_parser():
     p_set.add_argument("--add-skip", action="append", default=None)
     p_set.add_argument("--remove-skip", action="append", default=None)
 
+    # continue
+    p_continue = sub.add_parser(
+        "continue",
+        help=(
+            "Resume a blocked task after a review-cap block or with an explicit next step; "
+            "legacy: --add-review-rounds N --next-step <step>"
+        ),
+    )
+    p_continue.add_argument("task_id", type=int)
+    p_continue.add_argument(
+        "--add-review-rounds",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Grant N additional review rounds and resume at the stored maker step "
+            "(with --next-step: legacy review-cap recovery only)"
+        ),
+    )
+    p_continue.add_argument(
+        "--next-step",
+        default=None,
+        help=(
+            "Explicit recovery step for non-review-cap blocks "
+            "(with --add-review-rounds: legacy review-cap recovery only)"
+        ),
+    )
+
     # list
     p_list = sub.add_parser("list")
     p_list.add_argument("--status", default=None)
     p_list.add_argument("--next-step", default=None)
     p_list.add_argument("--branch", default=None)
+    p_list.add_argument("--parent", type=int, default=None)
     p_list.add_argument("--page", type=int, default=1)
 
     # show
@@ -869,6 +1265,20 @@ def build_parser():
     # restore
     sub.add_parser("restore")
 
+    # import-worktree
+    p_import = sub.add_parser(
+        "import-worktree",
+        help=(
+            "Import another worktree's Kanban database into the current database. "
+            "PATH may be a worktree root or a kanban-orchestra.db file. "
+            "Does not run any Git commands."
+        ),
+    )
+    p_import.add_argument(
+        "path",
+        help="Worktree root directory or path to kanban-orchestra.db",
+    )
+
     # get-commit-footer
     p_gcf = sub.add_parser("get-commit-footer")
     p_gcf.add_argument("task_id", type=int)
@@ -882,12 +1292,27 @@ def main():
     if args.command == "restore":
         cmd_restore(args)
         return
+    # import-worktree must not invoke Git (acceptance criterion). Resolve the
+    # target DB via KANBAN_DB or a cwd walk for kanban-orchestra.db.
+    if args.command == "import-worktree":
+        try:
+            target_db = db.get_db_path_without_git()
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        conn = db.connect(target_db)
+        try:
+            cmd_import_worktree(args, conn)
+        finally:
+            conn.close()
+        return
 
     conn = db.connect()
     try:
         dispatch = {
             "add": cmd_add,
             "set": cmd_set,
+            "continue": cmd_continue,
             "list": cmd_list,
             "show": cmd_show,
             "show-comments": cmd_show_comments,

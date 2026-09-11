@@ -12,13 +12,21 @@ How each agent discovers and loads custom commands and skills:
 ## Adding a Shared Orchestra Skill
 
 All shared Orchestra skills live in `$ORCHESTRA_DIR/AI-skills/{skill-name}.md`
-as the canonical source. Agents get a thin wrapper that points to the canonical
-file.
+as the canonical source. Agents load them through thin user-level wrappers
+installed once per machine.
 
 Wrappers use two prefixes:
 
 - `orch-kb-{skill-name}` for Kanban Orchestra skills.
 - `orch-adhoc-{skill-name}` for general shared workflow skills.
+
+Kanban skills (installed as `orch-kb-*`) are the names listed in
+`KANBAN_SKILLS` inside `shared_scripts/install_global_ai_skills.py`. Today that
+set is: `get-kanban-update`, `kanban`, `narrate`,
+`plan-to-tasks`, and `review-recent-kanban-tasks`. All other
+`AI-skills/*.md` files (except
+`AI-readme.md`) install as `orch-adhoc-*`. When you add a Kanban skill, update
+that frozenset so the wrapper name stays correct.
 
 ### 1. Write the canonical skill
 
@@ -26,74 +34,49 @@ Create `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` with the instructions the agen
 
 ### 2. Start the skill file with a one-line summary
 
-The wrapper sync script reads `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` directly. It uses the first non-empty line of the file as the wrapper description, so keep that opening line short and descriptive.
+The installer reads `$ORCHESTRA_DIR/AI-skills/{skill-name}.md` directly. It uses
+the first non-empty line of the file as the wrapper description, so keep that
+opening line short and descriptive.
 
-### 3. Sync wrappers into the target repo
-
-From the repo that should receive the wrappers:
+### 3. Install wrappers once per machine
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills"
+"$ORCHESTRA_DIR/bin/ko-install-global-skills"
 ```
 
-This creates or refreshes:
+This creates or refreshes thin wrappers under:
 
-- `.claude/skills/orch-kb-{skill-name}/SKILL.md` or `.claude/skills/orch-adhoc-{skill-name}/SKILL.md`
-- `.agents/skills/orch-kb-{skill-name}/SKILL.md` or `.agents/skills/orch-adhoc-{skill-name}/SKILL.md` (Open Agent Standard path used by Codex-, Antigravity-, Kilo-, and other compatible agents)
+- `~/.claude/skills/orch-kb-{skill-name}/SKILL.md` or `~/.claude/skills/orch-adhoc-{skill-name}/SKILL.md`
+- `~/.codex/skills/orch-kb-{skill-name}/SKILL.md` or `~/.codex/skills/orch-adhoc-{skill-name}/SKILL.md`
+- `~/.kilocode/skills/orch-kb-{skill-name}/SKILL.md` or `~/.kilocode/skills/orch-adhoc-{skill-name}/SKILL.md`
+- `~/.gemini/antigravity-cli/skills/orch-kb-{skill-name}/SKILL.md` or `~/.gemini/antigravity-cli/skills/orch-adhoc-{skill-name}/SKILL.md`
 
-To explicitly repair generated wrapper policy and clean old generated wrappers
-from current output paths, run:
+Wrappers reference the canonical skill through `$ORCHESTRA_DIR`. They do not
+copy skill text into work repos. After the one-time install, every worktree and
+repo on the machine uses the same user-level skills. Changes to an existing
+skill take effect immediately. Re-run the installer after adding, deleting, or
+renaming a skill, or after changing its first non-empty line (the wrapper
+description).
 
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --fix
-```
+The installer uses an explicit target map (not `.<agent>/skills` naming). It
+covers Claude, Codex, Kilo, and the installed `agy` Antigravity CLI. It does
+not install into the separate Antigravity IDE skill path.
 
-Fix mode ensures narrow `.gitignore` entries exist for generated
-`orch-kb-*` and `orch-adhoc-*` wrapper directories, removes generated
-unprefixed wrappers from current `.claude/skills` and `.agents/skills` paths,
-removes all legacy `ko-*` wrapper directories from those same current paths,
-and removes current generated wrappers from git tracking when run in a git
-repo. Current generated wrappers under `.claude/skills/orch-*` and
-`.agents/skills/orch-*` remain on disk as ignored local generated files.
-Hand-edited or unknown non-`ko-*` files are left untouched.
+Operational skills resolve Orchestra tooling only through `$ORCHESTRA_DIR`; they
+do not treat the current worktree as an Orchestra checkout fallback.
 
-### 4. Register repos for ad-hoc sync
+`AI-readme.md` is excluded from installation. Existing wrappers that the
+installer can identify as generated Orchestra wrappers are updated in place or
+removed when their canonical skill was deleted. Unrecognized or hand-edited
+skills under the same names are left untouched.
 
-To opt a repo into future bulk syncs from the Orchestra checkout:
+Fleet (`ko-fleet`) starts and stops orchestrators and dashboards for configured
+repos. It does not install, sync, or distribute skills.
 
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/client-repo --project-name "MIDI Designer"
-```
-
-Registration writes two things:
-
-- A repo-local `.orchestra-skill-sync` marker. This is safe to commit and says
-  the repo accepts shared Orchestra skill sync. When `--project-name` is passed,
-  the marker also stores the human display name used by the devlog skill.
-- A private machine-local path entry in
-  `~/.config/orchestra/skill-sync.repos`, or in the path named by
-  `$ORCHESTRA_SKILL_SYNC_REPOS`.
-
-From the Orchestra checkout, preview every registered repo:
+To verify installed wrappers without writing:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
-```
-
-To actually sync every registered repo:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-registered-skills" --apply
-```
-
-Applied registered sync runs fix mode and then normal sync for each repo whose
-path is still valid and whose repo root still contains `.orchestra-skill-sync`.
-Missing paths or repos without the marker are skipped rather than guessed.
-
-To opt out:
-
-```bash
-"$ORCHESTRA_DIR/bin/ko-sync-skills" --unregister /path/to/client-repo
+"$ORCHESTRA_DIR/bin/ko-install-global-skills" --check
 ```
 
 Each wrapper uses the same thin shared format:

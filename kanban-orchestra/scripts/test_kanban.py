@@ -7,13 +7,16 @@ comment aggregation.
 """
 
 import json
+import hashlib
 import importlib.util
 import io
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -47,15 +50,15 @@ active_agent_processes = _load_local_module(
 orchestrator_lock = _load_local_module("kanban_test_orchestrator_lock", "orchestrator_lock.py", canonical_name="orchestrator_lock")
 orchestrator = _load_local_module("kanban_test_orchestrator", "orchestrator.py")
 agent_runner = orchestrator.agent_runner
+smart_unblock = orchestrator.smart_unblock
 config = _load_local_module("kanban_test_config", "config.py")
 task_module = _load_local_module("kanban_test_task", "task.py")
 fleet = _load_local_module("kanban_test_fleet", "fleet.py")
 import agent_registry
 import agent_smoke
-skill_wrappers = _load_local_module("kanban_test_skill_wrappers", str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_ai_skill_wrappers.py"))
-registered_skill_wrappers = _load_local_module(
-    "kanban_test_registered_skill_wrappers",
-    str(SCRIPT_DIR.parent.parent / "shared_scripts" / "sync_registered_ai_skill_wrappers.py"),
+global_skill_installer = _load_local_module(
+    "kanban_test_global_skill_installer",
+    str(SCRIPT_DIR.parent.parent / "shared_scripts" / "install_global_ai_skills.py"),
 )
 repo_policy = _load_local_module("kanban_test_repo_policy", "repo_policy.py")
 devlog_helper = _load_local_module("kanban_test_devlog_helper", str(SCRIPT_DIR.parent.parent / "AI-skills" / "devlog" / "scripts" / "log_work.py"))
@@ -71,13 +74,8 @@ def _write_test_ai_skills(orchestra_dir: Path) -> None:
         "get-kanban-update",
         "git-commit",
         "kanban",
-        "prep-branch-for-squash-merge",
-        "prep-for-review",
-        "respond-to-review",
-        "review-build",
         "review-screenshot",
         "squash-and-merge-one-shot",
-        "squash-merge-branch",
     ):
         (skills_dir / f"{skill_name}.md").write_text(
             f"{skill_name} description.\n\nCanonical instructions.\n",
@@ -201,6 +199,9 @@ class TestDB(unittest.TestCase):
         self.assertEqual(task["stash_ref"], "stash@{0}")
         self.assertIsNotNone(task["ready_at"])
         self.assertEqual(task["last_ready_at"], task["ready_at"])
+        self.assertIsNone(task["first_started_at"])
+        listed = db.list_tasks(self.conn)[0]
+        self.assertIsNone(listed["first_started_at"])
 
     def test_update_task_status_transitions_manage_ready_at(self):
         tid = db.add_task(self.conn, "Queue transitions", branch="feat-q")
@@ -215,23 +216,36 @@ class TestDB(unittest.TestCase):
         db.update_task(self.conn, tid, coder_agent="codex")
         still_ready = db.get_task(self.conn, tid)
         self.assertEqual(still_ready["ready_at"], "2000-01-01 00:00:00")
+        self.assertIsNone(still_ready["first_started_at"])
 
         db.update_task(self.conn, tid, status="running")
         running = db.get_task(self.conn, tid)
         self.assertIsNone(running["ready_at"])
         self.assertEqual(running["last_ready_at"], still_ready["last_ready_at"])
+        self.assertIsNotNone(running["first_started_at"])
         self.assertIsNone(running["done_at"])
+        first_started_at = running["first_started_at"]
 
         db.update_task(self.conn, tid, status="ready")
         requeued = db.get_task(self.conn, tid)
         self.assertIsNotNone(requeued["ready_at"])
         self.assertNotEqual(requeued["ready_at"], "2000-01-01 00:00:00")
         self.assertEqual(requeued["last_ready_at"], requeued["ready_at"])
+        self.assertEqual(requeued["first_started_at"], first_started_at)
 
+        db.update_task(self.conn, tid, status="running")
+        rerunning = db.get_task(self.conn, tid)
+        self.assertEqual(rerunning["first_started_at"], first_started_at)
+
+        db.update_task(self.conn, tid, status="blocked")
+        blocked = db.get_task(self.conn, tid)
+        self.assertEqual(blocked["first_started_at"], first_started_at)
+
+        db.update_task(self.conn, tid, status="ready")
         db.update_task(self.conn, tid, status="done")
         done = db.get_task(self.conn, tid)
         self.assertIsNone(done["ready_at"])
-        self.assertEqual(done["last_ready_at"], requeued["last_ready_at"])
+        self.assertEqual(done["first_started_at"], first_started_at)
         self.assertIsNotNone(done["done_at"])
 
     def test_orchestrator_log_path_lives_under_repo_runtime_dir(self):
@@ -242,6 +256,122 @@ class TestDB(unittest.TestCase):
         tid = db.add_task(self.conn, "Blocked gate default")
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["allow_when_blocked"], 0)
+
+    def test_max_review_rounds_defaults_from_global(self):
+        tid = db.add_task(self.conn, "Cap default")
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_missing_max_review_rounds_and_resume_columns_are_migrated(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            legacy = sqlite3.connect(tmp.name)
+            legacy.execute(
+                """CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT NOT NULL DEFAULT 'none',
+                    next_step TEXT NOT NULL DEFAULT 'commit-make'
+                        CHECK(next_step IN ('commit-make', 'commit-review',
+                                            'commit-make-supertask', 'commit-review-supertask',
+                                            'commit-plan', 'commit-plan-review',
+                                            'pull-request-make', 'pull-request-review',
+                                            'other-make', 'other-review',
+                                            'none')),
+                    branch TEXT,
+                    commit_hash TEXT,
+                    stash_ref TEXT,
+                    coder_agent TEXT,
+                    reviewer_agent TEXT,
+                    review_round INTEGER DEFAULT 0,
+                    last_review_decision TEXT DEFAULT 'none',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ready_at DATETIME DEFAULT NULL,
+                    last_ready_at DATETIME DEFAULT NULL,
+                    done_at DATETIME DEFAULT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL DEFAULT 'commit',
+                    parent_task_id INTEGER REFERENCES tasks(id),
+                    sequence_index INTEGER,
+                    commit_plan TEXT,
+                    follow_up_task_id INTEGER REFERENCES tasks(id),
+                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE task_skips (
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    step TEXT NOT NULL
+                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
+                                       'commit-review-supertask','pull-request-review','other-review')),
+                    PRIMARY KEY (task_id, step)
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE run_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER REFERENCES tasks(id),
+                    verb TEXT,
+                    author TEXT,
+                    message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER REFERENCES tasks(id),
+                    review_round INTEGER,
+                    verb TEXT,
+                    author TEXT,
+                    message TEXT,
+                    kind TEXT DEFAULT 'comment'
+                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
+                                       'validation', 'plan-approval', 'plan-rejection',
+                                       'done-without-commit', 'deferred-build-changed')),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE orchestrator_runtime (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    status TEXT NOT NULL,
+                    pid INTEGER,
+                    started_at DATETIME,
+                    last_heartbeat_at DATETIME,
+                    current_task_id INTEGER REFERENCES tasks(id),
+                    current_step TEXT,
+                    current_branch TEXT,
+                    review_round INTEGER,
+                    active_agents INTEGER NOT NULL DEFAULT 0,
+                    status_message TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                "INSERT INTO tasks (id, title, status, next_step, kind) VALUES (1, 'Legacy', 'none', 'commit-plan', 'commit')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            migrated = db.connect(tmp.name)
+            try:
+                cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)").fetchall()}
+                self.assertIn("max_review_rounds", cols)
+                self.assertIn("block_reason", cols)
+                self.assertIn("resume_next_step", cols)
+                task = db.get_task(migrated, 1)
+                self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
+                self.assertIsNone(task["block_reason"])
+                self.assertIsNone(task["resume_next_step"])
+            finally:
+                migrated.close()
+        finally:
+            os.unlink(tmp.name)
 
     def test_task_add_defaults_normal_tasks_to_build_step(self):
         args = SimpleNamespace(
@@ -501,8 +631,10 @@ class TestDB(unittest.TestCase):
                 complete = db.get_task(migrated, 2)
                 self.assertEqual(queued["last_ready_at"], "2026-05-31 10:00:00")
                 self.assertIsNone(queued["done_at"])
+                self.assertIsNone(queued["first_started_at"])
                 self.assertIsNone(complete["last_ready_at"])
                 self.assertEqual(complete["done_at"], "2026-05-31 11:00:00")
+                self.assertIsNone(complete["first_started_at"])
             finally:
                 migrated.close()
         finally:
@@ -510,6 +642,167 @@ class TestDB(unittest.TestCase):
                 path = tmp.name + suffix
                 if os.path.exists(path):
                     os.unlink(path)
+
+    def test_missing_first_started_at_is_backfilled_from_run_log(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            legacy = sqlite3.connect(tmp.name)
+            legacy.execute(
+                """CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT NOT NULL DEFAULT 'none'
+                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
+                    next_step TEXT NOT NULL DEFAULT 'commit-make'
+                        CHECK(next_step IN ('commit-make', 'commit-review',
+                                            'commit-make-supertask', 'commit-review-supertask',
+                                            'commit-plan', 'commit-plan-review',
+                                            'pull-request-make', 'pull-request-review',
+                                            'other-make', 'other-review', 'none')),
+                    branch TEXT,
+                    commit_hash TEXT,
+                    stash_ref TEXT,
+                    coder_agent TEXT,
+                    reviewer_agent TEXT,
+                    review_round INTEGER DEFAULT 0,
+                    last_review_decision TEXT DEFAULT 'none',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ready_at DATETIME DEFAULT NULL,
+                    last_ready_at DATETIME DEFAULT NULL,
+                    done_at DATETIME DEFAULT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL DEFAULT 'commit'
+                        CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
+                    parent_task_id INTEGER REFERENCES tasks(id),
+                    sequence_index INTEGER,
+                    commit_plan TEXT,
+                    follow_up_task_id INTEGER REFERENCES tasks(id),
+                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE task_skips (
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    step TEXT NOT NULL
+                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
+                                       'commit-review-supertask','pull-request-review','other-review')),
+                    PRIMARY KEY (task_id, step)
+                )"""
+            )
+            legacy.execute(
+                """CREATE TABLE run_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER REFERENCES tasks(id),
+                    verb TEXT,
+                    author TEXT,
+                    message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, last_ready_at, done_at) "
+                "VALUES ('multi-round', 'done', 'none', "
+                "'2026-08-25 03:43:10', '2026-08-25 03:44:18')"
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, last_ready_at, done_at) "
+                "VALUES ('legacy-no-log', 'done', 'none', "
+                "'2026-05-31 10:00:00', '2026-05-31 10:10:00')"
+            )
+            legacy.execute(
+                "INSERT INTO tasks (title, status, next_step, ready_at, last_ready_at) "
+                "VALUES ('still-queued', 'ready', 'commit-make', "
+                "'2026-05-31 08:00:00', '2026-05-31 08:00:00')"
+            )
+            legacy.execute(
+                "INSERT INTO run_log (task_id, verb, author, message, created_at) "
+                "VALUES (1, 'commit-make', 'orchestrator', 'Starting commit-make', "
+                "'2026-08-25 03:05:57')"
+            )
+            legacy.execute(
+                "INSERT INTO run_log (task_id, verb, author, message, created_at) "
+                "VALUES (1, 'commit-make', 'orchestrator', 'Starting commit-make', "
+                "'2026-08-25 03:43:10')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            migrated = db.connect(tmp.name)
+            try:
+                multi = db.get_task(migrated, 1)
+                legacy_done = db.get_task(migrated, 2)
+                queued = db.get_task(migrated, 3)
+                self.assertEqual(multi["first_started_at"], "2026-08-25 03:05:57")
+                self.assertEqual(legacy_done["first_started_at"], "2026-05-31 10:00:00")
+                self.assertIsNone(queued["first_started_at"])
+            finally:
+                migrated.close()
+        finally:
+            for suffix in ("", "-shm", "-wal"):
+                path = tmp.name + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_current_schema_blocked_before_running_does_not_inherit_queue_time_on_reconnect(self):
+        """Ready → blocked (never running) must not treat last_ready_at as a start.
+
+        process_pinned_task can block a ready task before the pickup update.
+        Reconnect must leave first_started_at NULL so the later running
+        transition records the real start instead of initial queue wait.
+        """
+        tid = db.add_task(self.conn, "Blocked before pickup", branch="master")
+        db.update_task(self.conn, tid, status="ready")
+        queue_time = "2026-05-31 08:00:00"
+        self.conn.execute(
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
+            (queue_time, queue_time, tid),
+        )
+        self.conn.commit()
+        db.update_task(self.conn, tid, status="blocked")
+        blocked = db.get_task(self.conn, tid)
+        self.assertIsNone(blocked["first_started_at"])
+        self.assertEqual(blocked["last_ready_at"], queue_time)
+
+        self.conn.close()
+        self.conn = db.connect(self.tmp.name)
+        after_reconnect = db.get_task(self.conn, tid)
+        self.assertEqual(after_reconnect["status"], "blocked")
+        self.assertIsNone(after_reconnect["first_started_at"])
+        self.assertEqual(after_reconnect["last_ready_at"], queue_time)
+
+        db.update_task(self.conn, tid, status="ready")
+        db.update_task(self.conn, tid, status="running")
+        running = db.get_task(self.conn, tid)
+        self.assertIsNotNone(running["first_started_at"])
+        self.assertNotEqual(running["first_started_at"], queue_time)
+
+    def test_current_schema_reconnect_still_backfills_first_started_at_from_run_log(self):
+        tid = db.add_task(self.conn, "Needs run-log recovery", branch="feat-rt")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET first_started_at = NULL, last_ready_at = ?, done_at = ? "
+            "WHERE id = ?",
+            ("2026-08-25 03:43:10", "2026-08-25 03:44:18", tid),
+        )
+        db.add_run_log(
+            self.conn,
+            tid,
+            "Starting commit-make",
+            verb="commit-make",
+            author="orchestrator",
+        )
+        self.conn.execute(
+            "UPDATE run_log SET created_at = ? WHERE task_id = ?",
+            ("2026-08-25 03:05:57", tid),
+        )
+        self.conn.commit()
+
+        self.conn.close()
+        self.conn = db.connect(self.tmp.name)
+        recovered = db.get_task(self.conn, tid)
+        self.assertEqual(recovered["first_started_at"], "2026-08-25 03:05:57")
 
     def test_skip_commit_plan_column_migrates_to_task_skips(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -950,6 +1243,16 @@ class TestDB(unittest.TestCase):
         db.delete_task(self.conn, tid)
         self.assertIsNone(db.get_task(self.conn, tid))
 
+    def test_delete_follow_up_clears_source_reference(self):
+        source_id = db.add_task(self.conn, "Source")
+        follow_up_id = db.add_task(self.conn, "Follow-up")
+        db.update_task(self.conn, source_id, follow_up_task_id=follow_up_id)
+
+        db.delete_task(self.conn, follow_up_id)
+
+        self.assertIsNone(db.get_task(self.conn, follow_up_id))
+        self.assertIsNone(db.get_task(self.conn, source_id)["follow_up_task_id"])
+
     def test_delete_task_rejects_non_none(self):
         tid = db.add_task(self.conn, "Cant delete")
         db.update_task(self.conn, tid, status="ready", branch="b")
@@ -1017,6 +1320,18 @@ class TestDB(unittest.TestCase):
 
         found = db.find_ready_task(self.conn)
         self.assertEqual(found["id"], t3)
+
+    def test_find_ready_task_exclude_ids(self):
+        first = db.add_task(self.conn, "First", branch="b", sequence_index=1)
+        second = db.add_task(self.conn, "Second", branch="b", sequence_index=2)
+        db.update_task(self.conn, first, status="ready")
+        db.update_task(self.conn, second, status="ready")
+        self.assertEqual(db.find_ready_task(self.conn)["id"], first)
+        self.assertEqual(
+            db.find_ready_task(self.conn, exclude_ids=[first])["id"],
+            second,
+        )
+        self.assertIsNone(db.find_ready_task(self.conn, exclude_ids=[first, second]))
 
     def test_find_ready_task_tie_breaks_by_id_when_sequence_index_matches(self):
         t1 = db.add_task(self.conn, "Ready one", branch="b", sequence_index=100)
@@ -1089,9 +1404,370 @@ class TestDB(unittest.TestCase):
         db.purge_run_log(self.conn)
         self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
 
-        # Purge by days=0 removes everything
+        # days=0 still preserves unfinished-task history
         db.purge_run_log(self.conn, days=0)
-        self.assertEqual(len(db.get_run_log(self.conn, tid)), 0)
+        self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
+
+
+
+class TestRuntimeHistoryPurge(unittest.TestCase):
+    """Retention, eligibility, transcript safety, and idle compaction."""
+
+    UNFINISHED_STATUSES = ("none", "ready", "running", "blocked", "pending_subtasks")
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _age_latest_run_log(self, *sql_modifiers):
+        row_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        placeholders = ", ".join("?" for _ in sql_modifiers)
+        self.conn.execute(
+            f"UPDATE run_log SET created_at = datetime('now', {placeholders}) WHERE id = ?",
+            (*sql_modifiers, row_id),
+        )
+        self.conn.commit()
+        return row_id
+
+    def _add_aged_run_log(self, task_id, message, *sql_modifiers, author="orchestrator"):
+        db.add_run_log(self.conn, task_id, message, author=author)
+        return self._age_latest_run_log(*sql_modifiers)
+
+    def _write_transcript(self, task_id, name, text, age_seconds):
+        task_dir = db.get_artifacts_root(self.db_path) / f"task-{task_id}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        path = task_dir / name
+        path.write_text(text, encoding="utf-8")
+        aged = time.time() - age_seconds
+        os.utime(path, (aged, aged))
+        return path
+
+    def test_seven_day_boundary_deletes_only_older_done_rows(self):
+        tid = db.add_task(self.conn, "Done boundary")
+        db.update_task(self.conn, tid, status="done")
+        old_id = self._add_aged_run_log(tid, "old", "-7 days", "-1 hour")
+        boundary_id = self._add_aged_run_log(tid, "boundary", "-7 days", "+1 hour")
+        recent_id = self._add_aged_run_log(tid, "recent", "-6 days")
+
+        result = db.purge_run_log(self.conn)
+
+        remaining = {row["id"] for row in db.get_run_log(self.conn, tid)}
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertNotIn(old_id, remaining)
+        self.assertIn(boundary_id, remaining)
+        self.assertIn(recent_id, remaining)
+
+    def test_eligible_statuses_only_done_rows_are_deleted(self):
+        done_id = db.add_task(self.conn, "Done")
+        db.update_task(self.conn, done_id, status="done")
+        self._add_aged_run_log(done_id, "done old", "-8 days")
+
+        kept = {}
+        for status in self.UNFINISHED_STATUSES:
+            tid = db.add_task(self.conn, f"Status {status}", branch="feat")
+            db.update_task(self.conn, tid, status=status)
+            self._add_aged_run_log(tid, f"{status} old", "-8 days")
+            kept[status] = tid
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertEqual(db.get_run_log(self.conn, done_id), [])
+        for status, tid in kept.items():
+            logs = db.get_run_log(self.conn, tid)
+            self.assertEqual(len(logs), 1, status)
+            self.assertEqual(db.get_task(self.conn, tid)["status"], status)
+
+    def test_old_global_rows_are_purged(self):
+        self._add_aged_run_log(None, "old global", "-8 days")
+        self._add_aged_run_log(None, "recent global", "-1 days")
+
+        result = db.purge_run_log(self.conn)
+
+        remaining = [row["message"] for row in db.get_global_run_log(self.conn)]
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertEqual(remaining, ["recent global"])
+
+    def test_old_transcripts_deleted_only_for_completed_tasks(self):
+        done_id = db.add_task(self.conn, "Done transcripts")
+        db.update_task(self.conn, done_id, status="done")
+        old_done = self._write_transcript(
+            done_id, "old-done.log", "old done\n", 8 * 86400
+        )
+        recent_done = self._write_transcript(
+            done_id, "recent-done.log", "recent done\n", 2 * 86400
+        )
+
+        running_id = db.add_task(self.conn, "Running transcripts")
+        db.update_task(self.conn, running_id, status="running")
+        old_running = self._write_transcript(
+            running_id, "old-running.log", "old running\n", 8 * 86400
+        )
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 1)
+        self.assertGreater(result["reclaimed_artifact_bytes"], 0)
+        self.assertFalse(old_done.exists())
+        self.assertTrue(recent_done.exists())
+        self.assertTrue(old_running.exists())
+        self.assertTrue((db.get_artifacts_root(self.db_path) / f"task-{done_id}").is_dir())
+        self.assertTrue((db.get_artifacts_root(self.db_path) / f"task-{running_id}").is_dir())
+
+    def test_empty_task_artifact_directory_is_removed_after_transcript_purge(self):
+        done_id = db.add_task(self.conn, "Empty dir")
+        db.update_task(self.conn, done_id, status="done")
+        old = self._write_transcript(done_id, "only.log", "gone\n", 8 * 86400)
+        task_dir = old.parent
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 1)
+        self.assertFalse(old.exists())
+        self.assertFalse(task_dir.exists())
+
+    def test_unfinished_work_comments_and_tasks_are_preserved(self):
+        tid = db.add_task(self.conn, "Keep me", description="durable")
+        db.update_task(self.conn, tid, status="blocked")
+        db.add_comment(self.conn, tid, "keep this comment")
+        self._add_aged_run_log(tid, "blocked old log", "-30 days")
+        transcript = self._write_transcript(
+            tid, "blocked.log", "blocked transcript\n", 30 * 86400
+        )
+
+        result = db.purge_run_log(self.conn, days=0)
+
+        self.assertEqual(result["deleted_rows"], 0)
+        self.assertEqual(result["deleted_transcripts"], 0)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["title"], "Keep me")
+        self.assertEqual(task["description"], "durable")
+        self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
+        comments = db.get_comments(self.conn, tid)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["message"], "keep this comment")
+        self.assertTrue(transcript.exists())
+
+    def test_path_safety_does_not_follow_links_or_leave_artifacts_root(self):
+        done_id = db.add_task(self.conn, "Path safety")
+        db.update_task(self.conn, done_id, status="done")
+        outside_dir = Path(self.tmpdir.name) / "outside"
+        outside_dir.mkdir()
+        outside_file = outside_dir / "secret.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+
+        artifacts = db.get_artifacts_root(self.db_path)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        linked_task = artifacts / f"task-{done_id}"
+        linked_task.symlink_to(outside_dir)
+
+        other_done = db.add_task(self.conn, "Real done")
+        db.update_task(self.conn, other_done, status="done")
+        real_old = self._write_transcript(
+            other_done, "real-old.log", "delete me\n", 8 * 86400
+        )
+        linked_file = real_old.parent / "linked.log"
+        linked_file.symlink_to(outside_file)
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 1)
+        self.assertFalse(real_old.exists())
+        self.assertTrue(linked_file.is_symlink())
+        self.assertTrue(outside_file.exists())
+        self.assertTrue(linked_task.is_symlink())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+
+    def test_path_safety_survives_task_dir_symlink_swap_before_deletion(self):
+        done_id = db.add_task(self.conn, "Swap race")
+        db.update_task(self.conn, done_id, status="done")
+        planted = self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
+        task_dir = planted.parent
+
+        outside_dir = Path(self.tmpdir.name) / "outside"
+        outside_dir.mkdir()
+        outside_file = outside_dir / "old.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+        moved_dir = Path(self.tmpdir.name) / "moved-task-dir"
+        orig_purge_dir = db._purge_task_transcript_dir
+        swapped = {"done": False}
+
+        def swap_then_purge(*args, **kwargs):
+            if not swapped["done"]:
+                swapped["done"] = True
+                os.rename(task_dir, moved_dir)
+                os.symlink(outside_dir, task_dir)
+            return orig_purge_dir(*args, **kwargs)
+
+        with patch.object(db, "_purge_task_transcript_dir", side_effect=swap_then_purge):
+            db.purge_run_log(self.conn)
+
+        self.assertTrue(swapped["done"])
+        self.assertTrue(outside_file.exists())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+        self.assertTrue(task_dir.is_symlink())
+
+    def test_path_safety_survives_artifacts_root_symlink_swap_before_scan(self):
+        done_id = db.add_task(self.conn, "Root swap")
+        db.update_task(self.conn, done_id, status="done")
+        self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
+        artifacts = db.get_artifacts_root(self.db_path)
+
+        outside_root = Path(self.tmpdir.name) / "outside-artifacts"
+        outside_task = outside_root / f"task-{done_id}"
+        outside_task.mkdir(parents=True)
+        outside_file = outside_task / "old.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+        moved_root = Path(self.tmpdir.name) / "moved-artifacts"
+        orig_scandir = db.os.scandir
+        swapped = {"done": False}
+
+        def swap_then_scandir(path, *args, **kwargs):
+            if not swapped["done"]:
+                swapped["done"] = True
+                os.rename(artifacts, moved_root)
+                os.symlink(outside_root, artifacts)
+            return orig_scandir(path, *args, **kwargs)
+
+        with patch.object(db.os, "scandir", side_effect=swap_then_scandir):
+            db.purge_run_log(self.conn)
+
+        self.assertTrue(swapped["done"])
+        self.assertTrue(outside_file.exists())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+        self.assertTrue(artifacts.is_symlink())
+
+    def test_path_safety_skips_symlinked_artifacts_root(self):
+        done_id = db.add_task(self.conn, "Symlink root")
+        db.update_task(self.conn, done_id, status="done")
+        real_artifacts = Path(self.tmpdir.name) / "elsewhere" / "artifacts"
+        task_dir = real_artifacts / f"task-{done_id}"
+        task_dir.mkdir(parents=True)
+        planted = task_dir / "planted.log"
+        planted.write_text("keep\n", encoding="utf-8")
+        os.utime(planted, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+
+        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "artifacts").symlink_to(real_artifacts)
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 0)
+        self.assertTrue(planted.exists())
+
+    def test_path_safety_skips_symlinked_runtime_parent(self):
+        done_id = db.add_task(self.conn, "Symlink runtime")
+        db.update_task(self.conn, done_id, status="done")
+        outside_runtime = Path(self.tmpdir.name) / "elsewhere" / ".kanban-orchestra"
+        task_dir = outside_runtime / "artifacts" / f"task-{done_id}"
+        task_dir.mkdir(parents=True)
+        planted = task_dir / "planted.log"
+        planted.write_text("keep\n", encoding="utf-8")
+        os.utime(planted, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+
+        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+        runtime.symlink_to(outside_runtime)
+
+        result = db.purge_run_log(self.conn)
+
+        self.assertEqual(result["deleted_transcripts"], 0)
+        self.assertTrue(planted.exists())
+        self.assertEqual(planted.read_text(encoding="utf-8"), "keep\n")
+
+    def test_path_safety_survives_runtime_parent_symlink_swap_before_open(self):
+        done_id = db.add_task(self.conn, "Runtime swap")
+        db.update_task(self.conn, done_id, status="done")
+        self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
+        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+
+        outside_runtime = Path(self.tmpdir.name) / "outside-runtime"
+        outside_task = outside_runtime / "artifacts" / f"task-{done_id}"
+        outside_task.mkdir(parents=True)
+        outside_file = outside_task / "old.log"
+        outside_file.write_text("do not delete\n", encoding="utf-8")
+        aged = time.time() - 8 * 86400
+        os.utime(outside_file, (aged, aged))
+        moved_runtime = Path(self.tmpdir.name) / "moved-runtime"
+        orig_open = db._open_directory_nofollow
+        swapped = {"done": False}
+
+        def swap_then_open(path, *, dir_fd=None):
+            if path == ".kanban-orchestra" and not swapped["done"]:
+                swapped["done"] = True
+                os.rename(runtime, moved_runtime)
+                os.symlink(outside_runtime, runtime)
+            return orig_open(path, dir_fd=dir_fd)
+
+        with patch.object(db, "_open_directory_nofollow", side_effect=swap_then_open):
+            db.purge_run_log(self.conn)
+
+        self.assertTrue(swapped["done"])
+        self.assertTrue(outside_file.exists())
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "do not delete\n")
+        self.assertTrue(runtime.is_symlink())
+
+    def test_noop_purge_is_idempotent_and_skips_compact(self):
+        tid = db.add_task(self.conn, "Recent done")
+        db.update_task(self.conn, tid, status="done")
+        db.add_run_log(self.conn, tid, "fresh")
+        db.add_comment(self.conn, tid, "fresh comment")
+        transcript = self._write_transcript(tid, "fresh.log", "fresh\n", 60)
+
+        first = db.purge_run_log(self.conn, compact=True)
+        second = db.purge_run_log(self.conn, compact=True)
+
+        self.assertEqual(first["deleted_rows"], 0)
+        self.assertEqual(first["deleted_transcripts"], 0)
+        self.assertFalse(first["compacted"])
+        self.assertEqual(second, first)
+        self.assertEqual(len(db.get_run_log(self.conn, tid)), 1)
+        self.assertEqual(len(db.get_comments(self.conn, tid)), 1)
+        self.assertTrue(transcript.exists())
+
+    def test_compact_reclaims_database_pages_after_row_deletes(self):
+        tid = db.add_task(self.conn, "Compact me")
+        db.update_task(self.conn, tid, status="done")
+        payload = "x" * 8000
+        for index in range(40):
+            self._add_aged_run_log(tid, f"{payload}-{index}", "-8 days")
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = db._sqlite_disk_usage(self.db_path)
+
+        result = db.purge_run_log(self.conn, compact=True)
+
+        self.assertEqual(result["deleted_rows"], 40)
+        self.assertTrue(result["compacted"])
+        self.assertGreater(result["reclaimed_db_bytes"], 0)
+        self.assertLess(db._sqlite_disk_usage(self.db_path), before)
+        self.assertEqual(db.get_run_log(self.conn, tid), [])
+
+    def test_days_zero_purges_recent_eligible_history_only(self):
+        done_id = db.add_task(self.conn, "Done recent")
+        db.update_task(self.conn, done_id, status="done")
+        db.add_run_log(self.conn, done_id, "recent done")
+        db.add_comment(self.conn, done_id, "keep comment")
+        ready_id = db.add_task(self.conn, "Ready recent", branch="feat")
+        db.update_task(self.conn, ready_id, status="ready")
+        db.add_run_log(self.conn, ready_id, "recent ready")
+
+        result = db.purge_run_log(self.conn, days=0)
+
+        self.assertEqual(result["deleted_rows"], 1)
+        self.assertEqual(db.get_run_log(self.conn, done_id), [])
+        self.assertEqual(len(db.get_run_log(self.conn, ready_id)), 1)
+        self.assertEqual(len(db.get_comments(self.conn, done_id)), 1)
 
 
 
@@ -1676,8 +2352,8 @@ class TestReviewAggregation(unittest.TestCase):
 
         self.assertEqual(outcome, "error")
 
-    def test_reviewer_no_comment_returns_reject(self):
-        """Reviewer exits 0 but leaves no comment — treated as reject."""
+    def test_reviewer_no_comment_returns_error(self):
+        """Reviewer exits 0 but leaves no comment — treated as infrastructure failure."""
         tid = db.add_task(self.conn, "No comment", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-review")
         task = db.get_task(self.conn, tid)
@@ -1686,7 +2362,221 @@ class TestReviewAggregation(unittest.TestCase):
              patch.object(orchestrator, "run_agent", return_value=0):
             outcome = orchestrator.handle_commit_review(task, self.conn)
 
-        self.assertEqual(outcome, "reject")
+        self.assertEqual(outcome, "error")
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(
+            any("infrastructure failure" in c["message"] for c in comments),
+        )
+
+
+class TestReviewerInfrastructureFailures(unittest.TestCase):
+    """Lifecycle coverage for no-decision / transport failures vs content rejections."""
+
+    def setUp(self):
+        self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
+        self._ack_patcher.start()
+        self._sleep_patcher = patch.object(orchestrator.time, "sleep")
+        self._sleep_patcher.start()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.conn = db.connect(self.tmp.name)
+
+    def tearDown(self):
+        self._sleep_patcher.stop()
+        self._ack_patcher.stop()
+        self.conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_five_infra_failures_consume_zero_content_review_rounds(self):
+        """Five consecutive no-decision failures never invoke coder rework."""
+        tid = db.add_task(self.conn, "Infra failures", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review", review_round=0,
+        )
+        task = db.get_task(self.conn, tid)
+        attempts = {"n": 0}
+
+        def fake_review(review_task, conn):
+            attempts["n"] += 1
+            self.assertEqual(db.get_task(conn, tid)["review_round"], 0)
+            self.assertEqual(review_task["review_round"], 0)
+            return "error"
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", side_effect=fake_review), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "stash_task_wip") as mock_stash, \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertFalse(result)
+        self.assertEqual(attempts["n"], orchestrator.REVIEWER_INFRA_ATTEMPTS)
+        mock_make.assert_not_called()
+        mock_stash.assert_not_called()
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], 0)
+        self.assertEqual(updated["last_review_decision"], "none")
+
+    def test_explicit_rejection_still_consumes_one_review_round(self):
+        tid = db.add_task(self.conn, "Content reject", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review", review_round=0,
+        )
+        task = db.get_task(self.conn, tid)
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", return_value="reject") as mock_review, \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        mock_review.assert_called_once()
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "ready")
+        self.assertEqual(updated["next_step"], "commit-make")
+        self.assertEqual(updated["review_round"], 1)
+        self.assertEqual(updated["last_review_decision"], "reject")
+        self.assertIsNone(updated["block_reason"])
+
+    def test_reviewer_ack_failure_exhausts_infra_retries_without_coder_rework(self):
+        """A missing reviewer/tool ACK returns into the bounded retry policy."""
+        tid = db.add_task(self.conn, "Ack fail", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review", review_round=0,
+        )
+        task = db.get_task(self.conn, tid)
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "ensure_agent_acked", return_value=False) as mock_ack, \
+             patch.object(orchestrator, "run_agent") as mock_run, \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertFalse(result)
+        self.assertEqual(mock_ack.call_count, orchestrator.REVIEWER_INFRA_ATTEMPTS)
+        mock_run.assert_not_called()
+        mock_make.assert_not_called()
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], 0)
+        self.assertEqual(updated["last_review_decision"], "none")
+
+    def test_resumed_commit_review_restores_stash_before_reviewer(self):
+        """Direct commit-review resumption restores recorded WIP before the reviewer runs."""
+        tid = db.add_task(self.conn, "Restore then review", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review",
+            review_round=0, stash_ref="stash@{0}",
+        )
+        task = db.get_task(self.conn, tid)
+        order = []
+
+        def fake_restore(restore_task, conn):
+            order.append("restore")
+            self.assertEqual(restore_task["stash_ref"], "stash@{0}")
+            db.update_task(conn, restore_task["id"], stash_ref=None)
+            return True
+
+        def fake_review(review_task, conn):
+            order.append("review")
+            self.assertIsNone(db.get_task(conn, tid)["stash_ref"])
+            return "approve"
+
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "restore_task_wip", side_effect=fake_restore) as mock_restore, \
+             patch.object(orchestrator, "handle_commit_review", side_effect=fake_review), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            result = orchestrator.advance(task, self.conn)
+
+        self.assertTrue(result)
+        mock_restore.assert_called_once()
+        self.assertEqual(order, ["restore", "review"])
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["next_step"], "commit-make")
+        self.assertEqual(updated["last_review_decision"], "approve")
+        self.assertIsNone(updated["stash_ref"])
+
+    def test_resumed_reviewer_sees_restored_cached_diff(self):
+        """The resumed reviewer inspects the restored candidate via git diff --cached."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "init"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            (repo / "candidate.py").write_text("print('candidate')\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "candidate.py"], cwd=repo, check=True, capture_output=True,
+            )
+
+            tid = db.add_task(self.conn, "See candidate", coder_agent="claude")
+            db.update_task(
+                self.conn, tid,
+                status="running", branch="b", next_step="commit-review", review_round=0,
+            )
+            seen = {}
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(repo)
+                stash_ref = orchestrator.stash_task_wip(tid, self.conn)
+                self.assertTrue(stash_ref)
+                cached_before = subprocess.run(
+                    ["git", "diff", "--cached", "--name-only"],
+                    capture_output=True, text=True, check=True,
+                ).stdout
+                self.assertNotIn("candidate.py", cached_before)
+
+                task = db.get_task(self.conn, tid)
+                self.assertEqual(task["stash_ref"], stash_ref)
+
+                def fake_reviewer(name, prompt, task_id, conn, step, **kwargs):
+                    cached = subprocess.run(
+                        ["git", "diff", "--cached", "--name-only"],
+                        capture_output=True, text=True, check=True,
+                    ).stdout
+                    seen["cached"] = cached
+                    db.add_comment(
+                        conn, task_id, "LGTM",
+                        kind="approval", author=name, review_round=0,
+                    )
+                    return 0
+
+                with patch.object(orchestrator, "ensure_branch", return_value=True), \
+                     patch.object(orchestrator, "run_agent", side_effect=fake_reviewer):
+                    result = orchestrator.advance(task, self.conn)
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertTrue(result)
+            self.assertIn("candidate.py", seen.get("cached", ""))
+            updated = db.get_task(self.conn, tid)
+            self.assertIsNone(updated["stash_ref"])
+            self.assertEqual(updated["last_review_decision"], "approve")
+            comments = db.get_comments(self.conn, tid)
+            self.assertTrue(
+                any("Restored task WIP" in (c["message"] or "") for c in comments),
+            )
 
 
 class TestStateMachine(unittest.TestCase):
@@ -1695,11 +2585,14 @@ class TestStateMachine(unittest.TestCase):
     def setUp(self):
         self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
         self._ack_patcher.start()
+        self._sleep_patcher = patch.object(orchestrator.time, "sleep")
+        self._sleep_patcher.start()
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.conn = db.connect(self.tmp.name)
 
     def tearDown(self):
+        self._sleep_patcher.stop()
         self._ack_patcher.stop()
         self.conn.close()
         os.unlink(self.tmp.name)
@@ -2071,6 +2964,16 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["next_step"], "none")
         self.assertEqual(updated["commit_hash"], "a" * 40)
         self.assertIsNone(updated["ready_at"])
+        completion = [
+            c for c in db.get_comments(self.conn, tid)
+            if c["author"] == "orchestrator" and c["message"].startswith("Task complete:")
+        ]
+        self.assertEqual(len(completion), 1)
+        self.assertEqual(
+            completion[0]["message"],
+            "Task complete: commit finalized locally on branch 'b'.",
+        )
+        self.assertNotIn("pushed", completion[0]["message"])
 
     def test_commit_make_path_b_no_new_commit_no_signal_blocks(self):
         """Path B exits 0 without a new commit and no DONE_WITHOUT_COMMIT: task is blocked, not done."""
@@ -2205,7 +3108,7 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(len(commit_calls), 1)
 
     def test_commit_make_with_skip_review_and_deferred_policy_requeues_path_b_validation(self):
-        """Skipped review still runs Path B when SKIP_BUILD_UNTIL_APPROVED requires final validation."""
+        """Skipped review still runs Path B when CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER requires final validation."""
         tid = db.add_task(
             self.conn,
             "Skip review deferred",
@@ -2240,7 +3143,7 @@ class TestStateMachine(unittest.TestCase):
         ]
         self.assertEqual(commit_calls, [])
         comments = db.get_comments(self.conn, tid)
-        self.assertTrue(any("SKIP_BUILD_UNTIL_APPROVED is active" in c["message"] for c in comments))
+        self.assertTrue(any("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is active" in c["message"] for c in comments))
 
     def test_commit_make_failure_blocks_immediately(self):
         """Failed commit-make immediately blocks the task."""
@@ -2258,20 +3161,28 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["status"], "blocked")
         self.assertEqual(updated["next_step"], "none")
 
-    def test_reviewer_error_blocks_immediately(self):
-        """Reviewer error immediately blocks the task."""
+    def test_reviewer_error_blocks_as_reviewer_unavailable(self):
+        """Reviewer infrastructure errors retry then block as reviewer_unavailable."""
         tid = db.add_task(self.conn, "Review error block", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-review")
         task = db.get_task(self.conn, tid)
 
         with patch.object(orchestrator, "ensure_branch", return_value=True), \
-             patch.object(orchestrator, "handle_commit_review", return_value="error"):
+             patch.object(orchestrator, "handle_commit_review", return_value="error"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "stash_task_wip") as mock_stash, \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
             result = orchestrator.advance(task, self.conn)
 
         self.assertFalse(result)
+        mock_make.assert_not_called()
+        mock_stash.assert_not_called()
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
         self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], 0)
 
     def test_branch_failure_blocks(self):
         """If branch can't be checked out, task is blocked."""
@@ -2323,6 +3234,10 @@ class TestStateMachine(unittest.TestCase):
 
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(updated["resume_next_step"], "commit-make")
+        self.assertEqual(updated["review_round"], orchestrator.MAX_REVIEW_ROUNDS)
+        self.assertEqual(updated["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
 
     def test_max_review_rounds_dirty_worktree_preserves_wip(self):
         """Max review rounds with a dirty worktree stashes WIP and records stash_ref."""
@@ -2372,8 +3287,8 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["status"], "blocked")
         self.assertIsNone(updated["stash_ref"])
 
-    def test_max_review_errors_block(self):
-        """Reviewer error blocks the task immediately."""
+    def test_max_review_errors_block_as_reviewer_unavailable(self):
+        """Reviewer infrastructure errors do not spend content-review rounds or block as review_cap."""
         tid = db.add_task(self.conn, "Too many review errors", coder_agent="claude")
         round_num = orchestrator.MAX_REVIEW_ROUNDS - 1
         db.update_task(self.conn, tid, status="running", branch="b",
@@ -2381,12 +3296,20 @@ class TestStateMachine(unittest.TestCase):
         task = db.get_task(self.conn, tid)
 
         with patch.object(orchestrator, "ensure_branch", return_value=True), \
-             patch.object(orchestrator, "handle_commit_review", return_value="error"):
+             patch.object(orchestrator, "handle_commit_review", return_value="error"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator, "stash_task_wip"), \
+             patch.object(orchestrator, "handle_commit_make") as mock_make:
             orchestrator.advance(task, self.conn)
 
+        mock_make.assert_not_called()
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
         self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(updated["resume_next_step"], "commit-review")
+        self.assertEqual(updated["review_round"], round_num)
+        self.assertNotEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
 
     def test_dirty_at_pickup_blocks_without_starting_agent(self):
         """If the worktree is dirty before commit-make starts, block without running the agent."""
@@ -2492,6 +3415,30 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(ref, "stash@{0}")
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["stash_ref"], "stash@{0}")
+
+    def test_restore_task_wip_pops_index_and_clears_stash_ref(self):
+        """restore_task_wip pops with --index so git diff --cached sees the candidate."""
+        tid = db.add_task(self.conn, "Restore WIP index", coder_agent="claude")
+        db.update_task(self.conn, tid, status="running", branch="b", stash_ref="stash@{0}")
+        task = db.get_task(self.conn, tid)
+        commands = []
+
+        def fake_run(cmd, **kw):
+            commands.append(list(cmd))
+            mock = MagicMock()
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+            return mock
+
+        with patch.object(orchestrator.subprocess, "run", side_effect=fake_run):
+            ok = orchestrator.restore_task_wip(task, self.conn)
+
+        self.assertTrue(ok)
+        self.assertEqual(commands[0][:4], ["git", "stash", "pop", "--index"])
+        self.assertEqual(commands[0][4], "stash@{0}")
+        updated = db.get_task(self.conn, tid)
+        self.assertIsNone(updated["stash_ref"])
 
     def test_stash_ref_restore_flow(self):
         """Blocked task with recorded stash_ref advances through commit-make when coder succeeds.
@@ -3007,11 +3954,61 @@ class TestTaskCLI(unittest.TestCase):
         task = json.loads(r.stdout)
         self.assertEqual(task["reviewer_agent"], "antigravity")
 
+    def test_supertask_uses_super_agent_defaults(self):
+        env = {
+            **self.env,
+            "ORCHESTRA_DEFAULT_SUPER_PLANNER": "opus",
+            "ORCHESTRA_DEFAULT_SUPER_REVIEWER": "antigravity",
+            "ORCHESTRA_DEFAULT_CODER": "sonnet",
+            "ORCHESTRA_DEFAULT_REVIEWER": "codex",
+        }
+        r = self._run("add", "Default supertask", "--type", "supertask", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["coder_agent"], "opus")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
+
+    def test_supertask_preserves_explicit_agents(self):
+        r = self._run(
+            "add", "Explicit supertask", "--type", "supertask",
+            "--coder-agent", "haiku", "--reviewer-agent", "sonnet",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["coder_agent"], "haiku")
+        self.assertEqual(task["reviewer_agent"], "sonnet")
+
+    def test_commit_task_keeps_ordinary_agent_defaults(self):
+        env = {
+            **self.env,
+            "ORCHESTRA_DEFAULT_SUPER_PLANNER": "opus",
+            "ORCHESTRA_DEFAULT_SUPER_REVIEWER": "codex",
+            "ORCHESTRA_DEFAULT_CODER": "haiku",
+            "ORCHESTRA_DEFAULT_REVIEWER": "antigravity",
+        }
+        r = self._run("add", "Default commit", "--type", "commit", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["coder_agent"], "haiku")
+        self.assertEqual(task["reviewer_agent"], "antigravity")
+
     def test_coder_agent_accepts_provider_model_spec(self):
         spec = "cursor:claude-opus-4-8-high"
         r = self._run("add", "Dynamic coder", "--branch", "feature-dynamic", "--coder-agent", spec)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["coder_agent"], spec)
+
+    def test_coder_agent_accepts_registry_alias(self):
+        r = self._run("add", "Alias coder", "--branch", "feature-alias", "--coder-agent", "grok")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["coder_agent"], "grok")
+
+    def test_set_reviewer_agent_accepts_registry_alias(self):
+        r = self._run("add", "Alias reviewer")
+        tid = json.loads(r.stdout)["id"]
+        r2 = self._run("set", str(tid), "--reviewer-agent", "grok")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["reviewer_agent"], "grok")
 
     def test_set_reviewer_agent_accepts_provider_model_spec(self):
         spec = "cursor:claude-opus-4-8-high"
@@ -3096,6 +4093,383 @@ class TestTaskCLI(unittest.TestCase):
                 if path.exists():
                     path.unlink()
 
+
+class TestImportWorktree(unittest.TestCase):
+    """Focused coverage for task import-worktree / db.import_worktree_database."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.target_db = str(Path(self.tmpdir.name) / "target" / "kanban-orchestra.db")
+        self.source_root = Path(self.tmpdir.name) / "source-worktree"
+        self.source_root.mkdir(parents=True)
+        Path(self.target_db).parent.mkdir(parents=True)
+        self.source_db = str(self.source_root / "kanban-orchestra.db")
+        self.target_conn = db.connect(self.target_db)
+        self.source_conn = db.connect(self.source_db)
+        self.task_py = str(Path(__file__).resolve().parent / "task.py")
+        self.env = {
+            **os.environ,
+            "KANBAN_DB": self.target_db,
+            "KANBAN_NONINTERACTIVE": "1",
+        }
+
+    def tearDown(self):
+        self.target_conn.close()
+        self.source_conn.close()
+        self.tmpdir.cleanup()
+
+    def _run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, self.task_py] + list(args),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+    def _seed_source_graph(self):
+        parent_id = db.add_task(
+            self.source_conn,
+            "Parent task",
+            description="parent desc",
+            branch="feat-import",
+            skips=["commit-plan"],
+        )
+        child_id = db.add_task(
+            self.source_conn,
+            "Child task",
+            description="child desc",
+            branch="feat-import",
+            parent_task_id=parent_id,
+            sequence_index=1,
+            skips=["commit-plan"],
+        )
+        follow_id = db.add_task(
+            self.source_conn,
+            "Follow-up task",
+            description="follow desc",
+            branch="feat-import",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.source_conn, parent_id, follow_up_task_id=follow_id)
+        db.update_task(
+            self.source_conn,
+            child_id,
+            status="ready",
+            ready_at="2026-01-01 12:00:00",
+            stash_ref="stash@{0}",
+        )
+        db.update_task(
+            self.source_conn,
+            parent_id,
+            status="pending_subtasks",
+            next_step="commit-make-supertask",
+        )
+        done_id = db.add_task(
+            self.source_conn,
+            "Done task",
+            branch="feat-import",
+            skips=["commit-plan"],
+        )
+        db.update_task(
+            self.source_conn,
+            done_id,
+            status="done",
+            commit_hash="abc123",
+            first_started_at="2026-01-02 11:00:00",
+            done_at="2026-01-02 12:00:00",
+        )
+        db.add_comment(
+            self.source_conn,
+            child_id,
+            "needs changes",
+            kind="rejection",
+            author="codex",
+            review_round=1,
+        )
+        db.add_comment(
+            self.source_conn,
+            child_id,
+            "working on it",
+            kind="comment",
+            author="coder",
+        )
+        db.add_run_log(
+            self.source_conn,
+            child_id,
+            "ran commit-make",
+            verb="commit-make",
+            author="coder",
+        )
+        return {
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "follow_id": follow_id,
+            "done_id": done_id,
+        }
+
+    def test_import_success_remaps_ids_and_history(self):
+        existing_id = db.add_task(self.target_conn, "Already here", branch="develop")
+        ids = self._seed_source_graph()
+        source_stat = Path(self.source_db).stat()
+
+        result = db.import_worktree_database(self.target_conn, self.source_root)
+        id_map = {int(k): v for k, v in result["id_map"].items()}
+
+        self.assertEqual(result["imported_count"], 4)
+        self.assertEqual(
+            Path(result["source_db"]).resolve(),
+            Path(self.source_db).resolve(),
+        )
+        self.assertNotIn(existing_id, id_map.values())
+        self.assertEqual(
+            db.get_task(self.target_conn, existing_id)["title"],
+            "Already here",
+        )
+
+        new_parent = id_map[ids["parent_id"]]
+        new_child = id_map[ids["child_id"]]
+        new_follow = id_map[ids["follow_id"]]
+        new_done = id_map[ids["done_id"]]
+
+        parent = db.get_task(self.target_conn, new_parent)
+        child = db.get_task(self.target_conn, new_child)
+        follow = db.get_task(self.target_conn, new_follow)
+        done = db.get_task(self.target_conn, new_done)
+
+        self.assertEqual(parent["follow_up_task_id"], new_follow)
+        self.assertEqual(child["parent_task_id"], new_parent)
+        self.assertEqual(child["status"], "none")
+        self.assertIsNone(child["ready_at"])
+        self.assertIsNone(child["stash_ref"])
+        self.assertIsNotNone(child["first_started_at"])
+        self.assertEqual(parent["status"], "none")
+        self.assertEqual(follow["status"], "none")
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["commit_hash"], "abc123")
+        self.assertEqual(done["first_started_at"], "2026-01-02 11:00:00")
+        self.assertEqual(child["skips"], ["commit-plan"])
+
+        comments = db.get_comments(self.target_conn, new_child)
+        kinds = [c["kind"] for c in comments]
+        self.assertIn("rejection", kinds)
+        self.assertTrue(
+            any(
+                c["verb"] == "import-worktree" and f"source task id {ids['child_id']}" in c["message"]
+                and "feat-import" in c["message"]
+                for c in comments
+            )
+        )
+        run_log = db.get_run_log(self.target_conn, new_child)
+        self.assertEqual(run_log[0]["message"], "ran commit-make")
+
+        # Source DB untouched.
+        after = Path(self.source_db).stat()
+        self.assertEqual(after.st_mtime_ns, source_stat.st_mtime_ns)
+        self.assertEqual(db.get_task(self.source_conn, ids["child_id"])["status"], "ready")
+
+    def test_import_does_not_backfill_target_blocked_never_started_from_queue_time(self):
+        tid = db.add_task(
+            self.target_conn, "Blocked before pickup", branch="master"
+        )
+        db.update_task(self.target_conn, tid, status="ready")
+        queue_time = "2026-05-31 08:00:00"
+        self.target_conn.execute(
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
+            (queue_time, queue_time, tid),
+        )
+        self.target_conn.commit()
+        db.update_task(self.target_conn, tid, status="blocked")
+        self.assertIsNone(db.get_task(self.target_conn, tid)["first_started_at"])
+
+        self._seed_source_graph()
+        db.import_worktree_database(self.target_conn, self.source_root)
+
+        blocked = db.get_task(self.target_conn, tid)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIsNone(blocked["first_started_at"])
+        self.assertEqual(blocked["last_ready_at"], queue_time)
+
+    def test_import_cli_prints_id_map(self):
+        db.add_task(self.target_conn, "Keep me")
+        ids = self._seed_source_graph()
+        # Close writers so CLI can open the target DB.
+        self.target_conn.close()
+        self.source_conn.close()
+
+        result = self._run_cli("import-worktree", str(self.source_root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["imported_count"], 4)
+        self.assertEqual(
+            set(payload["id_map"]),
+            {str(ids["parent_id"]), str(ids["child_id"]), str(ids["follow_id"]), str(ids["done_id"])},
+        )
+
+        # Re-open for tearDown.
+        self.target_conn = db.connect(self.target_db)
+        self.source_conn = db.connect(self.source_db)
+
+    def test_import_cli_succeeds_without_git_or_kanban_db(self):
+        """import-worktree must not invoke Git when resolving the target DB."""
+        db.add_task(self.target_conn, "Keep me")
+        ids = self._seed_source_graph()
+        self.target_conn.close()
+        self.source_conn.close()
+
+        work_root = Path(self.target_db).resolve().parent
+        bin_dir = Path(self.tmpdir.name) / "no-git-bin"
+        bin_dir.mkdir()
+        git_call_marker = Path(self.tmpdir.name) / "git-was-called"
+        git_shim = bin_dir / "git"
+        git_shim.write_text(
+            "#!/bin/sh\n"
+            f'echo called > "{git_call_marker}"\n'
+            'echo "git should not be called" >&2\n'
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        git_shim.chmod(0o755)
+
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "KANBAN_DB"
+        }
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["KANBAN_NONINTERACTIVE"] = "1"
+
+        result = subprocess.run(
+            [sys.executable, self.task_py, "import-worktree", str(self.source_root)],
+            capture_output=True,
+            text=True,
+            cwd=str(work_root),
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            git_call_marker.exists(),
+            "import-worktree must not invoke git",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["imported_count"], 4)
+        self.assertEqual(
+            set(payload["id_map"]),
+            {
+                str(ids["parent_id"]),
+                str(ids["child_id"]),
+                str(ids["follow_id"]),
+                str(ids["done_id"]),
+            },
+        )
+
+        # Re-open for tearDown.
+        self.target_conn = db.connect(self.target_db)
+        self.source_conn = db.connect(self.source_db)
+
+    def test_import_normalizes_unfinished_statuses(self):
+        for status in ("ready", "running", "blocked", "pending_subtasks", "none"):
+            tid = db.add_task(self.source_conn, f"Status {status}", branch="b1")
+            fields = {"status": status}
+            if status == "ready":
+                fields["ready_at"] = "2026-01-01 00:00:00"
+            if status == "blocked":
+                fields["block_reason"] = "review_cap"
+            db.update_task(self.source_conn, tid, **fields)
+
+        result = db.import_worktree_database(self.target_conn, self.source_db)
+        for new_id in result["id_map"].values():
+            task = db.get_task(self.target_conn, new_id)
+            self.assertEqual(task["status"], "none")
+            self.assertIsNone(task["ready_at"])
+
+    def test_import_rolls_back_on_invalid_source(self):
+        existing_id = db.add_task(self.target_conn, "Untouched", branch="develop")
+        before_count = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+
+        bad_db = Path(self.tmpdir.name) / "bad.db"
+        bad_conn = sqlite3.connect(str(bad_db))
+        try:
+            bad_conn.execute("CREATE TABLE not_tasks (id INTEGER PRIMARY KEY)")
+            bad_conn.commit()
+        finally:
+            bad_conn.close()
+
+        with self.assertRaises(ValueError):
+            db.import_worktree_database(self.target_conn, bad_db)
+
+        after_count = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        self.assertEqual(after_count, before_count)
+        self.assertEqual(
+            db.get_task(self.target_conn, existing_id)["title"],
+            "Untouched",
+        )
+
+    def test_import_rolls_back_if_source_modified_during_import(self):
+        """Source mtime change must fail before commit and leave target unchanged."""
+        existing_id = db.add_task(self.target_conn, "Untouched", branch="develop")
+        before_count = self.target_conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks"
+        ).fetchone()["n"]
+        self._seed_source_graph()
+        source_resolved = Path(self.source_db).resolve()
+        real_stat = Path.stat
+        mtime_reads = {"n": 0}
+
+        def patched_stat(self, *args, **kwargs):
+            result = real_stat(self, *args, **kwargs)
+            try:
+                # Use os.path.samefile (os.stat) so we do not re-enter Path.stat.
+                matched = os.path.samefile(self, source_resolved)
+            except OSError:
+                matched = False
+            if not matched:
+                return result
+
+            class _StatProxy:
+                def __init__(self, st):
+                    self._st = st
+
+                @property
+                def st_mtime_ns(self):
+                    mtime_reads["n"] += 1
+                    # First read is the baseline snapshot; second is the
+                    # pre-commit check — report a change so import aborts.
+                    if mtime_reads["n"] >= 2:
+                        return self._st.st_mtime_ns + 1
+                    return self._st.st_mtime_ns
+
+                def __getattr__(self, name):
+                    return getattr(self._st, name)
+
+            return _StatProxy(result)
+
+        with patch.object(Path, "stat", patched_stat):
+            with self.assertRaises(RuntimeError) as ctx:
+                db.import_worktree_database(self.target_conn, self.source_root)
+            self.assertIn("modified during import", str(ctx.exception))
+
+        self.assertGreaterEqual(mtime_reads["n"], 2)
+        after_count = self.target_conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks"
+        ).fetchone()["n"]
+        self.assertEqual(after_count, before_count)
+        self.assertEqual(
+            db.get_task(self.target_conn, existing_id)["title"],
+            "Untouched",
+        )
+
+    def test_import_missing_path_fails_without_changing_target(self):
+        db.add_task(self.target_conn, "Stay")
+        before = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        missing = Path(self.tmpdir.name) / "no-such-worktree"
+        with self.assertRaises(FileNotFoundError):
+            db.import_worktree_database(self.target_conn, missing)
+        after = self.target_conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        self.assertEqual(after, before)
+
+    def test_import_rejects_self(self):
+        with self.assertRaises(ValueError):
+            db.import_worktree_database(self.target_conn, self.target_db)
 
 
 class TestAgentTranscriptCapture(unittest.TestCase):
@@ -3216,7 +4590,6 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -3246,7 +4619,6 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -3572,18 +4944,21 @@ class TestKanbanCLI(unittest.TestCase):
             "kanban-orchestra.db-wal",
             "kanban-orchestra.lock",
             ".kanban-orchestra/",
-            ".claude/skills/orch-kb-*/",
-            ".claude/skills/orch-adhoc-*/",
-            ".agents/skills/orch-kb-*/",
-            ".agents/skills/orch-adhoc-*/",
         ]:
             self.assertIn(entry, gitignore)
         gitignore_lines = gitignore.splitlines()
         self.assertNotIn(".claude/", gitignore_lines)
         self.assertNotIn(".agents/", gitignore_lines)
+        self.assertNotIn(".claude/skills/orch-kb-*/", gitignore_lines)
+        self.assertNotIn(".claude/skills/orch-adhoc-*/", gitignore_lines)
+        self.assertNotIn(".agents/skills/orch-kb-*/", gitignore_lines)
+        self.assertNotIn(".agents/skills/orch-adhoc-*/", gitignore_lines)
         self.assertNotIn(".gemini/skills/orch-kb-*/", gitignore_lines)
         self.assertNotIn(".codex/skills/orch-kb-*/", gitignore_lines)
         self.assertNotIn(".kilo/skills/orch-kb-*/", gitignore_lines)
+        self.assertFalse((self.repo_root / ".claude" / "skills").exists())
+        self.assertFalse((self.repo_root / ".agents" / "skills").exists())
+        self.assertFalse((self.repo_root / ".orchestra-skill-sync").exists())
 
 
 class TestInitTestRepo(unittest.TestCase):
@@ -3661,571 +5036,441 @@ class TestInitTestRepo(unittest.TestCase):
                 ],
             )
 
-
-class TestSyncAiSkillWrappers(unittest.TestCase):
-    """Test thin wrapper generation for shared AI skills."""
-
-    def test_default_orchestra_dir_reads_environment(self):
-        with patch.dict(os.environ, {"ORCHESTRA_DIR": "/tmp/orchestra-test"}, clear=False):
-            self.assertEqual(skill_wrappers._default_orchestra_dir(), "/tmp/orchestra-test")
-
-    def test_parse_args_requires_orchestra_dir_when_env_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with patch.object(sys, "argv", ["sync_ai_skill_wrappers.py"]):
-                with self.assertRaises(SystemExit) as exc:
-                    skill_wrappers.parse_args()
-        self.assertEqual(exc.exception.code, 2)
-
-    def test_parse_args_supports_fix_mode(self):
-        with patch.dict(os.environ, {"ORCHESTRA_DIR": "/tmp/orchestra-test"}, clear=False):
-            with patch.object(sys, "argv", ["sync_ai_skill_wrappers.py", "--fix"]):
-                args = skill_wrappers.parse_args()
-        self.assertTrue(args.fix)
-
-    def test_parse_args_rejects_old_registered_mode(self):
-        with patch.dict(os.environ, {"ORCHESTRA_DIR": "/tmp/orchestra-test"}, clear=False):
-            with patch.object(sys, "argv", ["sync_ai_skill_wrappers.py", "--registered"]):
-                with self.assertRaises(SystemExit) as exc:
-                    skill_wrappers.parse_args()
-        self.assertEqual(exc.exception.code, 2)
-
-    def test_registered_sync_parse_args_requires_orchestra_dir_when_env_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with patch.object(sys, "argv", ["sync_registered_ai_skill_wrappers.py"]):
-                with self.assertRaises(SystemExit) as exc:
-                    registered_skill_wrappers.parse_args()
-        self.assertEqual(exc.exception.code, 2)
-
-    def test_registered_sync_main_lists_by_default_without_syncing(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            _write_test_ai_skills(orchestra_dir)
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            skill_wrappers.register_repo_for_skill_sync(
-                target,
-                registry,
-                project_name="MIDI Designer",
-            )
-
-            stdout = io.StringIO()
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "sync_registered_ai_skill_wrappers.py",
-                    "--orchestra-dir",
-                    str(orchestra_dir),
-                    "--registry",
-                    str(registry),
-                ],
-            ), redirect_stdout(stdout):
-                rc = registered_skill_wrappers.main()
-
-            self.assertEqual(rc, 0)
-            self.assertIn("Registered AI skill repos (dry run; pass --apply to sync):", stdout.getvalue())
-            self.assertIn("ok", stdout.getvalue())
-            self.assertIn("MIDI Designer", stdout.getvalue())
-            self.assertFalse((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
-
-    def test_registered_sync_main_applies_when_requested(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            _write_test_ai_skills(orchestra_dir)
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            skill_wrappers.register_repo_for_skill_sync(
-                target,
-                registry,
-                project_name="MIDI Designer",
-            )
-
-            stdout = io.StringIO()
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "sync_registered_ai_skill_wrappers.py",
-                    "--orchestra-dir",
-                    str(orchestra_dir),
-                    "--registry",
-                    str(registry),
-                    "--apply",
-                ],
-            ), redirect_stdout(stdout):
-                rc = registered_skill_wrappers.main()
-
-            self.assertEqual(rc, 0)
-            self.assertIn("Registered AI skill repos synchronized: synced=1 skipped=0 failed=0", stdout.getvalue())
-            self.assertTrue((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
-
-    def test_sync_skill_wrappers_creates_all_agent_wrappers(self):
+    def test_init_test_repo_leaves_repo_free_of_local_skill_wrappers(self):
         with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
             orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
             _write_test_ai_skills(orchestra_dir)
 
-            summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
+            init_script = SCRIPT_DIR / "init_test_repo.py"
+            result = subprocess.run(
+                [sys.executable, str(init_script)],
+                capture_output=True,
+                text=True,
+                cwd=repo_tmp,
+                env={**os.environ, "ORCHESTRA_DIR": str(orchestra_dir)},
+                check=True,
+            )
 
-            skill_count = len(skill_wrappers._canonical_skill_files(orchestra_dir))
-            self.assertEqual(len(summary["created"]), skill_count * len(skill_wrappers.AGENTS))
+            self.assertIn("Test repo ready.", result.stdout)
+            target = Path(repo_tmp)
+            self.assertFalse((target / ".claude" / "skills").exists())
+            self.assertFalse((target / ".agents" / "skills").exists())
+            self.assertFalse((target / ".orchestra-skill-sync").exists())
+            gitignore = (target / ".gitignore").read_text(encoding="utf-8")
+            for entry in [
+                ".claude/skills/orch-kb-*/",
+                ".claude/skills/orch-adhoc-*/",
+                ".agents/skills/orch-kb-*/",
+                ".agents/skills/orch-adhoc-*/",
+            ]:
+                self.assertNotIn(entry, gitignore)
+
+
+class TestInstallGlobalAiSkills(unittest.TestCase):
+    """Test user-level Orchestra skill wrapper installation."""
+
+    def test_render_wrapper_references_orchestra_dir_env_var(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            _write_test_ai_skills(orchestra_dir)
+            canonical_path = orchestra_dir / "AI-skills" / "kanban.md"
+            description = global_skill_installer._skill_description(canonical_path)
+
+            rendered = global_skill_installer.render_wrapper(
+                "kanban",
+                description,
+                canonical_path,
+            )
+
+            self.assertIn("name: orch-kb-kanban\n", rendered)
+            self.assertIn('description: "kanban description."\n', rendered)
+            self.assertIn("- Location: $ORCHESTRA_DIR/AI-skills/kanban.md\n", rendered)
+            self.assertIn(f"- Least Seen at: {canonical_path.resolve()}\n", rendered)
+            self.assertNotIn("Canonical instructions.", rendered)
+
+    def test_wrapper_prefix_classifies_kanban_and_adhoc_skills(self):
+        self.assertIn("narrate", global_skill_installer.KANBAN_SKILLS)
+        self.assertNotIn("narrate-and-unblock", global_skill_installer.KANBAN_SKILLS)
+        self.assertEqual(
+            global_skill_installer._wrapper_skill_name("narrate"),
+            "orch-kb-narrate",
+        )
+        self.assertEqual(
+            global_skill_installer._wrapper_skill_name("kanban"),
+            "orch-kb-kanban",
+        )
+        self.assertEqual(
+            global_skill_installer._wrapper_skill_name("git-commit"),
+            "orch-adhoc-git-commit",
+        )
+
+        with tempfile.TemporaryDirectory() as orchestra_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            skills_dir = orchestra_dir / "AI-skills"
+            skills_dir.mkdir(parents=True)
+            narrate_path = skills_dir / "narrate.md"
+            narrate_path.write_text(
+                "Act as a live narrator.\n\nCanonical instructions.\n",
+                encoding="utf-8",
+            )
+            rendered = global_skill_installer.render_wrapper(
+                "narrate",
+                global_skill_installer._skill_description(narrate_path),
+                narrate_path,
+            )
+            self.assertIn("name: orch-kb-narrate\n", rendered)
+            self.assertIn(
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate.md\n",
+                rendered,
+            )
+
+    def test_install_creates_narrate_wrapper_and_removes_obsolete_wrapper(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        canonical = repo_root / "AI-skills" / "narrate.md"
+        self.assertTrue(canonical.is_file())
+        self.assertFalse((repo_root / "AI-skills" / "narrate-and-unblock.md").exists())
+        canonical_text = canonical.read_text(encoding="utf-8")
+        first_line = next(
+            line.strip()
+            for line in canonical_text.splitlines()
+            if line.strip()
+        )
+        self.assertNotIn("ko-unblock", first_line)
+        self.assertRegex(first_line, r"(?i)dashboard URL")
+        opening = canonical_text.split("## Opening report", 1)[1].split("## ", 1)[0]
+        self.assertRegex(opening, r"(?i)dashboard URL")
+        self.assertIn("ko-get-update", opening)
+        self.assertNotRegex(canonical_text, r"127\.0\.0\.1:\d+|localhost:\d+")
+        self.assertNotIn("8427", canonical_text)
+
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            skills_dir = orchestra_dir / "AI-skills"
+            skills_dir.mkdir(parents=True)
+            (skills_dir / "narrate.md").write_text(
+                canonical_text,
+                encoding="utf-8",
+            )
+            home = Path(home_tmp)
+            obsolete = home / ".claude" / "skills" / "orch-kb-narrate-and-unblock" / "SKILL.md"
+            obsolete.parent.mkdir(parents=True)
+            obsolete.write_text(
+                "---\n"
+                "name: orch-kb-narrate-and-unblock\n"
+                'description: "obsolete wrapper."\n'
+                "---\n\n"
+                "Follow the shared skill:\n\n"
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate-and-unblock.md\n"
+                "- Least Seen at: /tmp/AI-skills/narrate-and-unblock.md\n",
+                encoding="utf-8",
+            )
+
+            checked = global_skill_installer.install_global_skills(
+                orchestra_dir, home=home, check=True
+            )
+            self.assertIn(".claude/skills/orch-kb-narrate/SKILL.md", checked["missing"])
+            self.assertIn(
+                ".claude/skills/orch-kb-narrate-and-unblock/SKILL.md",
+                checked["stale"],
+            )
+            self.assertTrue(obsolete.exists())
+
+            summary = global_skill_installer.install_global_skills(
+                orchestra_dir, home=home
+            )
+            wrapper = home / ".claude" / "skills" / "orch-kb-narrate" / "SKILL.md"
+            text = wrapper.read_text(encoding="utf-8")
+            self.assertIn("name: orch-kb-narrate\n", text)
+            self.assertIn(first_line, text)
+            self.assertRegex(text, r"(?i)dashboard URL")
+            self.assertNotIn("ko-unblock", text)
+            self.assertIn(
+                "- Location: $ORCHESTRA_DIR/AI-skills/narrate.md\n",
+                text,
+            )
+            self.assertIn(".claude/skills/orch-kb-narrate/SKILL.md", summary["created"])
+            self.assertIn(
+                ".claude/skills/orch-kb-narrate-and-unblock/SKILL.md",
+                summary["removed"],
+            )
+            self.assertFalse(obsolete.exists())
+
+    def test_install_global_skills_writes_all_target_wrappers(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+
+            summary = global_skill_installer.install_global_skills(
+                orchestra_dir,
+                home=home,
+            )
+
+            skill_count = len(global_skill_installer._canonical_skill_files(orchestra_dir))
+            self.assertEqual(
+                global_skill_installer.SKILL_TARGETS,
+                {
+                    "claude": ".claude/skills",
+                    "codex": ".codex/skills",
+                    "kilo": ".kilocode/skills",
+                    "antigravity": ".gemini/antigravity-cli/skills",
+                },
+            )
+            self.assertEqual(len(summary["created"]), skill_count * len(global_skill_installer.AGENTS))
             self.assertEqual(summary["updated"], [])
             self.assertEqual(summary["skipped"], [])
-
-            expected = skill_wrappers.render_wrapper(
-                "review-build",
-                skill_wrappers._skill_description(orchestra_dir / "AI-skills" / "review-build.md"),
-                orchestra_dir / "AI-skills" / "review-build.md",
+            self.assertEqual(summary["missing"], [])
+            self.assertNotIn(
+                orchestra_dir / "AI-skills" / "AI-readme.md",
+                global_skill_installer._canonical_skill_files(orchestra_dir),
             )
-            for agent in skill_wrappers.AGENTS:
-                wrapper_path = target / f".{agent}" / "skills" / "orch-adhoc-review-build" / "SKILL.md"
+
+            expected = global_skill_installer.render_wrapper(
+                "git-commit",
+                global_skill_installer._skill_description(
+                    orchestra_dir / "AI-skills" / "git-commit.md"
+                ),
+                orchestra_dir / "AI-skills" / "git-commit.md",
+            )
+            for agent, skills_root in global_skill_installer.SKILL_TARGETS.items():
+                wrapper_path = home / skills_root / "orch-adhoc-git-commit" / "SKILL.md"
                 self.assertEqual(wrapper_path.read_text(encoding="utf-8"), expected)
-            self.assertTrue(
-                (target / ".agents" / "skills" / "orch-adhoc-review-build" / "SKILL.md").exists()
-            )
-            self.assertTrue(
-                (target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists()
-            )
-            self.assertFalse((target / ".gemini" / "skills" / "orch-adhoc-review-build").exists())
-
-    def test_fix_skill_wrappers_removes_old_unprefixed_generated_wrappers(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-            (target / "AI-skills").mkdir()
-            (target / "AI-skills" / "kanban.md").write_text(
-                "local canonical copy should stay\n",
-                encoding="utf-8",
-            )
-
-            skill_name = "kanban"
-            canonical_path = orchestra_dir / "AI-skills" / f"{skill_name}.md"
-            description = skill_wrappers._skill_description(canonical_path)
-            legacy_files = {
-                ".claude/skills/kanban/SKILL.md": (
-                    f"---\nname: {skill_name}\ndescription: {description}\n---\n\n"
-                    f"@{canonical_path.resolve()}\n"
-                ),
-                ".claude/skills/ko-kanban/SKILL.md": (
-                    f"---\nname: ko-{skill_name}\ndescription: {json.dumps(description)}\n---\n\n"
-                    "Follow the shared skill:\n\n"
-                    f"- Location: $ORCHESTRA_DIR/AI-skills/{skill_name}.md\n"
-                    f"- Least Seen at: {canonical_path.resolve()}\n"
-                ),
-                ".agents/skills/kanban/SKILL.md": (
-                    f"---\nname: {skill_name}\ndescription: {json.dumps(description)}\n---\n\n"
-                    "Follow the shared skill:\n\n"
-                    f"- Location: $ORCHESTRA_DIR/AI-skills/{skill_name}.md\n"
-                    f"- Least Seen at: {canonical_path.resolve()}\n"
-                ),
-                ".agents/skills/ko-kanban/SKILL.md": (
-                    f"---\nname: ko-{skill_name}\ndescription: {json.dumps(description)}\n---\n\n"
-                    "Follow the shared skill:\n\n"
-                    f"- Location: $ORCHESTRA_DIR/AI-skills/{skill_name}.md\n"
-                    f"- Least Seen at: {canonical_path.resolve()}\n"
-                ),
-            }
-            for relative_path, content in legacy_files.items():
-                wrapper_path = target / relative_path
-                wrapper_path.parent.mkdir(parents=True, exist_ok=True)
-                wrapper_path.write_text(content, encoding="utf-8")
-
-            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertEqual(
-                sorted(summary["removed"]),
-                sorted(legacy_files),
-            )
-            for relative_path in legacy_files:
-                self.assertFalse((target / relative_path).exists())
-            self.assertTrue((target / "AI-skills" / "kanban.md").exists())
-
-            second_summary = skill_wrappers.fix_skill_wrappers(
-                target=target,
-                orchestra_dir=orchestra_dir,
-            )
-            self.assertEqual(second_summary["removed"], [])
-            self.assertEqual(second_summary["gitignore_added"], [])
-
-    def test_fix_skill_wrappers_repairs_generated_wrapper_gitignore_entries(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-            (target / ".gitignore").write_text(
-                "# Existing policy\n.claude/skills/orch-kb-*/\n",
-                encoding="utf-8",
-            )
-
-            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertEqual(
-                summary["gitignore_added"],
-                [
-                    ".claude/skills/orch-adhoc-*/",
-                    ".agents/skills/orch-kb-*/",
-                    ".agents/skills/orch-adhoc-*/",
-                ],
-            )
-            gitignore_lines = (target / ".gitignore").read_text(encoding="utf-8").splitlines()
-            for entry in skill_wrappers.GENERATED_WRAPPER_GITIGNORE_ENTRIES:
-                self.assertEqual(gitignore_lines.count(entry), 1)
-
-            second_summary = skill_wrappers.fix_skill_wrappers(
-                target=target,
-                orchestra_dir=orchestra_dir,
-            )
-            self.assertEqual(second_summary["gitignore_added"], [])
-
-    def test_fix_skill_wrappers_ignores_obsolete_agent_wrapper_dirs(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-
-            skill_name = "kanban"
-            canonical_path = orchestra_dir / "AI-skills" / f"{skill_name}.md"
-            description = skill_wrappers._skill_description(canonical_path)
-            stale_wrappers = [
-                target / ".gemini" / "skills" / "ko-kanban" / "SKILL.md",
-                target / ".codex" / "skills" / "ko-kanban" / "SKILL.md",
-                target / ".kilo" / "skills" / "ko-kanban" / "SKILL.md",
-            ]
-            for stale_wrapper in stale_wrappers:
-                stale_wrapper.parent.mkdir(parents=True, exist_ok=True)
-                stale_wrapper.write_text(
-                    skill_wrappers.render_wrapper(skill_name, description, canonical_path),
-                    encoding="utf-8",
+                self.assertTrue(
+                    (home / skills_root / "orch-kb-kanban" / "SKILL.md").exists()
                 )
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            subprocess.run(["git", "add", "."], cwd=target, check=True)
+                self.assertIn(
+                    f"{skills_root}/orch-adhoc-git-commit/SKILL.md",
+                    summary["created"],
+                )
+            self.assertFalse((home / ".agents" / "skills" / "orch-kb-kanban").exists())
+            self.assertFalse((home / ".kilo" / "skills" / "orch-kb-kanban").exists())
+            self.assertFalse(
+                (home / ".gemini" / "antigravity-ide" / "skills" / "orch-kb-kanban").exists()
+            )
+            self.assertFalse((home / ".claude" / "skills" / "orch-adhoc-AI-readme").exists())
+            self.assertFalse((orchestra_dir / ".orchestra-skill-sync").exists())
+            self.assertFalse((orchestra_dir / ".claude" / "skills").exists())
+            self.assertFalse((orchestra_dir / ".agents" / "skills").exists())
 
-            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertEqual(summary["removed"], [])
-            self.assertEqual(summary["git_index_removed"], [])
-            for stale_wrapper in stale_wrappers:
-                self.assertTrue(stale_wrapper.exists())
-            tracked = subprocess.run(
-                ["git", "ls-files"],
-                cwd=target,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.splitlines()
-            self.assertIn(".gemini/skills/ko-kanban/SKILL.md", tracked)
-            self.assertIn(".codex/skills/ko-kanban/SKILL.md", tracked)
-            self.assertIn(".kilo/skills/ko-kanban/SKILL.md", tracked)
-
-    def test_fix_skill_wrappers_untracks_current_generated_wrappers_without_deleting(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
+    def test_install_global_skills_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
             orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
+            home = Path(home_tmp)
             _write_test_ai_skills(orchestra_dir)
 
-            skill_name = "kanban"
-            canonical_path = orchestra_dir / "AI-skills" / f"{skill_name}.md"
-            description = skill_wrappers._skill_description(canonical_path)
-            wrapper = target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md"
-            wrapper.parent.mkdir(parents=True, exist_ok=True)
-            wrapper.write_text(
-                skill_wrappers.render_wrapper(skill_name, description, canonical_path),
+            first = global_skill_installer.install_global_skills(orchestra_dir, home=home)
+            second = global_skill_installer.install_global_skills(orchestra_dir, home=home)
+
+            self.assertTrue(first["created"])
+            self.assertEqual(second["created"], [])
+            self.assertEqual(second["updated"], [])
+            self.assertEqual(second["skipped"], [])
+            self.assertEqual(len(second["unchanged"]), len(first["created"]))
+
+    def test_install_global_skills_skips_unrecognized_user_skills(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+            custom_path = home / ".claude" / "skills" / "orch-kb-kanban" / "SKILL.md"
+            custom_path.parent.mkdir(parents=True)
+            custom_text = (
+                "---\n"
+                "name: orch-kb-kanban\n"
+                'description: "custom local skill"\n'
+                "---\n\n"
+                "Hand-written instructions.\n"
+            )
+            custom_path.write_text(custom_text, encoding="utf-8")
+
+            summary = global_skill_installer.install_global_skills(orchestra_dir, home=home)
+
+            self.assertIn(".claude/skills/orch-kb-kanban/SKILL.md", summary["skipped"])
+            self.assertEqual(custom_path.read_text(encoding="utf-8"), custom_text)
+            self.assertTrue(
+                (home / ".codex" / "skills" / "orch-kb-kanban" / "SKILL.md").exists()
+            )
+
+    def test_install_global_skills_updates_generated_wrappers(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+            canonical_path = orchestra_dir / "AI-skills" / "kanban.md"
+            stale = global_skill_installer.render_wrapper(
+                "kanban",
+                "stale description.",
+                canonical_path,
+            )
+            wrapper_path = home / ".codex" / "skills" / "orch-kb-kanban" / "SKILL.md"
+            wrapper_path.parent.mkdir(parents=True)
+            wrapper_path.write_text(stale, encoding="utf-8")
+
+            summary = global_skill_installer.install_global_skills(orchestra_dir, home=home)
+
+            self.assertIn(".codex/skills/orch-kb-kanban/SKILL.md", summary["updated"])
+            expected = global_skill_installer.render_wrapper(
+                "kanban",
+                global_skill_installer._skill_description(canonical_path),
+                canonical_path,
+            )
+            self.assertEqual(wrapper_path.read_text(encoding="utf-8"), expected)
+
+    def test_check_mode_reports_drift_without_writing(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+
+            summary = global_skill_installer.install_global_skills(
+                orchestra_dir,
+                home=home,
+                check=True,
+            )
+
+            self.assertTrue(summary["missing"])
+            self.assertEqual(summary["created"], [])
+            for skills_root in global_skill_installer.SKILL_TARGETS.values():
+                self.assertFalse((home / skills_root).exists())
+
+            global_skill_installer.install_global_skills(orchestra_dir, home=home)
+            ok = global_skill_installer.install_global_skills(
+                orchestra_dir,
+                home=home,
+                check=True,
+            )
+            self.assertEqual(ok["missing"], [])
+            self.assertEqual(ok["updated"], [])
+            self.assertEqual(ok["skipped"], [])
+            self.assertTrue(ok["unchanged"])
+
+            stale_path = home / ".claude" / "skills" / "orch-adhoc-git-commit" / "SKILL.md"
+            stale_path.write_text(
+                global_skill_installer.render_wrapper(
+                    "git-commit",
+                    "stale description.",
+                    orchestra_dir / "AI-skills" / "git-commit.md",
+                ),
                 encoding="utf-8",
             )
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            subprocess.run(["git", "add", "."], cwd=target, check=True)
-
-            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertIn(".agents/skills/orch-kb-kanban/SKILL.md", summary["ignored"])
-            self.assertEqual(summary["git_index_removed"], [".agents/skills/orch-kb-kanban/SKILL.md"])
-            self.assertTrue(wrapper.exists())
-            tracked = subprocess.run(
-                ["git", "ls-files", "--", ".agents/skills/orch-kb-kanban/SKILL.md"],
-                cwd=target,
-                capture_output=True,
-                text=True,
+            drifted = global_skill_installer.install_global_skills(
+                orchestra_dir,
+                home=home,
                 check=True,
-            ).stdout
-            self.assertEqual(tracked, "")
-
-    def test_fix_skill_wrappers_skips_custom_wrapper_files(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-
-            custom_wrapper = target / ".agents" / "skills" / "kanban" / "SKILL.md"
-            custom_wrapper.parent.mkdir(parents=True, exist_ok=True)
-            custom_content = (
-                "---\n"
-                "name: kanban\n"
-                "description: Custom local instructions.\n"
-                "---\n\n"
-                "Use the local team-specific kanban workflow instead of the shared one.\n"
             )
-            custom_wrapper.write_text(custom_content, encoding="utf-8")
+            self.assertIn(".claude/skills/orch-adhoc-git-commit/SKILL.md", drifted["updated"])
+            self.assertIn("stale description.", stale_path.read_text(encoding="utf-8"))
 
-            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertIn(".agents/skills/kanban/SKILL.md", summary["skipped"])
-            self.assertEqual(custom_wrapper.read_text(encoding="utf-8"), custom_content)
-            self.assertFalse((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
-
-    def test_fix_skill_wrappers_removes_tracked_ko_wrapper_files_by_name(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
+    def test_main_check_uses_temporary_home_and_exit_codes(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
             orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
+            home = Path(home_tmp)
             _write_test_ai_skills(orchestra_dir)
-
-            custom_wrapper = target / ".agents" / "skills" / "ko-kanban" / "SKILL.md"
-            custom_wrapper.parent.mkdir(parents=True, exist_ok=True)
-            custom_content = (
-                "---\n"
-                "name: ko-kanban\n"
-                "description: Custom local instructions.\n"
-                "---\n\n"
-                "Use the local team-specific kanban workflow instead of the shared one.\n"
-            )
-            custom_wrapper.write_text(custom_content, encoding="utf-8")
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            subprocess.run(["git", "add", "."], cwd=target, check=True)
-
-            summary = skill_wrappers.fix_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertIn(".agents/skills/ko-kanban/SKILL.md", summary["removed"])
-            self.assertEqual(summary["git_index_removed"], [".agents/skills/ko-kanban/SKILL.md"])
-            self.assertFalse(custom_wrapper.exists())
-            tracked = subprocess.run(
-                ["git", "ls-files", "--", ".agents/skills/ko-kanban/SKILL.md"],
-                cwd=target,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-            self.assertEqual(tracked, "")
-
-    def test_fix_mode_prints_warning_for_skipped_ambiguous_skills(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-
-            custom_wrapper = target / ".agents" / "skills" / "kanban" / "SKILL.md"
-            custom_wrapper.parent.mkdir(parents=True, exist_ok=True)
-            custom_wrapper.write_text(
-                "---\n"
-                "name: kanban\n"
-                "description: Custom local instructions.\n"
-                "---\n\n"
-                "Use the local team-specific kanban workflow.\n",
-                encoding="utf-8",
-            )
 
             stdout = io.StringIO()
             with patch.object(
                 sys,
                 "argv",
                 [
-                    "sync_ai_skill_wrappers.py",
+                    "install_global_ai_skills.py",
                     "--orchestra-dir",
                     str(orchestra_dir),
-                    "--fix",
-                    str(target),
+                    "--home",
+                    str(home),
+                    "--check",
                 ],
             ), redirect_stdout(stdout):
-                rc = skill_wrappers.main()
+                rc = global_skill_installer.main()
+            self.assertEqual(rc, 1)
+            self.assertIn("missing=", stdout.getvalue())
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "install_global_ai_skills.py",
+                    "--orchestra-dir",
+                    str(orchestra_dir),
+                    "--home",
+                    str(home),
+                ],
+            ), redirect_stdout(io.StringIO()):
+                self.assertEqual(global_skill_installer.main(), 0)
+
+            stdout = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "install_global_ai_skills.py",
+                    "--orchestra-dir",
+                    str(orchestra_dir),
+                    "--home",
+                    str(home),
+                    "--check",
+                ],
+            ), redirect_stdout(stdout):
+                rc = global_skill_installer.main()
+            self.assertEqual(rc, 0)
+            self.assertIn("unchanged=", stdout.getvalue())
+
+    def test_removes_stale_generated_wrappers_but_keeps_user_skills(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+            stale_path = home / ".claude" / "skills" / "orch-adhoc-review-build" / "SKILL.md"
+            stale_path.parent.mkdir(parents=True)
+            stale_path.write_text(
+                global_skill_installer.render_wrapper(
+                    "review-build", "stale description.", orchestra_dir / "AI-skills" / "review-build.md"
+                ),
+                encoding="utf-8",
+            )
+            custom_path = home / ".codex" / "skills" / "orch-adhoc-review-build" / "SKILL.md"
+            custom_path.parent.mkdir(parents=True)
+            custom_path.write_text("custom skill\n", encoding="utf-8")
+
+            checked = global_skill_installer.install_global_skills(orchestra_dir, home=home, check=True)
+            self.assertIn(".claude/skills/orch-adhoc-review-build/SKILL.md", checked["stale"])
+            self.assertTrue(stale_path.exists())
+
+            summary = global_skill_installer.install_global_skills(orchestra_dir, home=home)
+            self.assertIn(".claude/skills/orch-adhoc-review-build/SKILL.md", summary["removed"])
+            self.assertFalse(stale_path.exists())
+            self.assertEqual(custom_path.read_text(encoding="utf-8"), "custom skill\n")
+
+    def test_main_honors_home_environment_via_path_home(self):
+        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as home_tmp:
+            orchestra_dir = Path(orchestra_tmp)
+            home = Path(home_tmp)
+            _write_test_ai_skills(orchestra_dir)
+
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False), patch(
+                "pathlib.Path.home",
+                return_value=home,
+            ), patch.object(
+                sys,
+                "argv",
+                [
+                    "install_global_ai_skills.py",
+                    "--orchestra-dir",
+                    str(orchestra_dir),
+                ],
+            ), redirect_stdout(io.StringIO()):
+                rc = global_skill_installer.main()
 
             self.assertEqual(rc, 0)
-            self.assertIn(
-                "Warning: skipped ambiguous wrapper: .agents/skills/kanban/SKILL.md",
-                stdout.getvalue(),
-            )
-
-    def test_sync_skill_wrappers_leaves_cleanup_to_fix_mode(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-
-            skill_name = "kanban"
-            canonical_path = orchestra_dir / "AI-skills" / f"{skill_name}.md"
-            description = skill_wrappers._skill_description(canonical_path)
-            old_wrapper = target / ".agents" / "skills" / skill_name / "SKILL.md"
-            old_wrapper.parent.mkdir(parents=True, exist_ok=True)
-            old_content = (
-                f"---\nname: {skill_name}\ndescription: {json.dumps(description)}\n---\n\n"
-                "Follow the shared skill:\n\n"
-                f"- Location: $ORCHESTRA_DIR/AI-skills/{skill_name}.md\n"
-                f"- Least Seen at: {canonical_path.resolve()}\n"
-            )
-            old_wrapper.write_text(old_content, encoding="utf-8")
-
-            summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertEqual(summary["skipped"], [])
-            self.assertEqual(old_wrapper.read_text(encoding="utf-8"), old_content)
-            self.assertTrue((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
-
-    def test_sync_skill_wrappers_picks_up_new_skill_file_automatically(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-            (orchestra_dir / "AI-skills" / "new-skill.md").write_text(
-                "New skill summary line.\n\nMore instructions.\n",
-                encoding="utf-8",
-            )
-
-            summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            for agent in skill_wrappers.AGENTS:
-                relative_path = f".{agent}/skills/orch-adhoc-new-skill/SKILL.md"
-                self.assertIn(relative_path, summary["created"])
-                wrapper_path = target / relative_path
-                self.assertIn(
-                    'description: "New skill summary line."',
-                    wrapper_path.read_text(encoding="utf-8"),
+            for skills_root in global_skill_installer.SKILL_TARGETS.values():
+                self.assertTrue(
+                    (home / skills_root / "orch-kb-kanban" / "SKILL.md").exists()
                 )
-
-    def test_sync_skill_wrappers_quotes_yaml_sensitive_descriptions(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            _write_test_ai_skills(orchestra_dir)
-            (orchestra_dir / "AI-skills" / "prep-for-review.md").write_text(
-                "**Note**: This is the ad-hoc manual workflow.\n\nMore instructions.\n",
-                encoding="utf-8",
+                self.assertTrue(
+                    (home / skills_root / "orch-kb-get-kanban-update" / "SKILL.md").exists()
+                )
+            self.assertFalse(
+                (home / ".gemini" / "antigravity-ide" / "skills" / "orch-kb-kanban").exists()
             )
-
-            summary = skill_wrappers.sync_skill_wrappers(target=target, orchestra_dir=orchestra_dir)
-
-            self.assertIn(".agents/skills/orch-adhoc-prep-for-review/SKILL.md", summary["created"])
-            wrapper_path = target / ".agents" / "skills" / "orch-adhoc-prep-for-review" / "SKILL.md"
-            self.assertIn(
-                'description: "**Note**: This is the ad-hoc manual workflow."',
-                wrapper_path.read_text(encoding="utf-8"),
-            )
-
-    def test_register_repo_for_skill_sync_writes_marker_and_private_registry(self):
-        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-
-            result = skill_wrappers.register_repo_for_skill_sync(
-                target,
-                registry,
-                project_name="MIDI Designer",
-            )
-            second_result = skill_wrappers.register_repo_for_skill_sync(target, registry)
-
-            marker = target / skill_wrappers.SKILL_SYNC_MARKER
-            self.assertTrue(marker.exists())
-            marker_text = marker.read_text(encoding="utf-8")
-            self.assertIn("skills = true", marker_text)
-            self.assertIn('devlog_project = "MIDI Designer"', marker_text)
-            self.assertEqual(result["repo"], str(target.resolve()))
-            self.assertFalse(second_result["registry_added"])
-            registry_lines = [
-                line for line in registry.read_text(encoding="utf-8").splitlines()
-                if line and not line.startswith("#")
-            ]
-            self.assertEqual(registry_lines, [str(target.resolve())])
-
-    def test_register_repo_for_skill_sync_preserves_existing_project_name(self):
-        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            (target / skill_wrappers.SKILL_SYNC_MARKER).write_text(
-                "skills = true\ndevlog_project = \"Orchestra\"\n",
-                encoding="utf-8",
-            )
-
-            skill_wrappers.register_repo_for_skill_sync(target, registry)
-
-            self.assertIn(
-                'devlog_project = "Orchestra"',
-                (target / skill_wrappers.SKILL_SYNC_MARKER).read_text(encoding="utf-8"),
-            )
-
-    def test_register_repo_for_skill_sync_unignores_marker_when_repo_uses_whitelist_gitignore(self):
-        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            (target / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
-
-            result = skill_wrappers.register_repo_for_skill_sync(
-                target,
-                registry,
-                project_name="MIDI Designer WordPress Site",
-            )
-
-            self.assertTrue(result["marker_gitignore_added"])
-            self.assertIn(
-                f"!{skill_wrappers.SKILL_SYNC_MARKER}",
-                (target / ".gitignore").read_text(encoding="utf-8"),
-            )
-            tracked_check = subprocess.run(
-                ["git", "check-ignore", "-q", "--", skill_wrappers.SKILL_SYNC_MARKER],
-                cwd=target,
-                check=False,
-            )
-            self.assertNotEqual(tracked_check.returncode, 0)
-
-    def test_sync_registered_repos_runs_fix_then_sync_for_opted_in_repo(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            _write_test_ai_skills(orchestra_dir)
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            skill_wrappers.register_repo_for_skill_sync(target, registry)
-
-            legacy = target / ".agents" / "skills" / "ko-kanban" / "SKILL.md"
-            legacy.parent.mkdir(parents=True)
-            legacy.write_text(
-                "---\nname: ko-kanban\ndescription: old\n---\n\nCustom old wrapper.\n",
-                encoding="utf-8",
-            )
-            subprocess.run(["git", "add", "."], cwd=target, check=True)
-
-            summary = skill_wrappers.sync_registered_repos(orchestra_dir, registry)
-
-            self.assertEqual(summary["synced"], [str(target.resolve())])
-            self.assertEqual(summary["skipped"], [])
-            self.assertEqual(summary["failed"], [])
-            self.assertFalse(legacy.exists())
-            self.assertTrue((target / ".agents" / "skills" / "orch-kb-kanban" / "SKILL.md").exists())
-            tracked = subprocess.run(
-                ["git", "ls-files", "--", ".agents/skills/ko-kanban/SKILL.md"],
-                cwd=target,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-            self.assertEqual(tracked, "")
-
-    def test_sync_registered_repos_skips_repo_without_opt_in_marker(self):
-        with tempfile.TemporaryDirectory() as orchestra_tmp, tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as config_tmp:
-            orchestra_dir = Path(orchestra_tmp)
-            target = Path(repo_tmp)
-            registry = Path(config_tmp) / "skill-sync.repos"
-            _write_test_ai_skills(orchestra_dir)
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            skill_wrappers._write_registered_repo_paths(registry, [target])
-
-            summary = skill_wrappers.sync_registered_repos(orchestra_dir, registry)
-
-            self.assertEqual(summary["synced"], [])
-            self.assertEqual(summary["failed"], [])
-            self.assertEqual(summary["skipped"], [f"{target.resolve()}: missing {skill_wrappers.SKILL_SYNC_MARKER}"])
-            self.assertFalse((target / ".agents" / "skills" / "orch-kb-kanban").exists())
 
 
 class TestDevlogSkillHelper(unittest.TestCase):
@@ -4313,26 +5558,49 @@ class TestDevlogSkillHelper(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ORCH_DEVLOG_DIR is not set"):
                 devlog_helper.default_journal_dir()
 
-    def test_default_project_uses_repo_skill_sync_marker(self):
+    def test_default_project_uses_orch_devlog_project_env(self):
         with tempfile.TemporaryDirectory() as repo_tmp:
             target = Path(repo_tmp)
             subprocess.run(["git", "init", "-q"], cwd=target, check=True)
-            (target / devlog_helper.PROJECT_CONFIG).write_text(
+
+            with patch.dict(os.environ, {"ORCH_DEVLOG_PROJECT": "MIDI Designer"}, clear=True):
+                self.assertEqual(devlog_helper.default_project(target), "MIDI Designer")
+
+    def test_default_project_derives_readable_name_from_git_repo(self):
+        with tempfile.TemporaryDirectory() as parent_tmp:
+            target = Path(parent_tmp) / "midi-designer3"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(devlog_helper.default_project(target), "Midi Designer3")
+
+    def test_default_project_ignores_orchestra_skill_sync_marker(self):
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            target = Path(repo_tmp) / "orchestra"
+            target.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+            (target / ".orchestra-skill-sync").write_text(
                 "skills = true\ndevlog_project = \"MIDI Designer\"\n",
                 encoding="utf-8",
             )
 
             with patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(devlog_helper.default_project(target), "MIDI Designer")
+                self.assertEqual(devlog_helper.default_project(target), "Orchestra")
 
-    def test_default_project_requires_configured_project(self):
+    def test_default_project_requires_env_or_git_repo(self):
         with tempfile.TemporaryDirectory() as repo_tmp:
             target = Path(repo_tmp)
-            subprocess.run(["git", "init", "-q"], cwd=target, check=True)
 
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaisesRegex(ValueError, "project is required"):
                     devlog_helper.default_project(target)
+
+    def test_readable_project_name_splits_hyphens_and_underscores(self):
+        self.assertEqual(
+            devlog_helper.readable_project_name(Path("/tmp/my_cool-repo")),
+            "My Cool Repo",
+        )
 
 
 class TestOrchestratorRuntime(unittest.TestCase):
@@ -4544,6 +5812,43 @@ class TestInitRuntime(unittest.TestCase):
         self.assertEqual(rt["active_agents"], 0)
         self.assertEqual(rt["status_message"], "Waiting for ready tasks")
 
+    def test_set_runtime_idle_runs_history_purge_and_logs_summary(self):
+        orchestrator.init_runtime(self.conn)
+        summary = {
+            "deleted_rows": 2,
+            "deleted_transcripts": 1,
+            "reclaimed_db_bytes": 100,
+            "reclaimed_artifact_bytes": 50,
+            "compacted": True,
+        }
+        with (
+            patch.object(orchestrator.db, "purge_run_log", return_value=summary) as purge,
+            patch.object(orchestrator, "log") as log,
+        ):
+            orchestrator.set_runtime_idle(self.conn)
+
+        purge.assert_called_once_with(self.conn, compact=True)
+        log.assert_called_once()
+        self.assertEqual(
+            log.call_args[0][0],
+            db.format_purge_summary(summary),
+        )
+
+    def test_set_runtime_idle_stays_quiet_on_noop_purge(self):
+        orchestrator.init_runtime(self.conn)
+        with (
+            patch.object(
+                orchestrator.db,
+                "purge_run_log",
+                return_value=db._empty_purge_result(),
+            ) as purge,
+            patch.object(orchestrator, "log") as log,
+        ):
+            orchestrator.set_runtime_idle(self.conn)
+
+        purge.assert_called_once_with(self.conn, compact=True)
+        log.assert_not_called()
+
 
 class TestMainLoop(unittest.TestCase):
     """Test main_loop scheduling-side behavior."""
@@ -4675,6 +5980,31 @@ class TestRuntimeAfterTask(unittest.TestCase):
         self.assertEqual(rt["current_step"], "none")
         self.assertEqual(rt["status_message"], f"Task {blocked_tid} blocked; continuing to next ready task")
 
+    def test_blocked_continue_skips_idle_history_purge(self):
+        blocked_tid = db.add_task(self.conn, "Blocked task", branch="feat-blocked")
+        next_tid = db.add_task(
+            self.conn,
+            "Next ready task",
+            branch="feat-next",
+            allow_when_blocked=True,
+        )
+        db.update_task(self.conn, blocked_tid, status="blocked", next_step="none")
+        db.update_task(self.conn, next_tid, status="ready", next_step="commit-make")
+        db.update_runtime(
+            self.conn,
+            status="running",
+            current_task_id=blocked_tid,
+            current_step="commit-make",
+            current_branch="feat-blocked",
+            status_message=f"Blocked: task {blocked_tid}",
+        )
+
+        with patch.object(orchestrator.db, "purge_run_log") as purge:
+            orchestrator.update_runtime_after_task(self.conn, blocked_tid, succeeded=False)
+
+        purge.assert_not_called()
+        self.assertEqual(db.get_runtime(self.conn)["status"], "running")
+
     def test_blocked_task_with_non_opted_in_ready_follow_up_goes_idle(self):
         blocked_tid = db.add_task(self.conn, "Blocked task", branch="feat-blocked")
         next_tid = db.add_task(self.conn, "Next ready task", branch="feat-next")
@@ -4744,6 +6074,649 @@ class TestHeartbeat(unittest.TestCase):
         rt_after = db.get_runtime(self.conn)
         # Heartbeat should have updated; at minimum updated_at should differ
         self.assertIsNotNone(rt_after["last_heartbeat_at"])
+
+
+class TestSmartUnblockThread(unittest.TestCase):
+    """Test the orchestrator's native smart-unblock thread wiring."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.repo_root = Path(self.tmpdir.name)
+        self.db_path = str(self.repo_root / "kanban-orchestra.db")
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        orchestrator.stop_smart_unblock()
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def test_start_delegates_to_the_watcher_with_task_defaults(self):
+        calls = []
+
+        def fake_run_watcher(db_path, *, agent=None, interval=None, stop_event=None):
+            calls.append((db_path, agent, interval, stop_event))
+
+        with patch.object(smart_unblock, "run_watcher", side_effect=fake_run_watcher):
+            orchestrator.start_smart_unblock(self.db_path)
+            orchestrator._smart_unblock_thread.join(timeout=5)
+
+        self.assertEqual(len(calls), 1)
+        called_db_path, called_agent, called_interval, called_stop_event = calls[0]
+        self.assertEqual(called_db_path, self.db_path)
+        self.assertEqual(called_agent, config.DEFAULT_UNBLOCKER)
+        self.assertEqual(called_interval, orchestrator.SMART_UNBLOCK_INTERVAL)
+        self.assertIs(called_stop_event, orchestrator._smart_unblock_stop)
+
+    def test_stop_sets_stop_event_and_terminates_active_consultation(self):
+        released = threading.Event()
+
+        def blocking_run_watcher(db_path, *, agent=None, interval=None, stop_event=None):
+            stop_event.wait()
+            released.set()
+
+        with (
+            patch.object(smart_unblock, "run_watcher", side_effect=blocking_run_watcher),
+            patch.object(smart_unblock, "terminate_active_consultation") as terminate,
+        ):
+            orchestrator.start_smart_unblock(self.db_path)
+            self.assertFalse(orchestrator._smart_unblock_stop.is_set())
+            orchestrator.stop_smart_unblock()
+
+        self.assertTrue(orchestrator._smart_unblock_stop.is_set())
+        terminate.assert_called_once()
+        self.assertTrue(released.wait(timeout=5))
+        self.assertFalse(orchestrator._smart_unblock_thread.is_alive())
+
+    def test_thread_survives_a_conflicting_watcher_lock(self):
+        log_messages = []
+
+        def capture_log(message, task_id=None):
+            log_messages.append(message)
+
+        handle = smart_unblock.acquire_watcher_lock(self.db_path, agent="sonnet", interval=60)
+        try:
+            with patch.object(orchestrator, "log", side_effect=capture_log):
+                orchestrator.start_smart_unblock(self.db_path)
+                orchestrator._smart_unblock_thread.join(timeout=5)
+        finally:
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertFalse(orchestrator._smart_unblock_thread.is_alive())
+        self.assertTrue(
+            any("smart-unblock" in m and "already" in m.lower() for m in log_messages),
+            log_messages,
+        )
+
+    def test_main_loop_starts_and_stops_it_around_stop_after_task(self):
+        stop_file = self.repo_root / config.STOP_AFTER_TASK_FILE
+        stop_file.write_text("")
+
+        start_calls = []
+        stop_calls = []
+
+        with (
+            patch.object(orchestrator, "start_smart_unblock", side_effect=lambda p: start_calls.append(p)),
+            patch.object(orchestrator, "stop_smart_unblock", side_effect=lambda: stop_calls.append(True)),
+            patch.object(orchestrator, "start_heartbeat"),
+            patch.object(orchestrator, "stop_heartbeat"),
+            patch.object(orchestrator.db, "get_db_path", return_value=self.db_path),
+        ):
+            orchestrator.main_loop(self.conn)
+
+        self.assertEqual(start_calls, [self.db_path])
+        self.assertEqual(stop_calls, [True])
+
+
+class TestSmartUnblockNativeRecovery(unittest.TestCase):
+    """End-to-end: the orchestrator's own thread recovers or explains blocked tasks."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.repo_root = Path(self.tmpdir.name)
+        self.db_path = str(self.repo_root / "kanban-orchestra.db")
+        self.conn = db.connect(self.db_path)
+        self.old_interval = orchestrator.SMART_UNBLOCK_INTERVAL
+        orchestrator.SMART_UNBLOCK_INTERVAL = 3600  # one poll only per test
+
+    def tearDown(self):
+        orchestrator.stop_smart_unblock()
+        orchestrator.SMART_UNBLOCK_INTERVAL = self.old_interval
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _blocked_task(self, title="Blocked task"):
+        # A plain resume_next_step (no review-cap block_reason) lets a bare
+        # `ko-task continue` recover it, unlike a structured review-cap block
+        # which requires an explicit --add-review-rounds grant.
+        task_id = db.add_task(self.conn, title, branch="feat-x")
+        db.update_task(
+            self.conn, task_id, status="blocked",
+            resume_next_step="commit-make",
+        )
+        return task_id
+
+    def _wait_until(self, predicate, timeout=10.0, interval=0.05):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return False
+
+    def test_recoverable_block_resumes_with_one_decision_comment(self):
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        # The agent only ever records its decision comment -- it never calls
+        # `continue` itself. The watcher performs the resume afterward, once
+        # it has read this already-durable comment back from the database.
+        # The orchestrator always consults `config.DEFAULT_UNBLOCKER`
+        # ("sonnet" here), so the decision must identify that agent by name.
+        script = (
+            'printf %s "smart-unblock (sonnet): RESUME safe to resume: '
+            'only a stale review-cap block" '
+            f'| "{sys.executable}" "{task_cli}" comment {task_id} '
+            "--message-stdin --comment --author smart-unblock\n"
+        )
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                orchestrator.start_smart_unblock(self.db_path)
+                recovered = self._wait_until(
+                    lambda: any(
+                        c["author"] == "smart-unblock"
+                        for c in db.get_comments(self.conn, task_id)
+                    )
+                )
+                self._wait_until(lambda: db.get_task(self.conn, task_id)["status"] == "ready")
+
+        self.assertTrue(recovered)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "ready")
+        notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "smart-unblock"]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0]["message"].startswith("smart-unblock (sonnet):"))
+        # The decision comment must have been recorded before the `continue`
+        # call's own "Operator continued..." comment, proving the protocol
+        # order and not just the eventual presence of both.
+        operator_notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "operator"]
+        self.assertEqual(len(operator_notes), 1)
+        self.assertLess(notes[0]["id"], operator_notes[0]["id"])
+
+    def test_unresolved_block_stays_blocked_with_one_explanatory_comment(self):
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        script = (
+            'printf %s "smart-unblock (sonnet): BLOCKED not safe: worktree '
+            'holds unattributed changes; a human must decide" '
+            f'| "{sys.executable}" "{task_cli}" comment {task_id} '
+            "--message-stdin --comment --author smart-unblock\n"
+        )
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                orchestrator.start_smart_unblock(self.db_path)
+                commented = self._wait_until(
+                    lambda: any(
+                        c["author"] == "smart-unblock"
+                        for c in db.get_comments(self.conn, task_id)
+                    )
+                )
+
+        self.assertTrue(commented)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "smart-unblock"]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0]["message"].startswith("smart-unblock (sonnet):"))
+
+    def test_nonconforming_agent_cannot_make_the_task_runnable(self):
+        """A resume now happens only through the watcher's own verified-decision
+        path (`_apply_resume_decision`); the agent is never told to call
+        `continue` at all. If a misbehaving agent ignores that and tries to
+        mutate the task directly instead of leaving a decision comment, the
+        CLI itself refuses the call inside the consultation's process tree
+        (task.SMART_UNBLOCK_CONSULTATION_ENV_VAR), so the task cannot be made
+        runnable no matter how the orchestrator's task loop is scheduled."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        script = f'"{sys.executable}" "{task_cli}" continue {task_id}\n'
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                results = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+
+        # The refused `continue` makes the consultation exit nonzero, so the
+        # watcher treats it as a failed consult rather than a verified decision.
+        self.assertEqual(results[0]["action"], "consult-failed")
+        run_log = db.get_run_log(self.conn, task_id)
+        self.assertTrue(
+            any("could not consult" in r["message"] for r in run_log),
+            run_log,
+        )
+        # The watcher itself never called _apply_resume_decision for this
+        # cycle, so it must not fingerprint the evidence as handled.
+        self.assertNotIn(str(task_id), smart_unblock.read_state(self.db_path))
+        # The rogue `continue` call itself was refused by the CLI (it ran
+        # inside the consultation's process tree), so the task genuinely
+        # never left `blocked` -- not merely "unfingerprinted".
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        operator_notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "operator"]
+        self.assertEqual(operator_notes, [])
+
+    def test_rogue_continue_is_refused_even_outside_the_watcher(self):
+        """Direct proof that the CLI itself -- not just the watcher's own
+        bookkeeping -- refuses `continue`/`set` while the consultation
+        environment flag is set, regardless of who invokes it or when."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+
+        env = dict(os.environ)
+        env["KANBAN_DB"] = self.db_path
+        env[task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR] = "1"
+        result = subprocess.run(
+            [sys.executable, str(task_cli), "continue", str(task_id)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("disabled during a smart-unblock consultation", result.stderr)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+
+    def test_lock_gate_refuses_continue_even_without_env_flag(self):
+        """The shared lock metadata gate refuses continue for the task under
+        consultation even when ORCHESTRA_SMART_UNBLOCK_CONSULTATION is unset."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        handle = smart_unblock.acquire_watcher_lock(
+            self.db_path, agent="fake-unblocker", interval=60
+        )
+        try:
+            smart_unblock._set_lock_field("consultation_task_id", task_id)
+            env = dict(os.environ)
+            env["KANBAN_DB"] = self.db_path
+            env.pop(task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR, None)
+            result = subprocess.run(
+                [sys.executable, str(task_cli), "continue", str(task_id)],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            smart_unblock._set_lock_field("consultation_task_id", None)
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("disabled during a smart-unblock consultation", result.stderr)
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+
+    def test_stale_unlocked_consultation_metadata_does_not_gate(self):
+        """Leftover consultation_task_id after crash/SIGKILL must not permanently
+        gate dispatch or continue/set once the watcher flock is gone."""
+        ready_id = db.add_task(self.conn, "Stale gate ready", branch="feat-x")
+        db.update_task(self.conn, ready_id, status="ready", next_step="commit-make")
+
+        lock_path = smart_unblock.watcher_lock_path(self.db_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Simulate abrupt exit: metadata left behind, flock not held.
+        lock_path.write_text(
+            "\n".join(
+                [
+                    "pid=999999",
+                    "agent=fake-unblocker",
+                    "interval=60",
+                    f"consultation_task_id={ready_id}",
+                    "consultation_pgid=999998",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        status = smart_unblock.watcher_status(self.db_path)
+        self.assertFalse(status["running"])
+        self.assertIsNone(status["consultation_task_id"])
+        self.assertIsNone(status["consultation_pgid"])
+        self.assertIsNone(smart_unblock.active_consultation_task_id(self.db_path))
+        self.assertEqual(
+            smart_unblock.find_dispatchable_task(self.conn, self.db_path)["id"],
+            ready_id,
+        )
+
+        blocked_id = self._blocked_task("Stale unlocked consultation")
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        env = dict(os.environ)
+        env["KANBAN_DB"] = self.db_path
+        env.pop(task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR, None)
+
+        # Point the stale gate at the blocked task for continue/set checks.
+        lock_path.write_text(
+            f"pid=999999\nconsultation_task_id={blocked_id}\n",
+            encoding="utf-8",
+        )
+
+        set_result = subprocess.run(
+            [
+                sys.executable,
+                str(task_cli),
+                "set",
+                str(blocked_id),
+                "--title",
+                "stale-gate-renamed",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(set_result.returncode, 0, set_result.stderr)
+        self.assertEqual(
+            db.get_task(self.conn, blocked_id)["title"],
+            "stale-gate-renamed",
+        )
+
+        continue_result = subprocess.run(
+            [sys.executable, str(task_cli), "continue", str(blocked_id)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(continue_result.returncode, 0, continue_result.stderr)
+        task = db.get_task(self.conn, blocked_id)
+        self.assertEqual(task["status"], "ready")
+
+    def test_agent_originated_continuation_is_rolled_back(self):
+        """If a consultation somehow mutates status without a verified decision
+        (e.g. by clearing the env gate), the watcher restores blocked before
+        returning so the orchestrator cannot dispatch the rogue-ready task."""
+        task_id = self._blocked_task()
+        # Bypass the env gate and continue in-process via a tiny Python agent
+        # that imports task.continue_blocked_task directly -- proving the
+        # post-consultation rollback, not merely the CLI refusal.
+        script = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import db, task as task_module\n"
+            f"conn = db.connect({self.db_path!r})\n"
+            f"task_module.continue_blocked_task(conn, {task_id})\n"
+            "conn.close()\n"
+        )
+        agent_cmd = [sys.executable, "-c", script, "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                results = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+
+        self.assertEqual(results[0]["action"], "rejected-agent-continuation")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertNotIn(str(task_id), smart_unblock.read_state(self.db_path))
+        run_log = db.get_run_log(self.conn, task_id)
+        self.assertTrue(
+            any("rejected agent-originated status change" in r["message"] for r in run_log),
+            run_log,
+        )
+
+    def test_rogue_ready_stays_undispatchable_while_consultation_runs(self):
+        """A consultation that bypasses the CLI and sets ready must remain
+        undispatchable for the whole subprocess lifetime through rollback.
+
+        The prior synchronous rollback test only checked eventual state after
+        poll_once returned. This asserts the shared gate keeps find_ready_task
+        / dispatch from picking the task up while status is already ready and
+        the consultation has not exited.
+        """
+        task_id = self._blocked_task()
+        ready_marker = self.repo_root / "rogue-ready"
+        release_marker = self.repo_root / "release-rogue"
+        script = (
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import db, task as task_module\n"
+            f"conn = db.connect({self.db_path!r})\n"
+            f"task_module.continue_blocked_task(conn, {task_id})\n"
+            "conn.close()\n"
+            f"open({str(ready_marker)!r}, 'w').close()\n"
+            "deadline = time.time() + 30\n"
+            f"while time.time() < deadline and not os.path.exists({str(release_marker)!r}):\n"
+            "    time.sleep(0.05)\n"
+        )
+        agent_cmd = [sys.executable, "-c", script, "{prompt}"]
+        results_holder: list = []
+        errors: list = []
+
+        def run_poll():
+            conn = db.connect(self.db_path)
+            try:
+                results_holder.extend(
+                    smart_unblock.poll_once(conn, self.db_path, agent="fake-unblocker")
+                )
+            except Exception as exc:  # noqa: BLE001 - surface to main thread
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        handle = smart_unblock.acquire_watcher_lock(
+            self.db_path, agent="fake-unblocker", interval=60
+        )
+        try:
+            with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+                with patch.object(
+                    smart_unblock.config, "resolve_agent_command", return_value=agent_cmd
+                ):
+                    poll_thread = threading.Thread(target=run_poll)
+                    poll_thread.start()
+                    self.assertTrue(
+                        self._wait_until(ready_marker.exists, timeout=10.0),
+                        "rogue consultation never marked the task ready",
+                    )
+                    self.assertEqual(
+                        smart_unblock.active_consultation_task_id(self.db_path),
+                        task_id,
+                    )
+                    check_conn = db.connect(self.db_path)
+                    try:
+                        task = db.get_task(check_conn, task_id)
+                        self.assertEqual(task["status"], "ready")
+                        # Ungated query would see the rogue-ready row.
+                        self.assertEqual(db.find_ready_task(check_conn)["id"], task_id)
+                        # Shared dispatch gate must keep it undispatchable.
+                        self.assertIsNone(
+                            smart_unblock.find_dispatchable_task(check_conn, self.db_path)
+                        )
+                    finally:
+                        check_conn.close()
+                    release_marker.touch()
+                    poll_thread.join(timeout=15)
+                    self.assertFalse(poll_thread.is_alive())
+        finally:
+            if not release_marker.exists():
+                release_marker.touch()
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results_holder[0]["action"], "rejected-agent-continuation")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertIsNone(smart_unblock.active_consultation_task_id(self.db_path))
+
+    def test_rogue_ready_does_not_continue_pinned_task_while_consultation_runs(self):
+        """process_pinned_task must honor consultation_task_id at its post-advance
+        continuation decision, not only main-queue find_dispatchable_task.
+
+        Scenario: advance() blocks the pinned task; a rogue consultation then
+        mutates it to ready while the gate is held. The pinned loop must not
+        mark it running or call advance again until validation/rollback finish.
+        """
+        task_id = db.add_task(self.conn, "Pinned rogue race", branch="feat-x")
+        db.update_task(
+            self.conn,
+            task_id,
+            status="ready",
+            next_step="commit-make",
+            resume_next_step="commit-make",
+        )
+        task = db.get_task(self.conn, task_id)
+
+        ready_marker = self.repo_root / "pinned-rogue-ready"
+        release_marker = self.repo_root / "pinned-release-rogue"
+        advance_blocked = threading.Event()
+        advance_calls = {"n": 0}
+        pinned_errors: list = []
+        pinned_result: list = []
+        results_holder: list = []
+        poll_errors: list = []
+
+        def advance_side_effect(current, conn):
+            advance_calls["n"] += 1
+            if advance_calls["n"] > 1:
+                raise AssertionError(
+                    "process_pinned_task continued into a second advance while "
+                    "the consultation gate was held"
+                )
+            # Plain resume metadata (not review_cap) so the rogue in-process
+            # continue_blocked_task can actually flip the row to ready.
+            db.update_task(
+                conn,
+                task_id,
+                status="blocked",
+                next_step="none",
+                resume_next_step="commit-make",
+            )
+            advance_blocked.set()
+            # Stay inside advance until the rogue consultation has published
+            # ready under the shared gate, so the post-advance continuation
+            # check observes ready + consultation_task_id together.
+            if not self._wait_until(ready_marker.exists, timeout=10.0):
+                raise AssertionError("rogue consultation never marked the task ready")
+            return False
+
+        script = (
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            "import db, task as task_module\n"
+            f"conn = db.connect({self.db_path!r})\n"
+            f"task_module.continue_blocked_task(conn, {task_id})\n"
+            "conn.close()\n"
+            f"open({str(ready_marker)!r}, 'w').close()\n"
+            "deadline = time.time() + 30\n"
+            f"while time.time() < deadline and not os.path.exists({str(release_marker)!r}):\n"
+            "    time.sleep(0.05)\n"
+        )
+        agent_cmd = [sys.executable, "-c", script, "{prompt}"]
+
+        def run_poll():
+            # Wait until advance has blocked the task so poll_once can see it.
+            if not advance_blocked.wait(timeout=10.0):
+                poll_errors.append(AssertionError("advance never blocked the task"))
+                return
+            conn = db.connect(self.db_path)
+            try:
+                results_holder.extend(
+                    smart_unblock.poll_once(conn, self.db_path, agent="fake-unblocker")
+                )
+            except Exception as exc:  # noqa: BLE001 - surface to main thread
+                poll_errors.append(exc)
+            finally:
+                conn.close()
+
+        def run_pinned():
+            conn = db.connect(self.db_path)
+            try:
+                pinned_result.append(
+                    orchestrator.process_pinned_task(db.get_task(conn, task_id), conn)
+                )
+            except Exception as exc:  # noqa: BLE001 - surface to main thread
+                pinned_errors.append(exc)
+            finally:
+                conn.close()
+
+        handle = smart_unblock.acquire_watcher_lock(
+            self.db_path, agent="fake-unblocker", interval=60
+        )
+        try:
+            with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+                with patch.object(
+                    smart_unblock.config, "resolve_agent_command", return_value=agent_cmd
+                ):
+                    with patch.object(
+                        orchestrator, "advance", side_effect=advance_side_effect
+                    ):
+                        pinned_thread = threading.Thread(target=run_pinned)
+                        poll_thread = threading.Thread(target=run_poll)
+                        pinned_thread.start()
+                        poll_thread.start()
+                        self.assertTrue(
+                            self._wait_until(ready_marker.exists, timeout=10.0),
+                            "rogue consultation never marked the task ready",
+                        )
+                        self.assertEqual(
+                            smart_unblock.active_consultation_task_id(self.db_path),
+                            task_id,
+                        )
+                        check_conn = db.connect(self.db_path)
+                        try:
+                            row = db.get_task(check_conn, task_id)
+                            self.assertEqual(row["status"], "ready")
+                            # Give the pinned loop time to reach the
+                            # post-advance continuation decision under the gate.
+                            time.sleep(0.2)
+                            row = db.get_task(check_conn, task_id)
+                            self.assertEqual(
+                                row["status"],
+                                "ready",
+                                "pinned path must not mark the rogue-ready task running",
+                            )
+                            self.assertEqual(advance_calls["n"], 1)
+                        finally:
+                            check_conn.close()
+                        release_marker.touch()
+                        pinned_thread.join(timeout=15)
+                        poll_thread.join(timeout=15)
+                        self.assertFalse(pinned_thread.is_alive())
+                        self.assertFalse(poll_thread.is_alive())
+        finally:
+            if not release_marker.exists():
+                release_marker.touch()
+            smart_unblock.release_watcher_lock(handle)
+
+        self.assertEqual(pinned_errors, [])
+        self.assertEqual(poll_errors, [])
+        self.assertEqual(pinned_result, [False])
+        self.assertEqual(advance_calls["n"], 1)
+        self.assertEqual(results_holder[0]["action"], "rejected-agent-continuation")
+        task = db.get_task(self.conn, task_id)
+        self.assertEqual(task["status"], "blocked")
+        self.assertIsNone(smart_unblock.active_consultation_task_id(self.db_path))
+
+    def test_missing_identification_is_not_fingerprinted_forever(self):
+        """A decision comment that never names the configured agent must be
+        reconsidered next cycle instead of being trusted as handled forever."""
+        task_id = self._blocked_task()
+        task_cli = Path(__file__).resolve().parent / "task.py"
+        script = (
+            'printf %s "not safe: needs a human decision" '
+            f'| "{sys.executable}" "{task_cli}" comment {task_id} '
+            "--message-stdin --comment --author smart-unblock\n"
+        )
+        agent_cmd = ["/bin/sh", "-c", script, "fake-unblocker", "{prompt}"]
+
+        with patch.dict(os.environ, {"KANBAN_DB": self.db_path}):
+            with patch.object(smart_unblock.config, "resolve_agent_command", return_value=agent_cmd):
+                first = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+                second = smart_unblock.poll_once(self.conn, self.db_path, agent="fake-unblocker")
+
+        self.assertEqual(first[0]["action"], "unverified-decision")
+        self.assertEqual(second[0]["action"], "unverified-decision")
+        notes = [c for c in db.get_comments(self.conn, task_id) if c["author"] == "smart-unblock"]
+        self.assertEqual(len(notes), 2)
 
 
 class TestSingletonLock(unittest.TestCase):
@@ -5287,10 +7260,89 @@ class TestFleetConfig(unittest.TestCase):
 
             with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
                  patch.object(fleet.shutil, "which", return_value=None), \
+                 patch.object(
+                     fleet,
+                     "preferred_dashboard_url",
+                     side_effect=lambda url, **kwargs: url,
+                 ), \
                  redirect_stdout(out):
                 fleet.open_dashboard(repo)
 
-            self.assertIn("http://127.0.0.1:8427", out.getvalue())
+            self.assertEqual(out.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
+            self.assertNotIn("Remote:", out.getvalue())
+
+    def test_open_dashboard_prints_preferred_tailscale_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
+                 patch.object(fleet.shutil, "which", return_value=None), \
+                 patch.object(
+                     fleet,
+                     "preferred_dashboard_url",
+                     return_value="https://node.example.ts.net:8427/",
+                 ) as preferred, \
+                 redirect_stdout(out):
+                fleet.open_dashboard(repo)
+
+            preferred.assert_called_once_with(
+                "http://127.0.0.1:8427",
+                prefer_local=False,
+            )
+            self.assertEqual(out.getvalue(), "Dashboard: https://node.example.ts.net:8427/\n")
+            self.assertNotIn("http://127.0.0.1:8427", out.getvalue())
+
+    def test_open_dashboard_local_flag_prints_localhost_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            runtime = root / ".kanban-orchestra"
+            runtime.mkdir()
+            (runtime / "dashboard.json").write_text(
+                json.dumps(
+                    {
+                        "role": "dashboard",
+                        "pid": os.getpid(),
+                        "host": "127.0.0.1",
+                        "port": 8427,
+                        "url": "http://127.0.0.1:8427",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "dashboard_endpoint_ready", return_value=True), \
+                 patch.object(fleet.shutil, "which", return_value=None), \
+                 patch.object(
+                     fleet,
+                     "preferred_dashboard_url",
+                     return_value="http://127.0.0.1:8427",
+                 ) as preferred, \
+                 redirect_stdout(out):
+                fleet.open_dashboard(repo, prefer_local=True)
+
+            preferred.assert_called_once_with(
+                "http://127.0.0.1:8427",
+                prefer_local=True,
+            )
+            self.assertEqual(out.getvalue(), "Dashboard: http://127.0.0.1:8427\n")
 
     def test_wait_stopped_polls_until_orchestrator_pid_exits(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
@@ -5367,12 +7419,6 @@ class TestSupertaskDB(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
         os.unlink(self.tmp.name)
-
-    def test_new_columns_present(self):
-        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)").fetchall()}
-        self.assertIn("kind", cols)
-        self.assertIn("parent_task_id", cols)
-        self.assertIn("sequence_index", cols)
 
     def test_legacy_supertask_db_with_koid_raises_error(self):
         """connect() must raise RuntimeError on a pre-supertask legacy schema with koid."""
@@ -5587,8 +7633,20 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.conn.close()
         os.unlink(self.tmp.name)
 
-    def _make_supertask(self, status="running", next_step="commit-make-supertask"):
-        tid = db.add_task(self.conn, "My plan", kind="supertask", branch="feat", coder_agent="claude")
+    def _make_supertask(
+        self,
+        status="running",
+        next_step="commit-make-supertask",
+        reviewer_agent=None,
+    ):
+        tid = db.add_task(
+            self.conn,
+            "My plan",
+            kind="supertask",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent=reviewer_agent,
+        )
         db.update_task(self.conn, tid, status=status, next_step=next_step)
         return db.get_task(self.conn, tid)
 
@@ -5632,10 +7690,18 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         self.assertEqual(comments[-1]["message"], "Plan: do A then B")
 
-    def test_advance_commit_make_supertask_to_review(self):
+    def test_advance_commit_make_supertask_activates_children(self):
         task = self._make_supertask()
 
         def fake_coder(name, prompt, task_id, conn, verb, **kw):
+            db.add_task(
+                conn,
+                "Child",
+                parent_task_id=task_id,
+                sequence_index=100,
+                branch="feat",
+                status="ready",
+            )
             db.add_comment(conn, task_id, "Plan summary", kind="commit-message", author=name)
             return 0
 
@@ -5644,27 +7710,27 @@ class TestSupertaskStateMachine(unittest.TestCase):
 
         updated = db.get_task(self.conn, task["id"])
         self.assertTrue(result)
-        self.assertEqual(updated["status"], "ready")
-        self.assertEqual(updated["next_step"], "commit-review-supertask")
+        self.assertEqual(updated["status"], "pending_subtasks")
+        self.assertEqual(updated["next_step"], "none")
 
-    def test_advance_commit_review_supertask_approve_sets_pending_subtasks(self):
+    def test_advance_commit_review_supertask_approve_finishes_parent(self):
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "LGTM",
-                       kind="approval", author=DEFAULT_REVIEWER, review_round=0)
+                       kind="approval", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
 
         with patch.object(orchestrator, "run_agent", return_value=0):
             result = orchestrator.advance(task, self.conn)
 
         updated = db.get_task(self.conn, task["id"])
         self.assertTrue(result)
-        self.assertEqual(updated["status"], "pending_subtasks")
+        self.assertEqual(updated["status"], "done")
         self.assertEqual(updated["next_step"], "none")
         self.assertIsNone(updated["commit_hash"])
 
     def test_advance_commit_review_supertask_reject_returns_to_make(self):
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "Needs more detail",
-                       kind="rejection", author=DEFAULT_REVIEWER, review_round=0)
+                       kind="rejection", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
 
         with patch.object(orchestrator, "run_agent", return_value=0):
             result = orchestrator.advance(task, self.conn)
@@ -5675,11 +7741,119 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.assertEqual(updated["next_step"], "commit-make-supertask")
         self.assertEqual(updated["review_round"], 1)
 
+    def test_commit_review_supertask_uses_configured_reviewer(self):
+        task = self._make_supertask(
+            status="running",
+            next_step="commit-review-supertask",
+            reviewer_agent="antigravity",
+        )
+        invoked = []
+
+        def fake_reviewer(name, prompt, task_id, conn, verb, **kw):
+            invoked.append((name, verb))
+            db.add_comment(
+                conn,
+                task_id,
+                "Combined implementation approved",
+                kind="approval",
+                author=name,
+                review_round=task["review_round"],
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_reviewer):
+            result = orchestrator.handle_commit_review_supertask(task, self.conn)
+
+        self.assertEqual(result, "approve")
+        self.assertEqual(invoked, [("antigravity", "commit-review-supertask")])
+
+    def test_final_review_defers_and_attaches_legacy_detached_follow_up(self):
+        parent = self._make_supertask(
+            status="running",
+            next_step="commit-review-supertask",
+        )
+        child_id = db.add_task(
+            self.conn,
+            "Completed child",
+            branch="feat",
+            parent_task_id=parent["id"],
+            sequence_index=100,
+            status="done",
+        )
+        follow_up_id = db.add_task(
+            self.conn,
+            "Detached follow-up",
+            branch="feat",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.conn, child_id, follow_up_task_id=follow_up_id)
+
+        with patch.object(orchestrator, "run_agent") as run_agent:
+            result = orchestrator.advance(parent, self.conn)
+
+        self.assertTrue(result)
+        run_agent.assert_not_called()
+        updated_parent = db.get_task(self.conn, parent["id"])
+        follow_up = db.get_task(self.conn, follow_up_id)
+        self.assertEqual(updated_parent["status"], "pending_subtasks")
+        self.assertEqual(updated_parent["next_step"], "none")
+        self.assertEqual(follow_up["parent_task_id"], parent["id"])
+        self.assertEqual(follow_up["sequence_index"], 200)
+        self.assertEqual(follow_up["status"], "ready")
+        self.assertEqual(follow_up["next_step"], "commit-make")
+
+    def test_follow_up_association_conflict_blocks_with_continue_metadata(self):
+        parent = self._make_supertask(
+            status="running",
+            next_step="commit-review-supertask",
+        )
+        other_parent_id = db.add_task(
+            self.conn,
+            "Other parent",
+            kind="supertask",
+            branch="feat",
+        )
+        child_id = db.add_task(
+            self.conn,
+            "Completed child",
+            branch="feat",
+            parent_task_id=parent["id"],
+            sequence_index=100,
+            status="done",
+        )
+        conflicting_follow_up_id = db.add_task(
+            self.conn,
+            "Conflicting follow-up",
+            branch="feat",
+            parent_task_id=other_parent_id,
+            sequence_index=100,
+            status="done",
+        )
+        db.update_task(
+            self.conn,
+            child_id,
+            follow_up_task_id=conflicting_follow_up_id,
+        )
+
+        result = orchestrator.advance(parent, self.conn)
+
+        self.assertFalse(result)
+        blocked = db.get_task(self.conn, parent["id"])
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["block_reason"], "follow_up_reconciliation")
+        self.assertEqual(blocked["resume_next_step"], "commit-review-supertask")
+
+        db.update_task(self.conn, child_id, follow_up_task_id=None)
+        with patch.object(orchestrator.task_cli, "validate_ready_worktree"):
+            resumed = orchestrator.task_cli.continue_blocked_task(self.conn, parent["id"])
+        self.assertEqual(resumed["status"], "ready")
+        self.assertEqual(resumed["next_step"], "commit-review-supertask")
+
     def test_supertask_never_gets_commit_hash(self):
         """After plan approval, supertask has no commit_hash."""
         task = self._make_supertask(status="running", next_step="commit-review-supertask")
         db.add_comment(self.conn, task["id"], "LGTM",
-                       kind="approval", author=DEFAULT_REVIEWER, review_round=0)
+                       kind="approval", author=orchestrator.DEFAULT_SUPER_REVIEWER, review_round=0)
 
         with patch.object(orchestrator, "run_agent", return_value=0):
             orchestrator.advance(task, self.conn)
@@ -5687,8 +7861,8 @@ class TestSupertaskStateMachine(unittest.TestCase):
         updated = db.get_task(self.conn, task["id"])
         self.assertIsNone(updated["commit_hash"])
 
-    def test_child_done_completes_parent(self):
-        """When all children are done, supertask becomes done."""
+    def test_child_done_queues_parent_final_review(self):
+        """When all children are done, the supertask queues its final review."""
         parent_id = db.add_task(
             self.conn, "Parent", kind="supertask", branch="feat", coder_agent="claude",
         )
@@ -5718,8 +7892,38 @@ class TestSupertaskStateMachine(unittest.TestCase):
         updated_parent = db.get_task(self.conn, parent_id)
         self.assertEqual(updated_child["status"], "done")
         self.assertEqual(updated_child["commit_hash"], fake_hash)
-        self.assertEqual(updated_parent["status"], "done")
+        self.assertEqual(updated_parent["status"], "ready")
+        self.assertEqual(updated_parent["next_step"], "commit-review-supertask")
         self.assertIsNone(updated_parent["commit_hash"])
+
+    def test_child_done_completes_parent_when_final_review_is_skipped(self):
+        parent_id = db.add_task(
+            self.conn,
+            "Parent",
+            kind="supertask",
+            branch="feat",
+            coder_agent="claude",
+            skips=["commit-review-supertask"],
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks")
+        child_id = db.add_task(
+            self.conn,
+            "Child",
+            parent_task_id=parent_id,
+            sequence_index=100,
+            branch="feat",
+            status="done",
+        )
+
+        orchestrator._check_parent_completion(child_id, self.conn)
+
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "done")
+        self.assertEqual(parent["next_step"], "none")
+        self.assertTrue(any(
+            "Final supertask review skipped" in comment["message"]
+            for comment in db.get_comments(self.conn, parent_id)
+        ))
 
     def test_child_blocked_propagates_to_parent(self):
         """When a child task is blocked, the parent supertask is also blocked."""
@@ -5831,6 +8035,29 @@ class TestSupertaskCLI(unittest.TestCase):
         child_id = json.loads(r.stdout)["id"]
         child = json.loads(self._run("show", str(child_id)).stdout)
         self.assertEqual(child["status"], "ready")
+
+    def test_list_parent_returns_all_children_in_sequence_order(self):
+        parent_id = self._add_supertask(title="First", branch="feat")
+        other_parent_id = self._add_supertask(title="Second", branch="feat")
+        later = json.loads(self._run(
+            "add", "Later", "--parent", str(parent_id), "--sequence-index", "200",
+        ).stdout)["id"]
+        earlier = json.loads(self._run(
+            "add", "Earlier", "--parent", str(parent_id), "--sequence-index", "100",
+        ).stdout)["id"]
+        self._run("add", "Unrelated", "--parent", str(other_parent_id))
+        self._run("set", str(earlier), "--sequence-index", "50")
+
+        conn = db.connect(self.db_path)
+        db.update_task(conn, later, status="done")
+        conn.close()
+
+        result = self._run("list", "--parent", str(parent_id))
+
+        self.assertEqual(result.returncode, 0)
+        children = json.loads(result.stdout)
+        self.assertEqual([child["id"] for child in children], [earlier, later])
+        self.assertEqual({child["status"] for child in children}, {"ready", "done"})
 
     def test_add_child_fails_when_parent_has_no_branch(self):
         r = self._run("add", "Branchless supertask", "--kind", "supertask")
@@ -6009,6 +8236,462 @@ class TestSupertaskCLI(unittest.TestCase):
 
         parent = json.loads(self._run("show", str(parent_id)).stdout)
         self.assertEqual(parent["status"], "blocked")
+
+
+class TestContinueBlockedTask(unittest.TestCase):
+    """CLI and orchestrator coverage for ko-task continue."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        self.task_py = str(Path(__file__).resolve().parent / "task.py")
+        self.env = {
+            **os.environ,
+            "KANBAN_DB": self.db_path,
+            "KANBAN_NONINTERACTIVE": "1",
+        }
+        self.conn = db.connect(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmpdir.cleanup()
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, self.task_py] + list(args),
+            capture_output=True, text=True, env=self.env,
+        )
+
+    def _block_at_review_cap(self, *, stash_ref="stash@{0}", review_round=None):
+        tid = db.add_task(self.conn, "Cap blocked", branch="feat-continue", coder_agent="claude")
+        if review_round is None:
+            review_round = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            review_round=review_round,
+            last_review_decision="reject",
+            stash_ref=stash_ref,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            max_review_rounds=orchestrator.MAX_REVIEW_ROUNDS,
+        )
+        db.add_comment(
+            self.conn, tid, "prior rejection", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round - 1,
+        )
+        return tid, review_round
+
+    def test_continue_add_review_rounds_preserves_history_and_stash(self):
+        tid, review_round = self._block_at_review_cap()
+        prior_comments = db.get_comments(self.conn, tid)
+
+        r = self._run("continue", str(tid), "--add-review-rounds", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS + 2)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+        comments = db.get_comments(self.conn, tid)
+        self.assertGreater(len(comments), len(prior_comments))
+        self.assertTrue(any(c["kind"] == "rejection" for c in comments))
+        self.assertTrue(
+            any(
+                c["author"] == "operator" and "additional review round" in c["message"]
+                for c in comments
+            ),
+        )
+
+    def test_continue_generic_next_step(self):
+        tid = db.add_task(self.conn, "Other block", branch="feat-generic", coder_agent="claude")
+        db.update_task(
+            self.conn, tid,
+            status="blocked", next_step="none",
+            review_round=1, stash_ref=None,
+        )
+
+        r = self._run("continue", str(tid), "--next-step", "commit-make")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], 1)
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(
+            any(c["author"] == "operator" and "requeued at next_step=commit-make" in c["message"]
+                for c in comments),
+        )
+
+    def test_continue_rejects_invalid_uses(self):
+        ready_id = db.add_task(self.conn, "Ready", branch="feat-ready")
+        db.update_task(self.conn, ready_id, status="ready", next_step="commit-make")
+        r = self._run("continue", str(ready_id), "--add-review-rounds", "1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("status=blocked", r.stderr)
+
+        tid, _ = self._block_at_review_cap()
+        r = self._run("continue", str(tid), "--add-review-rounds", "0")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("positive integer", r.stderr)
+
+        r = self._run("continue", str(tid), "--add-review-rounds", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("positive integer", r.stderr)
+
+        r = self._run(
+            "continue", str(tid),
+            "--add-review-rounds", "1", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("structured review-cap", r.stderr)
+
+        r = self._run("continue", str(tid), "--next-step", "commit-make")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        r = self._run("continue", str(tid))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        other = db.add_task(self.conn, "No metadata", branch="feat-none")
+        db.update_task(self.conn, other, status="blocked", next_step="none")
+        r = self._run("continue", str(other))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--next-step", r.stderr)
+
+        r = self._run("continue", str(other), "--add-review-rounds", "2")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr)
+
+    def test_set_status_ready_rejects_review_cap_bypass(self):
+        """task set --status ready must not bypass a review-cap block."""
+        tid, review_round = self._block_at_review_cap()
+        cap = db.get_task(self.conn, tid)["max_review_rounds"]
+
+        r = self._run(
+            "set", str(tid),
+            "--status", "ready", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr.lower())
+        self.assertIn("task continue", r.stderr.lower())
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["max_review_rounds"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def _block_reviewer_unavailable(self, *, review_round=0, stash_ref="stash@{0}"):
+        tid = db.add_task(
+            self.conn, "Reviewer unavailable", branch="feat-unavailable", coder_agent="claude",
+        )
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            review_round=review_round,
+            last_review_decision="none",
+            stash_ref=stash_ref,
+            block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+            resume_next_step="commit-review",
+        )
+        return tid
+
+    def test_continue_reviewer_unavailable_resumes_at_review(self):
+        tid = self._block_reviewer_unavailable()
+        r = self._run("continue", str(tid))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-review")
+        self.assertEqual(task["review_round"], 0)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_set_status_ready_rejects_reviewer_unavailable_bypass(self):
+        tid = self._block_reviewer_unavailable()
+        r = self._run(
+            "set", str(tid),
+            "--status", "ready", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("reviewer-unavailable", r.stderr.lower())
+        self.assertIn("task continue", r.stderr.lower())
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(task["resume_next_step"], "commit-review")
+        self.assertEqual(task["review_round"], 0)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_set_status_ready_rejects_two_step_review_cap_bypass(self):
+        """Clearing status alone must not open a set --status ready bypass."""
+        tid, review_round = self._block_at_review_cap()
+        cap = db.get_task(self.conn, tid)["max_review_rounds"]
+
+        r = self._run("set", str(tid), "--status", "none")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mid = db.get_task(self.conn, tid)
+        self.assertEqual(mid["status"], "none")
+        self.assertEqual(mid["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(mid["resume_next_step"], "commit-make")
+        self.assertEqual(mid["max_review_rounds"], cap)
+
+        r = self._run(
+            "set", str(tid),
+            "--status", "ready", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr.lower())
+        self.assertIn("task continue", r.stderr.lower())
+        self.assertIn("--add-review-rounds", r.stderr)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "none")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["max_review_rounds"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_continue_legacy_review_cap_with_next_step(self):
+        """Pre-schema review-cap blocks recover via --add-review-rounds + --next-step."""
+        tid = db.add_task(self.conn, "Legacy cap", branch="feat-legacy", coder_agent="claude")
+        review_round = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn, tid,
+            status="blocked", next_step="none",
+            review_round=review_round,
+            last_review_decision="reject",
+            stash_ref="stash@{9}",
+            block_reason=None,
+            resume_next_step=None,
+        )
+        db.add_comment(
+            self.conn, tid, "legacy rejection", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round - 1,
+        )
+        prior_comments = db.get_comments(self.conn, tid)
+
+        r = self._run(
+            "continue", str(tid),
+            "--add-review-rounds", "2", "--next-step", "commit-make",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = json.loads(r.stdout)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{9}")
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS + 2)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+        comments = db.get_comments(self.conn, tid)
+        self.assertGreater(len(comments), len(prior_comments))
+        self.assertTrue(any(c["kind"] == "rejection" for c in comments))
+        self.assertTrue(
+            any(
+                c["author"] == "operator"
+                and "legacy/manual review-cap recovery" in c["message"]
+                and "additional review round" in c["message"]
+                for c in comments
+            ),
+        )
+
+    def test_continue_legacy_rejects_invalid_combinations(self):
+        """Legacy form is only for tasks with no structured block metadata."""
+        # Known non-review-cap block: --add-review-rounds alone still rejected.
+        other = db.add_task(self.conn, "Other block", branch="feat-other-block")
+        db.update_task(
+            self.conn, other,
+            status="blocked", next_step="none",
+            review_round=1, stash_ref="stash@{1}",
+        )
+        r = self._run("continue", str(other), "--add-review-rounds", "2")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("review cap", r.stderr)
+
+        # Structured review-cap still rejects --next-step alongside rounds.
+        tid, review_round = self._block_at_review_cap()
+        r = self._run(
+            "continue", str(tid),
+            "--add-review-rounds", "1", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("structured review-cap", r.stderr)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+        # Resume step without block_reason is not legacy either.
+        partial = db.add_task(self.conn, "Partial meta", branch="feat-partial")
+        db.update_task(
+            self.conn, partial,
+            status="blocked", next_step="none",
+            resume_next_step="commit-make",
+            stash_ref="stash@{2}",
+            review_round=3,
+        )
+        r = self._run(
+            "continue", str(partial),
+            "--add-review-rounds", "1", "--next-step", "commit-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not both", r.stderr)
+        task = db.get_task(self.conn, partial)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["review_round"], 3)
+        self.assertEqual(task["stash_ref"], "stash@{2}")
+
+        # Legacy task still needs a valid maker step.
+        legacy = db.add_task(self.conn, "Legacy bad step", branch="feat-legacy-bad")
+        db.update_task(
+            self.conn, legacy,
+            status="blocked", next_step="none",
+            review_round=orchestrator.MAX_REVIEW_ROUNDS,
+            stash_ref="stash@{3}",
+        )
+        r = self._run(
+            "continue", str(legacy),
+            "--add-review-rounds", "1", "--next-step", "pull-request-make",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        task = db.get_task(self.conn, legacy)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["review_round"], orchestrator.MAX_REVIEW_ROUNDS)
+        self.assertEqual(task["stash_ref"], "stash@{3}")
+        self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
+
+    def test_continue_cap_enforcement_after_extension(self):
+        tid, review_round = self._block_at_review_cap(stash_ref=None)
+        r = self._run("continue", str(tid), "--add-review-rounds", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["max_review_rounds"], review_round + 2)
+
+        # First rejection under the raised cap requeues for another make/review.
+        db.update_task(
+            self.conn, tid,
+            status="running", next_step="commit-review", review_round=review_round,
+        )
+        db.add_comment(
+            self.conn, tid, "Still no", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round,
+        )
+        task = db.get_task(self.conn, tid)
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(task, self.conn)
+        mid = db.get_task(self.conn, tid)
+        self.assertEqual(mid["status"], "ready")
+        self.assertEqual(mid["next_step"], "commit-make")
+        self.assertEqual(mid["review_round"], review_round + 1)
+
+        # The next rejection hits the new cap and blocks again.
+        db.update_task(
+            self.conn, tid,
+            status="running", next_step="commit-review",
+        )
+        db.add_comment(
+            self.conn, tid, "Final no", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=review_round + 1,
+        )
+        task = db.get_task(self.conn, tid)
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_commit_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(task, self.conn)
+        blocked = db.get_task(self.conn, tid)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(blocked["resume_next_step"], "commit-make")
+        self.assertEqual(blocked["review_round"], review_round + 2)
+        self.assertEqual(blocked["max_review_rounds"], review_round + 2)
+
+    def test_continue_restores_parent_supertask(self):
+        parent_id = db.add_task(
+            self.conn, "Parent", kind="supertask", branch="feat-parent",
+            coder_agent="claude",
+        )
+        child_id = db.add_task(
+            self.conn, "Child", branch="feat-parent", parent_task_id=parent_id,
+            coder_agent="claude",
+        )
+        db.update_task(
+            self.conn, child_id,
+            status="blocked", next_step="none",
+            review_round=orchestrator.MAX_REVIEW_ROUNDS,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            stash_ref="stash@{3}",
+        )
+        db.update_task(self.conn, parent_id, status="blocked")
+
+        r = self._run("continue", str(child_id), "--add-review-rounds", "3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        child = json.loads(r.stdout)
+        self.assertEqual(child["status"], "ready")
+        self.assertEqual(child["stash_ref"], "stash@{3}")
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "pending_subtasks")
+
+    def test_orchestrator_records_pr_and_other_resume_steps(self):
+        pr_id = db.add_task(
+            self.conn, "PR", kind="pull_request", branch="feat-pr", coder_agent="claude",
+        )
+        round_num = orchestrator.MAX_REVIEW_ROUNDS - 1
+        db.update_task(
+            self.conn, pr_id,
+            status="running", next_step="pull-request-review", review_round=round_num,
+        )
+        db.add_comment(
+            self.conn, pr_id, "No", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=round_num,
+        )
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_pull_request_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(db.get_task(self.conn, pr_id), self.conn)
+        pr = db.get_task(self.conn, pr_id)
+        self.assertEqual(pr["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(pr["resume_next_step"], "pull-request-make")
+
+        other_id = db.add_task(
+            self.conn, "Other", kind="other", coder_agent="claude",
+        )
+        db.update_task(
+            self.conn, other_id,
+            status="running", next_step="other-review", review_round=round_num,
+        )
+        db.add_comment(
+            self.conn, other_id, "No", kind="rejection",
+            author=DEFAULT_REVIEWER, review_round=round_num,
+        )
+        with patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "handle_other_review", return_value="reject"), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            orchestrator.advance(db.get_task(self.conn, other_id), self.conn)
+        other = db.get_task(self.conn, other_id)
+        self.assertEqual(other["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(other["resume_next_step"], "other-make")
 
 
 class TestTaskPlanningDB(unittest.TestCase):
@@ -6341,11 +9024,14 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
     def setUp(self):
         self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
         self._ack_patcher.start()
+        self._sleep_patcher = patch.object(orchestrator.time, "sleep")
+        self._sleep_patcher.start()
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.conn = db.connect(self.tmp.name)
 
     def tearDown(self):
+        self._sleep_patcher.stop()
         self._ack_patcher.stop()
         self.conn.close()
         os.unlink(self.tmp.name)
@@ -6492,7 +9178,7 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertIsNone(task["commit_plan"])
 
     def test_plan_reviewer_error_blocks_task(self):
-        """Reviewer error during commit-plan-review blocks the task."""
+        """Reviewer error during commit-plan-review blocks as reviewer_unavailable."""
         tid = db.add_task(self.conn, "Plan review error", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b",
                        next_step="commit-plan-review", commit_plan="Draft plan")
@@ -6504,6 +9190,9 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertFalse(result)
         task = db.get_task(self.conn, tid)
         self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEWER_UNAVAILABLE)
+        self.assertEqual(task["resume_next_step"], "commit-plan-review")
+        self.assertEqual(task["review_round"], 0)
 
     def test_plan_review_decision_without_review_round_filtering(self):
         """Plan approval uses plan-approval kind, independent of review_round."""
@@ -6677,6 +9366,86 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         self.assertEqual(task["next_step"], "commit-plan")
         self.assertIsNone(task["commit_plan"])
 
+    def test_recover_running_commit_review_at_cap_blocks(self):
+        """Startup recovery of interrupted commit-review at the task cap blocks as review_cap."""
+        tid = db.add_task(self.conn, "Stuck review at cap", coder_agent="claude")
+        cap = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review",
+            review_round=cap - 1, max_review_rounds=cap,
+        )
+
+        def fake_stash(task_id_, conn_):
+            db.update_task(conn_, task_id_, stash_ref="stash@{0}")
+            return "stash@{0}"
+
+        with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
+             patch.object(orchestrator, "stash_task_wip", side_effect=fake_stash):
+            orchestrator.recover_running_tasks(self.conn)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], cap)
+        self.assertEqual(task["max_review_rounds"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_recover_running_commit_review_raised_cap_remains_eligible(self):
+        """Startup recovery below a raised per-task cap requeues at the next review round."""
+        tid = db.add_task(self.conn, "Stuck review under raised cap", coder_agent="claude")
+        raised_cap = orchestrator.MAX_REVIEW_ROUNDS + 3
+        start_round = orchestrator.MAX_REVIEW_ROUNDS  # would hit default cap, but task cap is higher
+        db.update_task(
+            self.conn, tid,
+            status="running", branch="b", next_step="commit-review",
+            review_round=start_round, max_review_rounds=raised_cap,
+        )
+
+        orchestrator.recover_running_tasks(self.conn)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-review")
+        self.assertEqual(task["review_round"], start_round + 1)
+        self.assertEqual(task["max_review_rounds"], raised_cap)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+
+    def test_keyboard_interrupt_commit_review_at_cap_blocks(self):
+        """KeyboardInterrupt during commit-review at the task cap blocks as review_cap."""
+        tid = db.add_task(self.conn, "Interrupted review at cap", coder_agent="claude")
+        cap = orchestrator.MAX_REVIEW_ROUNDS
+        db.update_task(
+            self.conn, tid,
+            status="ready", branch="b", next_step="commit-review",
+            review_round=cap - 1, max_review_rounds=cap,
+        )
+
+        def fake_agent(name, prompt, task_id, conn, verb, **kw):
+            raise KeyboardInterrupt
+
+        def fake_stash(task_id_, conn_):
+            db.update_task(conn_, task_id_, stash_ref="stash@{1}")
+            return "stash@{1}"
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_agent), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
+             patch.object(orchestrator, "stash_task_wip", side_effect=fake_stash):
+            with self.assertRaises(KeyboardInterrupt):
+                orchestrator.process_pinned_task(db.get_task(self.conn, tid), self.conn)
+
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["next_step"], "none")
+        self.assertEqual(task["review_round"], cap)
+        self.assertEqual(task["stash_ref"], "stash@{1}")
+
     def test_build_prompt_role_filtering(self):
         """build_prompt filters skips from context, but keeps commit_plan for planners."""
         task = {
@@ -6756,6 +9525,74 @@ class TestTaskPlanningOrchestrator(unittest.TestCase):
         # They may appear in the shared Rules text, but should be absent from the Context key-value list
         self.assertNotIn("- stash_ref:", prompt)
         self.assertNotIn("- commit_hash:", prompt)
+
+    def test_supertask_planner_prompt_is_plan_only(self):
+        task = {
+            "id": 99, "title": "Plan work", "description": "Split the work",
+            "branch": "b", "status": "running", "next_step": "commit-make-supertask",
+            "review_round": 0, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
+            "reviewer_agent": "antigravity", "kind": "supertask",
+        }
+
+        prompt = orchestrator.build_prompt(task, "commit-make-supertask", "claude", [])
+
+        self.assertIn("- role: planner", prompt)
+        self.assertIn("task list --parent 99", prompt)
+        self.assertIn('task add "<child title>"', prompt)
+        self.assertIn("task delete <child-id>", prompt)
+        self.assertNotIn("task set 99 --stash-ref", prompt)
+        self.assertNotIn("--validation", prompt)
+        self.assertNotIn("task get-commit-footer", prompt)
+        self.assertNotIn("git diff --cached", prompt)
+
+    def test_supertask_reviewer_prompt_includes_child_results(self):
+        task = {
+            "id": 99, "title": "Review plan", "description": "Split the work",
+            "branch": "b", "status": "running", "next_step": "commit-review-supertask",
+            "review_round": 2, "last_review_decision": "none",
+            "commit_hash": None, "stash_ref": None, "coder_agent": "claude",
+            "reviewer_agent": "antigravity", "kind": "supertask",
+        }
+        comments = [{
+            "kind": "commit-message",
+            "review_round": 2,
+            "author": "claude",
+            "message": "100: Add foundation\n200: Add behavior",
+        }]
+
+        prompt = orchestrator.build_prompt(
+            task,
+            "commit-review-supertask",
+            "antigravity",
+            comments,
+            supertask_children=[{
+                "id": 101,
+                "title": "Add foundation",
+                "status": "done",
+                "commit_hash": "a" * 40,
+                "follow_up_of": None,
+                "review_history": [{
+                    "kind": "approval",
+                    "review_round": 1,
+                    "author": "codex",
+                    "message": "Implementation is correct.",
+                }],
+            }],
+        )
+
+        self.assertIn("## Supertask Final Review Handoff", prompt)
+        self.assertIn("100: Add foundation", prompt)
+        self.assertIn("Task 101: Add foundation", prompt)
+        self.assertIn("a" * 40, prompt)
+        self.assertIn("Round 1 approval by codex", prompt)
+        self.assertIn("task list --parent 99", prompt)
+        self.assertIn("task show <child-id>", prompt)
+        self.assertIn("task show-comments <child-id>", prompt)
+        self.assertIn("git show <commit-hash>", prompt)
+        self.assertIn("- reviewer_agent: antigravity", prompt)
+        self.assertNotIn("git diff --cached", prompt)
+        self.assertNotIn("validation summary", prompt)
 
 
 class TestPickupRuntimeStep(unittest.TestCase):
@@ -6840,6 +9677,7 @@ class TestPickupRuntimeStep(unittest.TestCase):
         blocked = db.get_task(self.conn, tid)
         self.assertEqual(blocked["status"], "blocked")
         self.assertEqual(blocked["next_step"], "none")
+        self.assertIsNone(blocked["first_started_at"])
         comments = db.get_comments(self.conn, tid)
         self.assertEqual(len(comments), 1)
         self.assertIn("Tasks on master/main are disabled by default", comments[0]["message"])
@@ -7039,6 +9877,59 @@ class TestFollowUpCLI(unittest.TestCase):
         self.assertEqual(follow_up["coder_agent"], "sonnet")
         self.assertEqual(follow_up["reviewer_agent"], "antigravity")
 
+    def test_descendant_follow_ups_inherit_supertask_and_sequence(self):
+        conn = db.connect(self.db_path)
+        try:
+            parent_id = db.add_task(conn, "Parent", kind="supertask", branch="feat")
+            child_id = db.add_task(
+                conn,
+                "Child",
+                branch="feat",
+                parent_task_id=parent_id,
+                sequence_index=100,
+                status="running",
+                skips=["commit-plan"],
+            )
+            later_id = db.add_task(
+                conn,
+                "Later child",
+                branch="feat",
+                parent_task_id=parent_id,
+                sequence_index=200,
+                status="ready",
+                skips=["commit-plan"],
+            )
+            db.update_task(conn, child_id, next_step="commit-make")
+        finally:
+            conn.close()
+
+        first = self._run("follow-up", str(child_id), "--description", "First follow-up")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_id = json.loads(first.stdout)["id"]
+        self._set_running(first_id)
+        second = self._run("follow-up", str(first_id), "--description", "Nested follow-up")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_id = json.loads(second.stdout)["id"]
+
+        conn = db.connect(self.db_path)
+        try:
+            children = db.get_child_tasks(conn, parent_id)
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            [child["id"] for child in children],
+            [child_id, first_id, second_id, later_id],
+        )
+        self.assertEqual(
+            [child["parent_task_id"] for child in children],
+            [parent_id, parent_id, parent_id, parent_id],
+        )
+        self.assertEqual(
+            [child["sequence_index"] for child in children],
+            [100, 200, 300, 400],
+        )
+
     def test_follow_up_sets_follow_up_task_id_on_current(self):
         """follow_up_task_id is set on the current task after calling follow-up."""
         tid = self._add_task("My task")
@@ -7135,6 +10026,235 @@ class TestFollowUpOrchestrator(unittest.TestCase):
         self._ack_patcher.stop()
         self.conn.close()
         os.unlink(self.tmp.name)
+
+    def test_supertask_waits_for_follow_up_before_final_review(self):
+        parent_id = db.add_task(
+            self.conn,
+            "Parent supertask",
+            kind="supertask",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent="antigravity",
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks", next_step="none")
+        child_id = db.add_task(
+            self.conn,
+            "Original child",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent="codex",
+            parent_task_id=parent_id,
+            sequence_index=100,
+            status="running",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.conn, child_id, next_step="commit-make")
+        follow_up_id = None
+
+        def build_child(name, prompt, task_id, conn, verb, **kw):
+            nonlocal follow_up_id
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "task.py"),
+                    "follow-up",
+                    str(task_id),
+                    "--description",
+                    "Correct the integration discovered during implementation",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "KANBAN_DB": self.tmp.name,
+                    "KANBAN_NONINTERACTIVE": "1",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            follow_up_id = json.loads(result.stdout)["id"]
+            db.add_comment(
+                conn,
+                task_id,
+                "Original child commit",
+                kind="commit-message",
+                author=name,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=build_child), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, child_id), self.conn))
+
+        self.assertIsNotNone(follow_up_id)
+        follow_up = db.get_task(self.conn, follow_up_id)
+        self.assertEqual(follow_up["parent_task_id"], parent_id)
+        self.assertEqual(follow_up["status"], "ready")
+
+        db.add_comment(
+            self.conn,
+            child_id,
+            "Original child approved",
+            kind="approval",
+            author="codex",
+            review_round=0,
+        )
+        db.update_task(
+            self.conn,
+            child_id,
+            status="done",
+            next_step="none",
+            commit_hash="c" * 40,
+            last_review_decision="approve",
+        )
+        orchestrator._check_parent_completion(child_id, self.conn)
+
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "pending_subtasks")
+        self.assertEqual(parent["next_step"], "none")
+        self.assertFalse(any(
+            "Starting commit-review-supertask" in comment["message"]
+            for comment in db.get_comments(self.conn, parent_id)
+        ))
+
+        db.update_task(self.conn, follow_up_id, status="running", next_step="commit-make")
+
+        def build_follow_up(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(
+                conn,
+                task_id,
+                "Follow-up commit",
+                kind="commit-message",
+                author=name,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=build_follow_up), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, follow_up_id), self.conn))
+
+        db.update_task(self.conn, follow_up_id, status="running", next_step="commit-review")
+
+        def review_follow_up(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(
+                conn,
+                task_id,
+                "Follow-up integration approved",
+                kind="approval",
+                author=name,
+                review_round=0,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=review_follow_up), \
+             patch.object(orchestrator, "ensure_branch", return_value=True):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, follow_up_id), self.conn))
+
+        db.update_task(self.conn, follow_up_id, status="running", next_step="commit-make")
+        follow_up_hash = "f" * 40
+        with patch.object(orchestrator, "run_agent", return_value=0), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(
+                 orchestrator,
+                 "get_head_commit_hash",
+                 side_effect=["e" * 40, follow_up_hash, follow_up_hash],
+             ), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, follow_up_id), self.conn))
+
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "ready")
+        self.assertEqual(parent["next_step"], "commit-review-supertask")
+        self.assertEqual(db.get_task(self.conn, follow_up_id)["commit_hash"], follow_up_hash)
+
+        db.update_task(self.conn, parent_id, status="running")
+        final_prompt = []
+
+        def review_supertask(name, prompt, task_id, conn, verb, **kw):
+            final_prompt.append(prompt)
+            db.add_comment(
+                conn,
+                task_id,
+                "Combined implementation approved",
+                kind="approval",
+                author=name,
+                review_round=0,
+            )
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=review_supertask):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, parent_id), self.conn))
+
+        self.assertEqual(db.get_task(self.conn, parent_id)["status"], "done")
+        self.assertIn(follow_up_hash, final_prompt[0])
+        self.assertIn("Follow-up integration approved", final_prompt[0])
+        self.assertIn("follow-up of task", final_prompt[0])
+
+    def test_supertask_path_b_follow_up_is_queued_before_parent_completion(self):
+        parent_id = db.add_task(
+            self.conn,
+            "Parent supertask",
+            kind="supertask",
+            branch="feat",
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks", next_step="none")
+        child_id = db.add_task(
+            self.conn,
+            "Finalizing child",
+            branch="feat",
+            coder_agent="claude",
+            reviewer_agent="codex",
+            parent_task_id=parent_id,
+            sequence_index=100,
+            status="running",
+            skips=["commit-plan"],
+        )
+        db.update_task(
+            self.conn,
+            child_id,
+            next_step="commit-make",
+            last_review_decision="approve",
+        )
+        follow_up_id = None
+
+        def finalize_with_follow_up(name, prompt, task_id, conn, verb, **kw):
+            nonlocal follow_up_id
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "task.py"),
+                    "follow-up",
+                    str(task_id),
+                    "--description",
+                    "Work discovered during finalization",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "KANBAN_DB": self.tmp.name,
+                    "KANBAN_NONINTERACTIVE": "1",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            follow_up_id = json.loads(result.stdout)["id"]
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=finalize_with_follow_up), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", side_effect=["a" * 40, "b" * 40, "b" * 40]), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, child_id), self.conn))
+
+        self.assertIsNotNone(follow_up_id)
+        follow_up = db.get_task(self.conn, follow_up_id)
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(follow_up["parent_task_id"], parent_id)
+        self.assertEqual(follow_up["status"], "ready")
+        self.assertEqual(follow_up["next_step"], "commit-make")
+        self.assertEqual(parent["status"], "pending_subtasks")
+        self.assertEqual(parent["next_step"], "none")
 
     def test_commit_make_path_a_with_follow_up_queues_follow_up_after_current(self):
         """After commit-make Path A, if follow_up_task_id is set, both tasks become ready,
@@ -7406,6 +10526,12 @@ class TestConfigEnvOverrides(unittest.TestCase):
             for _, attr, _ in self._CASES:
                 self.assertEqual(getattr(cfg, attr), spec)
 
+    def test_registry_alias_env_override_applies(self):
+        """Registry aliases such as grok are valid role defaults."""
+        with patch.dict(os.environ, {"ORCHESTRA_DEFAULT_CODER": "grok"}, clear=False):
+            cfg = self._load_config()
+            self.assertEqual(cfg.DEFAULT_CODER, "grok")
+
     def test_fallback_when_env_var_empty(self):
         """Empty string env vars fall back to the hard-coded defaults."""
         env = {env_key: "" for env_key, _, _ in self._CASES}
@@ -7471,17 +10597,27 @@ class TestRepoPolicy(unittest.TestCase):
         self.assertFalse(result)
 
     def test_marker_present_returns_true(self):
-        self._write_agents_md("SKIP_BUILD_UNTIL_APPROVED\n")
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n")
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
         self.assertTrue(result)
 
+    def test_old_markers_return_false(self):
+        for marker in (
+            "SKIP_BUILD_UNTIL_APPROVED",
+            "KANBAN_SKIP_BUILD_UNTIL_APPROVED",
+        ):
+            with self.subTest(marker=marker):
+                self._write_agents_md(f"{marker}\n")
+                result = repo_policy.read_skip_build_until_approved(self.tmpdir)
+                self.assertFalse(result)
+
     def test_marker_with_leading_whitespace_returns_true(self):
-        self._write_agents_md("  SKIP_BUILD_UNTIL_APPROVED  \n")
+        self._write_agents_md("  CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER  \n")
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
         self.assertTrue(result)
 
     def test_marker_with_extra_text_returns_false(self):
-        self._write_agents_md("SKIP_BUILD_UNTIL_APPROVED: false\n")
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER: false\n")
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
         self.assertFalse(result)
 
@@ -7492,7 +10628,7 @@ class TestRepoPolicy(unittest.TestCase):
 
     def test_prose_mention_of_marker_does_not_match(self):
         self._write_agents_md(
-            "You can use SKIP_BUILD_UNTIL_APPROVED in your AGENTS.md to defer builds.\n"
+            "You can use CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER in your AGENTS.md to defer builds.\n"
             "This file does not actually opt in.\n"
         )
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
@@ -7501,7 +10637,7 @@ class TestRepoPolicy(unittest.TestCase):
     def test_marker_in_multiline_file_returns_true(self):
         self._write_agents_md(
             "# Build policy\n\n"
-            "SKIP_BUILD_UNTIL_APPROVED\n\n"
+            "CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n\n"
             "Run lint before submitting.\n"
         )
         result = repo_policy.read_skip_build_until_approved(self.tmpdir)
@@ -7513,7 +10649,7 @@ class TestRepoPolicy(unittest.TestCase):
         self.assertFalse(result)
 
     def test_path_object_accepted(self):
-        self._write_agents_md("SKIP_BUILD_UNTIL_APPROVED\n")
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n")
         result = repo_policy.read_skip_build_until_approved(Path(self.tmpdir))
         self.assertTrue(result)
 
@@ -7546,7 +10682,7 @@ class TestRepoPolicy(unittest.TestCase):
 
 
 class TestDeferredBuildPolicy(unittest.TestCase):
-    """Tests for SKIP_BUILD_UNTIL_APPROVED orchestrator behavior."""
+    """Tests for CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER orchestrator behavior."""
 
     def setUp(self):
         self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
@@ -7597,7 +10733,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertNotIn("skip_build_until_approved:", task_context_block)
 
     def test_reviewer_handoff_notes_deferred_validation_when_policy_active(self):
-        """Reviewer handoff explains missing validation when SKIP_BUILD_UNTIL_APPROVED is set."""
+        """Reviewer handoff explains missing validation when CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is set."""
         task = {
             "id": 5, "title": "T", "description": None,
             "branch": "b", "status": "running", "next_step": "commit-review",
@@ -7607,7 +10743,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         with patch.object(orchestrator.repo_policy, "read_skip_build_until_approved", return_value=True), \
              patch.object(orchestrator, "_repo_root", return_value="/fake/repo"):
             prompt = orchestrator.build_prompt(task, "commit-review", "codex", [])
-        self.assertIn("SKIP_BUILD_UNTIL_APPROVED", prompt)
+        self.assertIn("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER", prompt)
         self.assertIn("deferred", prompt.lower())
         # Should not say the standard "may not have run the build" fallback
         self.assertNotIn("maker may not have run the build", prompt)
@@ -7657,7 +10793,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertIsNone(updated["commit_hash"])
 
     def test_path_b_clean_deferred_build_finalizes_normally(self):
-        """Path B with SKIP_BUILD_UNTIL_APPROVED and a clean deferred build (new commit): task becomes done."""
+        """Path B with CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER and a clean deferred build (new commit): task becomes done."""
         tid = db.add_task(self.conn, "Deferred build clean", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b",
                        next_step="commit-make", last_review_decision="approve",
@@ -7708,6 +10844,11 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertFalse(result)
         updated = db.get_task(self.conn, tid)
         self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(updated["resume_next_step"], "commit-make")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["review_round"], orchestrator.MAX_REVIEW_ROUNDS - 1)
+        self.assertEqual(updated["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
 
     def test_path_b_deferred_build_changed_stale_signal_does_not_satisfy_new_run(self):
         """A deferred-build-changed comment from a prior run does not trigger re-review."""
@@ -7788,7 +10929,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertEqual(updated["status"], "blocked")
 
     def test_path_a_deferred_validation_comment_not_required_when_policy_inactive(self):
-        """Path A: no validation comment is fine when SKIP_BUILD_UNTIL_APPROVED is off."""
+        """Path A: no validation comment is fine when CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is off."""
         tid = db.add_task(self.conn, "Path A no policy", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b",
                        next_step="commit-make", last_review_decision="none",
@@ -7868,20 +11009,218 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         self.assertEqual(deferred[0]["message"], "Build generated new file")
 
 
+class TestAgentRegistryAliases(unittest.TestCase):
+    """Registry aliases target existing specs without duplicating commands."""
+
+    _MINIMAL_REGISTRY = """
+providers:
+  cursor:
+    label: Cursor {model}
+    command: ["agent", "--model", "{model}", "{prompt}"]
+agents:
+  - key: sonnet
+    label: Claude Sonnet
+    command: ["claude", "--model", "sonnet", "{prompt}"]
+"""
+
+    def _write_registry(self, body: str) -> Path:
+        handle = tempfile.NamedTemporaryFile(
+            suffix=".yaml", delete=False, mode="w", encoding="utf-8"
+        )
+        handle.write(body)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return Path(handle.name)
+
+    def test_grok_is_alias_not_command_entry(self):
+        self.assertNotIn("grok", agent_registry.AGENT_CMD)
+        self.assertEqual(
+            agent_registry.AGENT_ALIASES["grok"],
+            "cursor:cursor-grok-4.6-high",
+        )
+
+    def test_grok_command_resolution(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_command("grok"),
+            [
+                "agent",
+                "-p",
+                "--model",
+                "cursor-grok-4.6-high",
+                "--yolo",
+                "--trust",
+                "{prompt}",
+            ],
+        )
+
+    def test_grok_display_label_uses_resolved_target(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_label("grok"),
+            "Cursor cursor-grok-4.6-high",
+        )
+
+    def test_grok_attribution_keeps_alias_and_includes_model(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("grok"),
+            "grok (model: cursor-grok-4.6-high)",
+        )
+
+    def test_alias_chain_resolves_command_label_and_attribution(self):
+        aliases = {
+            "current": "grok",
+            "grok": "cursor:cursor-grok-4.6-high",
+        }
+        with patch.object(agent_registry, "AGENT_ALIASES", aliases):
+            self.assertEqual(
+                agent_registry.resolve_agent_command("current"),
+                agent_registry.resolve_agent_command("cursor:cursor-grok-4.6-high"),
+            )
+            self.assertEqual(
+                agent_registry.resolve_agent_label("current"),
+                "Cursor cursor-grok-4.6-high",
+            )
+            self.assertEqual(
+                agent_registry.resolve_agent_attribution("current"),
+                "current (model: cursor-grok-4.6-high)",
+            )
+
+    def test_alias_chain_to_fixed_agent_preserves_requested_name(self):
+        with patch.object(
+            agent_registry, "AGENT_ALIASES", {"favorite": "sonnet", "current": "favorite"}
+        ):
+            self.assertEqual(
+                agent_registry.resolve_agent_command("current"),
+                agent_registry.resolve_agent_command("sonnet"),
+            )
+            self.assertEqual(
+                agent_registry.resolve_agent_attribution("current"),
+                "current (model: sonnet)",
+            )
+
+    def test_alias_chain_loads_from_registry(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  current: grok
+  grok: cursor:cursor-grok-4.6-high
+"""
+        )
+        aliases = agent_registry.load_agent_aliases(path)
+        self.assertEqual(aliases["current"], "grok")
+        self.assertEqual(aliases["grok"], "cursor:cursor-grok-4.6-high")
+
+    def test_duplicate_alias_name_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  sonnet: cursor:cursor-grok-4.6-high
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("duplicate agent name in registry: sonnet", str(raised.exception))
+
+    def test_missing_alias_target_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  grok: nope
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias grok target not found: nope", str(raised.exception))
+
+    def test_codex_review_command_rejects_uncommitted_plus_prompt(self):
+        path = self._write_registry(
+            """
+providers: {}
+agents:
+  - key: codex
+    label: Codex
+    command: ["codex", "exec", "{prompt}"]
+    review_command: ["codex", "exec", "review", "--uncommitted", "{prompt}"]
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_review_commands(path)
+        self.assertIn(
+            "cannot combine --uncommitted with {prompt}",
+            str(raised.exception),
+        )
+
+    def test_unknown_provider_target_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  grok: unknown:model
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias grok target not found: unknown:model", str(raised.exception))
+
+    def test_alias_cycle_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  a: b
+  b: a
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias cycle: a -> b -> a", str(raised.exception))
+
+    def test_self_alias_cycle_is_rejected(self):
+        path = self._write_registry(
+            self._MINIMAL_REGISTRY
+            + """
+aliases:
+  grok: grok
+"""
+        )
+        with self.assertRaises(ValueError) as raised:
+            agent_registry.load_agent_aliases(path)
+        self.assertIn("alias cycle: grok -> grok", str(raised.exception))
+
+    def test_direct_claude_adhoc_commands_do_not_persist_sessions(self):
+        expected_models = {
+            "haiku": "haiku",
+            "sonnet": "sonnet",
+            "opus": "opus",
+            "fable": "fable",
+            "claude": "sonnet",
+        }
+        for key, model in expected_models.items():
+            with self.subTest(agent=key):
+                command = agent_registry.resolve_agent_command(key)
+                self.assertEqual(
+                    command,
+                    [
+                        "claude",
+                        "--model",
+                        model,
+                        "-p",
+                        "{prompt}",
+                        "--dangerously-skip-permissions",
+                        "--output-format",
+                        "text",
+                        "--no-session-persistence",
+                    ],
+                )
+                self.assertIn("--no-session-persistence", command)
+                self.assertNotIn("--remote-control", command)
+                self.assertNotIn("--cloud", command)
+
+
 class TestCommitFooter(unittest.TestCase):
     """Tests for get_agent_display_name() and task get-commit-footer subcommand."""
-
-    NEW_AGENT_KEYS = (
-        "antigravity",
-        "kilo-opus-4.6",
-        "kilo-opus-4.7",
-        "kilo-sonnet-4.6",
-        "cursor-auto",
-        "cursor-composer-2.5",
-        "cursor-opus-4.6",
-        "cursor-opus-4.7",
-        "cursor-sonnet-4.6",
-    )
 
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -7900,61 +11239,6 @@ class TestCommitFooter(unittest.TestCase):
             capture_output=True, text=True, env=env,
         )
 
-    def test_display_name_sonnet(self):
-        self.assertEqual(config.get_agent_display_name("sonnet"), "Claude Sonnet 4.5")
-
-    def test_display_name_haiku(self):
-        self.assertEqual(config.get_agent_display_name("haiku"), "Claude Haiku 4.5")
-
-    def test_display_name_opus(self):
-        self.assertEqual(config.get_agent_display_name("opus"), "Claude Opus 4.6")
-
-    def test_display_name_claude_alias(self):
-        self.assertEqual(config.get_agent_display_name("claude"), "Claude Sonnet 4.5")
-
-    def test_display_name_fallback_for_codex(self):
-        self.assertEqual(agent_registry.AGENT_DISPLAY_LABELS["codex"], "GPT-5.5")
-        result = config.get_agent_display_name("codex")
-        self.assertEqual(result, "GPT-5.5")
-
-    def test_existing_registry_labels_preserve_previous_fallbacks(self):
-        self.assertEqual(config.get_agent_display_name("antigravity"), "Antigravity")
-        self.assertEqual(config.get_agent_display_name("kilo"), "kilo/kilo-auto/free")
-
-    def test_agent_registry_keys_are_unique(self):
-        self.assertEqual(len(agent_registry.AGENTS), len(set(agent_registry.AGENTS)))
-
-    def test_agent_registry_commands_have_one_prompt_placeholder(self):
-        for key, command in agent_registry.AGENT_CMD.items():
-            with self.subTest(key=key):
-                prompt_count = sum(part.count("{prompt}") for part in command)
-                self.assertEqual(prompt_count, 1)
-
-    def test_agent_registry_provider_specs_are_loaded(self):
-        self.assertIn("cursor", agent_registry.AGENT_PROVIDERS)
-        self.assertIn("kilo", agent_registry.AGENT_PROVIDERS)
-
-    def test_new_agent_keys_are_allowed(self):
-        for key in self.NEW_AGENT_KEYS:
-            with self.subTest(key=key):
-                self.assertIn(key, config.AGENTS)
-
-    def test_display_names_for_new_agent_keys(self):
-        expected = {
-            "antigravity": "Antigravity",
-            "kilo-opus-4.6": "Kilo Claude Opus 4.6",
-            "kilo-opus-4.7": "Kilo Claude Opus 4.7",
-            "kilo-sonnet-4.6": "Kilo Claude Sonnet 4.6",
-            "cursor-auto": "Cursor Auto",
-            "cursor-composer-2.5": "Cursor Composer 2.5",
-            "cursor-opus-4.6": "Cursor Opus 4.6",
-            "cursor-opus-4.7": "Cursor Opus 4.7",
-            "cursor-sonnet-4.6": "Cursor Sonnet 4.6",
-        }
-        for key, label in expected.items():
-            with self.subTest(key=key):
-                self.assertEqual(config.get_agent_display_name(key), label)
-
     def test_provider_model_display_name(self):
         self.assertEqual(
             config.get_agent_display_name("cursor:claude-opus-4-8-high"),
@@ -7965,7 +11249,6 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_agent_command("cursor:claude-opus-4-8-high"),
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -7976,11 +11259,35 @@ class TestCommitFooter(unittest.TestCase):
             ],
         )
 
+    def test_dynamic_provider_model_attribution_preserves_explicit_model(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("cursor:claude-opus-4-8-high"),
+            "cursor:claude-opus-4-8-high",
+        )
+
+    def test_attribution_uses_command_values_not_display_label(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("sonnet"),
+            "sonnet (model: sonnet)",
+        )
+        self.assertNotIn(
+            agent_registry.AGENT_DISPLAY_LABELS["sonnet"],
+            agent_registry.resolve_agent_attribution("sonnet"),
+        )
+
+    def test_attribution_omits_model_and_effort_when_command_omits_them(self):
+        self.assertEqual(agent_registry.resolve_agent_attribution("antigravity"), "antigravity")
+
+    def test_unknown_agent_attribution_does_not_repeat_unresolved_claim(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("claimed-gpt-99"),
+            "unattributed",
+        )
+
     def test_cursor_alias_review_command_uses_normal_permissive_mode(self):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor-composer-2.5"),
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -7997,7 +11304,6 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor:claude-opus-4-8-high"),
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -8011,7 +11317,59 @@ class TestCommitFooter(unittest.TestCase):
     def test_codex_review_command_uses_review_subcommand(self):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("codex"),
-            ["codex", "exec", "review", "--uncommitted", "{prompt}"],
+            [
+                "codex", "exec", "--model", "gpt-5.6-sol",
+                "-c", 'model_reasoning_effort="medium"',
+                "review", "{prompt}",
+            ],
+        )
+        self.assertNotIn(
+            "--uncommitted",
+            agent_registry.resolve_review_agent_command("codex"),
+        )
+
+    def test_codex_review_command_parses_against_installed_cli(self):
+        if shutil.which("codex") is None:
+            self.skipTest("codex CLI not installed")
+        template = agent_registry.resolve_review_agent_command("codex")
+        self.assertIsNotNone(template)
+        prompt_cmd = [
+            part.replace("{prompt}", "orchestra-parse-probe") for part in template
+        ]
+        probe = subprocess.run(
+            prompt_cmd + ["--___orchestra_parse_probe"],
+            capture_output=True,
+            text=True,
+        )
+        probe_text = f"{probe.stdout}\n{probe.stderr}"
+        self.assertNotIn("cannot be used with", probe_text)
+        self.assertIn("unexpected argument", probe_text.lower())
+
+        review_at = prompt_cmd.index("review")
+        conflict = subprocess.run(
+            prompt_cmd[: review_at + 1] + ["--uncommitted"] + prompt_cmd[review_at + 1 :],
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn(
+            "cannot be used with",
+            f"{conflict.stdout}\n{conflict.stderr}",
+        )
+
+    def test_codex_run_command_explicitly_sets_model_effort_and_preserves_yolo(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_command("codex"),
+            [
+                "codex", "exec", "--model", "gpt-5.6-sol",
+                "-c", 'model_reasoning_effort="medium"',
+                "--yolo", "{prompt}",
+            ],
+        )
+
+    def test_codex_review_attribution_uses_explicit_command_configuration(self):
+        self.assertEqual(
+            agent_registry.resolve_agent_attribution("codex", review=True),
+            "codex (model: gpt-5.6-sol; reasoning effort: medium)",
         )
 
     def test_review_command_falls_back_to_normal_command(self):
@@ -8041,7 +11399,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Claude Sonnet 4.5; reviewer: GPT-5.5; review rejections: 0)",
+            f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
     def test_get_commit_footer_default_agent(self):
@@ -8061,7 +11419,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
     def test_get_commit_footer_codex_agent(self):
-        """get-commit-footer uses config labels for agents without --model."""
+        """get-commit-footer uses explicit Codex command configuration."""
         r = self._run("add", "Codex footer task", "--branch", "test")
         self.assertEqual(r.returncode, 0)
         tid = json.loads(r.stdout)["id"]
@@ -8072,11 +11430,11 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: GPT-5.5; reviewer: pending; review rejections: 0)",
+            f"Task {tid} (coder: codex (model: gpt-5.6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)",
         )
 
     def test_get_commit_footer_provider_model_agent(self):
-        """get-commit-footer resolves labels for provider/model specs."""
+        """get-commit-footer preserves explicit dynamic provider/model specs."""
         spec = "cursor:claude-opus-4-8-high"
         r = self._run("add", "Dynamic footer task", "--branch", "test", "--coder-agent", spec)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -8087,7 +11445,24 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Cursor claude-opus-4-8-high; reviewer: Cursor claude-opus-4-8-high; review rejections: 0)",
+            f"Task {tid} (coder: {spec}; reviewer: {spec}; review rejections: 0)",
+        )
+
+    def test_get_commit_footer_does_not_repeat_unresolved_agent_claims(self):
+        r = self._run("add", "Unresolved footer task", "--branch", "test")
+        self.assertEqual(r.returncode, 0)
+        tid = json.loads(r.stdout)["id"]
+        db.update_task(self.conn, tid, coder_agent="claimed-coder-model")
+        db.add_comment(
+            self.conn, tid, "Approved", kind="approval",
+            author="claimed-reviewer-model", review_round=0,
+        )
+
+        r2 = self._run("get-commit-footer", str(tid))
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(
+            r2.stdout.strip(),
+            f"Task {tid} (coder: unattributed; reviewer: unattributed; review rejections: 0)",
         )
 
     def test_get_commit_footer_counts_only_code_review_rejections(self):
@@ -8121,7 +11496,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Claude Haiku 4.5; reviewer: Claude Sonnet 4.5; review rejections: 2)",
+            f"Task {tid} (coder: haiku (model: haiku); reviewer: sonnet (model: sonnet); review rejections: 2)",
         )
 
     def test_get_commit_footer_uses_final_approval_reviewer(self):
@@ -8143,17 +11518,11 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: Claude Haiku 4.5; reviewer: GPT-5.5; review rejections: 0)",
+            f"Task {tid} (coder: haiku (model: haiku); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
 
 class TestAgentSmoke(unittest.TestCase):
-    def test_default_matrix_contains_replacement_agents(self):
-        matrix = {agent.name: agent.spec for agent in agent_smoke.AGENT_MATRIX}
-        self.assertEqual(matrix["antigravity"], "antigravity")
-        self.assertEqual(matrix["cursor-composer-2.5"], "cursor-composer-2.5")
-        self.assertEqual(matrix["kilo-opus-4.8"], "kilo:kilo/anthropic/claude-opus-4.8")
-
     def test_selected_agents_can_skip_by_name_or_spec(self):
         selected = agent_smoke.selected_agents(
             ["extra=cursor:auto"],
@@ -8165,12 +11534,6 @@ class TestAgentSmoke(unittest.TestCase):
                 ("cursor-composer-2.5", "cursor-composer-2.5"),
                 ("kilo-opus-4.8", "kilo:kilo/anthropic/claude-opus-4.8"),
             ],
-        )
-
-    def test_default_output_dir_is_repo_local_runtime_path(self):
-        self.assertEqual(
-            agent_smoke.default_output_dir(),
-            Path.cwd() / ".kanban-orchestra" / "agent-smoke",
         )
 
     def test_run_one_writes_stdout_stderr_and_requires_report(self):
@@ -8236,7 +11599,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: Claude Sonnet 4.5; reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: sonnet); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
@@ -8261,7 +11624,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: Claude Sonnet 4.5; reviewer: GPT-5.5; review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)"
             ),
             repr(result),
         )
@@ -8273,19 +11636,19 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: Claude Haiku 4.5; reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: haiku (model: haiku); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
 
-    def test_fallback_agent_in_normalized_footer(self):
-        """Normalization uses configured agent display labels."""
+    def test_explicit_codex_config_in_normalized_footer(self):
+        """Normalization uses command-backed Codex attribution."""
         tid = self._add_task("codex")
         message = f"Some work\n\nTask {tid}"
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: GPT-5.5; reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: codex (model: gpt-5.6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
@@ -8296,7 +11659,7 @@ class TestFinalizationFooter(unittest.TestCase):
         expected_footer = task_module.get_commit_footer(tid, self.conn)
         self.assertEqual(
             expected_footer,
-            f"Task {tid} (coder: Claude Opus 4.6; reviewer: pending; review rejections: 0)",
+            f"Task {tid} (coder: opus (model: opus); reviewer: pending; review rejections: 0)",
         )
         message = "Refactor internals\n\nSome body."
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
@@ -8371,7 +11734,6 @@ class TestAgentPingACKGate(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "cursor",
                 "agent",
                 "-p",
                 "--model",
@@ -8409,8 +11771,125 @@ class TestAgentPingACKGate(unittest.TestCase):
         """Cache key is present after a successful ping so subsequent calls hit it."""
         with patch.object(agent_runner, "ping_agent", return_value=True):
             agent_runner.ensure_agent_acked("sonnet", 30, self.conn)
-        self.assertIn(("sonnet", 30) if False else (30, "sonnet"),
-                      agent_runner._agent_ack_cache)
+        self.assertIn((30, "sonnet", "run"), agent_runner._agent_ack_cache)
+
+    def test_run_ack_does_not_satisfy_review_purpose(self):
+        """A prior run ping does not prove the review/tool path is usable."""
+        with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
+            agent_runner.ensure_agent_acked("sonnet", 70, self.conn)
+            agent_runner.ensure_agent_acked("sonnet", 70, self.conn, purpose="review")
+        self.assertEqual(mock_ping.call_count, 2)
+        self.assertEqual(mock_ping.call_args_list[0].args, ("sonnet", 70))
+        self.assertEqual(mock_ping.call_args_list[1].kwargs.get("purpose"), "review")
+        self.assertIn((70, "sonnet", "run"), agent_runner._agent_ack_cache)
+        self.assertIn((70, "sonnet", "review"), agent_runner._agent_ack_cache)
+
+    def test_review_ack_failure_returns_false_without_retry_loop(self):
+        """A failed reviewer probe returns False instead of stalling forever."""
+        with (
+            patch.object(agent_runner, "ping_agent", return_value=False) as mock_ping,
+            patch.object(agent_runner, "time") as mock_time,
+            patch.object(agent_runner.db, "update_runtime") as mock_runtime,
+        ):
+            result = agent_runner.ensure_agent_acked(
+                "codex", 80, self.conn, purpose="review",
+            )
+
+        self.assertFalse(result)
+        mock_ping.assert_called_once()
+        mock_time.sleep.assert_not_called()
+        mock_runtime.assert_not_called()
+        self.assertNotIn((80, "codex", "review"), agent_runner._agent_ack_cache)
+
+    def _ping_review(self, task_id, *, digest, chunks=None, read_side_effect=None):
+        """Run a reviewer probe with mocked subprocess I/O and a fixed digest."""
+        mock_proc = MagicMock()
+        stdout = MagicMock()
+        stdout.fileno.return_value = 3
+        mock_proc.stdout = stdout
+        mock_proc.pid = 99
+        if read_side_effect is None:
+            remaining = list(chunks or [b""])
+
+            def read_side_effect(*_args):
+                return remaining.pop(0) if remaining else b""
+
+        with patch.object(agent_runner.subprocess, "Popen", return_value=mock_proc), \
+             patch.object(agent_runner.select, "select", return_value=([stdout], [], [])), \
+             patch.object(agent_runner.os, "read", side_effect=read_side_effect), \
+             patch.object(agent_runner.active_agent_processes, "register_active_agent", return_value=1), \
+             patch.object(agent_runner.active_agent_processes, "clear_active_agent"), \
+             patch.object(agent_runner.db, "get_db_path", return_value=self.tmp.name), \
+             patch.object(agent_runner, "_resolve_command_template", return_value=["echo", "{prompt}"]), \
+             patch.object(agent_runner, "cached_diff_digest", return_value=digest), \
+             patch.object(agent_runner.time, "sleep"):
+            return agent_runner.ping_agent(
+                "codex", task_id, purpose="review", conn=self.conn,
+            )
+
+    def test_review_ping_requires_ack_token_not_banner_text(self):
+        """Shallow CLI banner text is not enough to ACK a reviewer probe."""
+        tid = db.add_task(self.conn, "Banner probe")
+        result = self._ping_review(
+            tid, digest="aa" * 32, chunks=[b"Welcome to Codex CLI\nready.\n", b""],
+        )
+        self.assertFalse(result)
+
+    def test_review_ping_echoed_prompt_does_not_ack(self):
+        """Stdout that echoes the full probe prompt cannot satisfy readiness."""
+        tid = db.add_task(self.conn, "Echo probe")
+        digest = "ab" * 32
+        prompt = agent_runner.review_ping_prompt(tid)
+        token = agent_runner.review_ready_token(digest)
+        self.assertNotIn(digest, prompt)
+        self.assertNotIn(token, prompt)
+        result = self._ping_review(tid, digest=digest, chunks=[prompt.encode(), b""])
+        self.assertFalse(result)
+
+    def test_review_ping_stdout_digest_without_comment_does_not_ack(self):
+        """Printing the cached-diff token without a durable comment is not enough."""
+        tid = db.add_task(self.conn, "Stdout token probe")
+        digest = "cd" * 32
+        token = agent_runner.review_ready_token(digest)
+        result = self._ping_review(
+            tid, digest=digest, chunks=[f"{token}\nACK\n".encode(), b""],
+        )
+        self.assertFalse(result)
+
+    def test_review_ping_accepts_new_comment_with_cached_diff_digest(self):
+        """A new durable comment carrying the cached-diff digest proves the tool path."""
+        tid = db.add_task(self.conn, "Comment probe")
+        digest = "ef" * 32
+        token = agent_runner.review_ready_token(digest)
+        reads = {"n": 0}
+
+        def fake_read(_fd, _n):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                db.add_comment(self.conn, tid, f"reviewer probe {token}")
+                return b"running git diff --cached\n"
+            return b""
+
+        result = self._ping_review(tid, digest=digest, read_side_effect=fake_read)
+        self.assertTrue(result)
+
+    def test_review_ping_ignores_ready_token_comment_from_before_probe(self):
+        """Leftover comments with the same digest cannot false-ACK a later probe."""
+        tid = db.add_task(self.conn, "Stale probe")
+        digest = "12" * 32
+        token = agent_runner.review_ready_token(digest)
+        db.add_comment(self.conn, tid, f"old probe {token}")
+        result = self._ping_review(tid, digest=digest, chunks=[b"ACK\n", b""])
+        self.assertFalse(result)
+
+    def test_cached_diff_digest_hashes_git_stdout(self):
+        payload = b"diff --git a/f b/f\n"
+        with patch.object(agent_runner.subprocess, "run") as mock_run:
+            mock_run.return_value = SimpleNamespace(stdout=payload)
+            digest = agent_runner.cached_diff_digest(cwd="/tmp")
+        self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args.args[0], ["git", "diff", "--cached"])
 
     # ── retry loop ───────────────────────────────────────────────────
 
@@ -8531,7 +12010,7 @@ class TestAgentPingACKGate(unittest.TestCase):
 
     def test_no_status_update_when_cache_hit(self):
         """Cache hit path never calls update_runtime (no unnecessary DB writes)."""
-        agent_runner._agent_ack_cache.add((60, "sonnet"))
+        agent_runner._agent_ack_cache.add((60, "sonnet", "run"))
 
         with patch.object(agent_runner.db, "update_runtime") as mock_update:
             agent_runner.ensure_agent_acked("sonnet", 60, self.conn)

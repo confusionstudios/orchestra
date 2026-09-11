@@ -7,14 +7,18 @@ PR title/body quality and branch-summary accuracy.
 
 1. **Read the PR metadata handoff** above, including the recorded PR URL, title,
    and body.
-2. **Check the branch summary against `master`.** Use targeted commands only as
-   needed to verify that the PR body accurately summarizes the branch. Do not
-   review implementation correctness, tests, or code quality.
+2. **Check the branch summary against the PR base branch.** Use targeted
+   commands only as needed to verify that the PR body accurately summarizes the
+   branch. Do not review implementation correctness, tests, or code quality.
 3. **Evaluate the metadata.**
 
    What to check:
    - The title is clear, specific, and matches the branch purpose.
-   - The body accurately summarizes the branch against `master`.
+   - The body accurately summarizes the branch against the PR base.
+   - The body has a leading paragraph, optional `## Why`, and concise
+     `## Work` bullets in that order. `## Other` and `## Notes` appear only
+     when they contain useful content. When present, `## Why` states the
+     problem being solved without repeating the implementation.
    - The body gives reviewers enough context to understand scope and validation.
    - The PR URL is present and points to a GitHub pull request.
 

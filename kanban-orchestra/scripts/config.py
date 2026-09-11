@@ -7,11 +7,13 @@ if str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
 from agent_registry import (  # type: ignore  # noqa: E402
     AGENTS as AGENTS,
+    AGENT_ALIASES as AGENT_ALIASES,
     AGENT_CMD as AGENT_CMD,
     AGENT_DISPLAY_LABELS as AGENT_DISPLAY_LABELS,
     AGENT_PROVIDERS as AGENT_PROVIDERS,
     has_review_agent_command as has_review_agent_command,
     is_valid_agent_spec,
+    resolve_agent_attribution as resolve_agent_attribution,
     resolve_agent_command,
     resolve_agent_label,
     resolve_review_agent_command as resolve_review_agent_command,
@@ -27,12 +29,11 @@ def _agent_default(env_key: str, fallback: str) -> str:
 
 
 def get_agent_display_label(agent: str) -> str:
-    """Return the display label for an agent/model.
+    """Return the friendly UI display label for an agent/model.
 
     Prefer the shared human-readable label map. If no label is configured,
     infer a label from the configured --model value, then fall back to the key.
-    This keeps commit attribution tied to orchestration config rather than
-    agent self-reporting.
+    Commit attribution intentionally uses get_agent_attribution() instead.
     """
     label = resolve_agent_label(agent)
     if label is not None:
@@ -54,6 +55,11 @@ def get_agent_display_name(agent: str) -> str:
     return get_agent_display_label(agent)
 
 
+def get_agent_attribution(agent: str, *, review: bool = False) -> str:
+    """Return command-backed commit attribution for an agent spec."""
+    return resolve_agent_attribution(agent, review=review)
+
+
 DEFAULT_SUPER_PLANNER = _agent_default("ORCHESTRA_DEFAULT_SUPER_PLANNER", "opus")
 DEFAULT_SUPER_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_SUPER_REVIEWER", "codex")
 
@@ -63,7 +69,14 @@ DEFAULT_PLAN_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_PLAN_REVIEWER", "codex
 DEFAULT_CODER = _agent_default("ORCHESTRA_DEFAULT_CODER", "sonnet")
 DEFAULT_REVIEWER = _agent_default("ORCHESTRA_DEFAULT_REVIEWER", "codex")
 
+DEFAULT_UNBLOCKER = _agent_default("ORCHESTRA_DEFAULT_UNBLOCKER", "sonnet")
+
 MAX_REVIEW_ROUNDS = 5
+# Bounded retries for reviewer transport, tool-host, and no-decision failures.
+# These do not consume content-review rounds. After this many consecutive
+# failures the task blocks as reviewer_unavailable and resumes at review.
+REVIEWER_INFRA_ATTEMPTS = 5
+REVIEWER_INFRA_BACKOFF_SECONDS = (2, 4, 8, 16)
 MAX_PRIOR_COMMENTS = 10
 POLL_INTERVAL = 5
 HEARTBEAT_INTERVAL = 10

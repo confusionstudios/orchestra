@@ -22,6 +22,19 @@ import db
 import dashboard
 
 
+def setUpModule():
+    """Keep dashboard page tests from probing a live Fleet Dashboard."""
+    global _fleet_live_payload_patcher
+    _fleet_live_payload_patcher = patch.object(
+        dashboard.fleet, "fleet_dashboard_live_payload", return_value=None
+    )
+    _fleet_live_payload_patcher.start()
+
+
+def tearDownModule():
+    _fleet_live_payload_patcher.stop()
+
+
 def _fresh_conn():
     """Return a connection to a fresh in-memory-ish temp DB."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -53,6 +66,32 @@ class TestHelpers(unittest.TestCase):
 
     def test_format_duration_hhmmss(self):
         self.assertEqual(dashboard._format_duration_hhmmss(3661), "01:01:01")
+
+    def test_format_done_recency_recent_uses_relative_words(self):
+        ts = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(dashboard._format_done_recency(ts), "2 hours ago")
+
+    def test_format_done_recency_just_under_cutoff_stays_relative(self):
+        ts = (
+            datetime.now(timezone.utc) - dashboard.DONE_RECENCY_CUTOFF + timedelta(hours=12)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(dashboard._format_done_recency(ts), "6 days ago")
+
+    def test_format_done_recency_at_cutoff_uses_calendar_date(self):
+        done_at = datetime.now(timezone.utc) - dashboard.DONE_RECENCY_CUTOFF
+        ts = done_at.strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(dashboard._format_done_recency(ts), done_at.strftime("%Y-%m-%d"))
+
+    def test_format_done_recency_older_uses_calendar_date(self):
+        self.assertEqual(
+            dashboard._format_done_recency("2026-01-15 09:30:00"),
+            "2026-01-15",
+        )
+
+    def test_format_done_recency_missing_or_invalid_is_empty(self):
+        self.assertEqual(dashboard._format_done_recency(None), "")
+        self.assertEqual(dashboard._format_done_recency(""), "")
+        self.assertEqual(dashboard._format_done_recency("not-a-timestamp"), "")
 
     def test_client_timestamp_is_utc_iso(self):
         self.assertEqual(
@@ -92,6 +131,7 @@ class TestHelpers(unittest.TestCase):
                 self.assertEqual(payload["host"], "127.0.0.1")
                 self.assertEqual(payload["port"], 8430)
                 self.assertEqual(payload["url"], "http://127.0.0.1:8430")
+                self.assertIsNone(payload["remote_url"])
 
                 dashboard._remove_dashboard_metadata()
                 self.assertFalse(metadata_path.exists())
@@ -164,6 +204,12 @@ class TestHelpers(unittest.TestCase):
             "Round 1: antigravity reviewing; Review round 3 approved.",
         )
 
+    def test_display_review_round_count_converts_stored_zero_based_values(self):
+        self.assertEqual(dashboard._display_review_round_count(0), 1)
+        self.assertEqual(dashboard._display_review_round_count(2), 3)
+        self.assertIsNone(dashboard._display_review_round_count(None))
+        self.assertIsNone(dashboard._display_review_round_count("legacy"))
+
 
 class TestPageShell(unittest.TestCase):
     """Tests for shared page shell timestamp formatting."""
@@ -185,6 +231,212 @@ class TestPageShell(unittest.TestCase):
         self.assertIn('<a class="nav-title" href="/">Kanban Orchestra</a>', html)
         self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', html)
         self.assertNotIn("Running against", html)
+
+    def test_palette_is_allowlisted_and_dark_safe_for_normal_text(self):
+        self.assertEqual(dashboard._validated_accent("violet"), "violet")
+        self.assertEqual(dashboard._validated_accent("green"), dashboard.DEFAULT_ACCENT)
+        self.assertEqual(dashboard._validated_accent("#ffffff"), dashboard.DEFAULT_ACCENT)
+        self.assertEqual(dashboard._validated_accent(None), dashboard.DEFAULT_ACCENT)
+        self.assertGreater(len(dashboard.ACCENT_PALETTE), 1)
+
+        for name, accent in dashboard.ACCENT_PALETTE.items():
+            with self.subTest(accent=name):
+                self.assertGreaterEqual(dashboard._contrast_ratio(accent["color"], "#000000"), 4.5)
+                self.assertGreaterEqual(dashboard._contrast_ratio(accent["color"], "#0c0c0c"), 4.5)
+
+    def test_accent_identities_are_stable_hashed_and_distinct(self):
+        repo_a = Path.home() / "accent-repo-a"
+        repo_b = Path.home() / "accent-repo-b"
+        identity_a = dashboard.repo_accent_identity(repo_a)
+        identity_b = dashboard.repo_accent_identity(repo_b)
+        fleet_identity = dashboard.fleet_accent_identity()
+
+        self.assertEqual(identity_a, dashboard.repo_accent_identity(str(repo_a)))
+        self.assertNotEqual(identity_a, identity_b)
+        self.assertNotEqual(identity_a, fleet_identity)
+        self.assertNotEqual(identity_b, fleet_identity)
+        self.assertEqual(fleet_identity, dashboard.fleet_accent_identity())
+        self.assertRegex(identity_a, r"^[0-9a-f]{64}$")
+        self.assertRegex(fleet_identity, r"^[0-9a-f]{64}$")
+
+        cookie_a = dashboard.accent_cookie_name(identity_a)
+        self.assertTrue(cookie_a.startswith(dashboard.ACCENT_COOKIE_PREFIX))
+        self.assertNotIn(str(repo_a), cookie_a)
+        self.assertNotIn(str(repo_a.resolve()), cookie_a)
+        self.assertNotIn("/", cookie_a)
+        self.assertNotIn(":", cookie_a)
+        with self.assertRaises(ValueError):
+            dashboard.accent_cookie_name(str(repo_a))
+        with self.assertRaises(ValueError):
+            dashboard.accent_cookie_name("orchestra_accent")
+
+    def test_page_shell_applies_allowlisted_cookie_before_styles_and_renders_accessible_picker(self):
+        html = dashboard._page_shell("Title", "<p>Body</p>")
+        cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
+        picker_html = dashboard.accent_picker_html()
+
+        self.assertLess(html.index(cookie), html.index("<style>"))
+        self.assertIn('Object.prototype.hasOwnProperty.call(palette, requested)', html)
+        self.assertIn(f'? requested : "{dashboard.DEFAULT_ACCENT}"', html)
+        self.assertIn(picker_html, html)
+        self.assertIn(
+            'id="orchestra-accent-picker" role="radiogroup" aria-label="Accent"',
+            html,
+        )
+        self.assertNotIn("<select", html)
+        self.assertNotIn("<option", html)
+        self.assertNotIn('type="color"', html)
+        self.assertNotIn("orchestra_accent=", html)
+        self.assertIn(".accent-chit input:checked + .accent-chit-swatch", html)
+        self.assertIn(".accent-chit input:checked + .accent-chit-swatch::after", html)
+        self.assertIn(".accent-chit input:focus-visible + .accent-chit-swatch", html)
+        self.assertIn("input.checked = input.value === name", html)
+        self.assertEqual(html.count('class="accent-chit"'), len(dashboard.ACCENT_PALETTE))
+        for name, accent in dashboard.ACCENT_PALETTE.items():
+            with self.subTest(accent=name):
+                self.assertIn(
+                    f'<label class="accent-chit" title="{accent["label"]}" '
+                    f'style="--chit-color: {accent["color"]}">',
+                    html,
+                )
+                self.assertIn(
+                    f'<input type="radio" name="accent" value="{name}" '
+                    f'aria-label="{accent["label"]}">',
+                    html,
+                )
+                self.assertNotIn(f'>{accent["label"]}<', html)
+
+    def test_picker_persists_host_only_cross_port_cookie(self):
+        html = dashboard._page_shell("Title", "<p>Body</p>")
+        cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
+
+        self.assertIn(f"{cookie}=", html)
+        self.assertIn("; Path=/; Max-Age=31536000; SameSite=Lax", html)
+        self.assertNotIn("; Domain=", html)
+        self.assertNotIn("localStorage", html)
+        self.assertIn("window.location.reload()", html)
+
+    def test_page_shell_scopes_accent_cookie_to_repo_identity(self):
+        repo_a = Path.home() / "accent-scope-a"
+        repo_b = Path.home() / "accent-scope-b"
+        cookie_a = dashboard.accent_cookie_name(dashboard.repo_accent_identity(repo_a))
+        cookie_b = dashboard.accent_cookie_name(dashboard.repo_accent_identity(repo_b))
+        fleet_cookie = dashboard.accent_cookie_name(dashboard.fleet_accent_identity())
+        identity_a = {
+            "repo_root": str(repo_a.resolve()),
+            "repo_label": repo_a.name,
+            "db_path": str(repo_a / "kanban-orchestra.db"),
+            "runtime_root": str(repo_a / ".kanban-orchestra"),
+            "lock_path": str(repo_a / "kanban-orchestra.lock"),
+        }
+        identity_b = {
+            **identity_a,
+            "repo_root": str(repo_b.resolve()),
+            "repo_label": repo_b.name,
+            "db_path": str(repo_b / "kanban-orchestra.db"),
+            "runtime_root": str(repo_b / ".kanban-orchestra"),
+            "lock_path": str(repo_b / "kanban-orchestra.lock"),
+        }
+
+        with patch.object(dashboard.db, "get_instance_identity", return_value=identity_a):
+            html_a = dashboard._page_shell("Title", "<p>Body</p>")
+        with patch.object(dashboard.db, "get_instance_identity", return_value=identity_b):
+            html_b = dashboard._page_shell("Title", "<p>Body</p>")
+
+        self.assertNotEqual(cookie_a, cookie_b)
+        self.assertIn(f"{cookie_a}=", html_a)
+        self.assertNotIn(f"{cookie_b}=", html_a)
+        self.assertIn(f"{cookie_b}=", html_b)
+        self.assertNotIn(f"{cookie_a}=", html_b)
+        self.assertNotIn(f"{fleet_cookie}=", html_a)
+        self.assertNotIn("orchestra_accent=", html_a)
+        self.assertNotIn(str(repo_a.resolve()), cookie_a)
+
+    def test_generic_accent_and_semantic_status_colors_are_separate(self):
+        self.assertIn("--accent-rgb: 0 204 68", dashboard.COMMON_CSS)
+        self.assertIn("rgb(var(--accent-rgb) / 0.28)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-ready", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--green)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-running", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--blue)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-blocked", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--red)", dashboard.COMMON_CSS)
+        self.assertIn(".badge-pending-subtasks", dashboard.COMMON_CSS)
+        self.assertIn("color: var(--orange)", dashboard.COMMON_CSS)
+
+
+class TestLiveFleetDashboardUrl(unittest.TestCase):
+    """URL-resolution for the repo-dashboard Fleet Dashboard action."""
+
+    def test_prefers_live_tailscale_url(self):
+        payload = {"role": "fleet-dashboard", "url": "http://127.0.0.1:8426"}
+        preferred = "https://node.example.ts.net:8426/"
+        with patch.object(dashboard.fleet, "fleet_dashboard_live_payload", return_value=payload), \
+             patch.object(
+                 dashboard.fleet,
+                 "preferred_dashboard_url",
+                 return_value=preferred,
+             ) as lookup:
+            self.assertEqual(dashboard.live_fleet_dashboard_url(), preferred)
+            lookup.assert_called_once_with("http://127.0.0.1:8426")
+            html = dashboard.fleet_dashboard_nav_html()
+
+        self.assertIn(f'href="{preferred}"', html)
+        self.assertIn(dashboard.FLEET_DASHBOARD_LABEL, html)
+        self.assertIn(f'title="{dashboard.FLEET_DASHBOARD_LABEL}"', html)
+        self.assertNotIn("target=", html)
+
+    def test_falls_back_to_live_localhost_url(self):
+        payload = {"role": "fleet-dashboard", "url": "http://127.0.0.1:8426"}
+        with patch.object(dashboard.fleet, "fleet_dashboard_live_payload", return_value=payload), \
+             patch.object(
+                 dashboard.fleet,
+                 "preferred_dashboard_url",
+                 side_effect=lambda url, **kwargs: url,
+             ) as lookup:
+            self.assertEqual(
+                dashboard.live_fleet_dashboard_url(),
+                "http://127.0.0.1:8426",
+            )
+            lookup.assert_called_once_with("http://127.0.0.1:8426")
+            html = dashboard.fleet_dashboard_nav_html()
+
+        self.assertIn('href="http://127.0.0.1:8426"', html)
+        self.assertNotIn("target=", html)
+
+    def test_omits_action_when_fleet_is_unavailable(self):
+        with patch.object(dashboard.fleet, "fleet_dashboard_live_payload", return_value=None), \
+             patch.object(dashboard.fleet, "preferred_dashboard_url") as lookup:
+            self.assertIsNone(dashboard.live_fleet_dashboard_url())
+            html = dashboard.fleet_dashboard_nav_html()
+
+        lookup.assert_not_called()
+        self.assertNotIn("nav-fleet-dashboard-link", html)
+        self.assertNotIn("href=", html)
+
+    def test_omits_action_when_live_payload_lacks_url(self):
+        with patch.object(
+            dashboard.fleet,
+            "fleet_dashboard_live_payload",
+            return_value={"role": "fleet-dashboard"},
+        ), patch.object(dashboard.fleet, "preferred_dashboard_url") as lookup:
+            self.assertIsNone(dashboard.live_fleet_dashboard_url())
+            html = dashboard.fleet_dashboard_nav_html()
+
+        lookup.assert_not_called()
+        self.assertNotIn("nav-fleet-dashboard-link", html)
+
+    def test_omits_action_when_metadata_lookup_raises(self):
+        with patch.object(
+            dashboard.fleet,
+            "fleet_dashboard_live_payload",
+            side_effect=OSError("stale metadata"),
+        ), patch.object(dashboard.fleet, "preferred_dashboard_url") as lookup:
+            self.assertIsNone(dashboard.live_fleet_dashboard_url())
+            html = dashboard.fleet_dashboard_nav_html()
+
+        lookup.assert_not_called()
+        self.assertNotIn("nav-fleet-dashboard-link", html)
 
 
 class TestHealthCard(unittest.TestCase):
@@ -462,7 +714,7 @@ class TestReadyQueue(unittest.TestCase):
         html = dashboard.render_ready_queue(self.conn)
         self.assertLess(html.find("Earlier ready"), html.find("Later ready"))
 
-    def test_child_ready_task_waiting_for_plan_review_is_gated(self):
+    def test_child_ready_task_waiting_for_final_review_is_gated(self):
         parent_id = db.add_task(self.conn, "Parent supertask", branch="feat-parent", kind="supertask")
         db.update_task(self.conn, parent_id, status="ready", next_step="commit-review-supertask")
         child_id = db.add_task(
@@ -477,7 +729,7 @@ class TestReadyQueue(unittest.TestCase):
         html = dashboard.render_ready_queue(self.conn)
         self.assertIn("Runnable Now", html)
         self.assertIn("Queued Behind Supertask", html)
-        self.assertIn("waiting for supertask plan review", html)
+        self.assertIn("waiting for final supertask review", html)
         self.assertIn("Child task", html)
 
     def test_later_child_waits_for_earlier_sibling(self):
@@ -741,65 +993,224 @@ class TestRecentlyDone(unittest.TestCase):
         self.assertIn("22222222", html)
         self.assertIn("claude", html)
         self.assertIn("antigravity", html)
-        self.assertIn("<th class='col-agent'>Reviewer</th>", html)
-        self.assertIn("<th class='col-count'>Rejections</th>", html)
-        self.assertIn("<td>2</td>", html)
+        self.assertIn('class="task-record-reviewer">(reviewed by antigravity)</span>', html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("2 rejections", html)
         self.assertNotIn("Configured Reviewer", html)
         self.assertNotIn("Approver", html)
+
+    def test_recently_done_shows_first_review_as_one_round(self):
+        tid = db.add_task(self.conn, "First-round approval", branch="feat-round-one")
+        db.update_task(
+            self.conn,
+            tid,
+            status="done",
+            review_round=0,
+            coder_agent="grok",
+            reviewer_agent="codex",
+        )
+        db.add_comment(
+            self.conn, tid, "LGTM", kind="approval", author="codex", review_round=0
+        )
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-review-rounds">'
+            '<span class="task-record-label">review rounds</span> 1</span>',
+            html,
+        )
+        self.assertNotIn("1 review round", html)
+        self.assertNotIn("0 review round", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("rejection", html)
+
+    def test_recently_done_shows_multiple_review_rounds_without_rejection_count(self):
+        tid = db.add_task(self.conn, "Multi-round task", branch="feat-round-multi")
+        db.update_task(
+            self.conn,
+            tid,
+            status="done",
+            review_round=2,
+            coder_agent="grok",
+            reviewer_agent="codex",
+        )
+        db.add_comment(
+            self.conn, tid, "Fix this", kind="rejection", author="codex", review_round=0
+        )
+        db.add_comment(
+            self.conn, tid, "Still failing", kind="rejection", author="codex", review_round=1
+        )
+        db.add_comment(
+            self.conn, tid, "LGTM", kind="approval", author="codex", review_round=2
+        )
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-review-rounds">'
+            '<span class="task-record-label">review rounds</span> 3</span>',
+            html,
+        )
+        self.assertNotIn("3 review rounds", html)
+        self.assertNotIn("2 review rounds", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("2 rejections", html)
+        self.assertNotIn("3 rejections", html)
+        self.assertNotIn("rejection", html)
+
+    def test_recently_done_omits_review_rounds_when_not_applicable(self):
+        other_id = db.add_task(
+            self.conn, "Legacy other task", branch="feat-other", kind="other"
+        )
+        db.update_task(self.conn, other_id, status="done", review_round=None)
+        pr_id = db.add_task(
+            self.conn, "Legacy pull request", branch="feat-pr", kind="pull_request"
+        )
+        db.update_task(self.conn, pr_id, status="done")
+        self.conn.execute("UPDATE tasks SET review_round = NULL WHERE id = ?", (pr_id,))
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("Legacy other task", html)
+        self.assertIn("Legacy pull request", html)
+        self.assertNotIn("task-record-review-rounds", html)
+        self.assertNotIn("task-record-label\">review rounds", html)
+        self.assertNotIn("review round", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("rejection", html)
+
+    def test_recently_done_omits_review_rounds_for_default_round_without_decision(self):
+        tid = db.add_task(self.conn, "Skipped review task", branch="feat-skip")
+        db.update_task(self.conn, tid, status="done")
+        task = db.get_task(self.conn, tid)
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertEqual(task["review_round"], 0)
+        self.assertIn("Skipped review task", html)
+        self.assertNotIn("task-record-review-rounds", html)
+        self.assertNotIn("task-record-label\">review rounds", html)
+        self.assertNotIn("review round", html)
+        self.assertNotIn("task-record-rejections", html)
+        self.assertNotIn("rejection", html)
 
     def test_recently_done_shows_elapsed_runtime(self):
         tid = db.add_task(self.conn, "Runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="done")
         self.conn.execute(
-            "UPDATE tasks SET last_ready_at = ?, done_at = ? WHERE id = ?",
-            ("2026-05-31 10:00:00", "2026-05-31 12:03:04", tid),
+            "UPDATE tasks SET first_started_at = ?, last_ready_at = ?, done_at = ? WHERE id = ?",
+            ("2026-05-31 10:00:00", "2026-05-31 11:00:00", "2026-05-31 12:03:04", tid),
         )
         self.conn.commit()
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("<th class='col-duration'>Runtime</th>", html)
-        self.assertIn("<td>02:03:04</td>", html)
+        self.assertIn("task-record-runtime", html)
+        self.assertIn("02:03:04", html)
+        self.assertNotIn("01:03:04", html)
 
-    def test_recently_done_elapsed_runtime_uses_latest_ready_time(self):
+    def test_recently_done_elapsed_runtime_uses_first_pickup_time(self):
         tid = db.add_task(self.conn, "Requeued runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="ready")
         self.conn.execute(
             "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
-            ("2026-05-31 08:00:00", "2026-05-31 08:00:00", tid),
+            ("2026-08-25 03:00:00", "2026-08-25 03:00:00", tid),
         )
         self.conn.commit()
         db.update_task(self.conn, tid, status="running")
         db.update_task(self.conn, tid, status="ready")
         self.conn.execute(
-            "UPDATE tasks SET ready_at = ?, last_ready_at = ? WHERE id = ?",
-            ("2026-05-31 10:00:00", "2026-05-31 10:00:00", tid),
+            "UPDATE tasks SET ready_at = ?, last_ready_at = ?, first_started_at = ? WHERE id = ?",
+            (
+                "2026-08-25 03:43:10",
+                "2026-08-25 03:43:10",
+                "2026-08-25 03:05:57",
+                tid,
+            ),
         )
         self.conn.commit()
         db.update_task(self.conn, tid, status="done")
         self.conn.execute(
             "UPDATE tasks SET done_at = ? WHERE id = ?",
-            ("2026-05-31 10:10:05", tid),
+            ("2026-08-25 03:44:18", tid),
         )
         self.conn.commit()
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("<td>00:10:05</td>", html)
-        self.assertNotIn("<td>02:10:05</td>", html)
+        self.assertIn("00:38:21", html)
+        self.assertNotIn("00:01:08", html)
+        self.assertNotIn("00:44:18", html)
 
-    def test_recently_done_elapsed_runtime_missing_timestamp_fallback(self):
+    def test_recently_done_elapsed_runtime_excludes_initial_queue_wait(self):
+        tid = db.add_task(self.conn, "Queued runtime task", branch="feat-runtime")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET ready_at = NULL, last_ready_at = ?, first_started_at = ?, done_at = ? WHERE id = ?",
+            ("2026-05-31 08:00:00", "2026-05-31 10:00:00", "2026-05-31 10:10:05", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("00:10:05", html)
+        self.assertNotIn("02:10:05", html)
+
+    def test_recently_done_elapsed_runtime_omits_queue_time_without_first_start(self):
         tid = db.add_task(self.conn, "Missing runtime task", branch="feat-runtime")
         db.update_task(self.conn, tid, status="done")
         self.conn.execute(
-            "UPDATE tasks SET last_ready_at = NULL WHERE id = ?",
-            (tid,),
+            "UPDATE tasks SET ready_at = NULL, last_ready_at = ?, first_started_at = NULL, "
+            "done_at = ? WHERE id = ?",
+            ("2026-05-31 10:00:00", "2026-05-31 10:10:00", tid),
         )
         self.conn.commit()
 
         html = dashboard.render_recently_done(self.conn)
 
-        self.assertIn("<td>unknown</td>", html)
+        self.assertIn("Missing runtime task", html)
+        self.assertNotIn("task-record-runtime", html)
+        self.assertNotIn("00:10:00", html)
+        self.assertNotIn(">unknown<", html)
+
+    def test_recently_done_shows_finished_after_runtime_from_done_at(self):
+        tid = db.add_task(self.conn, "Finished recency task", branch="feat-finished")
+        db.update_task(self.conn, tid, status="done")
+        done_at = (datetime.now(timezone.utc) - timedelta(hours=2, minutes=5)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self.conn.execute(
+            "UPDATE tasks SET first_started_at = ?, last_ready_at = ?, done_at = ?, updated_at = ? WHERE id = ?",
+            ("2026-01-01 00:00:00", "2026-01-01 00:00:00", done_at, "2026-01-01 00:00:00", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        runtime_at = html.find("task-record-runtime")
+        finished_at = html.find("task-record-finished")
+        self.assertNotEqual(runtime_at, -1)
+        self.assertNotEqual(finished_at, -1)
+        self.assertLess(runtime_at, finished_at)
+        self.assertIn("2 hours ago", html)
+        self.assertNotIn("2026-01-01", html)
+
+    def test_recently_done_finished_missing_timestamp_is_omitted(self):
+        tid = db.add_task(self.conn, "Missing finished task", branch="feat-finished")
+        db.update_task(self.conn, tid, status="done")
+        self.conn.execute(
+            "UPDATE tasks SET last_ready_at = ?, done_at = NULL WHERE id = ?",
+            ("2026-05-31 10:00:00", tid),
+        )
+        self.conn.commit()
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn("Missing finished task", html)
+        self.assertNotIn("task-record-finished", html)
+        self.assertNotIn(">unknown<", html)
 
     def test_recently_done_reviewer_falls_back_to_configured_reviewer(self):
         tid = db.add_task(self.conn, "Done task", branch="feat-done", reviewer_agent="opus")
@@ -809,7 +1220,7 @@ class TestRecentlyDone(unittest.TestCase):
 
         self.assertIn("Done task", html)
         self.assertIn("opus", html)
-        self.assertIn("<td>0</td>", html)
+        self.assertNotIn("task-record-rejections", html)
 
     def test_recently_done_initially_hides_rows_after_first_five(self):
         for i in range(7):
@@ -844,6 +1255,153 @@ class TestRecentlyDone(unittest.TestCase):
         db.update_task(self.conn, older_id, status="done")
         html = dashboard.render_recently_done(self.conn)
         self.assertLess(html.find("Older task"), html.find("Newer task"))
+
+
+class TestTaskRecordLists(unittest.TestCase):
+    """Focused coverage for compact responsive task-record list markup."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+
+    def test_ready_queue_uses_wrapping_task_records(self):
+        long_agent = "cursor:provider/model-with-a-very-long-spec-name"
+        tid = db.add_task(
+            self.conn,
+            "Ready record",
+            branch="feat-ready",
+            coder_agent=long_agent,
+            reviewer_agent="codex",
+            skips=["commit-plan"],
+        )
+        db.update_task(self.conn, tid, status="ready", next_step="commit-make")
+
+        html = dashboard.render_ready_queue(self.conn)
+
+        self.assertIn('class="task-record-list"', html)
+        self.assertIn('class="task-record"', html)
+        self.assertIn(f'href="/task/{tid}"', html)
+        self.assertIn('class="task-record-title">Ready record</span>', html)
+        self.assertIn(f'class="task-record-coder">{long_agent}</span>', html)
+        self.assertIn("(reviewed by codex)", html)
+        self.assertIn("task-record-step", html)
+        self.assertIn("commit-make", html)
+        self.assertIn("commit-plan", html)
+        self.assertNotIn("<table>", html)
+        self.assertIn("task-record-meta", dashboard.COMMON_CSS)
+        self.assertIn("overflow-wrap: anywhere", dashboard.COMMON_CSS)
+
+    def test_icebox_and_blocked_use_task_records(self):
+        ice_id = db.add_task(
+            self.conn,
+            "Parked idea",
+            branch="feat-ice",
+            coder_agent="antigravity",
+            reviewer_agent="opus",
+        )
+        blocked_id = db.add_task(
+            self.conn,
+            "Stuck work",
+            branch="feat-block",
+            coder_agent="claude",
+            reviewer_agent="codex",
+            skips=["commit-review"],
+        )
+        db.update_task(self.conn, blocked_id, status="blocked")
+        db.add_comment(self.conn, blocked_id, "Waiting on dependency")
+
+        ice_html = dashboard.render_icebox(self.conn)
+        blocked_html = dashboard.render_blocked_tasks(self.conn)
+
+        self.assertIn('class="task-record-list"', ice_html)
+        self.assertIn(f'href="/task/{ice_id}"', ice_html)
+        self.assertIn("Parked idea", ice_html)
+        self.assertIn("by <span class=\"task-record-coder\">antigravity</span>", ice_html)
+        self.assertIn("(reviewed by opus)", ice_html)
+        self.assertNotIn("<table>", ice_html)
+
+        self.assertIn('class="task-record-list"', blocked_html)
+        self.assertIn(f'href="/task/{blocked_id}"', blocked_html)
+        self.assertIn("Stuck work", blocked_html)
+        self.assertIn("Waiting on dependency", blocked_html)
+        self.assertIn("commit-review", blocked_html)
+        self.assertNotIn("<table>", blocked_html)
+
+    def test_recently_done_record_metadata_and_show_more(self):
+        for i in range(6):
+            tid = db.add_task(
+                self.conn,
+                f"Done record {i}",
+                branch=f"feat-{i}",
+                coder_agent="cursor:grok-4.5-high",
+                reviewer_agent="codex",
+            )
+            db.update_task(
+                self.conn,
+                tid,
+                status="done",
+                commit_hash=f"{i:08x}deadbeef",
+            )
+            self.conn.execute(
+                "UPDATE tasks SET first_started_at = ?, last_ready_at = ?, done_at = ? WHERE id = ?",
+                ("2026-05-31 10:00:00", "2026-05-31 10:00:00", "2026-05-31 10:05:00", tid),
+            )
+        self.conn.commit()
+        first_id = 1
+        db.add_comment(self.conn, first_id, "Fix", kind="rejection", author="codex", review_round=0)
+
+        html = dashboard.render_recently_done(self.conn)
+
+        self.assertIn('class="task-record-list"', html)
+        self.assertIn("task-record-agents", html)
+        self.assertIn("cursor:grok-4.5-high", html)
+        self.assertIn("(reviewed by codex)", html)
+        self.assertIn("task-record-hash", html)
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-review-rounds">'
+            '<span class="task-record-label">review rounds</span> 1</span>',
+            html,
+        )
+        self.assertIn(
+            '<span class="task-record-meta-item task-record-runtime">'
+            '<span class="task-record-label">runtime</span> 00:05:00</span>',
+            html,
+        )
+        self.assertIn("task-record-finished", html)
+        self.assertIn('<span class="task-record-label">finished</span>', html)
+        self.assertIn("2026-05-31", html)
+        self.assertNotIn("1 review round", html)
+        self.assertNotIn("1 rejection", html)
+        self.assertNotIn("task-record-rejections", html)
+        review_at = html.find("task-record-review-rounds")
+        self.assertNotEqual(review_at, -1)
+        self.assertLess(review_at, html.find("task-record-runtime", review_at))
+        self.assertLess(html.find("task-record-runtime"), html.find("task-record-finished"))
+        self.assertIn('data-show-more-row data-row-index="5" hidden', html)
+        self.assertIn("Show More", html)
+        self.assertNotIn("<thead>", html)
+        self.assertNotIn("<table>", html)
+
+    def test_active_supertasks_remain_comparative_table(self):
+        parent_id = db.add_task(self.conn, "Parent", branch="feat-parent", kind="supertask")
+        db.update_task(self.conn, parent_id, status="pending_subtasks")
+        child_id = db.add_task(
+            self.conn,
+            "Child",
+            branch="feat-parent",
+            parent_task_id=parent_id,
+            sequence_index=100,
+        )
+        db.update_task(self.conn, child_id, status="ready")
+
+        html = dashboard.render_active_supertasks(self.conn)
+
+        self.assertIn("<table>", html)
+        self.assertIn("<th class='col-count'>Done</th>", html)
+        self.assertNotIn('class="task-record-list"', html)
 
 
 class TestTaskHeader(unittest.TestCase):
@@ -1432,6 +1990,39 @@ class TestTaskRuntimePanel(unittest.TestCase):
         html = dashboard.render_task_runtime_panel(task, None)
         self.assertIn('action="/task/5/set-ready"', html)
         self.assertIn("Set to ready", html)
+        self.assertNotIn("continue-review-cap", html)
+
+    def test_structured_review_cap_shows_continue_form(self):
+        task = {
+            "id": 5,
+            "status": "blocked",
+            "next_step": "none",
+            "kind": "commit",
+            "block_reason": db.BLOCK_REASON_REVIEW_CAP,
+            "resume_next_step": "commit-make",
+        }
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn('action="/task/5/continue-review-cap"', html)
+        self.assertIn('name="add_review_rounds"', html)
+        self.assertIn('min="1"', html)
+        self.assertIn('value="3"', html)
+        self.assertIn("Continue with additional rounds", html)
+        self.assertNotIn('action="/task/5/set-ready"', html)
+        self.assertNotIn("Set to ready", html)
+
+    def test_legacy_blocked_without_metadata_keeps_set_ready(self):
+        task = {
+            "id": 5,
+            "status": "blocked",
+            "next_step": "commit-review",
+            "kind": "commit",
+            "block_reason": None,
+            "resume_next_step": None,
+        }
+        html = dashboard.render_task_runtime_panel(task, None)
+        self.assertIn('action="/task/5/set-ready"', html)
+        self.assertIn("Set to ready", html)
+        self.assertNotIn("continue-review-cap", html)
 
     def test_missing_next_step_prompts_for_inferred_default(self):
         task = {"id": 5, "status": "blocked", "next_step": "none", "kind": "pull_request"}
@@ -1567,6 +2158,39 @@ class TestReadyActionHelpers(unittest.TestCase):
             with self.assertRaisesRegex(dashboard.ReadyActionError, "worktree is dirty"):
                 dashboard._ready_update_fields(self.conn, task)
 
+    def test_structured_review_cap_refused_by_helper(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "none",
+            "kind": "commit",
+            "branch": "feat-ready",
+            "block_reason": db.BLOCK_REASON_REVIEW_CAP,
+            "resume_next_step": "commit-make",
+        }
+        with self.assertRaisesRegex(dashboard.ReadyActionError, "review cap"):
+            dashboard._ready_update_fields(self.conn, task)
+        state = dashboard._ready_action_state(task)
+        self.assertFalse(state["available"])
+        self.assertIn("Continue with additional", state["error"])
+
+    def test_reviewer_unavailable_prefers_resume_next_step(self):
+        task = {
+            "id": 1,
+            "status": "blocked",
+            "next_step": "none",
+            "kind": "commit",
+            "branch": "feat-ready",
+            "block_reason": db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+            "resume_next_step": "commit-review",
+        }
+        self.assertEqual(dashboard._infer_ready_next_step(task), "commit-review")
+        fields = dashboard._ready_update_fields(self.conn, task)
+        self.assertEqual(fields["status"], "ready")
+        self.assertEqual(fields["next_step"], "commit-review")
+        self.assertIsNone(fields["block_reason"])
+        self.assertIsNone(fields["resume_next_step"])
+
 
 class TestTaskDetailLiveHeader(unittest.TestCase):
     """Tests that task detail keeps the header live over SSE."""
@@ -1660,6 +2284,52 @@ class TestTaskEditingRoutes(unittest.TestCase):
             fresh.close()
         self.assertEqual(task["title"], "Updated title")
         self.assertEqual(task["description"], "## Heading\n\nNew text")
+
+    def test_post_edit_accepts_same_origin_proxy_host(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{self.tid}/edit",
+            data={"title": "Tailscale title", "description": "Proxy origin"},
+            headers={
+                "host": "192.0.2.1:8427",
+                "origin": "http://192.0.2.1:8427",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+
+        fresh = db.connect(self.db_path)
+        try:
+            task = db.get_task(fresh, self.tid)
+        finally:
+            fresh.close()
+        self.assertEqual(task["title"], "Tailscale title")
+        self.assertEqual(task["description"], "Proxy origin")
+
+    def test_post_edit_accepts_same_origin_referer_proxy_host(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{self.tid}/edit",
+            data={"title": "Referer title", "description": "Referer origin"},
+            headers={
+                "host": "192.0.2.1:8427",
+                "referer": f"http://192.0.2.1:8427/task/{self.tid}",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+
+        fresh = db.connect(self.db_path)
+        try:
+            task = db.get_task(fresh, self.tid)
+        finally:
+            fresh.close()
+        self.assertEqual(task["title"], "Referer title")
+        self.assertEqual(task["description"], "Referer origin")
 
     def test_post_edit_blank_description_clears_description(self):
         from fastapi.testclient import TestClient
@@ -1823,6 +2493,159 @@ class TestTaskSetReadyRoutes(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 403)
 
+    def test_set_ready_rejects_structured_review_cap(self):
+        tid = db.add_task(self.conn, "Cap blocked", branch="feat-ready")
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            max_review_rounds=3,
+            review_round=3,
+        )
+
+        resp = self._post_ready(tid)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("review cap", resp.text.lower())
+        self.assertIn("Continue with additional", resp.text)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+        self.assertEqual(task["resume_next_step"], "commit-make")
+        self.assertEqual(task["max_review_rounds"], 3)
+
+
+class TestTaskContinueReviewCapRoutes(unittest.TestCase):
+    """Tests for task detail review-cap continuation flow."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+        os.environ["KANBAN_DB"] = self.db_path
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db_path)
+        os.environ.pop("KANBAN_DB", None)
+
+    def _block_at_review_cap(self, *, stash_ref="stash@{0}", max_rounds=3, review_round=None):
+        tid = db.add_task(self.conn, "Cap blocked", branch="feat-continue")
+        if review_round is None:
+            review_round = max_rounds
+        db.update_task(
+            self.conn,
+            tid,
+            status="blocked",
+            next_step="none",
+            review_round=review_round,
+            last_review_decision="reject",
+            stash_ref=stash_ref,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            max_review_rounds=max_rounds,
+        )
+        return tid, review_round, max_rounds
+
+    def _post_continue(self, task_id, data=None):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(dashboard.app)
+        return client.post(
+            f"/task/{task_id}/continue-review-cap",
+            data=data if data is not None else {"add_review_rounds": "3"},
+            headers={"origin": "http://127.0.0.1:8427"},
+            follow_redirects=False,
+        )
+
+    def test_continue_review_cap_success(self):
+        tid, review_round, max_rounds = self._block_at_review_cap()
+
+        resp = self._post_continue(tid, {"add_review_rounds": "2"})
+
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], f"/task/{tid}")
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "ready")
+        self.assertEqual(task["next_step"], "commit-make")
+        self.assertEqual(task["review_round"], review_round)
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+        self.assertEqual(task["max_review_rounds"], max_rounds + 2)
+        self.assertIsNone(task["block_reason"])
+        self.assertIsNone(task["resume_next_step"])
+        comments = db.get_comments(self.conn, tid)
+        self.assertTrue(
+            any(
+                c["author"] == "operator" and "additional review round" in c["message"]
+                for c in comments
+            ),
+        )
+
+    def test_continue_invalid_rounds_leaves_task_unchanged(self):
+        tid, review_round, max_rounds = self._block_at_review_cap()
+
+        for payload in (
+            {},
+            {"add_review_rounds": ""},
+            {"add_review_rounds": "abc"},
+            {"add_review_rounds": "0"},
+            {"add_review_rounds": "-1"},
+        ):
+            with self.subTest(payload=payload):
+                resp = self._post_continue(tid, payload)
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("positive integer", resp.text.lower())
+                self.assertIn("continue-review-cap", resp.text)
+                task = db.get_task(self.conn, tid)
+                self.assertEqual(task["status"], "blocked")
+                self.assertEqual(task["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
+                self.assertEqual(task["resume_next_step"], "commit-make")
+                self.assertEqual(task["review_round"], review_round)
+                self.assertEqual(task["max_review_rounds"], max_rounds)
+                self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_continue_restores_parent_supertask(self):
+        parent_id = db.add_task(
+            self.conn, "Parent", kind="supertask", branch="feat-parent",
+        )
+        child_id = db.add_task(
+            self.conn, "Child", branch="feat-parent", parent_task_id=parent_id,
+        )
+        db.update_task(
+            self.conn, child_id,
+            status="blocked", next_step="none",
+            review_round=3,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step="commit-make",
+            stash_ref="stash@{3}",
+            max_review_rounds=3,
+        )
+        db.update_task(self.conn, parent_id, status="blocked")
+
+        resp = self._post_continue(child_id, {"add_review_rounds": "3"})
+
+        self.assertEqual(resp.status_code, 303)
+        child = db.get_task(self.conn, child_id)
+        self.assertEqual(child["status"], "ready")
+        self.assertEqual(child["stash_ref"], "stash@{3}")
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(parent["status"], "pending_subtasks")
+
+    def test_continue_rejects_cross_origin(self):
+        from fastapi.testclient import TestClient
+
+        tid, _, _ = self._block_at_review_cap()
+        client = TestClient(dashboard.app)
+        resp = client.post(
+            f"/task/{tid}/continue-review-cap",
+            data={"add_review_rounds": "3"},
+            headers={"origin": "http://evil.example.com"},
+        )
+        self.assertEqual(resp.status_code, 403)
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "blocked")
+
 
 class TestOverviewPage(unittest.TestCase):
     """Tests for overview page layout."""
@@ -1857,6 +2680,29 @@ class TestOverviewPage(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
         self.assertNotIn("Running against", resp.text)
+
+    def test_accent_picker_renders_on_overview_and_task_detail(self):
+        from fastapi.testclient import TestClient
+
+        tid = db.add_task(self.conn, "Task with accent picker", branch="feat-accent")
+        client = TestClient(dashboard.app)
+
+        cookie = dashboard.accent_cookie_name(dashboard.repo_accent_identity())
+        for path in ("/", f"/task/{tid}"):
+            with self.subTest(path=path):
+                resp = client.get(path)
+                self.assertEqual(resp.status_code, 200)
+                self.assertIn('id="orchestra-accent-picker"', resp.text)
+                self.assertIn('role="radiogroup"', resp.text)
+                self.assertIn('class="accent-chit"', resp.text)
+                self.assertNotIn("<select", resp.text)
+                self.assertIn(f"{cookie}=", resp.text)
+                self.assertNotIn("orchestra_accent=", resp.text)
+                for name, accent in dashboard.ACCENT_PALETTE.items():
+                    self.assertIn(f'value="{name}"', resp.text)
+                    self.assertIn(f'aria-label="{accent["label"]}"', resp.text)
+                    self.assertIn(f'title="{accent["label"]}"', resp.text)
+                    self.assertIn(f"--chit-color: {accent['color']}", resp.text)
 
     def test_overview_timezone_note_moves_to_bottom(self):
         from fastapi.testclient import TestClient
@@ -1923,6 +2769,22 @@ class TestFindFreePort(unittest.TestCase):
 
 class TestRunDashboard(unittest.TestCase):
     """Tests for _run_dashboard: startup-flow wiring and final-port reporting."""
+
+    def setUp(self):
+        self.publish_patch = patch.object(
+            dashboard.dashboard_tailscale,
+            "schedule_publish_dashboard",
+            return_value=None,
+        )
+        self.publish_mock = self.publish_patch.start()
+        self.addCleanup(self.publish_patch.stop)
+        self.fallback_patch = patch.object(
+            dashboard.dashboard_tailscale,
+            "schedule_startup_dashboard_fallback",
+            return_value=None,
+        )
+        self.fallback_mock = self.fallback_patch.start()
+        self.addCleanup(self.fallback_patch.stop)
 
     def _make_mock_uvicorn(self):
         """Return a minimal mock that stands in for the uvicorn module."""

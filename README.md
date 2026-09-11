@@ -1,259 +1,264 @@
 # Orchestra
 
-Orchestra coordinates the AI coding CLIs you already have installed —
-[Claude Code](https://claude.ai/code),
-[OpenAI Codex CLI](https://github.com/openai/codex),
-Antigravity through the `agy` CLI —
-into an autonomous development team. You describe tasks in plain language;
-Orchestra queues them, assigns one CLI to code and another to review, runs
-rejection cycles on the staged diffs, and lands approved commits — while you
-do something else.
+**One developer. One machine. A durable queue of coherent coding tickets.**
+
+Orchestra coordinates the AI coding CLIs already installed on your machine. You
+describe a piece of work once; Orchestra queues it, assigns agents to plan,
+build, and review it, records the complete decision trail, and lands the
+approved commit in your repo.
+
+The machine remains the execution boundary. Git state, task history, agent
+processes, credentials, and builds stay local. Tailscale makes the dashboards
+available over tailnet-only HTTPS, so the same single-developer workflow works
+from your desk, phone, or iPad without turning Orchestra into a hosted or
+multi-user service.
+
+<p align="center">
+  <img src="docs/fleet-dashboard.png" alt="Fleet Dashboard showing repositories running Orchestra on one machine" width="100%" />
+</p>
+
+## The Point
+
+Orchestra is designed for a single developer who wants to queue several
+well-specified tickets and let local coding agents carry each one through a
+coherent lifecycle. It is deliberately not a team issue tracker, distributed
+worker system, or cloud build service.
+
+For a normal commit task, Orchestra manages two feedback loops:
+
+```text
+ticket
+  ↓
+[ plan  ⇄  plan review ]
+  ↓
+commit-make  ⇄  [ commit review ]
+  ↓
+commit-make (finalize)  →  one landed commit
+```
+
+Brackets mark optional steps. A plan rejection returns to the planner; a commit
+rejection returns to the same sticky coder. Approval continues downward, and
+the actual git commit is not created until finalization.
+
+- **Plan** and **plan review** are optional. Normal tasks skip planning by
+  default; enable it when implementation deserves a reviewed approach before
+  files change.
+- **Commit-make** is required. The assigned coder builds or reworks the staged
+  candidate and records validation evidence and the proposed commit message.
+- **Commit review** is optional. When enabled, a separate reviewer inspects the
+  staged diff. Rejections return to the same coder; approval returns to that
+  coder for finalization.
+- Reviewer infrastructure failures are not content rejections. Orchestra
+  retries them without spending a review round, then blocks with the candidate
+  preserved if the reviewer remains unavailable.
+
+Each repo instance processes one task at a time, so agents cannot trample one
+another in the same worktree. Fleet can run several repo instances side by side
+on the same machine.
+
+## How You Use It
+
+The primary interface is your AI agent's **Kanban skill**, not a CLI you need
+to operate by hand. In a work repo, ask your agent for what you want:
+
+> "Using the Kanban skill, queue a task to fix the broken pagination query."
+
+The skill turns that request into a durable Markdown ticket, lets you refine it
+in `none`, and moves it to `ready` when it is coherent. The orchestrator then
+owns normal workflow transitions. You step back in when a task needs a product
+decision, missing context, or an explicit recovery choice.
+
+The task database and durable comments keep the ticket, plan, validation,
+review decisions, run history, and landed commit tied together. A coding-agent
+session can end without losing the workflow.
+
+### Task Types
+
+The normal unit is a **commit task**: one coherent ticket, one eventual landed
+commit. Orchestra also supports narrower advanced workflows:
+
+- **Pull request tasks** manage a PR and its review without landing commits.
+- **Other tasks** perform non-standard or operational work and leave durable
+  completion evidence instead of requiring a commit or PR.
+- **Supertasks** let a planner derive and sequence the commit-sized child tasks
+  needed for a larger outcome; the supertask itself never lands a commit.
+
+## One Machine, From Anywhere
+
+Remote use preserves the same operating model. Orchestra and every coding CLI
+continue to run on one developer-controlled machine. Tailscale only extends the
+control surface:
+
+- dashboard startup brings localhost online first
+- it then makes a best-effort attempt to publish an exact Tailscale Serve HTTPS
+  mapping
+- existing mappings are reused and unrelated Serve routes are left untouched
+- Tailscale absence or failure never blocks localhost
+- Funnel is not enabled; remote dashboards remain tailnet-only
+
+Use the exact URL printed by `ko-get-update`, `ko-fleet status`, or dashboard
+startup. Orchestra prefers the live Tailscale URL when an exact mapping exists
+and otherwise falls back to localhost. Dashboard hostnames and ports are
+runtime state, not configuration to hard-code.
+
+From a remote Codex or Claude session that reaches the machine, you can queue a
+ticket in plain language. From the Fleet Dashboard, you can watch every repo,
+open its dashboard, and start an eligible stopped instance. The result is the
+same single-developer workflow whether you are sitting at the Mac or checking
+in from an iPhone or iPad.
+
+## Dashboards
+
+### Fleet Dashboard
+
+The Fleet Dashboard turns every repo in your private fleet config into a status
+card. Each card shows its path, branch, runtime state, current task, Ready,
+Recently Done, and Icebox counts, plus its Dashboard action and any known
+startup failure. An eligible stopped repo gets a play action that uses the same
+validation and startup path as `ko-fleet start <repo>`.
+
+Repo dashboards open in a new tab so the Fleet view stays put. A Fleet view
+reached through Tailscale links cards to their exact Tailscale mappings; a
+local Fleet view links cards to localhost.
+
+### Repo Dashboard
+
+The repo dashboard exposes the active task, queues, recent completions,
+review-round count, durable comments, and run history. The task-detail view
+keeps the goal, acceptance criteria, orchestration state, review evidence, and
+logs together.
+
+When a live Fleet Dashboard is discoverable, repo overview and task-detail
+pages show a compact **Fleet Dashboard** action in the top bar. It uses the
+preferred Tailscale-or-local URL and returns to Fleet in the same tab.
 
 <table>
   <tr>
-    <td width="50%">
-      <img src="docs/dashboard1.jpg" alt="Kanban dashboard task overview" width="100%" />
-    </td>
-    <td width="50%">
-      <img src="docs/dashboard2.jpg" alt="Kanban dashboard task detail" width="100%" />
-    </td>
+    <th width="50%">Repo overview</th>
+    <th width="50%">Task detail</th>
+  </tr>
+  <tr>
+    <td><img src="docs/dashboard-overview.png" alt="Repo dashboard overview with active, queued, blocked, and completed work" width="100%" /></td>
+    <td><img src="docs/dashboard-task.png" alt="Task dashboard with acceptance criteria, review state, comments, and run history" width="100%" /></td>
   </tr>
 </table>
 
-## How It Works
-
-Orchestra is a Python-based local task queue backed by SQLite. Each task is
-scoped to one git commit. The orchestrator prompts a coding agent to make the
-change, routes the diff through a review agent, and repeats until the reviewer
-approves or the retry budget is exhausted. The approved commit is then
-finalized on the branch.
-
-The primary interface is your AI agent's **Kanban skill**, not a CLI you drive
-by hand. You install the skill into your agent, then talk to it: *"Queue a
-task to fix X."* The skill handles bootstrapping, task creation, status
-checks, and all wrapper commands.
-
-## Operator Visibility
-
-Everything the orchestrator does is visible. The live dashboard shows active
-tasks, ready and blocked queues, recent completions, and the orchestrator's own
-heartbeat. Each task carries durable comments — reviewer feedback, validation
-results, commit messages — so you can trace every decision without reading
-agent logs. Run logs capture the full session, and `ko-task` lets you inspect
-or update any task from another terminal or a remote agent session. If something
-stalls or fails, you see it immediately and can intervene.
-
-## Supported Agents
-
-Orchestra shells out to local agent CLIs. It ships with built-in support for:
-
-| Key | Agent CLI | Notes |
-|-----|-----------|-------|
-| `sonnet` / `claude` / `haiku` / `opus` | [Claude Code](https://claude.ai/code) | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
-| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) | Default reviewer, plan reviewer, and supertask reviewer |
-| `antigravity` | Antigravity (`agy`) | Uses `agy --print` with tool permission auto-approval |
-| `kilo` / `kilo-opus-4.6` / `kilo-opus-4.7` / `kilo-sonnet-4.6` | [Kilo Code](https://kilocode.ai) | `kilo` uses Kilo auto/free; the other keys pin specific Anthropic models |
-| `cursor-auto` / `cursor-composer-2.5` / `cursor-opus-4.6` / `cursor-opus-4.7` / `cursor-sonnet-4.6` | [Cursor Agent](https://cursor.com) | Cursor model availability depends on your Cursor account and installed CLI version |
-| `cursor:<model>` / `kilo:<model>` | Provider/model specs | Resolve dynamically through the registry, for example `cursor:claude-opus-4-8-high` |
-
-Agent keys, command templates, and display labels live in
-`shared_scripts/agent_registry.yaml`. Orchestra does not provide API keys,
-accounts, or billing — install and authenticate each CLI yourself.
-
-## Prerequisites
-
-- **Python 3.10+**
-- **Git**
-- **macOS or Linux** (Windows is untested)
-- At least one supported agent CLI installed and authenticated
+Both dashboard types include a dark-safe **Accent** picker. The Fleet Dashboard
+and each repo persist their own tint by dashboard identity, so a new dashboard
+does not inherit another dashboard's color. Localhost and Tailscale are separate
+browser origins and therefore retain separate browser-local choices.
 
 ## Getting Started
 
-1. **Clone the repo:**
+### Prerequisites
+
+- Python 3.10+
+- Git
+- macOS or Linux (Windows is untested)
+- at least one supported coding-agent CLI installed and authenticated
+- Tailscale when remote dashboard access is desired
+
+### Install Orchestra
+
+1. Clone the repo:
 
    ```bash
    git clone https://github.com/confusionstudios/orchestra.git /path/to/orchestra
    ```
 
-2. **Set `ORCHESTRA_DIR`** in your shell startup file (`.zshrc`, `.bashrc`, or
-   equivalent):
+2. Point `ORCHESTRA_DIR` at that checkout in `.zshrc`, `.bashrc`, or the
+   equivalent:
 
    ```bash
    export ORCHESTRA_DIR="/path/to/orchestra"
    ```
 
-   `ORCHESTRA_DIR` may point at the same checkout you are currently operating
-   on. When you use Orchestra to work on Orchestra itself, that single checkout
-   is both the tooling checkout and the launched work repo.
+3. Bootstrap the checkout-local Python environment and install the shared
+   skills:
 
-   zsh users can also load the optional command helpers:
+   ```bash
+   "$ORCHESTRA_DIR/shared_scripts/bootstrap-python-env.sh"
+   "$ORCHESTRA_DIR/bin/ko-install-global-skills"
+   ```
+
+   The skill installer writes thin user-level wrappers for Claude, Codex, Kilo,
+   and Antigravity. Those wrappers read their canonical instructions from
+   `$ORCHESTRA_DIR/AI-skills`, so edits to an existing skill take effect
+   immediately. Re-run the installer after adding, deleting, or renaming a
+   skill; use `--check` to detect wrapper drift without writing.
+
+4. Optionally load the zsh helpers:
 
    ```zsh
    source "$ORCHESTRA_DIR/shell/orchestra.zsh"
    ```
 
-3. **Bootstrap the Python environment:**
+### Start One Repo
 
-   ```bash
-   "$ORCHESTRA_DIR/shared_scripts/bootstrap-python-env.sh"
-   ```
-
-4. **Sync skills into a work repo:**
-
-   ```bash
-   cd /path/to/work-repo
-   "$ORCHESTRA_DIR/bin/ko-sync-skills"
-   ```
-
-   To sync a specific repo from anywhere:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-skills" /path/to/work-repo
-   ```
-
-   To register a repo for future bulk skill sync:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-skills" --register /path/to/work-repo --project-name "Project Name"
-   ```
-
-   To inspect every registered repo without changing anything:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-registered-skills"
-   ```
-
-   To update every registered repo:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-sync-registered-skills" --apply
-   ```
-
-5. **Start the repo instance** from the work repo root and keep it running:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-orchestrator"
-   ```
-
-   For first use, run it in a dedicated terminal. The important part is the
-   launch directory: the orchestrator uses the current git repo as the work
-   repo, stores state there, and starts the matching dashboard for that repo.
-
-   Check status from another terminal or through the Kanban skill:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-get-update"
-   ```
-
-   The dashboard is attached to that same repo instance. If you loaded the zsh
-   helpers, `ko-start` starts the orchestrator/dashboard pair from the current
-   repo root, `ko-status` prints the current repo status, and `ko-dashboard`
-   opens that repo dashboard.
-
-   For multiple repos, create a private fleet list:
-
-   ```bash
-   "$ORCHESTRA_DIR/bin/ko-fleet" init
-   "$ORCHESTRA_DIR/bin/ko-fleet" add .
-   "$ORCHESTRA_DIR/bin/ko-fleet" status
-   "$ORCHESTRA_DIR/bin/ko-fleet" start
-   ```
-
-   The fleet config is `~/.config/orchestra/fleet.repos`: one git repo root per
-   line, with blank lines and `#` comments allowed.
-   `ko-fleet stop`, `restart`, `attach`, `logs`, and `dashboard` operate on the
-   selected repo label or path. `ko-fleet dashboard-open` is an explicit alias
-   for opening the repo dashboard. Use `ko-get-update` for a concise status
-   snapshot and `ko-task` to inspect, comment on, or update individual tasks.
-
-6. **Talk to your agent.** In the work repo, invoke the Kanban skill with a
-   plain-language request:
-
-   > "Using the Kanban skill, queue a task to fix the broken pagination query."
-
-   The skill handles the rest.
-
-### Remote Control
-
-The orchestrator runs continuously on your machine, polling for tasks and
-dispatching local agents to do the work. You don't need to be at the terminal
-to queue tasks. Use
-[Claude Code Remote Control](https://docs.anthropic.com/en/docs/claude-code/remote-control),
-[OpenAI Codex](https://chatgpt.com/codex) from the ChatGPT app, or any agent
-channel that reaches your machine — Discord bots, Telegram, whatever you wire
-up. Say *"queue a task to refactor the auth middleware"* from your phone, and
-the orchestrator picks it up.
-
-From there, everything happens locally: agents write the code, other agents
-review the diff, rejections loop back for another attempt, and approved commits
-land on the branch — all while you're away from your desk.
-
-### Running The Orchestrator
-
-The orchestrator is the durable worker. Start it from the root of each work
-repo where you want tasks processed, and keep it alive in whatever way you
-normally keep local development processes alive. It starts the matching
-dashboard for that same repo instance. The launched repo root owns the state
-(`kanban-orchestra.db`, runtime files, dashboard metadata, and logs).
-`ORCHESTRA_DIR` provides the tools and may be the same path when Orchestra is
-working on its own checkout.
-
-For first use, run it directly in a dedicated terminal:
+Run the instance from the root of the work repo it should own:
 
 ```bash
 cd /path/to/work-repo
 "$ORCHESTRA_DIR/bin/ko-orchestrator"
 ```
 
-Codex, Claude, or another agent can still be your operator interface: ask it to
-queue tasks, check status, or open the dashboard when you need to inspect the
-queue visually. It should not be the long-lived process host unless you are
-doing a short experiment and are comfortable with the orchestrator stopping
-when that session ends.
+The launch directory is the instance identity. That process owns the repo's
+task queue, runs one task at a time, and starts the matching dashboard. Keep it
+alive in a dedicated terminal or another local process supervisor.
 
-For several repo instances, use the fleet command:
+From another terminal—or through the Kanban skill—check it with:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-get-update"
+```
+
+With the optional zsh helpers, `ko-start`, `ko-status`, and `ko-dashboard` run
+those same current-repo operations.
+
+### Start A Fleet
+
+Fleet is still single-machine operation; it simply manages one Orchestra
+instance per configured repo:
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-fleet" init
 "$ORCHESTRA_DIR/bin/ko-fleet" add /path/to/work-repo
 "$ORCHESTRA_DIR/bin/ko-fleet" precheck
 "$ORCHESTRA_DIR/bin/ko-fleet" start
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 ```
 
-`ko-fleet` reads `~/.config/orchestra/fleet.repos`, a private flat list with
-one repo root per line. It derives display names from each path. `start`
-skips dirty stopped repos and keeps launching clean stopped repos; invalid
-repo config remains a hard failure.
+The private config at `~/.config/orchestra/fleet.repos` contains one repo root
+per line; blank lines and `#` comments are allowed. Fleet provides `status`,
+`start`, `stop`, `stop-all`, `restart`, `attach`, and `logs`, plus:
 
-### YOLO Mode and Hardening
+```bash
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard-open <repo>
+```
 
-Orchestra delegates work to local AI coding CLIs in their non-interactive
-YOLO-style modes, where the agent can run shell commands without stopping for
-per-command permission prompts. Those agent processes run as your local user.
-If a prompt-injected or misbehaving agent decides to read, change, or
-exfiltrate files, it can reach whatever that user account can reach: SSH keys,
-GitHub credentials, browser state, other repos, private notes, and unrelated
-project files.
-
-You should always run Orchestra and the agent CLIs under a separate macOS user
-account, an OrbStack/Docker container, or a `sandbox-exec` profile. See
-[SECURITY.md](SECURITY.md) for the full threat model.
-
-### Tips
-
-* A single Orchestra instance will not launch against a dirty worktree. Commit
-  or stash before starting that repo.
-* The agent running the Kanban skill should not modify the worktree itself —
-  queued runs block if uncommitted changes appear between tasks.
-* Set a task to `none` status while you're still editing it. Change it to
-  `ready` when it should be picked up.
-* The Kanban skill can adjust task details before launch: add/remove skipped
-  steps, swap the coding or review agent, change retry limits. Ask it.
+Dashboard commands prefer the exact Tailscale URL. Pass `--local` when you
+specifically want localhost for debugging.
 
 ## Agent Configuration
 
-Default agent roles can be overridden with environment variables. Set each one
-to a key from `shared_scripts/agent_registry.yaml`:
+Orchestra shells out to local agent CLIs. The registry supports named agents
+and dynamic provider/model specs:
+
+| Key or syntax | Agent CLI | Notes |
+|---|---|---|
+| `haiku`, `sonnet`, `opus`, `fable`, `claude` | Claude Code | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
+| `codex` | OpenAI Codex CLI | Default reviewer, plan reviewer, and supertask reviewer |
+| `antigravity` | Antigravity (`agy`) | Runs through its non-interactive print mode |
+| `cursor:<model>` | Cursor Agent | Passes the exact model string to Cursor; `grok` currently aliases `cursor:cursor-grok-4.6-high` |
+| `kilo:<model>` | Kilo Code | Passes the exact model string to Kilo; `kilo` uses its auto/free model |
+
+`shared_scripts/agent_registry.yaml` is the source of truth for built-in keys,
+aliases, display labels, and command templates. Orchestra does not provide API
+keys, accounts, or model billing.
+
+Default roles can be changed without editing the registry:
 
 ```bash
 export ORCHESTRA_DEFAULT_CODER=sonnet
@@ -262,62 +267,73 @@ export ORCHESTRA_DEFAULT_PLANNER=sonnet
 export ORCHESTRA_DEFAULT_PLAN_REVIEWER=codex
 export ORCHESTRA_DEFAULT_SUPER_PLANNER=opus
 export ORCHESTRA_DEFAULT_SUPER_REVIEWER=codex
+export ORCHESTRA_DEFAULT_UNBLOCKER=sonnet
 ```
 
-To smoke-test the configured replacement agents, run:
+Smoke-test the configured agents with:
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-agent-smoke"
 ```
 
-It uses `shared_scripts/agent_registry.yaml`, asks each enabled matrix entry
-to write a short report, and stores local output under
-`.kanban-orchestra/agent-smoke/`. Edit `AGENT_MATRIX` in
-`shared_scripts/agent_smoke.py` to change the default agent/model set, or use
-`--skip` for a one-off run.
+Reports remain local under `.kanban-orchestra/agent-smoke/`.
+
+## Operating Model
+
+Kanban state belongs to the launched work repo:
+
+- `kanban-orchestra.db` — durable SQLite task state
+- `kanban-orchestra.sql` — portable database dump
+- `.kanban-orchestra/` — runtime metadata, transcripts, and logs
+- `kanban-orchestra.lock` — repo-scoped orchestrator ownership
+
+These files are local runtime state and ignored by git. `ORCHESTRA_DIR` supplies
+the shared tools; it may point at the same checkout when Orchestra works on
+itself.
+
+The orchestrator expects exclusive access to a clean worktree. It refuses to
+launch dirty and blocks rather than continuing through unexpected uncommitted
+changes. Tasks on `master` or `main` are disabled by default; a repo must opt in
+with a standalone `ALLOW_TASKS_ON_MASTER` line in its root `AGENTS.md`.
+
+Useful operator rules:
+
+- Keep a ticket in `none` while refining it; set it to `ready` when it is
+  coherent and should run.
+- The agent operating the Kanban skill should manage task state, not edit the
+  worktree beside the orchestrator.
+- Use `ko-task continue` for structured recovery. Review-cap blocks require
+  `--add-review-rounds N`; other blocks require the recorded or explicit next
+  step.
+- A running orchestrator reassesses blocked tasks with the configured unblocker
+  and either resumes a safely recoverable task or leaves a durable explanation.
+
+## Security
+
+Orchestra runs coding agents in non-interactive YOLO-style modes as your local
+user. It is not a sandbox or permission boundary. A prompt-injected or
+misbehaving agent can reach files, credentials, browser state, and repositories
+available to that account.
+
+Run Orchestra and its coding CLIs under a dedicated macOS user, container, or
+another boundary appropriate to your risk. Tailscale limits who can reach the
+dashboard; it does not limit what a local agent process can do. See
+[SECURITY.md](SECURITY.md) for the threat model and deployment guidance.
 
 ## Source Layout
 
 | Path | Contents |
-|------|----------|
-| `AI-skills/` | Canonical skill instructions — `bin/ko-sync-skills` syncs one repo, and `bin/ko-sync-registered-skills --apply` syncs repos registered with `.orchestra-skill-sync` |
-| `kanban-orchestra/scripts/` | Task queue, dashboard, orchestrator, and CLI |
+|---|---|
+| `AI-skills/` | Canonical Kanban and ad-hoc agent instructions |
+| `kanban-orchestra/scripts/` | Task database, orchestrator, dashboards, Fleet, and CLI implementation |
 | `kanban-orchestra/prompts/` | Prompts injected into task agents |
-| `bin/` | Thin wrappers that run through the checkout-local venv |
-| `shared_scripts/` | Setup and helper scripts |
-
-## Operating Model
-
-Kanban state lives in the **launched repo root**:
-
-- `kanban-orchestra.db` — task state (SQLite)
-- `.kanban-orchestra/` — runtime files and logs
-- Tasks target the work repo's current branch unless overridden
-
-If `ORCHESTRA_DIR` points at that same checkout, these state files live beside
-the Orchestra source and remain ignored by git.
-
-The orchestrator expects a clean worktree. It refuses to launch when dirty and
-blocks rather than continuing through unexpected uncommitted changes.
-
-## Policies
-
-Orchestra is not a sandbox or permission boundary. Agent commands run as your
-local user and can read or write any files available to that user. Run
-Orchestra under a dedicated user account or container — see
-[YOLO Mode and Hardening](#yolo-mode-and-hardening).
-
-Automatic task execution requires non-interactive agent CLI modes. If an agent
-needs a permission prompt for every command, queued work will not complete
-reliably.
-
-Tasks on `master` or `main` are blocked by default. To opt in, add
-`ALLOW_TASKS_ON_MASTER` to the work repo's root `AGENTS.md`.
+| `bin/` | Thin wrappers using the checkout-local Python environment |
+| `shared_scripts/` | Agent registry, setup, installation, and helper scripts |
+| `tasks/kanban-orchestra-spec.md` | Canonical workflow and state-machine specification |
 
 ## Development
 
-To work on Orchestra itself, skip the orchestration workflow and treat it as a
-normal Python repo:
+There is no build step. Bootstrap the local environment and run the test suite:
 
 ```bash
 export ORCHESTRA_DIR="/path/to/orchestra"
@@ -325,9 +341,9 @@ export ORCHESTRA_DIR="/path/to/orchestra"
 "$ORCHESTRA_DIR/bin/ko-test"
 ```
 
-If you do use Orchestra to work on this repo, restart running orchestrator or
-fleet instances after pulling or changing Orchestra code. Existing long-lived
-Python processes may keep running the code they started with.
+When Orchestra is working on its own checkout, restart the running repo or
+Fleet instance after code changes. Long-lived Python processes continue using
+the code they loaded at startup.
 
 ## License
 

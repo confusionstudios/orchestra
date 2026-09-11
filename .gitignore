@@ -24,17 +24,8 @@ eraseme/
 orchestra
 test_workspace/
 
-# Generated Orchestra skill wrappers. Canonical source lives in AI-skills/.
+# Local Kanban Orchestra runtime
 .kanban-orchestra/
-.claude/skills/orch-kb-*/
-.claude/skills/orch-adhoc-*/
-.agents/skills/orch-kb-*/
-.agents/skills/orch-adhoc-*/
-.claude/skills/ko-*/
-.gemini/skills/ko-*/
-.agents/skills/ko-*/
-.codex/skills/ko-*/
-.kilo/skills/ko-*/
 
 # Local Claude settings
 .claude/settings.local.json

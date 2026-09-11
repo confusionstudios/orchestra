@@ -20,13 +20,13 @@ def _read_standalone_marker(repo_root, marker: str) -> bool:
 
 
 def read_skip_build_until_approved(repo_root) -> bool:
-    """Return True if AGENTS.md in repo_root contains the SKIP_BUILD_UNTIL_APPROVED marker.
+    """Return True when AGENTS.md contains the deferred coder-build marker.
 
     The marker must appear as a standalone line (after stripping whitespace):
-        SKIP_BUILD_UNTIL_APPROVED
+        CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER
     Freeform prose mentioning the marker name does not count.
     """
-    return _read_standalone_marker(repo_root, "SKIP_BUILD_UNTIL_APPROVED")
+    return _read_standalone_marker(repo_root, "CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER")
 
 
 def read_allow_tasks_on_master(repo_root) -> bool:

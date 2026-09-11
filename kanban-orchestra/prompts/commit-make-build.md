@@ -57,7 +57,8 @@ the task requires detail:
    ```
    When you skipped the build, state that explicitly here — e.g. `"Purely
    additive change — no build step"` or `"Full build deferred by
-   SKIP_BUILD_UNTIL_APPROVED policy; will run during finalization after approval."`
+   CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER policy; will run during
+   finalization after approval."`
    The deferral comment is required when the policy is active so reviewers
    know the missing build output is intentional.
 6. **Stage everything** with `git add .` so reviewers see the diff via
@@ -74,8 +75,9 @@ the task requires detail:
 
    Each round's message must stand alone: write it as if the review
    conversation never happened, describing the full task end-to-end. Follow
-   the format in `$ORCHESTRA_DIR/AI-skills/git-commit.md`. End with the
-   canonical footer from:
+   the format in `$ORCHESTRA_DIR/AI-skills/git-commit.md`, including an
+   optional `WHY` section only when the problem being solved adds useful
+   context. End with the canonical footer from:
    ```
    task get-commit-footer <id>
    ```

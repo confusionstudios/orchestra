@@ -106,6 +106,7 @@ hard-coded default is used.
 - Initial value: `0`
 - Incremented after a rejection
 - Also incremented when a review round is abandoned due to interruption or stale recovery
+- Not incremented for reviewer infrastructure or agent-execution failures (nonzero exit, empty or malformed output, missing durable approval/rejection, tool-host/transport failure). Those retries and the eventual `reviewer_unavailable` block leave `review_round` unchanged.
 
 ## System Invariants
 
@@ -172,12 +173,26 @@ Important columns:
 - `last_review_decision`
 - `ready_at`
 - `last_ready_at`
+- `first_started_at`
 - `done_at`
 - `kind`
 - `parent_task_id`
 - `sequence_index`
 - `commit_plan`
 - `allow_when_blocked`
+- `block_reason`
+- `resume_next_step`
+
+Task timestamps:
+
+- `created_at`: row creation time.
+- `ready_at`: time the task entered the current ready-queue wait. Cleared when the task leaves `ready`.
+- `last_ready_at`: most recent time the task entered `ready`, including internal requeues between build, review, rework, and finalization.
+- `first_started_at`: first status transition to `running` (first actual pickup). This is the durable wall-clock runtime start. It is not set while the task is waiting in the initial ready queue, and later requeues or blocked/resumed lifecycle steps do not reset it. Missing values are recovered from the earliest retained `run_log` row when one exists. The `last_ready_at`/`ready_at` fallback applies only during the one-time missing-column migration and when importing a legacy source that lacks `first_started_at`.
+- `done_at`: terminal completion time.
+- `updated_at`: last task-row mutation.
+
+Dashboard elapsed runtime for a done task is `done_at - first_started_at`. That span excludes initial queue wait and includes internal requeues and blocked time through completion.
 
 #### `task_skips`
 
@@ -220,6 +235,14 @@ Ephemeral operational log.
 - Stores task-scoped orchestrator and agent progress messages
 - Ordered newest-first in the CLI
 - May be purged
+- Automatic retention keeps seven days of history for `done` tasks and for
+  global orchestrator rows (`task_id IS NULL`)
+- Rows belonging to `none`, `ready`, `running`, `blocked`, or
+  `pending_subtasks` tasks are retained
+- `task purge` uses the same eligibility rules; `--days 0` deletes eligible
+  history immediately without changing unfinished-task preservation
+- After a purge that deleted rows, idle-time maintenance runs `VACUUM` so the
+  database file on disk can shrink
 
 #### `orchestrator_runtime`
 
@@ -256,8 +279,15 @@ Runtime status values:
   the orchestrator for the current repo without process hunting.
 - `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
 - `.kanban-orchestra/dashboard.json`: repo-scoped metadata for the dashboard
-  owned by the orchestrator instance, including PID, host, port, and URL.
-- `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts
+  owned by the orchestrator instance, including PID, host, port, localhost URL,
+  and optional Tailscale remote URL when Serve publication succeeds.
+- `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts.
+  Idle-time maintenance deletes `*.log` transcript files older than seven days
+  only for completed (`done`) tasks, then removes empty `task-<id>` directories.
+  File cleanup starts from the trusted database-parent directory, opens
+  `.kanban-orchestra` and `artifacts` descriptor-relatively without following
+  links, then traverses and deletes through no-follow directory descriptors.
+  It does not take paths from database content.
 - `.kanban-orchestra/active-agent-processes.json`: transient process-group
   metadata for active agent children, maintained by the active-agent runtime
   helpers
@@ -271,14 +301,14 @@ Runtime status values:
 - `running`: currently being processed by the orchestrator
 - `done`: landed and submitted
 - `blocked`: requires human intervention
-- `pending_subtasks`: approved supertask plan with child execution in progress
+- `pending_subtasks`: supertask child and follow-up execution in progress
 
 ### `next_step`
 
 - `commit-make`: coder builds or finalizes a commit task
 - `commit-review`: reviewer inspects the staged diff for a commit task
 - `commit-make-supertask`: coder plans a supertask
-- `commit-review-supertask`: reviewer reviews a supertask plan
+- `commit-review-supertask`: reviewer performs final aggregate supertask review
 - `commit-plan`: coder drafts an implementation plan for a normal task
 - `commit-plan-review`: reviewer approves or rejects the drafted plan
 - `none`: no pending step
@@ -297,7 +327,7 @@ Rules:
 - The orchestrator records the resulting `HEAD` as `commit_hash`.
 - If `commit-make` becomes blocked after local changes exist, the orchestrator stages and stashes WIP, records `stash_ref`, and leaves a durable comment.
 
-## Deferred Full-Build Validation (SKIP_BUILD_UNTIL_APPROVED)
+## Deferred Full-Build Validation (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER)
 
 Some repos — particularly those with expensive builds (e.g. iOS apps) — may defer
 full-build validation until after initial code review rather than running it on every
@@ -308,7 +338,7 @@ full-build validation until after initial code review rather than running it on 
 Repos opt in by adding this exact line to their root `AGENTS.md`:
 
 ```
-SKIP_BUILD_UNTIL_APPROVED
+CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER
 ```
 
 The marker must appear as a standalone line (leading/trailing whitespace is ignored).
@@ -320,7 +350,8 @@ When the marker is present:
 
 - The coder **skips the full build** on Path A.
 - The coder **must** record a `validation` comment explicitly stating that the full
-  build was intentionally deferred by `SKIP_BUILD_UNTIL_APPROVED` policy.
+  build was intentionally deferred by
+  `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` policy.
 - Reviewers see this context in the `## Reviewer Handoff` section and must **not**
   reject solely because a full-build result is absent.
 
@@ -408,7 +439,7 @@ function. CLI and orchestrator behavior is driven by this function's output.
 ### Read Commands
 
 ```bash
-task list [--status <status>] [--next-step <step>] [--branch <branch>] [--page <n>]
+task list [--status <status>] [--next-step <step>] [--branch <branch>] [--parent <task-id>] [--page <n>]
 task show <task-id>
 task show-comments <task-id>
 task show-run-log <task-id>
@@ -484,7 +515,8 @@ Required behavior:
 - Read prior comments, especially rejections and human guidance.
 - Implement the requested change.
 - Run the repo-defined validation command when the task requires it. If the repo has
-  `SKIP_BUILD_UNTIL_APPROVED` in `AGENTS.md`, skip the full build on Path A and
+  `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER` in `AGENTS.md`, skip the
+  full build on Path A and
   record a `validation` comment stating the deferral explicitly.
 - Record validation results as a `validation` comment for the current round.
 - Stage the full candidate diff with `git add .`.
@@ -512,10 +544,10 @@ Required behavior:
   return to review or human triage.
 - Read the latest `commit-message` comment.
 - Ensure the canonical footer `Task <id> (<attribution>)` is present. Run `task get-commit-footer <id>` to produce it.
-- If the repo has `SKIP_BUILD_UNTIL_APPROVED`, run the full build now. If the
-  build changes the staged diff, record a `deferred-build-changed` comment and exit
-  without committing; the orchestrator re-enters review. If the build is clean,
-  proceed to commit.
+- If the repo has `CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER`, run the
+  full build now. If the build changes the staged diff, record a
+  `deferred-build-changed` comment and exit without committing; the orchestrator
+  re-enters review. If the build is clean, proceed to commit.
 - Create the real commit with plain `git commit`.
 
 ### `commit-review`
@@ -533,7 +565,8 @@ Required behavior:
 Review aggregation rules:
 
 - The orchestrator looks only at reviewer comments for the current round.
-- A missing reviewer decision after a successful reviewer process is treated as rejection.
+- A missing reviewer decision after a reviewer run — including a nonzero exit, empty or malformed output, or a tool-host/transport failure — is a reviewer infrastructure failure, not a content rejection. `review_round` is left unchanged and the coder is not sent through rework. The orchestrator retries the same review step under `REVIEWER_INFRA_ATTEMPTS` / `REVIEWER_INFRA_BACKOFF_SECONDS`. After those retries are exhausted the task is blocked with `block_reason=reviewer_unavailable` and `resume_next_step` equal to the review step that failed.
+- Explicit reviewer rejections still advance `review_round`, return to the maker step, and count toward `max_review_rounds`.
 - The reviewer comment itself does not set `last_review_decision`; the orchestrator does.
 
 ### Commit Task State Transitions
@@ -556,6 +589,17 @@ Review aggregation rules:
 - `next_step -> commit-make`
 - `review_round += 1`
 - `last_review_decision -> reject`
+
+#### On reviewer infrastructure failure after bounded retries
+
+- `status -> blocked`
+- `next_step -> none`
+- `review_round` unchanged
+- `block_reason -> reviewer_unavailable`
+- `resume_next_step -> commit-review` (or the review step that failed)
+- Staged/WIP state is preserved (`stash_ref` when `commit-review` left a dirty tree)
+
+A later healthy reviewer, smart-unblock recovery, reviewer switch, or explicit human continuation (`task continue` or a durable `CONTINUE`/`RESUME` comment) resumes that review step without granting artificial content-review rounds. `task set --status ready` is refused for this structured reason. When `commit-review` resumes with a recorded `stash_ref`, the orchestrator restores that stash (including the index) before the reviewer runs so `git diff --cached` shows the candidate.
 
 #### On successful Path B finalization
 
@@ -615,6 +659,9 @@ Task planning is distinct from commit review:
 
 - `status -> blocked`
 - `next_step -> none`
+- `block_reason -> reviewer_unavailable`
+- `resume_next_step -> commit-plan-review`
+- `review_round` unchanged
 
 ### Recovery
 
@@ -632,16 +679,21 @@ Supertasks are planning tasks with child execution.
 - A supertask uses `commit-make-supertask` and `commit-review-supertask`.
 - Child tasks must point at a supertask parent.
 - Child tasks inherit the supertask branch.
+- Follow-ups created by any child remain children of the same supertask and
+  are inserted immediately after their source task.
 - Child ordering is controlled by `sequence_index`.
 - Siblings are renumbered at `100` intervals after insertion or reorder.
 
 ### Supertask Planning Flow
 
-1. `commit-make-supertask`: coder writes the plan and creates child tasks
-2. `commit-review-supertask`: reviewer approves or rejects the plan
-3. On approval: supertask becomes `pending_subtasks`
-4. Child tasks execute in sequence
-5. When all children are `done`, the supertask becomes `done`
+1. `commit-make-supertask`: planner writes the plan and creates child tasks
+2. The supertask becomes `pending_subtasks`
+3. Child tasks and recursively created follow-ups execute in sequence
+4. When every associated task is `done`, the supertask queues
+   `commit-review-supertask`
+5. The reviewer evaluates the aggregate commits and child review history
+6. Approval completes the supertask; rejection returns to
+   `commit-make-supertask` so corrective child tasks can be added
 
 ### Child Task Eligibility
 
@@ -655,7 +707,8 @@ A ready child task is eligible only when:
 - Child tasks are created as `ready`.
 - If a child becomes `blocked`, the parent supertask becomes `blocked`.
 - If a blocked child is restored to `ready` and no other siblings remain blocked, the parent returns to `pending_subtasks`.
-- When all children are `done`, the orchestrator marks the parent `done`.
+- When all children and their follow-ups are `done`, the orchestrator queues
+  final supertask review. If that review is skipped, it marks the parent done.
 
 ## Orchestrator Contract
 
@@ -693,6 +746,25 @@ When the file is detected:
 
 The file is a one-shot signal: deletion is the acknowledgment, so the orchestrator will not stop again on the next run unless the file is recreated.
 
+### Native Smart Unblocking
+
+While the orchestrator is running, a background thread reassesses each
+`blocked` task about once a minute. It collects current evidence (task row,
+durable comments, run log, latest transcript, git stash list, and worktree
+status) and asks the configured unblocker agent (`ORCHESTRA_DEFAULT_UNBLOCKER`,
+default `sonnet`) whether recovery is safe.
+
+The agent records exactly one durable comment authored as `smart-unblock`,
+starting with either `RESUME` or `BLOCKED`. The orchestrator then either
+continues the task or leaves that explanation for the operator. Before
+consulting, the watcher looks for a durable human `CONTINUE`/`RESUME` comment
+recorded after the orchestrator `Blocked:` comment and applies that decision
+itself so operators do not race `task continue` / `task set` against dispatch.
+Unchanged evidence is not reconsidered until something in the task's evidence
+changes, and the watcher does not write another explanatory comment for the
+same fingerprint. Stopping the orchestrator stops this recovery loop. There is
+no separate unblock process or command.
+
 ### Instance and Fleet Control
 
 The primary runtime unit is a repo instance: one orchestrator process and one
@@ -721,13 +793,15 @@ names are derived from the basename of the resolved repo path.
 "$ORCHESTRA_DIR/bin/ko-fleet" restart <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" attach <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" logs <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
 `ko-fleet start`:
 - starts the orchestrator/dashboard pair for every selected configured repo
 - refuses duplicates when the repo singleton lock is already live
-- refuses all selected starts when any selected repo is dirty or invalid
+- skips dirty selected repos while continuing to start clean selected repos
+- refuses selected starts when any selected repo configuration is invalid
 - keeps process-supervision details behind the fleet command
 
 `ko-fleet stop`:
@@ -736,15 +810,35 @@ names are derived from the basename of the resolved repo path.
 
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
-`ko-fleet attach`, `ko-fleet logs`, and `ko-fleet dashboard` select by repo
-label/path and then use the selected repo's tmux session, repo-local
-`.kanban-orchestra/orchestrator.log`, and repo-local dashboard metadata.
-`ko-fleet dashboard-open` is an alias for `ko-fleet dashboard`.
+`ko-fleet attach` and `ko-fleet logs` select by repo label/path and then use
+the selected repo's tmux session and repo-local
+`.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
+starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
+that repo's preferred dashboard from repo-local dashboard metadata.
+`ko-fleet dashboard-open` is an explicit open verb that requires a repo
+selector. Both open commands accept `--local` to open the localhost URL
+instead of the preferred Tailscale mapping.
 
-The repo dashboard is the supported UI surface: it is read-only, repo-scoped,
-and attached to the matching orchestrator instance. The old process-manager UI
-and its heartbeat/request/response JSON files are removed, not compatibility
-surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
+The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
+The Fleet Dashboard shows one card per configured repo: name, path, branch,
+status, current task, and ready / recently done / icebox counts. Both the
+Fleet Dashboard and each repo dashboard publish an HTTPS Tailscale Serve proxy
+to the chosen localhost port in the background after startup when the
+`tailscale` CLI is available. Existing exact mappings are reused; a same-port
+HTTPS listener is preferred when that port is free; a free alternate HTTPS
+listener is used when it is not; unrelated Serve routes are never overwritten;
+and mappings persist after the dashboard stops. Tailscale
+absence, authentication failure, startup delay, or Serve failure never blocks
+the localhost dashboard and does not emit dashboard UI warnings. Operator UX
+presents one `Dashboard:` URL: the exact HTTPS mapping when it exists,
+otherwise the localhost URL. The fleet table remains localhost. Each Fleet
+card has one Dashboard action: local Fleet views use localhost and Tailscale
+Fleet views use the exact remote mapping, omitting the action when that mapping
+is unavailable. Play on a stopped card is equivalent to
+`ko-fleet start <configured-repo-label>`. Each repo dashboard is read-only,
+repo-scoped, and attached to the matching orchestrator instance. The old
+process-manager UI and its heartbeat/request/response JSON files are removed,
+not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
 `ko-task`, and `ko-get-update`; active child process metadata is maintained
 independently in `.kanban-orchestra/active-agent-processes.json`. The old
 `BREAK` control is intentionally removed as a remote operator command: it killed
@@ -764,11 +858,12 @@ between `commit-make` and `commit-review`.
 Before running any non-skipped agent-driven step, the orchestrator performs a
 pre-flight ping for the assigned agent.
 
-- Ping prompt: `This is a ping. Respond with ACK.`
-- Any text response counts as a successful acknowledgment.
-- A successful acknowledgment is cached per `(task_id, agent_name)` for the life of the current orchestrator process.
-- On a cache miss with no response, the orchestrator keeps the task pinned, sets runtime `status_message` to a stalled wait message, and retries every `60` seconds.
-- While the orchestrator is stalled on this gate, no other tasks run.
+- Ping prompt for ordinary run steps: `This is a ping. Respond with ACK.`
+- Any text response counts as a successful acknowledgment for ordinary run pings.
+- Reviewer readiness uses a non-self-matching probe: the expected evidence is a SHA-256 of `git diff --cached` recorded in a durable task comment written during the probe. Echoing the probe prompt, a shallow CLI banner, or a bare ACK token cannot satisfy it. A prior run ping does not satisfy a later review probe.
+- A successful acknowledgment is cached per `(task_id, agent_name, purpose)` (`purpose` is `"run"` or `"review"`) for the life of the current orchestrator process.
+- On a cache miss with no response for an ordinary run ping, the orchestrator keeps the task pinned, sets runtime `status_message` to a stalled wait message, and retries every `60` seconds. While stalled on that gate, no other tasks run.
+- A failed reviewer readiness probe does not stall forever. It is an infrastructure failure: the review handler returns `error` into `REVIEWER_INFRA_ATTEMPTS` / `REVIEWER_INFRA_BACKOFF_SECONDS`. Exhausting that bound blocks as `reviewer_unavailable`.
 
 ### Branch Handling
 
@@ -781,8 +876,9 @@ Before non-supertask steps:
 
 ### Review Round Limits
 
-- Maximum review rounds: `5`
-- Reaching the limit blocks the task instead of requeueing it
+- Maximum content-review rounds: `5`
+- Reaching the limit on an explicit rejection blocks the task as `review_cap` instead of requeueing it
+- Reviewer infrastructure failures use a separate bound (`REVIEWER_INFRA_ATTEMPTS`, default 5) and do not consume content-review rounds. Exhausting that bound blocks as `reviewer_unavailable` with `resume_next_step` set to the review step.
 
 ## Recovery and Failure Handling
 
@@ -843,6 +939,10 @@ Primary questions:
 ### Runtime Semantics
 
 - The orchestrator writes a singleton runtime row on startup.
+- When runtime becomes `idle`, the orchestrator runs automatic runtime-history
+  retention: old eligible `run_log` rows and completed-task transcripts are
+  removed, and SQLite is compacted only when rows were deleted. One maintenance
+  summary is logged when anything was deleted.
 - The orchestrator starts the matching dashboard for the same repo instance.
 - Heartbeat updates every `10` seconds.
 - A stale heartbeat indicates a dead or wedged orchestrator even if stored status still says `running`.
@@ -959,14 +1059,20 @@ sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, curre
 ### Unblock A Task
 
 When a task is blocked because the agent needs a decision, context, or manual
-repair:
+repair, first read any durable `smart-unblock` comment already on the task.
+A running orchestrator may have already explained the block or resumed it.
+
+To intervene by hand:
 
 ```bash
 cat <<'EOF' | python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py comment <task-id> --message-stdin --comment
+CONTINUE
 Here is the missing decision or context
 EOF
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py set <task-id> --status ready --next-step commit-make
+python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py continue <task-id>
 ```
+
+For a `review_cap` block, grant extra rounds with `task continue <id> --add-review-rounds N` instead of a bare continue. `task set --status ready` is refused for `review_cap` and `reviewer_unavailable` blocks so `resume_next_step` is restored without racing dispatch. A durable `CONTINUE`/`RESUME` comment is also observed by smart-unblock.
 
 Rules:
 

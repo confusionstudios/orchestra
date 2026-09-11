@@ -1,28 +1,31 @@
 providers:
   cursor:
     label: Cursor {model}
-    command: ["cursor", "agent", "-p", "--model", "{model}", "--yolo", "--trust", "{prompt}"]
+    command: ["agent", "-p", "--model", "{model}", "--yolo", "--trust", "{prompt}"]
   kilo:
     label: Kilo {model}
     command: ["kilo", "--model", "{model}", "run", "{prompt}"]
 
 agents:
   - key: haiku
-    label: Claude Haiku 4.5
-    command: ["claude", "--model", "Haiku", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+    label: Claude Haiku
+    command: ["claude", "--model", "haiku", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text", "--no-session-persistence"]
   - key: sonnet
-    label: Claude Sonnet 4.5
-    command: ["claude", "--model", "Sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+    label: Claude Sonnet
+    command: ["claude", "--model", "sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text", "--no-session-persistence"]
   - key: opus
-    label: Claude Opus 4.6
-    command: ["claude", "--model", "claude-opus-4-6", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+    label: Claude Opus
+    command: ["claude", "--model", "opus", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text", "--no-session-persistence"]
+  - key: fable
+    label: Claude Fable
+    command: ["claude", "--model", "fable", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text", "--no-session-persistence"]
   - key: claude
-    label: Claude Sonnet 4.5
-    command: ["claude", "--model", "Sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text"]
+    label: Claude Sonnet
+    command: ["claude", "--model", "sonnet", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text", "--no-session-persistence"]
   - key: codex
-    label: GPT-5.5
-    command: ["codex", "exec", "--yolo", "{prompt}"]
-    review_command: ["codex", "exec", "review", "--uncommitted", "{prompt}"]
+    label: Codex
+    command: ["codex", "exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"medium\"", "--yolo", "{prompt}"]
+    review_command: ["codex", "exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"medium\"", "review", "{prompt}"]
   - key: antigravity
     label: Antigravity
     command: ["agy", "--print", "{prompt}", "--dangerously-skip-permissions"]
@@ -40,16 +43,22 @@ agents:
     command: ["kilo", "--model", "kilo/anthropic/claude-sonnet-4.6", "run", "{prompt}"]
   - key: cursor-auto
     label: Cursor Auto
-    command: ["cursor", "agent", "-p", "--model", "auto", "--yolo", "--trust", "{prompt}"]
+    command: ["agent", "-p", "--model", "auto", "--yolo", "--trust", "{prompt}"]
   - key: cursor-composer-2.5
     label: Cursor Composer 2.5
-    command: ["cursor", "agent", "-p", "--model", "composer-2.5", "--yolo", "--trust", "{prompt}"]
+    command: ["agent", "-p", "--model", "composer-2.5", "--yolo", "--trust", "{prompt}"]
+  - key: cursor-grok-4.5
+    label: Cursor Grok 4.5
+    command: ["agent", "-p", "--model", "cursor-grok-4.5-high", "--yolo", "--trust", "{prompt}"]
   - key: cursor-opus-4.6
     label: Cursor Opus 4.6
-    command: ["cursor", "agent", "-p", "--model", "claude-4.6-opus-high", "--yolo", "--trust", "{prompt}"]
+    command: ["agent", "-p", "--model", "claude-4.6-opus-high", "--yolo", "--trust", "{prompt}"]
   - key: cursor-opus-4.7
     label: Cursor Opus 4.7
-    command: ["cursor", "agent", "-p", "--model", "claude-opus-4-7-high", "--yolo", "--trust", "{prompt}"]
+    command: ["agent", "-p", "--model", "claude-opus-4-7-high", "--yolo", "--trust", "{prompt}"]
   - key: cursor-sonnet-4.6
     label: Cursor Sonnet 4.6
-    command: ["cursor", "agent", "-p", "--model", "claude-4.6-sonnet-medium", "--yolo", "--trust", "{prompt}"]
+    command: ["agent", "-p", "--model", "claude-4.6-sonnet-medium", "--yolo", "--trust", "{prompt}"]
+
+aliases:
+  grok: cursor:cursor-grok-4.6-high

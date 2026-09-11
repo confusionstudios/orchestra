@@ -5,16 +5,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
-import tomllib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
 DEVLOG_ENV = "ORCH_DEVLOG_DIR"
 PROJECT_ENV = "ORCH_DEVLOG_PROJECT"
-PROJECT_CONFIG = ".orchestra-skill-sync"
 
 
 def default_journal_dir() -> Path:
@@ -38,20 +37,15 @@ def git_repo_root(path: Path) -> Path | None:
     return Path(result.stdout.strip())
 
 
-def project_from_config(path: Path) -> str | None:
-    config_path = path / PROJECT_CONFIG
-    if not config_path.is_file():
-        return None
-    try:
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"invalid {PROJECT_CONFIG}: {exc}") from exc
-    raw = data.get("devlog_project")
-    if raw is None:
-        return None
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError(f"{PROJECT_CONFIG} devlog_project must be a non-empty string")
-    return raw.strip()
+def readable_project_name(repo_root: Path) -> str:
+    """Derive a readable project label from a git repo root directory name."""
+    raw = repo_root.name.strip()
+    if not raw:
+        raise ValueError(f"cannot derive project name from empty repo path: {repo_root}")
+    parts = [part for part in re.split(r"[-_]+", raw) if part]
+    if not parts:
+        raise ValueError(f"cannot derive project name from repo directory: {raw!r}")
+    return " ".join(part[:1].upper() + part[1:] for part in parts)
 
 
 def default_project(cwd: Path | None = None) -> str:
@@ -62,13 +56,11 @@ def default_project(cwd: Path | None = None) -> str:
     start = (cwd or Path.cwd()).resolve()
     repo_root = git_repo_root(start)
     if repo_root is not None:
-        configured = project_from_config(repo_root)
-        if configured:
-            return configured
+        return readable_project_name(repo_root)
 
     raise ValueError(
         f"project is required; pass --project, set {PROJECT_ENV}, "
-        f"or set devlog_project in {PROJECT_CONFIG}"
+        "or run from a Git repository"
     )
 
 
@@ -217,7 +209,7 @@ def parse_args() -> argparse.Namespace:
         "--project",
         help=(
             "Project label to place first in the bullet. Defaults to "
-            f"${PROJECT_ENV} or devlog_project in {PROJECT_CONFIG}."
+            f"${PROJECT_ENV} or a readable name from the current Git repo."
         ),
     )
     parser.add_argument(

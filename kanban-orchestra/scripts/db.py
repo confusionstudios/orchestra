@@ -8,14 +8,23 @@ and all queries used by task.py and orchestrator.py.
 import sqlite3
 import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+import config
+
+SCHEMA_VERSION = 19
 LOCK_FILE_NAME = "kanban-orchestra.lock"
 COMMIT_TASK_KINDS = {"commit", "task"}
+BLOCK_REASON_REVIEW_CAP = "review_cap"
+BLOCK_REASON_REVIEWER_UNAVAILABLE = "reviewer_unavailable"
+DEFAULT_MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
+RUN_LOG_RETENTION_DAYS = 7
+COMPLETED_TASK_STATUS = "done"
+TASK_ARTIFACT_DIR_PREFIX = "task-"
 
-SCHEMA_SQL = """\
+SCHEMA_SQL = f"""\
 CREATE TABLE IF NOT EXISTS tasks (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     title                   TEXT NOT NULL,
@@ -35,11 +44,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     coder_agent             TEXT,
     reviewer_agent          TEXT,
     review_round            INTEGER DEFAULT 0,
+    max_review_rounds       INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS},
     last_review_decision    TEXT DEFAULT 'none'
         CHECK(last_review_decision IN ('none', 'approve', 'reject')),
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     ready_at                DATETIME DEFAULT NULL,
     last_ready_at           DATETIME DEFAULT NULL,
+    first_started_at        DATETIME DEFAULT NULL,
     done_at                 DATETIME DEFAULT NULL,
     updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
     kind                    TEXT NOT NULL DEFAULT 'commit'
@@ -48,7 +59,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     sequence_index          INTEGER,
     commit_plan             TEXT,
     follow_up_task_id       INTEGER REFERENCES tasks(id),
-    allow_when_blocked      INTEGER NOT NULL DEFAULT 0
+    allow_when_blocked      INTEGER NOT NULL DEFAULT 0,
+    block_reason            TEXT,
+    resume_next_step        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_skips (
@@ -116,6 +129,32 @@ def get_db_path(db_path: str | None = None) -> str:
     if os.environ.get("KANBAN_DB"):
         return os.environ["KANBAN_DB"]
     return str(get_workspace()["db_path"])
+
+
+def get_db_path_without_git(
+    db_path: str | None = None,
+    *,
+    cwd: str | None = None,
+) -> str:
+    """Resolve the Kanban DB path without invoking Git.
+
+    Order: explicit arg, ``KANBAN_DB``, then walk upward from ``cwd`` (default:
+    process cwd) looking for an existing ``kanban-orchestra.db`` file.
+    """
+    if db_path:
+        return db_path
+    if os.environ.get("KANBAN_DB"):
+        return os.environ["KANBAN_DB"]
+    start = Path(cwd or os.getcwd()).resolve()
+    for directory in [start, *start.parents]:
+        candidate = directory / "kanban-orchestra.db"
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeError(
+        "Could not locate kanban-orchestra.db from the current directory "
+        "without Git. Set KANBAN_DB or run from a worktree that contains "
+        "kanban-orchestra.db."
+    )
 
 
 def get_repo_root(cwd: str | None = None) -> Path:
@@ -374,9 +413,9 @@ def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
     """)
 
 
-def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str]) -> None:
-    """Migrate the old tasks.skip_commit_plan flag into task_skips rows."""
-    value_expr = {
+def _tasks_value_expr(task_cols: set[str]) -> dict[str, str]:
+    """Column expressions used when recreating the tasks table during migration."""
+    return {
         "id": "id",
         "title": "title",
         "description": "description" if "description" in task_cols else "NULL",
@@ -388,10 +427,15 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
         "coder_agent": "coder_agent" if "coder_agent" in task_cols else "NULL",
         "reviewer_agent": "reviewer_agent" if "reviewer_agent" in task_cols else "NULL",
         "review_round": "review_round" if "review_round" in task_cols else "0",
+        "max_review_rounds": (
+            "max_review_rounds" if "max_review_rounds" in task_cols
+            else str(DEFAULT_MAX_REVIEW_ROUNDS)
+        ),
         "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
         "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
         "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
         "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
+        "first_started_at": "first_started_at" if "first_started_at" in task_cols else "NULL",
         "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
         "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
         "kind": "kind" if "kind" in task_cols else "'commit'",
@@ -400,16 +444,15 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
         "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
         "follow_up_task_id": "follow_up_task_id" if "follow_up_task_id" in task_cols else "NULL",
         "allow_when_blocked": "allow_when_blocked" if "allow_when_blocked" in task_cols else "0",
+        "block_reason": "block_reason" if "block_reason" in task_cols else "NULL",
+        "resume_next_step": "resume_next_step" if "resume_next_step" in task_cols else "NULL",
     }
-    columns = list(value_expr)
 
-    conn.execute("PRAGMA foreign_keys=OFF")
-    try:
-        conn.executescript(f"""
-            BEGIN;
-            CREATE TEMP TABLE skip_commit_plan_tasks AS
-                SELECT id FROM tasks WHERE skip_commit_plan = 1;
-            CREATE TABLE tasks_migrated (
+
+def _tasks_create_table_sql(table_name: str = "tasks_migrated") -> str:
+    """Current tasks DDL used by table-recreation migrations."""
+    return f"""
+            CREATE TABLE {table_name} (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 title                   TEXT NOT NULL,
                 description             TEXT,
@@ -428,11 +471,13 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                 coder_agent             TEXT,
                 reviewer_agent          TEXT,
                 review_round            INTEGER DEFAULT 0,
+                max_review_rounds       INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS},
                 last_review_decision    TEXT DEFAULT 'none'
                     CHECK(last_review_decision IN ('none', 'approve', 'reject')),
                 created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 ready_at                DATETIME DEFAULT NULL,
                 last_ready_at           DATETIME DEFAULT NULL,
+                first_started_at        DATETIME DEFAULT NULL,
                 done_at                 DATETIME DEFAULT NULL,
                 updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
                 kind                    TEXT NOT NULL DEFAULT 'commit'
@@ -441,8 +486,25 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
                 sequence_index          INTEGER,
                 commit_plan             TEXT,
                 follow_up_task_id       INTEGER REFERENCES tasks(id),
-                allow_when_blocked      INTEGER NOT NULL DEFAULT 0
+                allow_when_blocked      INTEGER NOT NULL DEFAULT 0,
+                block_reason            TEXT,
+                resume_next_step        TEXT
             );
+    """
+
+
+def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str]) -> None:
+    """Migrate the old tasks.skip_commit_plan flag into task_skips rows."""
+    value_expr = _tasks_value_expr(task_cols)
+    columns = list(value_expr)
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(f"""
+            BEGIN;
+            CREATE TEMP TABLE skip_commit_plan_tasks AS
+                SELECT id FROM tasks WHERE skip_commit_plan = 1;
+            {_tasks_create_table_sql("tasks_migrated")}
             INSERT INTO tasks_migrated ({", ".join(columns)})
                 SELECT {", ".join(value_expr[column] for column in columns)}
                 FROM tasks;
@@ -471,71 +533,14 @@ def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str
 
 def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> None:
     """Recreate tasks with current next_step/kind CHECK constraints."""
-    value_expr = {
-        "id": "id",
-        "title": "title",
-        "description": "description" if "description" in task_cols else "NULL",
-        "status": "status" if "status" in task_cols else "'none'",
-        "next_step": "next_step" if "next_step" in task_cols else "'commit-make'",
-        "branch": "branch" if "branch" in task_cols else "NULL",
-        "commit_hash": "commit_hash" if "commit_hash" in task_cols else "NULL",
-        "stash_ref": "stash_ref" if "stash_ref" in task_cols else "NULL",
-        "coder_agent": "coder_agent" if "coder_agent" in task_cols else "NULL",
-        "reviewer_agent": "reviewer_agent" if "reviewer_agent" in task_cols else "NULL",
-        "review_round": "review_round" if "review_round" in task_cols else "0",
-        "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
-        "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
-        "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
-        "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
-        "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
-        "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
-        "kind": "kind" if "kind" in task_cols else "'commit'",
-        "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
-        "sequence_index": "sequence_index" if "sequence_index" in task_cols else "NULL",
-        "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
-        "follow_up_task_id": "follow_up_task_id" if "follow_up_task_id" in task_cols else "NULL",
-        "allow_when_blocked": "allow_when_blocked" if "allow_when_blocked" in task_cols else "0",
-    }
+    value_expr = _tasks_value_expr(task_cols)
     columns = list(value_expr)
 
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
         conn.executescript(f"""
             BEGIN;
-            CREATE TABLE tasks_migrated (
-                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                title                   TEXT NOT NULL,
-                description             TEXT,
-                status                  TEXT NOT NULL DEFAULT 'none'
-                    CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                next_step               TEXT NOT NULL DEFAULT 'commit-make'
-                    CHECK(next_step IN ('commit-make', 'commit-review',
-                                        'commit-make-supertask', 'commit-review-supertask',
-                                        'commit-plan', 'commit-plan-review',
-                                        'pull-request-make', 'pull-request-review',
-                                        'other-make', 'other-review',
-                                        'none')),
-                branch                  TEXT,
-                commit_hash             TEXT,
-                stash_ref               TEXT,
-                coder_agent             TEXT,
-                reviewer_agent          TEXT,
-                review_round            INTEGER DEFAULT 0,
-                last_review_decision    TEXT DEFAULT 'none'
-                    CHECK(last_review_decision IN ('none', 'approve', 'reject')),
-                created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ready_at                DATETIME DEFAULT NULL,
-                last_ready_at           DATETIME DEFAULT NULL,
-                done_at                 DATETIME DEFAULT NULL,
-                updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                kind                    TEXT NOT NULL DEFAULT 'commit'
-                    CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
-                parent_task_id          INTEGER REFERENCES tasks(id),
-                sequence_index          INTEGER,
-                commit_plan             TEXT,
-                follow_up_task_id       INTEGER REFERENCES tasks(id),
-                allow_when_blocked      INTEGER NOT NULL DEFAULT 0
-            );
+            {_tasks_create_table_sql("tasks_migrated")}
             INSERT INTO tasks_migrated ({", ".join(columns)})
                 SELECT {", ".join(value_expr[column] for column in columns)}
                 FROM tasks;
@@ -630,6 +635,9 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
     if not task_cols:
         return  # Fresh DB — no tables yet
 
+    # Capture before table-recreation migrations that introduce the column.
+    needs_first_started_at_legacy_fallback = "first_started_at" not in task_cols
+
     if "skip_commit_plan" in task_cols:
         _migrate_skip_commit_plan_tasks(conn, task_cols)
         task_cols = {
@@ -672,6 +680,22 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
             "ALTER TABLE tasks ADD COLUMN allow_when_blocked INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
+    if "max_review_rounds" not in task_cols:
+        # Existing tasks inherit the present global default; new tasks also use it.
+        conn.execute(
+            f"ALTER TABLE tasks ADD COLUMN max_review_rounds "
+            f"INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS}"
+        )
+        conn.commit()
+        task_cols.add("max_review_rounds")
+    if "block_reason" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN block_reason TEXT")
+        conn.commit()
+        task_cols.add("block_reason")
+    if "resume_next_step" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN resume_next_step TEXT")
+        conn.commit()
+        task_cols.add("resume_next_step")
     if "reviewer_agent" not in task_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN reviewer_agent TEXT")
         conn.commit()
@@ -683,6 +707,20 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN done_at DATETIME DEFAULT NULL")
         conn.execute("UPDATE tasks SET done_at = updated_at WHERE status = 'done'")
         conn.commit()
+        task_cols.add("done_at")
+    if "first_started_at" not in task_cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN first_started_at DATETIME DEFAULT NULL"
+        )
+        conn.commit()
+        task_cols.add("first_started_at")
+
+    # Refresh after ALTER TABLE so later table-recreation migrations copy
+    # newly added timestamp columns instead of inserting NULL placeholders.
+    task_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
 
     # The task_skips table must exist and its step CHECK constraint must be current.
     skips_schema = conn.execute(
@@ -800,6 +838,67 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
                 COMMIT;
             """)
 
+    _backfill_first_started_at(
+        conn, use_legacy_fallback=needs_first_started_at_legacy_fallback
+    )
+    conn.commit()
+
+
+def _backfill_first_started_at(conn, *, use_legacy_fallback=False, task_ids=None):
+    """Fill missing first_started_at from run_log, optionally with a legacy fallback.
+
+    Prefer the earliest retained task run_log row (first actual pickup). The
+    last_ready_at/ready_at fallback is only for the one-time missing-column
+    migration and legacy-source import. Current-schema reconnects must not
+    treat queue timestamps as a start time, including blocked tasks that have
+    not yet transitioned to running.
+    """
+    task_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    if "first_started_at" not in task_cols:
+        return
+    id_clause = ""
+    id_params = []
+    if task_ids is not None:
+        if not task_ids:
+            return
+        id_clause = f" AND tasks.id IN ({', '.join('?' for _ in task_ids)})"
+        id_params = list(task_ids)
+    tables = set(_list_user_tables(conn))
+    if "run_log" in tables:
+        conn.execute(
+            f"""
+            UPDATE tasks
+            SET first_started_at = (
+                SELECT MIN(created_at) FROM run_log WHERE run_log.task_id = tasks.id
+            )
+            WHERE first_started_at IS NULL
+              AND EXISTS (SELECT 1 FROM run_log WHERE run_log.task_id = tasks.id)
+              {id_clause}
+            """,
+            id_params,
+        )
+    if not use_legacy_fallback:
+        return
+    fallback_cols = [
+        column
+        for column in ("last_ready_at", "ready_at")
+        if column in task_cols
+    ]
+    if fallback_cols:
+        conn.execute(
+            f"""
+            UPDATE tasks
+            SET first_started_at = COALESCE({", ".join(fallback_cols)})
+            WHERE first_started_at IS NULL
+              AND status IN ('running', 'blocked', 'done', 'pending_subtasks')
+              {id_clause}
+            """,
+            id_params,
+        )
+
 
 def _row_to_task(row):
     return dict(row)
@@ -847,9 +946,9 @@ def add_task(
         """INSERT INTO tasks (
                title, description, branch, coder_agent, reviewer_agent,
                kind, parent_task_id, sequence_index, next_step, status,
-               allow_when_blocked
+               allow_when_blocked, max_review_rounds
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             description,
@@ -862,6 +961,7 @@ def add_task(
             next_step,
             status,
             int(bool(allow_when_blocked)),
+            DEFAULT_MAX_REVIEW_ROUNDS,
         ),
     )
     task_id = cur.lastrowid
@@ -933,10 +1033,18 @@ READY_TASK_ORDER_BY = (
 )
 
 
-def list_tasks(conn, status=None, next_step=None, branch=None, page=1, page_size=20):
+def list_tasks(
+    conn,
+    status=None,
+    next_step=None,
+    branch=None,
+    page=1,
+    page_size=20,
+    parent=None,
+):
     query = (
         "SELECT id, title, status, next_step, branch, coder_agent, reviewer_agent, "
-        "review_round, created_at, ready_at, last_ready_at, done_at, updated_at, "
+        "review_round, created_at, ready_at, last_ready_at, first_started_at, done_at, updated_at, "
         "kind, parent_task_id, sequence_index, allow_when_blocked "
         "FROM tasks WHERE 1=1"
     )
@@ -950,7 +1058,10 @@ def list_tasks(conn, status=None, next_step=None, branch=None, page=1, page_size
     if branch:
         query += " AND branch = ?"
         params.append(branch)
-    if status == "ready":
+    if parent is not None:
+        query += " AND parent_task_id = ?"
+        params.append(parent)
+    if status == "ready" or parent is not None:
         query += f" ORDER BY {READY_TASK_ORDER_BY}"
     else:
         query += " ORDER BY id ASC"
@@ -973,17 +1084,17 @@ def update_task(conn, task_id, **fields):
     allowed = {
         "title", "description", "status", "next_step", "branch",
         "commit_hash", "stash_ref", "coder_agent", "reviewer_agent",
-        "review_round", "last_review_decision", "ready_at",
-        "last_ready_at", "done_at",
+        "review_round", "max_review_rounds", "last_review_decision", "ready_at",
+        "last_ready_at", "first_started_at", "done_at",
         "sequence_index", "commit_plan", "follow_up_task_id",
-        "allow_when_blocked",
+        "allow_when_blocked", "block_reason", "resume_next_step",
     }
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"Cannot update fields: {bad}")
     if "status" in fields:
         current = conn.execute(
-            "SELECT status, ready_at, done_at FROM tasks WHERE id = ?",
+            "SELECT status, ready_at, done_at, first_started_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if current:
@@ -1000,6 +1111,12 @@ def update_task(conn, task_id, **fields):
                         fields["done_at"] = "CURRENT_TIMESTAMP"
                 else:
                     fields["done_at"] = None
+            if (
+                new_status == "running"
+                and current["first_started_at"] is None
+                and "first_started_at" not in fields
+            ):
+                fields["first_started_at"] = "CURRENT_TIMESTAMP"
     fields["updated_at"] = "CURRENT_TIMESTAMP"
     sets = []
     params = []
@@ -1020,6 +1137,12 @@ def delete_task(conn, task_id):
         raise ValueError(f"Task {task_id} not found")
     if task["status"] != "none":
         raise ValueError(f"Can only delete tasks with status 'none', got '{task['status']}'")
+    conn.execute(
+        """UPDATE tasks
+           SET follow_up_task_id = NULL, updated_at = CURRENT_TIMESTAMP
+           WHERE follow_up_task_id = ?""",
+        (task_id,),
+    )
     conn.execute("DELETE FROM run_log WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM comments WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -1067,28 +1190,280 @@ def get_orchestrator_run_log(conn, limit=200):
     return [dict(r) for r in rows]
 
 
-def purge_run_log(conn, before_date=None, days=None):
-    """Purge ephemeral run_log entries. Defaults to done tasks older than 30 days."""
-    if before_date:
-        conn.execute(
-            "DELETE FROM run_log WHERE created_at < ?", (before_date,)
-        )
-    elif days is not None:
-        if days == 0:
-            conn.execute("DELETE FROM run_log")
-        else:
-            conn.execute(
-                "DELETE FROM run_log WHERE created_at < datetime('now', ?)",
-                (f"-{days} days",),
-            )
-    else:
-        # Default: purge logs for done tasks older than 30 days
-        conn.execute(
-            """DELETE FROM run_log WHERE task_id IN (
-                SELECT id FROM tasks WHERE status = 'done'
-            ) AND created_at < datetime('now', '-30 days')"""
-        )
+def _empty_purge_result(**overrides):
+    result = {
+        "deleted_rows": 0,
+        "deleted_transcripts": 0,
+        "reclaimed_db_bytes": 0,
+        "reclaimed_artifact_bytes": 0,
+        "compacted": False,
+    }
+    result.update(overrides)
+    return result
+
+
+def format_purge_summary(result):
+    """Return one concise maintenance line for a purge result."""
+    return (
+        "Maintenance purge: "
+        f"deleted {result.get('deleted_rows', 0)} run_log rows, "
+        f"{result.get('deleted_transcripts', 0)} transcripts; "
+        f"reclaimed {result.get('reclaimed_db_bytes', 0)} B database, "
+        f"{result.get('reclaimed_artifact_bytes', 0)} B artifacts"
+    )
+
+
+def _sqlite_disk_usage(db_path):
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += Path(f"{db_path}{suffix}").stat().st_size
+        except FileNotFoundError:
+            pass
+    return total
+
+
+def _vacuum(conn):
+    """Rewrite the database to reclaim free pages. Requires no open transaction.
+
+    In WAL mode the compact copy lands in the WAL, so a truncate checkpoint is
+    required before the main database file shrinks on disk.
+    """
     conn.commit()
+    isolation = conn.isolation_level
+    try:
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.isolation_level = isolation
+
+
+def _parse_before_date_posix(before_date):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(before_date, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_task_artifact_id(name):
+    if not name.startswith(TASK_ARTIFACT_DIR_PREFIX):
+        return None
+    suffix = name[len(TASK_ARTIFACT_DIR_PREFIX):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+_DIRECTORY_NOFOLLOW_FLAGS = _DIRECTORY_FLAGS | os.O_NOFOLLOW
+_RUNTIME_DIR_NAME = ".kanban-orchestra"
+_ARTIFACTS_DIR_NAME = "artifacts"
+
+
+def _open_directory_nofollow(path, *, dir_fd=None):
+    """Open a directory without following a symlink at the last component."""
+    if dir_fd is None:
+        return os.open(path, _DIRECTORY_NOFOLLOW_FLAGS)
+    return os.open(path, _DIRECTORY_NOFOLLOW_FLAGS, dir_fd=dir_fd)
+
+
+def _open_nested_directory_nofollow(parent_path, *components):
+    """Open nested directories from a trusted parent without following links.
+
+    The parent is opened by its already-resolved path. Each additional
+    component is opened descriptor-relatively with O_DIRECTORY|O_NOFOLLOW so
+    an intermediate symlink cannot redirect traversal.
+    """
+    fds = []
+    try:
+        fds.append(os.open(os.fspath(parent_path), _DIRECTORY_FLAGS))
+        for component in components:
+            if not _is_simple_filename(component):
+                raise OSError("refusing unsafe path component")
+            fds.append(_open_directory_nofollow(component, dir_fd=fds[-1]))
+        return fds.pop()
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _open_canonical_artifacts_fd(db_path):
+    """Open the canonical artifacts directory from the database parent."""
+    return _open_nested_directory_nofollow(
+        Path(db_path).resolve().parent,
+        _RUNTIME_DIR_NAME,
+        _ARTIFACTS_DIR_NAME,
+    )
+
+
+def _is_simple_filename(name):
+    return (
+        name not in (".", "..")
+        and os.sep not in name
+        and (os.altsep is None or os.altsep not in name)
+    )
+
+
+def _completed_task_ids(conn):
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = ?",
+        (COMPLETED_TASK_STATUS,),
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def _purge_completed_task_transcripts(db_path, done_task_ids, cutoff_ts):
+    """Delete old transcript files under the canonical artifacts root.
+
+    Starts from the trusted directory that contains the database, then opens
+    `.kanban-orchestra` and `artifacts` descriptor-relatively with
+    O_DIRECTORY|O_NOFOLLOW. Task directories are opened the same way so a
+    swapped symlink cannot redirect cleanup outside the canonical tree.
+    """
+    deleted = 0
+    reclaimed = 0
+    if cutoff_ts is None or not done_task_ids:
+        return deleted, reclaimed
+
+    try:
+        root_fd = _open_canonical_artifacts_fd(db_path)
+    except OSError:
+        return deleted, reclaimed
+
+    try:
+        with os.scandir(root_fd) as dir_entries:
+            for entry in dir_entries:
+                task_id = _parse_task_artifact_id(entry.name)
+                if task_id is None or task_id not in done_task_ids:
+                    continue
+                if not _is_simple_filename(entry.name):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    task_fd = _open_directory_nofollow(entry.name, dir_fd=root_fd)
+                except OSError:
+                    continue
+                try:
+                    deleted_here, reclaimed_here = _purge_task_transcript_dir(
+                        task_fd, cutoff_ts
+                    )
+                finally:
+                    os.close(task_fd)
+                deleted += deleted_here
+                reclaimed += reclaimed_here
+                try:
+                    os.rmdir(entry.name, dir_fd=root_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(root_fd)
+    return deleted, reclaimed
+
+
+def _purge_task_transcript_dir(task_fd, cutoff_ts):
+    deleted = 0
+    reclaimed = 0
+    try:
+        file_entries = os.scandir(task_fd)
+    except OSError:
+        return deleted, reclaimed
+
+    with file_entries:
+        for entry in file_entries:
+            if not entry.name.endswith(".log") or not _is_simple_filename(entry.name):
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_mtime >= cutoff_ts:
+                continue
+            try:
+                os.unlink(entry.name, dir_fd=task_fd)
+            except OSError:
+                continue
+            deleted += 1
+            reclaimed += max(0, st.st_size)
+    return deleted, reclaimed
+
+
+def purge_run_log(conn, before_date=None, days=None, compact=False):
+    """Purge ephemeral runtime history for completed work.
+
+    Default retention is seven days. Eligible rows are run_log entries for
+    done tasks and global orchestrator entries (`task_id IS NULL`). Unfinished
+    task history, task records, and comments are preserved. Old transcript
+    files for completed tasks are removed from the canonical artifacts root.
+    Cleanup opens `.kanban-orchestra` and `artifacts` from the database parent
+    through no-follow directory descriptors. When `compact` is true and rows
+    were deleted, SQLite pages are reclaimed with VACUUM.
+    """
+    if days is not None and days < 0:
+        raise ValueError("days must be >= 0")
+
+    params = [COMPLETED_TASK_STATUS]
+    if before_date:
+        cutoff_sql = "created_at < ?"
+        params.append(before_date)
+        file_cutoff = _parse_before_date_posix(before_date)
+    elif days == 0:
+        cutoff_sql = "1"
+        file_cutoff = time.time()
+    else:
+        retention = RUN_LOG_RETENTION_DAYS if days is None else days
+        cutoff_sql = "created_at < datetime('now', ?)"
+        params.append(f"-{retention} days")
+        file_cutoff = time.time() - retention * 86400
+
+    db_path = get_connection_db_path(conn)
+    before_disk = _sqlite_disk_usage(db_path) if compact and db_path else 0
+
+    deleted_rows = conn.execute(
+        "DELETE FROM run_log WHERE "
+        "(task_id IS NULL OR task_id IN "
+        "(SELECT id FROM tasks WHERE status = ?)) "
+        f"AND ({cutoff_sql})",
+        params,
+    ).rowcount
+    conn.commit()
+    if deleted_rows is None or deleted_rows < 0:
+        deleted_rows = 0
+
+    deleted_transcripts = 0
+    reclaimed_artifact_bytes = 0
+    if db_path and file_cutoff is not None:
+        deleted_transcripts, reclaimed_artifact_bytes = (
+            _purge_completed_task_transcripts(
+                db_path,
+                _completed_task_ids(conn),
+                file_cutoff,
+            )
+        )
+
+    compacted = False
+    reclaimed_db_bytes = 0
+    if compact and deleted_rows and db_path:
+        try:
+            _vacuum(conn)
+            compacted = True
+        except sqlite3.Error:
+            compacted = False
+        if compacted:
+            reclaimed_db_bytes = max(0, before_disk - _sqlite_disk_usage(db_path))
+
+    return _empty_purge_result(
+        deleted_rows=deleted_rows,
+        deleted_transcripts=deleted_transcripts,
+        reclaimed_db_bytes=reclaimed_db_bytes,
+        reclaimed_artifact_bytes=reclaimed_artifact_bytes,
+        compacted=compacted,
+    )
 
 
 # ── Comments ───────────────────────────────────────────────────────────
@@ -1135,7 +1510,7 @@ def get_comments(conn, task_id):
 
 # ── Queries for orchestrator ───────────────────────────────────────────
 
-def find_ready_task(conn):
+def find_ready_task(conn, exclude_ids=None):
     """Find the first queued ready task, ordered by sequence_index then id.
 
     When any supertask is in ``pending_subtasks``, only its runnable children
@@ -1145,9 +1520,19 @@ def find_ready_task(conn):
     Child tasks (parent_task_id IS NOT NULL) are only eligible when:
       1. Their parent supertask has status = 'pending_subtasks', AND
       2. No earlier sibling (lower sequence_index) is still non-done.
+
+    ``exclude_ids`` skips those task ids (used to keep a task under
+    smart-unblock consultation undispatchable even if status was mutated).
     """
+    excluded = [int(i) for i in (exclude_ids or ()) if i is not None]
+    exclude_sql = ""
+    params: list = []
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        exclude_sql = f" AND id NOT IN ({placeholders})"
+        params.extend(excluded)
     row = conn.execute(
-        """WITH has_active_supertask(active) AS (
+        f"""WITH has_active_supertask(active) AS (
                SELECT EXISTS (
                    SELECT 1 FROM tasks active_parent WHERE active_parent.status = 'pending_subtasks'
                )
@@ -1159,6 +1544,7 @@ def find_ready_task(conn):
            )
            SELECT * FROM tasks
            WHERE status = 'ready'
+           {exclude_sql}
            AND (
                (SELECT blocked FROM has_blocked_task) = 0
                OR allow_when_blocked = 1
@@ -1200,7 +1586,8 @@ def find_ready_task(conn):
            )
            ORDER BY CASE WHEN sequence_index IS NULL THEN 1 ELSE 0 END ASC,
                     sequence_index ASC, id ASC
-           LIMIT 1"""
+           LIMIT 1""",
+        params,
     ).fetchone()
     return _row_to_task(row) if row else None
 
@@ -1289,6 +1676,43 @@ def renumber_siblings(conn, parent_task_id):
             (new_index, child["id"]),
         )
     conn.commit()
+
+
+def attach_follow_up_to_supertask(conn, source_task_id, follow_up_task_id):
+    """Attach a detached follow-up after its source within the same supertask."""
+    source = get_task(conn, source_task_id)
+    follow_up = get_task(conn, follow_up_task_id)
+    if not source or not follow_up:
+        raise ValueError("source task and follow-up task must both exist")
+
+    parent_id = source.get("parent_task_id")
+    if parent_id is None:
+        return False
+    if follow_up.get("parent_task_id") == parent_id:
+        return True
+    if follow_up.get("parent_task_id") is not None:
+        raise ValueError(
+            f"Follow-up task {follow_up_task_id} already belongs to "
+            f"supertask {follow_up['parent_task_id']}"
+        )
+
+    parent = get_task(conn, parent_id)
+    if not parent or parent.get("kind") != "supertask":
+        raise ValueError(f"Parent task {parent_id} is not a supertask")
+
+    renumber_siblings(conn, parent_id)
+    source = get_task(conn, source_task_id)
+    sequence_index = (source.get("sequence_index") or 0) + 1
+    conn.execute(
+        """UPDATE tasks
+           SET parent_task_id = ?, sequence_index = ?, branch = ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?""",
+        (parent_id, sequence_index, parent["branch"], follow_up_task_id),
+    )
+    renumber_siblings(conn, parent_id)
+    conn.commit()
+    return True
 
 
 def reposition_task(conn, task_id, *, before_id=None, after_id=None):
@@ -1419,3 +1843,273 @@ def get_runtime(conn):
         "SELECT * FROM orchestrator_runtime WHERE singleton = 1"
     ).fetchone()
     return dict(row) if row else None
+
+
+# ── Worktree database import ───────────────────────────────────────────
+
+IMPORT_TASK_TABLES = ("tasks", "task_skips", "comments", "run_log")
+
+# Columns copied from a source tasks row into the target insert.
+_IMPORT_TASK_COLUMNS = (
+    "title",
+    "description",
+    "status",
+    "next_step",
+    "branch",
+    "commit_hash",
+    "stash_ref",
+    "coder_agent",
+    "reviewer_agent",
+    "review_round",
+    "max_review_rounds",
+    "last_review_decision",
+    "created_at",
+    "ready_at",
+    "last_ready_at",
+    "first_started_at",
+    "done_at",
+    "updated_at",
+    "kind",
+    "sequence_index",
+    "commit_plan",
+    "allow_when_blocked",
+    "block_reason",
+    "resume_next_step",
+)
+
+
+def resolve_worktree_db_path(path: str | Path) -> Path:
+    """Resolve a worktree root or database file path to kanban-orchestra.db."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Import path not found: {resolved}")
+    if resolved.is_file():
+        return resolved
+    db_path = resolved / "kanban-orchestra.db"
+    if not db_path.is_file():
+        raise FileNotFoundError(
+            f"No kanban-orchestra.db found under worktree path: {resolved}"
+        )
+    return db_path
+
+
+def _open_source_db_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open a source database read-only without running migrations."""
+    uri = f"file:{db_path.as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _validate_import_source(conn: sqlite3.Connection) -> None:
+    """Raise ValueError if the source DB is missing required import tables/columns."""
+    tables = set(_list_user_tables(conn))
+    missing_tables = [name for name in IMPORT_TASK_TABLES if name not in tables]
+    if missing_tables:
+        raise ValueError(
+            "Source database is missing required tables: "
+            + ", ".join(missing_tables)
+        )
+
+    task_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    required = (
+        {"id", *_IMPORT_TASK_COLUMNS, "parent_task_id", "follow_up_task_id"}
+        - {"first_started_at"}
+    )
+    missing_cols = sorted(required - task_cols)
+    if missing_cols:
+        raise ValueError(
+            "Source database tasks table is missing required columns: "
+            + ", ".join(missing_cols)
+        )
+
+
+def _normalize_imported_task_fields(row: sqlite3.Row) -> tuple[dict, str | None]:
+    """Copy task fields and normalize unfinished tasks to status none."""
+    source_keys = set(row.keys())
+    data = {col: row[col] for col in _IMPORT_TASK_COLUMNS if col in source_keys}
+    source_branch = data.get("branch")
+    if data.get("status") != "done":
+        data["status"] = "none"
+        data["ready_at"] = None
+        # Stash refs are worktree-local Git state and must not transfer.
+        data["stash_ref"] = None
+    return data, source_branch
+
+
+def import_worktree_database(
+    target_conn: sqlite3.Connection,
+    source_path: str | Path,
+) -> dict:
+    """Import tasks and task-owned history from another worktree database.
+
+    The target database remains authoritative: imported tasks receive fresh IDs.
+    Source is opened read-only and never modified. The target import runs in a
+    single transaction and is rolled back on failure.
+
+    Returns a result dict with ``id_map`` (old_id -> new_id), ``source_db``,
+    and ``imported_count``.
+    """
+    source_db = resolve_worktree_db_path(source_path)
+    target_db = get_connection_db_path(target_conn)
+    if target_db and Path(target_db).resolve() == source_db:
+        raise ValueError("Cannot import a worktree database into itself")
+
+    source_conn = _open_source_db_readonly(source_db)
+    try:
+        _validate_import_source(source_conn)
+
+        source_tasks = source_conn.execute(
+            "SELECT * FROM tasks ORDER BY id ASC"
+        ).fetchall()
+        source_by_id = {row["id"]: row for row in source_tasks}
+        source_skips = source_conn.execute(
+            "SELECT task_id, step FROM task_skips ORDER BY task_id ASC, step ASC"
+        ).fetchall()
+        source_comments = source_conn.execute(
+            "SELECT * FROM comments WHERE task_id IS NOT NULL ORDER BY id ASC"
+        ).fetchall()
+        source_run_logs = source_conn.execute(
+            "SELECT * FROM run_log WHERE task_id IS NOT NULL ORDER BY id ASC"
+        ).fetchall()
+
+        # Snapshot after reads so callers can verify we never wrote the source.
+        source_mtime_ns = source_db.stat().st_mtime_ns
+
+        id_map: dict[int, int] = {}
+        source_branches: dict[int, str | None] = {}
+
+        # End any open transaction so the import is one atomic unit.
+        target_conn.commit()
+        try:
+            for row in source_tasks:
+                fields, source_branch = _normalize_imported_task_fields(row)
+                source_branches[row["id"]] = source_branch
+                cols = list(fields.keys())
+                placeholders = ", ".join("?" for _ in cols)
+                cur = target_conn.execute(
+                    f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({placeholders})",
+                    [fields[c] for c in cols],
+                )
+                id_map[row["id"]] = cur.lastrowid
+
+            for old_id, new_id in id_map.items():
+                source_row = source_by_id[old_id]
+                parent_old = source_row["parent_task_id"]
+                follow_old = source_row["follow_up_task_id"]
+                parent_new = id_map.get(parent_old) if parent_old is not None else None
+                follow_new = id_map.get(follow_old) if follow_old is not None else None
+                if parent_old is not None and parent_new is None:
+                    raise ValueError(
+                        f"Source task {old_id} references missing parent_task_id {parent_old}"
+                    )
+                if follow_old is not None and follow_new is None:
+                    raise ValueError(
+                        f"Source task {old_id} references missing follow_up_task_id {follow_old}"
+                    )
+                target_conn.execute(
+                    "UPDATE tasks SET parent_task_id = ?, follow_up_task_id = ? WHERE id = ?",
+                    (parent_new, follow_new, new_id),
+                )
+
+            for skip in source_skips:
+                new_task_id = id_map.get(skip["task_id"])
+                if new_task_id is None:
+                    raise ValueError(
+                        f"Source task_skips references missing task_id {skip['task_id']}"
+                    )
+                target_conn.execute(
+                    "INSERT INTO task_skips (task_id, step) VALUES (?, ?)",
+                    (new_task_id, skip["step"]),
+                )
+
+            for comment in source_comments:
+                new_task_id = id_map.get(comment["task_id"])
+                if new_task_id is None:
+                    raise ValueError(
+                        f"Source comments references missing task_id {comment['task_id']}"
+                    )
+                target_conn.execute(
+                    """INSERT INTO comments (
+                           task_id, review_round, verb, author, message, kind, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_task_id,
+                        comment["review_round"],
+                        comment["verb"],
+                        comment["author"],
+                        comment["message"],
+                        comment["kind"],
+                        comment["created_at"],
+                    ),
+                )
+
+            for entry in source_run_logs:
+                new_task_id = id_map.get(entry["task_id"])
+                if new_task_id is None:
+                    raise ValueError(
+                        f"Source run_log references missing task_id {entry['task_id']}"
+                    )
+                target_conn.execute(
+                    """INSERT INTO run_log (
+                           task_id, verb, author, message, created_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        new_task_id,
+                        entry["verb"],
+                        entry["author"],
+                        entry["message"],
+                        entry["created_at"],
+                    ),
+                )
+
+            # Preserve source branch metadata as durable per-task history.
+            for old_id, new_id in id_map.items():
+                branch = source_branches.get(old_id)
+                branch_text = branch if branch else "(none)"
+                target_conn.execute(
+                    """INSERT INTO comments (
+                           task_id, review_round, verb, author, message, kind
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id,
+                        0,
+                        "import-worktree",
+                        "kanban",
+                        (
+                            f"Imported from worktree database {source_db} "
+                            f"(source task id {old_id}). "
+                            f"Source branch: {branch_text}."
+                        ),
+                        "comment",
+                    ),
+                )
+
+            # Validate before commit so a mid-import source change rolls back
+            # the target instead of reporting failure after a successful write.
+            if source_db.stat().st_mtime_ns != source_mtime_ns:
+                raise RuntimeError("Source database was modified during import")
+
+            source_has_first_started_at = "first_started_at" in {
+                row["name"]
+                for row in source_conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            _backfill_first_started_at(
+                target_conn,
+                use_legacy_fallback=not source_has_first_started_at,
+                task_ids=list(id_map.values()),
+            )
+            target_conn.commit()
+        except Exception:
+            target_conn.rollback()
+            raise
+
+        return {
+            "source_db": str(source_db),
+            "imported_count": len(id_map),
+            "id_map": {str(old): new for old, new in id_map.items()},
+        }
+    finally:
+        source_conn.close()

@@ -1,44 +1,57 @@
-Synthesize a squash-merge commit message in memory and immediately squash-merge the branch into master — no intermediate files written.
+Synthesize a squash-merge commit message in memory and immediately squash-merge a working branch into the appropriate target branch — no intermediate files written.
 
-## Branch Selection
+## Choose Source And Target
 
-- If a branch name argument is provided, use it.
-- If no argument and current branch is not `master`, use current branch as source.
-- If no argument and current branch is `master`, ask which branch to merge and suggest the most recently updated local branch that is not `master`.
+- If a source branch argument is provided, use it.
+- If no source branch is provided and the current branch is not a long-lived branch such as `master`, `main`, or `develop`, use the current branch as source.
+- If no source branch is provided and the current branch is long-lived, ask which working branch to merge and suggest the most recently updated local working branch.
+- Honor a target branch the user explicitly named.
+- Otherwise infer the target from repository context. For example, use `develop` when it exists and the source branch is clearly based on it; otherwise use the repository default branch.
+- If the likely target is ambiguous, ask the user. Do not silently assume `master`.
 
 ## Steps
 
-1. Resolve source branch using the rules above. Validate it exists locally.
+1. Resolve source and target branches using the rules above. Validate they exist locally and are different.
 2. Collect branch context in memory:
-   - `git log master..HEAD --oneline` — commit list
-   - `git log master..HEAD --format="%H %s%n%b"` — full commit messages
-   - `git diff master...HEAD --stat` — change summary
-   - `git diff master...HEAD --name-only` — file list
+   - `git log {target}..{source} --oneline` — commit list
+   - `git log {target}..{source} --format="%H %s%n%b"` — full commit messages
+   - `git diff {target}...{source} --stat` — change summary
+   - `git diff {target}...{source} --name-only` — file list
 3. Synthesize a commit message in memory using this exact structure:
 
    ```
    <Title Case commit title under 80 chars>
 
-   Why
+   <One concise paragraph: what this branch delivers and why it matters>
 
-   <1-3 concise paragraphs: why this branch exists and what problem it solves>
+   <When the motivation adds useful context, add:>
+   WHY
 
-   Work
+   • <motivation, not implementation detail>
 
-   <concise bullets (use • not -) or short paragraphs describing major implementation chunks>
+   WORK
 
-   Other
+   • <concise main implementation work>
 
-   <optional notes: risks, follow-ups, migration notes, or "None">
+   <When there is related secondary work, add:>
+   OTHER
+
+   • <related work that does not fit under Work>
+
+   <When there are useful process details, add:>
+   NOTES
+
+   • <validation, risks, follow-ups, or migration notes>
    ```
 
    Rules:
    - Do not list commits one by one. Group changes into coherent logical chunks.
    - Do not describe changes by file or method name. Write what was done and why at a feature/behavior level. Git has the file-level changes, you don't need to repeat them.
    - Keep it factual, concise, and human-readable. Keep it positive, avoid saying what was NOT done.
+   - Omit `WHY`, `OTHER`, and `NOTES` entirely when they have no bullets.
    - No AI references.
 
-4. Switch to master: `git checkout master`. Stop and report if checkout fails.
+4. Switch to the target branch: `git checkout <target-branch>`. Stop and report if checkout fails.
 5. Run squash merge: `git merge --squash <source-branch>`.
 6. Show the user for explicit confirmation:
    - Source branch and target branch

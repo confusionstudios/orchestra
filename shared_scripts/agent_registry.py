@@ -43,10 +43,27 @@ def _validate_command(command: Any, *, subject: str, require_model: bool = False
     return command
 
 
+def _reject_codex_review_uncommitted_with_prompt(command: list[str], *, subject: str) -> None:
+    """Current Codex CLI treats `review --uncommitted` and `[PROMPT]` as exclusive."""
+    if not command or command[0] != "codex":
+        return
+    if "review" not in command:
+        return
+    has_uncommitted = "--uncommitted" in command
+    has_prompt = any("{prompt}" in part for part in command)
+    if has_uncommitted and has_prompt:
+        raise ValueError(
+            f"{subject} cannot combine --uncommitted with {{prompt}}: "
+            "current Codex CLI treats those arguments as mutually exclusive"
+        )
+
+
 def _validate_optional_review_command(command: Any, *, subject: str, require_model: bool = False) -> list[str] | None:
     if command is None:
         return None
-    return _validate_command(command, subject=subject, require_model=require_model)
+    command = _validate_command(command, subject=subject, require_model=require_model)
+    _reject_codex_review_uncommitted_with_prompt(command, subject=subject)
+    return command
 
 
 def _validate_agent(entry: Any, seen: set[str]) -> tuple[str, list[str], str, list[str] | None]:
@@ -168,6 +185,77 @@ def load_provider_review_commands(path: Path = REGISTRY_PATH) -> dict[str, list[
     return commands
 
 
+def _agent_keys(raw: dict[str, Any], *, path: Path) -> set[str]:
+    agents_raw = raw.get("agents")
+    if not isinstance(agents_raw, list):
+        raise ValueError(f"agent registry must contain an agents list: {path}")
+    seen: set[str] = set()
+    for entry in agents_raw:
+        _validate_agent(entry, seen)
+    return seen
+
+
+def _provider_names(raw: dict[str, Any], *, path: Path) -> set[str]:
+    providers_raw = raw.get("providers", {})
+    if providers_raw is None:
+        providers_raw = {}
+    if not isinstance(providers_raw, dict):
+        raise ValueError(f"agent registry providers must be a mapping: {path}")
+    names: set[str] = set()
+    for name, entry in providers_raw.items():
+        provider, _command, _label, _review_command = _validate_provider(name, entry)
+        names.add(provider)
+    return names
+
+
+def _validate_alias_graph(
+    aliases: dict[str, str],
+    *,
+    agent_keys: set[str],
+    provider_names: set[str],
+) -> None:
+    for name in aliases:
+        path = [name]
+        current = aliases[name]
+        while current in aliases:
+            if current in path:
+                raise ValueError(f"alias cycle: {' -> '.join(path + [current])}")
+            path.append(current)
+            current = aliases[current]
+        if current in agent_keys:
+            continue
+        parsed = _split_provider_model(current)
+        if parsed is not None and parsed[0] in provider_names:
+            continue
+        raise ValueError(f"alias {name} target not found: {current}")
+
+
+def load_agent_aliases(path: Path = REGISTRY_PATH) -> dict[str, str]:
+    """Load semantic aliases that target existing agent specs without duplicating commands."""
+    raw = _load_registry(path)
+    agent_keys = _agent_keys(raw, path=path)
+    provider_names = _provider_names(raw, path=path)
+
+    aliases_raw = raw.get("aliases", {})
+    if aliases_raw is None:
+        aliases_raw = {}
+    if not isinstance(aliases_raw, dict):
+        raise ValueError(f"agent registry aliases must be a mapping: {path}")
+
+    aliases: dict[str, str] = {}
+    for name, target in aliases_raw.items():
+        if not isinstance(name, str) or not name.strip() or not _PROVIDER_RE.fullmatch(name):
+            raise ValueError(f"alias has invalid name: {name}")
+        if name in agent_keys:
+            raise ValueError(f"duplicate agent name in registry: {name}")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError(f"alias {name} has invalid target")
+        aliases[name] = target
+
+    _validate_alias_graph(aliases, agent_keys=agent_keys, provider_names=provider_names)
+    return aliases
+
+
 def _split_provider_model(spec: str) -> tuple[str, str] | None:
     if ":" not in spec:
         return None
@@ -183,8 +271,21 @@ def _split_provider_model(spec: str) -> tuple[str, str] | None:
     return provider, model
 
 
+def _deref_alias(spec: str) -> str:
+    """Follow registry alias chains to a command-backed agent spec."""
+    path: list[str] = []
+    current = spec
+    while current in AGENT_ALIASES:
+        if current in path:
+            raise ValueError(f"alias cycle: {' -> '.join(path + [current])}")
+        path.append(current)
+        current = AGENT_ALIASES[current]
+    return current
+
+
 def resolve_agent_command(spec: str) -> list[str] | None:
     """Return a command template for an alias or provider:model agent spec."""
+    spec = _deref_alias(spec)
     if spec in AGENT_CMD:
         return list(AGENT_CMD[spec])
 
@@ -200,6 +301,7 @@ def resolve_agent_command(spec: str) -> list[str] | None:
 
 def has_review_agent_command(spec: str) -> bool:
     """Return True when an alias/provider:model spec has an explicit review command."""
+    spec = _deref_alias(spec)
     if spec in AGENT_REVIEW_CMD:
         return True
 
@@ -212,6 +314,7 @@ def has_review_agent_command(spec: str) -> bool:
 
 def resolve_review_agent_command(spec: str) -> list[str] | None:
     """Return the review command for an agent spec, falling back to the normal command."""
+    spec = _deref_alias(spec)
     if spec in AGENT_REVIEW_CMD:
         return list(AGENT_REVIEW_CMD[spec])
     if spec in AGENT_CMD:
@@ -229,6 +332,7 @@ def resolve_review_agent_command(spec: str) -> list[str] | None:
 
 def resolve_agent_label(spec: str) -> str | None:
     """Return a display label for an alias or provider:model agent spec."""
+    spec = _deref_alias(spec)
     if spec in AGENT_DISPLAY_LABELS:
         return AGENT_DISPLAY_LABELS[spec]
 
@@ -242,6 +346,52 @@ def resolve_agent_label(spec: str) -> str | None:
     return label.replace("{model}", model)
 
 
+def _command_option(command: list[str], *options: str) -> str | None:
+    """Return an explicitly supplied command option value, if present."""
+    for index, part in enumerate(command):
+        if part in options and index + 1 < len(command):
+            return command[index + 1]
+        for option in options:
+            prefix = f"{option}="
+            if part.startswith(prefix):
+                return part[len(prefix):]
+    return None
+
+
+def _command_reasoning_effort(command: list[str]) -> str | None:
+    """Return an explicit Codex reasoning-effort config value, if present."""
+    config_options = {"-c", "--config"}
+    for index, part in enumerate(command):
+        value = command[index + 1] if part in config_options and index + 1 < len(command) else None
+        if value is None and part.startswith("--config="):
+            value = part.removeprefix("--config=")
+        if value and value.startswith("model_reasoning_effort="):
+            return value.split("=", 1)[1].strip('"\'')
+    return None
+
+
+def resolve_agent_attribution(spec: str, *, review: bool = False) -> str:
+    """Return the exact agent spec plus facts explicit in its resolved command.
+
+    Display labels are intentionally excluded: they are UI copy and can become
+    stale. Only an explicit --model option and model_reasoning_effort config are
+    included as additional facts.
+    """
+    command = resolve_review_agent_command(spec) if review else resolve_agent_command(spec)
+    if not command:
+        return "unattributed"
+
+    model = _command_option(command, "-m", "--model")
+    effort = _command_reasoning_effort(command)
+
+    facts = []
+    if model and _split_provider_model(spec) is None:
+        facts.append(f"model: {model}")
+    if effort:
+        facts.append(f"reasoning effort: {effort}")
+    return f"{spec} ({'; '.join(facts)})" if facts else spec
+
+
 def is_valid_agent_spec(spec: str) -> bool:
     return resolve_agent_command(spec) is not None
 
@@ -250,3 +400,4 @@ AGENTS, AGENT_CMD, AGENT_DISPLAY_LABELS = load_agent_registry()
 AGENT_PROVIDERS, PROVIDER_CMD, PROVIDER_DISPLAY_LABELS = load_agent_providers()
 AGENT_REVIEW_CMD = load_agent_review_commands()
 PROVIDER_REVIEW_CMD = load_provider_review_commands()
+AGENT_ALIASES = load_agent_aliases()

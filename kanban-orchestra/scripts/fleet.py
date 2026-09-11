@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -14,14 +15,18 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import config
+import dashboard_tailscale
 
 
 ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
 DEFAULT_CONFIG_PATH = Path("~/.config/orchestra/fleet.repos").expanduser()
+FLEET_DASHBOARD_PORT = config.DASHBOARD_PORT_BASE - 1
+FLEET_DASHBOARD_METADATA_NAME = "fleet-dashboard.json"
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,31 @@ class FleetRepo:
 
 def config_path() -> Path:
     return Path(os.environ.get("ORCHESTRA_FLEET_REPOS", DEFAULT_CONFIG_PATH)).expanduser()
+
+
+def fleet_dashboard_metadata_path() -> Path:
+    """Return the fleet-scoped dashboard metadata path beside fleet.repos."""
+    override = os.environ.get("KO_FLEET_DASHBOARD_METADATA_PATH")
+    if override:
+        return Path(override).expanduser().resolve()
+    return config_path().with_name(FLEET_DASHBOARD_METADATA_NAME)
+
+
+def fleet_dashboard_start_lock_path() -> Path:
+    """Return the user-scoped lock serializing Fleet Dashboard launches."""
+    return fleet_dashboard_metadata_path().with_suffix(".start.lock")
+
+
+@contextmanager
+def _fleet_dashboard_start_lock():
+    path = fleet_dashboard_start_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def run(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -342,6 +372,19 @@ def dashboard_status_url(repo: FleetRepo) -> str:
     return str(url)
 
 
+def tailscale_dashboard_url(local_url: str) -> str | None:
+    """Return the HTTPS Serve URL proxying one loopback dashboard, if present."""
+    return dashboard_tailscale.lookup_dashboard_url(local_url)
+
+
+def preferred_dashboard_url(local_url: str, *, prefer_local: bool = False) -> str:
+    """Return the operator-facing URL for one localhost dashboard."""
+    return dashboard_tailscale.preferred_dashboard_url(
+        local_url,
+        prefer_local=prefer_local,
+    )
+
+
 def wait_dashboard_ready(repo: FleetRepo, *, timeout: float = 12.0) -> bool:
     """Wait for Fleet-visible dashboard metadata for one running repo."""
     deadline = time.monotonic() + timeout
@@ -574,6 +617,28 @@ def clean_start_repos(repos: list[FleetRepo]) -> list[FleetRepo]:
     return clean
 
 
+def current_repo_root() -> Path | None:
+    """Return the git root containing the current directory, if any."""
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd())
+    if result.returncode != 0:
+        return None
+    try:
+        return Path(result.stdout.strip()).resolve()
+    except OSError:
+        return None
+
+
+def current_fleet_repo(repos: list[FleetRepo]) -> FleetRepo | None:
+    """Return the configured fleet repo containing the current directory."""
+    root = current_repo_root()
+    if root is None:
+        return None
+    for repo in repos:
+        if repo.managed and repo.root is not None and repo.root.resolve() == root:
+            return repo
+    return None
+
+
 def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
@@ -620,6 +685,20 @@ def print_status(repos: list[FleetRepo]) -> None:
             f"{dashboard_url:<{widths[4]}}  {owner:<{widths[5]}}  {root}"
         )
 
+    current_repo = current_fleet_repo(repos)
+    if current_repo is not None:
+        status, _, _, _ = repo_process_state(current_repo)
+        dashboard_url = dashboard_status_url(current_repo) if not current_repo.error else "-"
+        if dashboard_url != "-":
+            dashboard_display = preferred_dashboard_url(dashboard_url)
+        else:
+            dashboard_display = "not running"
+        print()
+        print(
+            f"This repo ({current_repo.label}) is {status}. "
+            f"{dashboard_tailscale.format_dashboard_line(dashboard_display)}"
+        )
+
 
 def precheck(repos: list[FleetRepo]) -> int:
     rows = []
@@ -657,6 +736,54 @@ def precheck(repos: list[FleetRepo]) -> int:
             if len(lines) > 12:
                 print(f"  ... {len(lines) - 12} more")
     return exit_code
+
+
+def start_tmux_session(repo: FleetRepo, *, preferred_port: int, orchestrator: Path) -> bool:
+    """Create the fleet tmux session for one stopped repo. Return dashboard-ready."""
+    subprocess.run(
+        [
+            "tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root),
+            str(orchestrator), "--dashboard-port", str(preferred_port),
+        ],
+        check=True,
+    )
+    return wait_dashboard_ready(repo)
+
+
+def try_start_repo(repo: FleetRepo, *, preferred_port: int | None = None) -> str | None:
+    """Start one configured repo without exiting.
+
+    Return None on success, or a concise failure reason. Dirty worktrees are
+    reported as ``Worktree dirty`` instead of being skipped silently.
+    """
+    if preferred_port is None:
+        preferred_port = dashboard_port_for_index(0)
+    if not repo.managed:
+        return "Unmanaged repo"
+    if repo.error or repo.root is None:
+        return "Invalid config"
+
+    status, _, dashboard_pid, session = repo_process_state(repo)
+    if status_is_running(status):
+        if dashboard_pid == "-":
+            request_dashboard_start(repo, preferred_port=preferred_port)
+            wait_dashboard_ready(repo)
+        return None
+    if session != "-":
+        return f"tmux session already exists without a live orchestrator ({session})"
+    if dirty_lines(repo):
+        return "Worktree dirty"
+    if shutil.which("tmux") is None:
+        return "required tool not found on PATH: tmux"
+
+    orchestrator = ORCHESTRA_ROOT / "bin" / "ko-orchestrator"
+    if not orchestrator.exists() or not os.access(orchestrator, os.X_OK):
+        return "orchestrator executable not found"
+    try:
+        start_tmux_session(repo, preferred_port=preferred_port, orchestrator=orchestrator)
+    except (OSError, subprocess.CalledProcessError):
+        return "Start failed"
+    return None
 
 
 def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
@@ -700,14 +827,7 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
             continue
         if repo.root not in startable_roots:
             continue
-        subprocess.run(
-            [
-                "tmux", "new-session", "-d", "-s", repo.session, "-c", str(repo.root),
-                str(orchestrator), "--dashboard-port", str(preferred_port),
-            ],
-            check=True,
-        )
-        if wait_dashboard_ready(repo):
+        if start_tmux_session(repo, preferred_port=preferred_port, orchestrator=orchestrator):
             print(f"{repo.label}: started ({repo.session})")
         else:
             print(f"{repo.label}: started ({repo.session}); dashboard still pending")
@@ -845,7 +965,13 @@ def logs(repo: FleetRepo) -> None:
     os.execvp("tail", ["tail", "-f", str(repo.log_path)])
 
 
-def open_dashboard(repo: FleetRepo) -> None:
+def _open_dashboard_url(url: str) -> None:
+    if sys.platform == "darwin" and shutil.which("open"):
+        subprocess.run(["open", url], check=False)
+    print(dashboard_tailscale.format_dashboard_line(url))
+
+
+def open_dashboard(repo: FleetRepo, *, prefer_local: bool = False) -> None:
     payload = read_key_value_or_json(repo.dashboard_metadata_path)
     url = payload.get("url")
     if not url:
@@ -857,9 +983,69 @@ def open_dashboard(repo: FleetRepo) -> None:
         die(f"dashboard is not running for {repo.label}")
     if not dashboard_endpoint_ready(payload):
         die(f"dashboard is not accepting connections for {repo.label}: {url}")
-    if sys.platform == "darwin" and shutil.which("open"):
-        subprocess.run(["open", url], check=False)
-    print(url)
+    _open_dashboard_url(preferred_dashboard_url(str(url), prefer_local=prefer_local))
+
+
+def fleet_dashboard_live_payload() -> dict | None:
+    """Return live Fleet Dashboard metadata when the process and endpoint are up."""
+    path = fleet_dashboard_metadata_path()
+    payload = read_key_value_or_json(path)
+    if payload.get("role") != "fleet-dashboard":
+        return None
+    try:
+        pid = int(payload["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not pid_alive(pid):
+        return None
+    url = payload.get("url")
+    if not url or not dashboard_endpoint_ready(payload):
+        return None
+    return payload
+
+
+def wait_fleet_dashboard_ready(*, timeout: float = 12.0) -> dict | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = fleet_dashboard_live_payload()
+        if payload is not None:
+            return payload
+        time.sleep(0.2)
+    return fleet_dashboard_live_payload()
+
+
+def start_fleet_dashboard_process() -> subprocess.Popen:
+    """Spawn the Fleet Dashboard server as a detached background process."""
+    script = Path(__file__).resolve().parent / "fleet_dashboard.py"
+    if not script.exists():
+        die(f"expected script not found: {script}")
+    metadata_path = fleet_dashboard_metadata_path()
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["KO_FLEET_DASHBOARD_METADATA_PATH"] = str(metadata_path)
+    env["KO_FLEET_DASH_PORT"] = str(FLEET_DASHBOARD_PORT)
+    return subprocess.Popen(
+        [sys.executable, str(script)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def open_or_start_fleet_dashboard(*, prefer_local: bool = False) -> None:
+    """Open a running Fleet Dashboard, or start one and print its preferred URL."""
+    with _fleet_dashboard_start_lock():
+        payload = fleet_dashboard_live_payload()
+        if payload is None:
+            start_fleet_dashboard_process()
+            payload = wait_fleet_dashboard_ready()
+            if payload is None:
+                die("fleet dashboard did not become ready")
+    url = payload.get("url")
+    if not url:
+        die("fleet dashboard metadata is missing a URL")
+    _open_dashboard_url(preferred_dashboard_url(str(url), prefer_local=prefer_local))
 
 
 def init_config() -> None:
@@ -930,9 +1116,34 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name)
         p.add_argument("repos", nargs="*", help="optional repo labels or paths")
 
-    for name in ("attach", "logs", "dashboard", "dashboard-open"):
+    for name in ("attach", "logs"):
         p = sub.add_parser(name)
         p.add_argument("repo", nargs=1, help="repo label or path")
+
+    local_help = (
+        "open the localhost dashboard URL instead of the preferred Tailscale URL"
+    )
+    p_dash = sub.add_parser(
+        "dashboard",
+        help="start or open the Fleet Dashboard, or a repo dashboard when a selector is given",
+        description=(
+            "With no repo argument, start or open the Fleet Dashboard and print "
+            "its preferred Dashboard URL. With a repo selector, open that repo's "
+            "preferred dashboard. Pass --local to open localhost."
+        ),
+    )
+    p_dash.add_argument(
+        "repo",
+        nargs="?",
+        help="repo label or path; omit to start or open the Fleet Dashboard",
+    )
+    p_dash.add_argument("--local", action="store_true", help=local_help)
+    p_open = sub.add_parser(
+        "dashboard-open",
+        help="open a repo dashboard (requires a repo selector)",
+    )
+    p_open.add_argument("repo", nargs=1, help="repo label or path")
+    p_open.add_argument("--local", action="store_true", help=local_help)
 
     sub.add_parser("init")
     p_add = sub.add_parser("add")
@@ -971,8 +1182,13 @@ def main(argv: list[str] | None = None) -> int:
         attach(one_repo(args.repo))
     elif args.command == "logs":
         logs(one_repo(args.repo))
-    elif args.command in {"dashboard", "dashboard-open"}:
-        open_dashboard(one_repo(args.repo))
+    elif args.command == "dashboard":
+        if args.repo:
+            open_dashboard(one_repo([args.repo]), prefer_local=args.local)
+        else:
+            open_or_start_fleet_dashboard(prefer_local=args.local)
+    elif args.command == "dashboard-open":
+        open_dashboard(one_repo(args.repo), prefer_local=args.local)
     elif args.command == "init":
         init_config()
     elif args.command == "add":

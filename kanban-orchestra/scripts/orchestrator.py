@@ -29,6 +29,7 @@ import task as task_cli
 import orchestrator_lock
 import agent_runner
 import prompt_builder
+import smart_unblock
 
 # Import shared agent registry from the orchestra repo
 ORCHESTRA_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -43,9 +44,12 @@ DEFAULT_PLAN_REVIEWER = config.DEFAULT_PLAN_REVIEWER
 DEFAULT_REVIEWER = config.DEFAULT_REVIEWER
 DEFAULT_SUPER_REVIEWER = config.DEFAULT_SUPER_REVIEWER
 MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
+REVIEWER_INFRA_ATTEMPTS = config.REVIEWER_INFRA_ATTEMPTS
+REVIEWER_INFRA_BACKOFF_SECONDS = config.REVIEWER_INFRA_BACKOFF_SECONDS
 MAX_PRIOR_COMMENTS = config.MAX_PRIOR_COMMENTS
 POLL_INTERVAL = config.POLL_INTERVAL
 HEARTBEAT_INTERVAL = config.HEARTBEAT_INTERVAL
+SMART_UNBLOCK_INTERVAL = smart_unblock.POLL_INTERVAL
 STOP_AFTER_TASK_FILE = config.STOP_AFTER_TASK_FILE
 DASHBOARD_START_REQUEST_FILE = config.DASHBOARD_START_REQUEST_FILE
 MASTER_BRANCHES = {"master", "main"}
@@ -91,8 +95,9 @@ def format_task_ref(task):
 
 
 def _task_reviewer(task):
-    """Return the code-review agent configured for a task."""
-    return task.get("reviewer_agent") or DEFAULT_REVIEWER
+    """Return the reviewer agent configured for a task."""
+    fallback = DEFAULT_SUPER_REVIEWER if task.get("kind") == "supertask" else DEFAULT_REVIEWER
+    return task.get("reviewer_agent") or fallback
 
 
 # ── Heartbeat thread ─────────────────────────────────────────────────
@@ -194,6 +199,51 @@ def stop_heartbeat():
         _heartbeat_thread.join(timeout=5)
 
 
+# ── Smart-unblock thread ────────────────────────────────────────────────
+#
+# Runs blocked-task recovery as a background thread of this orchestrator
+# process. Each cycle gathers evidence for blocked tasks and asks the
+# configured LLM whether to continue the task or leave a durable explanation.
+# The loop holds a repo-scoped flock so a second thread cannot consult the
+# same blocked task at once.
+
+_smart_unblock_stop = threading.Event()
+_smart_unblock_thread = None
+
+
+def _smart_unblock_loop(db_path):
+    """Reassess blocked tasks on SMART_UNBLOCK_INTERVAL until told to stop."""
+    try:
+        smart_unblock.run_watcher(
+            db_path,
+            agent=config.DEFAULT_UNBLOCKER,
+            interval=SMART_UNBLOCK_INTERVAL,
+            stop_event=_smart_unblock_stop,
+        )
+    except smart_unblock.WatcherAlreadyRunning as exc:
+        log(f"smart-unblock: {exc}; recovery already running for this repo")
+    except Exception as exc:  # keep the orchestrator alive on watcher failures
+        log(f"smart-unblock thread failed: {exc}")
+
+
+def start_smart_unblock(db_path):
+    global _smart_unblock_thread
+    _smart_unblock_stop.clear()
+    _smart_unblock_thread = threading.Thread(
+        target=_smart_unblock_loop, args=(db_path,), daemon=True,
+    )
+    _smart_unblock_thread.start()
+
+
+def stop_smart_unblock():
+    _smart_unblock_stop.set()
+    # Belt-and-braces: also reach in and kill a consultation directly, in case
+    # the watcher loop hasn't yet reached its own stop_event check.
+    smart_unblock.terminate_active_consultation()
+    if _smart_unblock_thread is not None:
+        _smart_unblock_thread.join(timeout=15)
+
+
 def set_runtime_idle(conn, status_message="Waiting for ready tasks"):
     """Set runtime to idle state, clearing task/agent fields."""
     db.update_runtime(
@@ -207,6 +257,18 @@ def set_runtime_idle(conn, status_message="Waiting for ready tasks"):
         status_message=status_message,
         last_heartbeat_at="CURRENT_TIMESTAMP",
     )
+    _run_idle_maintenance(conn)
+
+
+def _run_idle_maintenance(conn):
+    """Purge expired runtime history while the orchestrator is idle."""
+    try:
+        result = db.purge_run_log(conn, compact=True)
+    except Exception as exc:
+        log(f"Maintenance purge failed: {exc}")
+        return
+    if result["deleted_rows"] or result["deleted_transcripts"]:
+        log(db.format_purge_summary(result))
 
 
 def _dashboard_metadata_path(db_path=None):
@@ -483,12 +545,77 @@ def stash_task_wip(task_id, conn):
         return None
 
 
-def mark_blocked(task_id, conn, comment, runtime_status, log_message=None, preserve_wip=False):
+def restore_task_wip(task, conn):
+    """
+    Restore orchestrator-preserved task WIP, including the index.
+
+    Reviewers inspect `git diff --cached`. A stash pop without --index would
+    leave the candidate unstaged. Returns True when there is nothing to
+    restore or the stash was applied and stash_ref cleared.
+    """
+    stash_ref = task.get("stash_ref")
+    if not stash_ref:
+        return True
+    task_id = task["id"]
+    try:
+        result = subprocess.run(
+            ["git", "stash", "pop", "--index", stash_ref],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            # --index can fail for untracked-bearing stashes; pop then restage.
+            result = subprocess.run(
+                ["git", "stash", "pop", stash_ref],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "git stash pop produced no output").strip()
+                log(f"Failed to restore stashed candidate {stash_ref}: {detail}", task_id)
+                db.add_comment(
+                    conn, task_id,
+                    f"Could not restore stashed candidate {stash_ref} before review:\n\n{detail}",
+                    kind="comment", author="orchestrator",
+                )
+                return False
+            subprocess.run(["git", "add", "."], check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        log(f"Failed to restore stashed candidate {stash_ref}: {exc}", task_id)
+        db.add_comment(
+            conn, task_id,
+            f"Could not restore stashed candidate {stash_ref} before review.",
+            kind="comment", author="orchestrator",
+        )
+        return False
+    db.update_task(conn, task_id, stash_ref=None)
+    db.add_comment(
+        conn, task_id,
+        f"Restored task WIP from {stash_ref} for review; candidate is staged "
+        "for git diff --cached.",
+        kind="comment", author="orchestrator",
+    )
+    return True
+
+
+def mark_blocked(
+    task_id,
+    conn,
+    comment,
+    runtime_status,
+    log_message=None,
+    preserve_wip=False,
+    block_reason=None,
+    resume_next_step=None,
+):
     """
     Block a task with a consistent state transition.
 
     When preserve_wip is True, any dirty worktree is treated as task-created WIP:
     stage it, stash it, record stash_ref, and leave a durable note.
+
+    Optional block_reason / resume_next_step record structured resume context so
+    operators can continue safely without parsing comments.
     """
     if preserve_wip and is_worktree_dirty():
         stash_ref = stash_task_wip(task_id, conn)
@@ -505,11 +632,189 @@ def mark_blocked(task_id, conn, comment, runtime_status, log_message=None, prese
                 kind="comment", author="orchestrator",
             )
 
-    db.update_task(conn, task_id, status="blocked", next_step="none")
+    db.update_task(
+        conn,
+        task_id,
+        status="blocked",
+        next_step="none",
+        block_reason=block_reason,
+        resume_next_step=resume_next_step,
+    )
     db.add_comment(conn, task_id, comment, kind="comment", author="orchestrator")
     db.update_runtime(conn, status_message=runtime_status)
     if log_message:
         log(log_message, task_id)
+
+
+def task_max_review_rounds(task):
+    """Return the per-task review round cap, falling back to the global default."""
+    cap = task.get("max_review_rounds")
+    if cap is None:
+        return MAX_REVIEW_ROUNDS
+    return int(cap)
+
+
+def _reviewer_infra_backoff(attempt):
+    """Return the sleep before retrying after a 1-based failed attempt."""
+    index = attempt - 1
+    if index < 0 or index >= len(REVIEWER_INFRA_BACKOFF_SECONDS):
+        return REVIEWER_INFRA_BACKOFF_SECONDS[-1] if REVIEWER_INFRA_BACKOFF_SECONDS else 0
+    return REVIEWER_INFRA_BACKOFF_SECONDS[index]
+
+
+def _run_review_with_infra_retries(task, conn, handler, *, step, reviewer):
+    """Run one review handler, retrying infrastructure failures without advancing rounds.
+
+    A missing durable approval/rejection, nonzero exit, or transport/tool-host
+    failure is not a content rejection. Keep review_round unchanged, do not send
+    the maker through rework, and retry the same review step until the bound is
+    exhausted. Returns the handler's final 'approve'/'reject'/'error' outcome.
+    """
+    last_outcome = "error"
+    for attempt in range(1, REVIEWER_INFRA_ATTEMPTS + 1):
+        last_outcome = handler(task, conn)
+        if last_outcome != "error":
+            return last_outcome
+        log(
+            f"Reviewer '{reviewer}' infrastructure failure on {step} "
+            f"attempt {attempt}/{REVIEWER_INFRA_ATTEMPTS}; "
+            f"review_round={task['review_round']} unchanged",
+            task["id"],
+        )
+        if attempt >= REVIEWER_INFRA_ATTEMPTS:
+            break
+        delay = _reviewer_infra_backoff(attempt)
+        db.update_runtime(
+            conn,
+            status_message=(
+                f"Reviewer '{reviewer}' unavailable; retrying {step} in {delay}s "
+                f"(attempt {attempt}/{REVIEWER_INFRA_ATTEMPTS})"
+            ),
+        )
+        time.sleep(delay)
+    return last_outcome
+
+
+def _block_reviewer_unavailable(task, conn, *, step, reviewer, preserve_wip):
+    """Block after exhausting reviewer infrastructure retries.
+
+    Resume stays on the review step so a later healthy reviewer, smart-unblock,
+    reviewer switch, or explicit continue does not grant extra content-review
+    rounds or send the maker through rework.
+    """
+    mark_blocked(
+        task["id"],
+        conn,
+        (
+            f"Blocked: reviewer '{reviewer}' unavailable after "
+            f"{REVIEWER_INFRA_ATTEMPTS} infrastructure failures on {step} "
+            f"(review_round={task['review_round']} unchanged). "
+            f"Resume at {step} when a healthy reviewer is available."
+        ),
+        f"Blocked: reviewer unavailable on task {task['id']}",
+        log_message=f"Blocked: reviewer unavailable on {step}",
+        preserve_wip=preserve_wip,
+        block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+        resume_next_step=step,
+    )
+
+
+def _ensure_reviewer_acked(task, conn, reviewer, *, step):
+    """Return True when the reviewer ACK probe succeeded.
+
+    A failed review/tool-path probe is an infrastructure failure, not a
+    content rejection. Callers return 'error' so `_run_review_with_infra_retries`
+    can apply the bounded retry policy instead of stalling forever.
+    """
+    if ensure_agent_acked(reviewer, task["id"], conn, purpose="review"):
+        return True
+    log(
+        f"Reviewer '{reviewer}' did not acknowledge the review/tool path before {step}",
+        task["id"],
+    )
+    db.add_comment(
+        conn,
+        task["id"],
+        (
+            f"Reviewer '{reviewer}' did not acknowledge the review/tool path "
+            f"before {step}; treating as an infrastructure failure, not a "
+            "content rejection."
+        ),
+        kind="comment",
+        author="orchestrator",
+    )
+    return False
+
+
+def _missing_review_decision(task, conn, reviewer, *, step, round_label=None):
+    """Record a no-decision infrastructure failure and return 'error'."""
+    round_note = f" for round {round_label}" if round_label is not None else ""
+    log(
+        f"Reviewer '{reviewer}' exited 0 but left no durable decision{round_note}",
+        task["id"],
+    )
+    db.add_comment(
+        conn,
+        task["id"],
+        (
+            f"Reviewer '{reviewer}' completed {step}{round_note} without a durable "
+            "approval/rejection; treating as an infrastructure failure, not a "
+            "content rejection."
+        ),
+        kind="comment",
+        author="orchestrator",
+    )
+    return "error"
+
+
+# Review steps that advance review_round on interrupt/recovery, mapped to the
+# maker step operators should resume at after a review-cap block.
+_INTERRUPT_REVIEW_RESUME = {
+    "commit-review": ("commit-make", True),
+    "commit-review-supertask": ("commit-make-supertask", False),
+    "pull-request-review": ("pull-request-make", False),
+    "other-review": ("other-make", False),
+}
+
+
+def _requeue_or_block_interrupted_review(task, conn):
+    """
+    Advance review_round after an interrupted review so stale votes are not reused.
+
+    If the advanced round reaches the task's persisted review cap, block as a
+    review-cap block at the maker resume step instead of leaving the task ready
+    for another review. Returns ("ready"|"blocked", new_round).
+    """
+    step = task["next_step"]
+    resume_step, preserve_wip = _INTERRUPT_REVIEW_RESUME[step]
+    new_round = task["review_round"] + 1
+    review_cap = task_max_review_rounds(task)
+    task_id = task["id"]
+
+    if new_round >= review_cap:
+        db.update_task(
+            conn, task_id,
+            review_round=new_round, last_review_decision="none",
+        )
+        mark_blocked(
+            task_id,
+            conn,
+            f"Blocked: interrupted {step} advanced to review round {new_round}, "
+            f"reaching max review rounds ({review_cap})",
+            f"Task {task_id} blocked after interrupted {step} reached review cap",
+            log_message=f"Interrupted {step} reached review cap at round {new_round}",
+            preserve_wip=preserve_wip,
+            block_reason=db.BLOCK_REASON_REVIEW_CAP,
+            resume_next_step=resume_step,
+        )
+        return "blocked", new_round
+
+    db.update_task(
+        conn, task_id,
+        status="ready", next_step=step,
+        review_round=new_round, last_review_decision="none",
+    )
+    return "ready", new_round
 
 
 def ensure_branch(task, conn):
@@ -574,7 +879,7 @@ def ensure_branch(task, conn):
 def handle_commit_make(task, conn):
     """Execute a commit-make step. Returns (success, done_without_commit, needs_rereview).
 
-    needs_rereview is True when a SKIP_BUILD_UNTIL_APPROVED repo's Path B deferred build
+    needs_rereview is True when a CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER repo's Path B deferred build
     changed the staged diff. The orchestrator re-enters commit-review in that case instead
     of finalizing.
     """
@@ -644,13 +949,13 @@ def handle_commit_make(task, conn):
             validation_count_after = sum(1 for c in comments_after if c["kind"] == "validation")
             if validation_count_after <= validation_count_before:
                 log(
-                    f"commit-make Path A: {agent} exited 0 with SKIP_BUILD_UNTIL_APPROVED active "
+                    f"commit-make Path A: {agent} exited 0 with CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER active "
                     "but wrote no fresh validation comment stating deferral; treating as failure",
                     task["id"],
                 )
                 db.add_run_log(
                     conn, task["id"],
-                    f"{agent} exited 0 on Path A with SKIP_BUILD_UNTIL_APPROVED active "
+                    f"{agent} exited 0 on Path A with CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER active "
                     "but wrote no fresh validation comment",
                     verb="commit-make", author="orchestrator",
                 )
@@ -723,7 +1028,8 @@ def handle_commit_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -761,11 +1067,9 @@ def handle_commit_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(
-            f"Reviewer '{reviewer}' exited 0 but left no decision for round {current_round}",
-            task["id"],
+        return _missing_review_decision(
+            task, conn, reviewer, step="commit-review", round_label=current_round,
         )
-        return "reject"
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -835,7 +1139,8 @@ def handle_pull_request_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="pull-request-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -877,11 +1182,9 @@ def handle_pull_request_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(
-            f"Reviewer '{reviewer}' exited 0 but left no PR review decision for round {current_round}",
-            task["id"],
+        return _missing_review_decision(
+            task, conn, reviewer, step="pull-request-review", round_label=current_round,
         )
-        return "reject"
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -959,7 +1262,8 @@ def handle_other_review(task, conn):
     Returns ('approve'|'reject'|'error').
     """
     reviewer = _task_reviewer(task)
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="other-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1001,11 +1305,9 @@ def handle_other_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(
-            f"Reviewer '{reviewer}' exited 0 but left no other-review decision for round {current_round}",
-            task["id"],
+        return _missing_review_decision(
+            task, conn, reviewer, step="other-review", round_label=current_round,
         )
-        return "reject"
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -1067,26 +1369,56 @@ def handle_commit_make_supertask(task, conn):
 
 def handle_commit_review_supertask(task, conn):
     """
-    Execute commit-review-supertask (plan review) with the single reviewer agent.
+    Execute final aggregate supertask review with the configured reviewer.
     Returns ('approve'|'reject'|'error').
     """
-    reviewer = DEFAULT_SUPER_REVIEWER
-    ensure_agent_acked(reviewer, task["id"], conn)
+    reviewer = _task_reviewer(task)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-review-supertask"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
+    children = db.get_child_tasks(conn, task["id"])
+    follow_up_sources = {
+        child["follow_up_task_id"]: child["id"]
+        for child in children
+        if child.get("follow_up_task_id") is not None
+    }
+    child_evidence = []
+    for child in children:
+        review_history = [
+            comment
+            for comment in db.get_comments(conn, child["id"])
+            if comment["kind"] in ("approval", "rejection")
+        ]
+        child_evidence.append(
+            {
+                "id": child["id"],
+                "title": child["title"],
+                "status": child["status"],
+                "commit_hash": child.get("commit_hash"),
+                "follow_up_of": follow_up_sources.get(child["id"]),
+                "review_history": review_history,
+            }
+        )
 
     db.update_runtime(
         conn,
         current_step="commit-review-supertask",
         active_agents=1,
         review_round=task["review_round"],
-        status_message=f"Round {task['review_round']}: {reviewer} reviewing plan",
+        status_message=f"Round {task['review_round']}: {reviewer} reviewing supertask result",
     )
 
     db.add_comment(conn, task["id"],
                    f"Starting commit-review-supertask round {task['review_round']} with reviewer: {reviewer}.",
                    kind="comment", author="orchestrator")
 
-    prompt = prompt_builder.build_prompt(task, "commit-review-supertask", reviewer, comments)
+    prompt = prompt_builder.build_prompt(
+        task,
+        "commit-review-supertask",
+        reviewer,
+        comments,
+        supertask_children=child_evidence,
+    )
     exit_code = run_agent(reviewer, prompt, task["id"], conn, "commit-review-supertask")
 
     if exit_code != 0:
@@ -1106,8 +1438,9 @@ def handle_commit_review_supertask(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(f"Reviewer '{reviewer}' exited 0 but left no decision for round {current_round}", task["id"])
-        return "reject"
+        return _missing_review_decision(
+            task, conn, reviewer, step="commit-review-supertask", round_label=current_round,
+        )
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "approval":
@@ -1187,7 +1520,8 @@ def handle_commit_plan_review(task, conn):
     is not incremented for planning rejections.
     """
     reviewer = DEFAULT_PLAN_REVIEWER
-    ensure_agent_acked(reviewer, task["id"], conn)
+    if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-plan-review"):
+        return "error"
     comments = db.get_comments(conn, task["id"])
 
     db.update_runtime(
@@ -1228,8 +1562,9 @@ def handle_commit_plan_review(task, conn):
     ]
 
     if not reviewer_decisions:
-        log(f"Reviewer '{reviewer}' exited 0 but left no plan decision", task["id"])
-        return "reject"
+        return _missing_review_decision(
+            task, conn, reviewer, step="commit-plan-review",
+        )
 
     decision = reviewer_decisions[-1]["kind"]
     if decision == "plan-approval":
@@ -1240,24 +1575,150 @@ def handle_commit_plan_review(task, conn):
     return "reject"
 
 
+def _complete_supertask(task, conn, *, review_skipped=False):
+    """Mark a supertask done after final review or an explicit review skip."""
+    task_id = task["id"]
+    db.update_task(
+        conn,
+        task_id,
+        status="done",
+        next_step="none",
+        last_review_decision="approve",
+    )
+    completion_message = (
+        "All child tasks and follow-ups done. Final supertask review skipped; "
+        "supertask complete."
+        if review_skipped
+        else "Final supertask review approved. Supertask complete."
+    )
+    db.add_comment(
+        conn,
+        task_id,
+        completion_message,
+        kind="comment",
+        author="orchestrator",
+    )
+    suffix = "with final review skipped" if review_skipped else "after final review"
+    db.update_runtime(conn, status_message=f"Supertask {task_id} done {suffix}")
+    log(f"Supertask {task_id} complete {suffix}", task_id)
+
+
+def _reconcile_supertask_follow_ups(parent_id, conn):
+    """Attach linked follow-up chains created before parent inheritance existed."""
+    pending = list(db.get_child_tasks(conn, parent_id))
+    visited = set()
+    while pending:
+        source = pending.pop(0)
+        if source["id"] in visited:
+            continue
+        visited.add(source["id"])
+        follow_up_id = source.get("follow_up_task_id")
+        if follow_up_id is None:
+            continue
+        follow_up = db.get_task(conn, follow_up_id)
+        if follow_up is None:
+            db.update_task(conn, source["id"], follow_up_task_id=None)
+            db.add_comment(
+                conn,
+                parent_id,
+                f"Cleared missing follow-up task {follow_up_id} referenced by "
+                f"child task {source['id']}.",
+                kind="comment",
+                author="orchestrator",
+            )
+            log(
+                f"Cleared missing follow-up {follow_up_id} from child {source['id']}",
+                parent_id,
+            )
+            continue
+        try:
+            db.attach_follow_up_to_supertask(conn, source["id"], follow_up_id)
+        except ValueError as error:
+            mark_blocked(
+                parent_id,
+                conn,
+                f"Could not associate follow-up task {follow_up_id}: {error}",
+                f"Blocked: supertask {parent_id} follow-up association needs correction",
+                log_message=f"Supertask follow-up reconciliation failed: {error}",
+                preserve_wip=False,
+                block_reason="follow_up_reconciliation",
+                resume_next_step="commit-review-supertask",
+            )
+            return False
+        follow_up = db.get_task(conn, follow_up_id)
+        if follow_up and follow_up.get("parent_task_id") == parent_id:
+            if follow_up["status"] == "none":
+                db.update_task(
+                    conn,
+                    follow_up_id,
+                    status="ready",
+                    next_step="commit-make",
+                )
+                db.add_comment(
+                    conn,
+                    follow_up_id,
+                    f"Queued after task {source['id']} during supertask reconciliation.",
+                    kind="comment",
+                    author="orchestrator",
+                )
+                log(
+                    f"Queued reconciled follow-up task {follow_up_id} after child {source['id']}",
+                    parent_id,
+                )
+                follow_up = db.get_task(conn, follow_up_id)
+            pending.append(follow_up)
+    return True
+
+
+def _queue_supertask_final_review_if_complete(parent_id, conn, *, log_task_id=None):
+    """Queue final review once every child and descendant follow-up is done."""
+    parent = db.get_task(conn, parent_id)
+    if not parent or parent["status"] != "pending_subtasks":
+        return False
+    if not _reconcile_supertask_follow_ups(parent_id, conn):
+        return False
+    children = db.get_child_tasks(conn, parent_id)
+    if not all(child["status"] == "done" for child in children):
+        return False
+
+    if db.should_skip_step(conn, parent_id, "commit-review-supertask"):
+        _complete_supertask(parent, conn, review_skipped=True)
+        return True
+
+    db.update_task(
+        conn,
+        parent_id,
+        status="ready",
+        next_step="commit-review-supertask",
+        last_review_decision="none",
+    )
+    db.add_comment(
+        conn,
+        parent_id,
+        "All child tasks and follow-ups done. Queued final supertask review.",
+        kind="comment",
+        author="orchestrator",
+    )
+    db.update_runtime(
+        conn,
+        status_message=f"Supertask {parent_id} children complete; queued final review",
+    )
+    log(
+        f"Supertask {parent_id} queued for final review",
+        log_task_id or parent_id,
+    )
+    return True
+
+
 def _check_parent_completion(task_id, conn):
-    """If task has a parent supertask and all siblings are done, mark parent done."""
+    """Queue final supertask review when this task completes the child sequence."""
     task = db.get_task(conn, task_id)
     if not task:
         return
     parent_id = task.get("parent_task_id")
     if not parent_id:
         return
-    parent = db.get_task(conn, parent_id)
-    if not parent or parent["status"] != "pending_subtasks":
-        return
-    children = db.get_child_tasks(conn, parent_id)
-    if all(c["status"] == "done" for c in children):
-        db.update_task(conn, parent_id, status="done", next_step="none")
-        db.add_comment(conn, parent_id,
-                       "All child tasks done. Supertask complete.",
-                       kind="comment", author="orchestrator")
-        log(f"Supertask {parent_id} complete (all children done)", task_id)
+    _queue_supertask_final_review_if_complete(parent_id, conn, log_task_id=task_id)
 
 
 def _finalize_commit(task, conn, done_without_commit=False):
@@ -1278,10 +1739,11 @@ def _finalize_commit(task, conn, done_without_commit=False):
             log(f"Recorded commit_hash {new_hash[:8]}", task_id)
         db.update_task(conn, task_id, status="done", next_step="none")
         db.add_comment(conn, task_id,
-                       f"Task complete: commit finalized and pushed to branch '{task['branch']}'.",
+                       f"Task complete: commit finalized locally on branch '{task['branch']}'.",
                        kind="comment", author="orchestrator")
         db.update_runtime(conn, status_message=f"Task {task_id} done (commit finalized)")
         log("Task done (commit finalized)", task_id)
+    _queue_follow_up_if_needed(db.get_task(conn, task_id), conn)
     _check_parent_completion(task_id, conn)
 
 
@@ -1347,7 +1809,7 @@ def _queue_deferred_validation_after_skipped_review(task, conn):
     db.add_comment(
         conn,
         task["id"],
-        "Commit review skipped, but SKIP_BUILD_UNTIL_APPROVED is active; queued "
+        "Commit review skipped, but CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER is active; queued "
         "commit-make Path B so the deferred full-build validation still runs before "
         "finalization.",
         kind="comment",
@@ -1386,7 +1848,7 @@ def _finalize_other(task, conn):
 
 
 def _requeue_for_review_after_deferred_build(task, conn):
-    """Re-enter commit-review after a SKIP_BUILD_UNTIL_APPROVED Path B build changed the staged diff.
+    """Re-enter commit-review after a CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER Path B build changed the staged diff.
 
     The coder staged the build-modified diff and signaled deferred-build-changed.
     Increment review_round and route to commit-review so the reviewer sees the updated diff.
@@ -1398,7 +1860,7 @@ def _requeue_for_review_after_deferred_build(task, conn):
                    review_round=new_round, last_review_decision="none")
     db.add_comment(
         conn, task_id,
-        f"Deferred full build (SKIP_BUILD_UNTIL_APPROVED) changed the staged diff. "
+        f"Deferred full build (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER) changed the staged diff. "
         f"Re-entering review at round {new_round} so the updated diff is reviewed before landing.",
         kind="comment", author="orchestrator",
     )
@@ -1436,14 +1898,23 @@ def _queue_follow_up_if_needed(task, conn):
     if not follow_up:
         log(f"WARNING: follow_up_task_id {follow_up_id} not found; skipping requeue", task_id)
         return None
+
+    try:
+        attached = db.attach_follow_up_to_supertask(conn, task_id, follow_up_id)
+    except ValueError as error:
+        log(f"WARNING: could not attach follow-up {follow_up_id}: {error}", task_id)
+        return None
+    if attached:
+        follow_up = db.get_task(conn, follow_up_id)
     if follow_up["status"] != "none":
         log(f"Follow-up task {follow_up_id} already queued; skipping re-queue", task_id)
         return None
     db.update_task(conn, follow_up_id, status="ready", next_step="commit-make")
-    try:
-        db.reposition_task(conn, follow_up_id, after_id=task_id)
-    except ValueError as e:
-        log(f"WARNING: could not reposition follow-up {follow_up_id}: {e}", task_id)
+    if follow_up.get("parent_task_id") is None:
+        try:
+            db.reposition_task(conn, follow_up_id, after_id=task_id)
+        except ValueError as e:
+            log(f"WARNING: could not reposition follow-up {follow_up_id}: {e}", task_id)
     db.add_comment(conn, task_id,
                    f"Follow-up task {follow_up_id} ('{follow_up['title']}') queued after this task.",
                    kind="comment", author="orchestrator")
@@ -1454,14 +1925,15 @@ def _queue_follow_up_if_needed(task, conn):
     return follow_up_id
 
 
-def _approve_supertask_plan(task, conn):
-    """Advance supertask to pending_subtasks after approval or skip."""
+def _activate_supertask_children(task, conn):
+    """Activate a supertask's children after planning or final-review rework."""
     task_id = task["id"]
     db.update_task(conn, task_id,
                    status="pending_subtasks", next_step="none",
                    last_review_decision="approve")
-    db.update_runtime(conn, status_message=f"Supertask {task_id} plan approved; children now active")
-    log("Supertask plan approved, status=pending_subtasks", task_id)
+    db.update_runtime(conn, status_message=f"Supertask {task_id} planning complete; children now active")
+    log("Supertask planning complete, status=pending_subtasks", task_id)
+    _queue_supertask_final_review_if_complete(task_id, conn)
 
 
 def _approve_plan(task, conn):
@@ -1609,37 +2081,60 @@ def advance(task, conn):
             )
             return False
 
-        if db.should_skip_step(conn, task_id, "commit-review-supertask"):
-            _approve_supertask_plan(task, conn)
-        else:
-            db.update_task(conn, task_id,
-                           status="ready", next_step="commit-review-supertask",
-                           last_review_decision="none")
-            db.update_runtime(conn, status_message=f"Supertask {task_id} plan built, queued for review")
-            log("Supertask plan built, queued for review", task_id)
+        _activate_supertask_children(task, conn)
         return True
 
     elif step == "commit-review-supertask":
 
-        outcome = handle_commit_review_supertask(task, conn)
+        if not _reconcile_supertask_follow_ups(task_id, conn):
+            return False
+        incomplete_children = [
+            child
+            for child in db.get_child_tasks(conn, task_id)
+            if child["status"] != "done"
+        ]
+        if incomplete_children:
+            db.update_task(conn, task_id, status="pending_subtasks", next_step="none")
+            db.add_comment(
+                conn,
+                task_id,
+                "Final supertask review deferred because associated child or follow-up "
+                "work is not done.",
+                kind="comment",
+                author="orchestrator",
+            )
+            db.update_runtime(
+                conn,
+                status_message=f"Supertask {task_id} final review deferred; children still active",
+            )
+            log("Final supertask review deferred; child work remains", task_id)
+            return True
+
+        if db.should_skip_step(conn, task_id, "commit-review-supertask"):
+            _complete_supertask(task, conn, review_skipped=True)
+            return True
+
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_commit_review_supertask,
+            step="commit-review-supertask", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{DEFAULT_SUPER_REVIEWER}' failed supertask review round {task['review_round']}; "
-                "task blocked for human triage.",
-                f"Blocked: reviewer failed on supertask {task_id}",
-                log_message="Blocked: reviewer failed on supertask",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="commit-review-supertask",
+                reviewer=reviewer,
                 preserve_wip=False,
             )
             return False
 
         if outcome == "approve":
-            _approve_supertask_plan(task, conn)
+            _complete_supertask(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1647,10 +2142,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Supertask {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Supertask blocked after {MAX_REVIEW_ROUNDS} review rounds",
+                    f"Blocked: reached max review rounds ({review_cap})",
+                    f"Supertask {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Supertask blocked after {review_cap} review rounds",
                     preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="commit-make-supertask",
                 )
             else:
                 db.update_task(conn, task_id,
@@ -1695,15 +2192,16 @@ def advance(task, conn):
             _approve_plan(task, conn)
             return True
 
-        outcome = handle_commit_plan_review(task, conn)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_commit_plan_review,
+            step="commit-plan-review", reviewer=DEFAULT_PLAN_REVIEWER,
+        )
 
         if outcome == "error":
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{DEFAULT_PLAN_REVIEWER}' failed commit-plan-review; task blocked for human triage.",
-                f"Blocked: plan reviewer failed on task {task_id}",
-                log_message="Blocked: plan reviewer failed",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="commit-plan-review",
+                reviewer=DEFAULT_PLAN_REVIEWER,
                 preserve_wip=False,
             )
             return False
@@ -1751,17 +2249,17 @@ def advance(task, conn):
         return True
 
     elif step == "pull-request-review":
-        outcome = handle_pull_request_review(task, conn)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_pull_request_review,
+            step="pull-request-review", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            reviewer = _task_reviewer(task)
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{reviewer}' failed pull-request-review round {task['review_round']}; "
-                "task blocked for human triage.",
-                f"Blocked: PR reviewer failed on task {task_id}",
-                log_message="Blocked: PR reviewer failed",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="pull-request-review",
+                reviewer=reviewer,
                 preserve_wip=False,
             )
             return False
@@ -1771,7 +2269,8 @@ def advance(task, conn):
             _finalize_pull_request(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1779,10 +2278,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max pull request review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Pull request task {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Blocked after {MAX_REVIEW_ROUNDS} pull request review rounds",
+                    f"Blocked: reached max pull request review rounds ({review_cap})",
+                    f"Pull request task {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Blocked after {review_cap} pull request review rounds",
                     preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="pull-request-make",
                 )
             else:
                 db.update_task(
@@ -1834,17 +2335,17 @@ def advance(task, conn):
         return True
 
     elif step == "other-review":
-        outcome = handle_other_review(task, conn)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_other_review,
+            step="other-review", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            reviewer = _task_reviewer(task)
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{reviewer}' failed other-review round {task['review_round']}; "
-                "task blocked for human triage.",
-                f"Blocked: other reviewer failed on task {task_id}",
-                log_message="Blocked: other reviewer failed",
+            _block_reviewer_unavailable(
+                task, conn,
+                step="other-review",
+                reviewer=reviewer,
                 preserve_wip=False,
             )
             return False
@@ -1854,7 +2355,8 @@ def advance(task, conn):
             _finalize_other(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1862,10 +2364,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max other-review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Other task {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Blocked after {MAX_REVIEW_ROUNDS} other-review rounds",
+                    f"Blocked: reached max other-review rounds ({review_cap})",
+                    f"Other task {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Blocked after {review_cap} other-review rounds",
                     preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="other-make",
                 )
             else:
                 db.update_task(
@@ -1907,16 +2411,19 @@ def advance(task, conn):
 
         if task["last_review_decision"] == "approve":
             if needs_rereview:
-                # Deferred build (SKIP_BUILD_UNTIL_APPROVED) changed the diff: re-enter review.
+                # Deferred build (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER) changed the diff: re-enter review.
                 new_round = task["review_round"] + 1
-                if new_round >= MAX_REVIEW_ROUNDS:
+                review_cap = task_max_review_rounds(task)
+                if new_round >= review_cap:
                     mark_blocked(
                         task_id,
                         conn,
-                        f"Blocked: deferred build changed diff and max review rounds ({MAX_REVIEW_ROUNDS}) reached.",
+                        f"Blocked: deferred build changed diff and max review rounds ({review_cap}) reached.",
                         f"Task {task_id} blocked after deferred build diff change at round limit",
                         log_message="Blocked: deferred build diff change at round limit",
                         preserve_wip=True,
+                        block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                        resume_next_step="commit-make",
                     )
                     return False
                 _requeue_for_review_after_deferred_build(task, conn)
@@ -1961,17 +2468,36 @@ def advance(task, conn):
             log("Commit built, queued for review", task_id)
         return True
     elif step == "commit-review":
-        outcome = handle_commit_review(task, conn)
+        if task.get("stash_ref"):
+            if not restore_task_wip(task, conn):
+                mark_blocked(
+                    task_id,
+                    conn,
+                    (
+                        f"Blocked: could not restore stashed candidate "
+                        f"{task.get('stash_ref')} before commit-review. "
+                        "Resume at commit-review when the stash is recoverable."
+                    ),
+                    f"Blocked: stash restore failed for task {task_id}",
+                    log_message="Blocked: could not restore stashed candidate before commit-review",
+                    preserve_wip=False,
+                    block_reason=db.BLOCK_REASON_REVIEWER_UNAVAILABLE,
+                    resume_next_step="commit-review",
+                )
+                return False
+            task = db.get_task(conn, task_id)
+        reviewer = _task_reviewer(task)
+        outcome = _run_review_with_infra_retries(
+            task, conn, handle_commit_review,
+            step="commit-review", reviewer=reviewer,
+        )
 
         if outcome == "error":
-            reviewer = _task_reviewer(task)
-            mark_blocked(
-                task_id,
-                conn,
-                f"Reviewer '{reviewer}' failed review round {task['review_round']}; task blocked for human triage.",
-                f"Blocked: reviewer failed on task {task_id}",
-                log_message="Blocked: reviewer failed",
-                preserve_wip=False,
+            _block_reviewer_unavailable(
+                task, conn,
+                step="commit-review",
+                reviewer=reviewer,
+                preserve_wip=True,
             )
             return False
 
@@ -1979,7 +2505,8 @@ def advance(task, conn):
             _approve_commit(task, conn)
         else:
             new_round = task["review_round"] + 1
-            if new_round >= MAX_REVIEW_ROUNDS:
+            review_cap = task_max_review_rounds(task)
+            if new_round >= review_cap:
                 db.update_task(
                     conn, task_id,
                     review_round=new_round, last_review_decision="reject",
@@ -1987,10 +2514,12 @@ def advance(task, conn):
                 mark_blocked(
                     task_id,
                     conn,
-                    f"Blocked: reached max review rounds ({MAX_REVIEW_ROUNDS})",
-                    f"Task {task_id} blocked after {MAX_REVIEW_ROUNDS} review rounds",
-                    log_message=f"Blocked after {MAX_REVIEW_ROUNDS} review rounds",
+                    f"Blocked: reached max review rounds ({review_cap})",
+                    f"Task {task_id} blocked after {review_cap} review rounds",
+                    log_message=f"Blocked after {review_cap} review rounds",
                     preserve_wip=True,
+                    block_reason=db.BLOCK_REASON_REVIEW_CAP,
+                    resume_next_step="commit-make",
                 )
             else:
                 db.update_task(conn, task_id,
@@ -2039,7 +2568,7 @@ def recover_running_tasks(conn):
     On startup, reset any tasks stuck in 'running' from a previous orchestrator
     instance. These are invisible to find_ready_task and would be orphaned forever.
 
-    For commit-review tasks, advance review_round before re-queuing — matching the
+    For review tasks, advance review_round before re-queuing — matching the
     KeyboardInterrupt handler — so stale reviewer votes from the interrupted round are
     not mixed with fresh votes in the new run.
     """
@@ -2048,16 +2577,26 @@ def recover_running_tasks(conn):
     ).fetchall()
     for row in rows:
         task = db._row_to_task(row)
-        if task["next_step"] in ("commit-review", "commit-review-supertask", "pull-request-review", "other-review"):
-            new_round = task["review_round"] + 1
-            db.update_task(conn, task["id"], status="ready", review_round=new_round, last_review_decision="none")
-            db.add_comment(
-                conn, task["id"],
-                f"Task was stuck in 'running' state ({task['next_step']}) at orchestrator startup. "
-                f"Advanced to review round {new_round} to avoid mixing stale votes.",
-                kind="comment", author="orchestrator",
-            )
-            log(f"Recovered stuck {task['next_step']} task (advanced to round {new_round}): '{task['title']}'", task["id"])
+        if task["next_step"] in _INTERRUPT_REVIEW_RESUME:
+            outcome, new_round = _requeue_or_block_interrupted_review(task, conn)
+            if outcome == "ready":
+                db.add_comment(
+                    conn, task["id"],
+                    f"Task was stuck in 'running' state ({task['next_step']}) at orchestrator startup. "
+                    f"Advanced to review round {new_round} to avoid mixing stale votes.",
+                    kind="comment", author="orchestrator",
+                )
+                log(
+                    f"Recovered stuck {task['next_step']} task "
+                    f"(advanced to round {new_round}): '{task['title']}'",
+                    task["id"],
+                )
+            else:
+                log(
+                    f"Recovered stuck {task['next_step']} task "
+                    f"(blocked at review cap round {new_round}): '{task['title']}'",
+                    task["id"],
+                )
         elif task["next_step"] == "commit-plan-review":
             # For plan review, reset to commit-plan so the plan can be re-reviewed
             # cleanly without mixing stale approval/rejection comments.
@@ -2098,7 +2637,7 @@ def update_runtime_after_task(conn, task_id, succeeded):
         set_runtime_idle(conn)
         return
 
-    next_ready = db.find_ready_task(conn)
+    next_ready = smart_unblock.find_dispatchable_task(conn)
     if next_ready:
         db.update_runtime(
             conn,
@@ -2130,6 +2669,7 @@ def process_pinned_task(task, conn):
     """
     current = task
     task_id = task["id"]
+    db_path = db.get_connection_db_path(conn) or db.get_db_path()
 
     while True:
         if _task_on_disallowed_master_branch(current):
@@ -2142,6 +2682,17 @@ def process_pinned_task(task, conn):
                 author="orchestrator",
             )
             log(f"Blocked ready task on protected branch '{current['branch']}'", task_id)
+            update_runtime_after_task(conn, task_id, False)
+            return False
+
+        # Shared consultation gate: never mark running while smart-unblock still
+        # holds this task for validation/rollback (including a rogue ready).
+        if smart_unblock.is_consultation_gated(task_id, db_path):
+            log(
+                "Pinned task is under smart-unblock consultation; "
+                "not marking running until validation/rollback completes",
+                task_id,
+            )
             update_runtime_after_task(conn, task_id, False)
             return False
 
@@ -2174,12 +2725,12 @@ def process_pinned_task(task, conn):
             # Ctrl-C during processing — recover task, then re-raise
             # so main() can run the stopping→stopped shutdown path.
             log("Interrupted!", task_id)
-            if current["next_step"] in ("commit-review", "commit-review-supertask", "pull-request-review", "other-review"):
-                new_round = current["review_round"] + 1
-                db.update_task(conn, task_id,
-                               status="ready", next_step=current["next_step"],
-                               review_round=new_round, last_review_decision="none")
-                log(f"Review interrupted, advancing to round {new_round}", task_id)
+            if current["next_step"] in _INTERRUPT_REVIEW_RESUME:
+                outcome, new_round = _requeue_or_block_interrupted_review(current, conn)
+                if outcome == "ready":
+                    log(f"Review interrupted, advancing to round {new_round}", task_id)
+                else:
+                    log(f"Review interrupted, blocked at review cap round {new_round}", task_id)
             elif current["next_step"] == "commit-plan-review":
                 # Reset to commit-plan so plan review starts fresh.
                 # Also clear commit_plan so a stale plan cannot be re-submitted as-is.
@@ -2230,6 +2781,16 @@ def process_pinned_task(task, conn):
                 log(f"Child task blocked; supertask {parent_id} also blocked", task_id)
 
         if current["status"] == "ready" and current["next_step"] != "none":
+            # Same gate as find_dispatchable_task: a rogue consultation can flip
+            # blocked→ready after advance() returns; do not pin-continue it.
+            if smart_unblock.is_consultation_gated(task_id, db_path):
+                log(
+                    "Pinned task became ready during smart-unblock consultation; "
+                    "not continuing until validation/rollback completes",
+                    task_id,
+                )
+                update_runtime_after_task(conn, task_id, False)
+                return False
             log(f"Continuing pinned task at step={current['next_step']}", task_id)
             continue
 
@@ -2245,6 +2806,7 @@ def main_loop(conn, *, db_path=None):
     init_runtime(conn)
     recover_running_tasks(conn)
     start_heartbeat(db.get_db_path())
+    start_smart_unblock(db.get_db_path())
     set_runtime_idle(conn)
 
     stop_file = Path(db.get_db_path()).parent / STOP_AFTER_TASK_FILE
@@ -2259,6 +2821,7 @@ def main_loop(conn, *, db_path=None):
             db.update_runtime(conn, status="stopping", active_agents=0,
                               status_message="Stop-after-task requested")
             stop_heartbeat()
+            stop_smart_unblock()
             db.update_runtime(conn, status="stopped",
                               status_message="Stopped")
             break
@@ -2276,7 +2839,7 @@ def main_loop(conn, *, db_path=None):
             )
             blocked_gate_logged_task_ids.add(gated_task["id"])
 
-        task = db.find_ready_task(conn)
+        task = smart_unblock.find_dispatchable_task(conn)
         if not task:
             time.sleep(POLL_INTERVAL)
             continue
@@ -2363,6 +2926,7 @@ def main(argv=None):
         except Exception:
             pass
         stop_heartbeat()
+        stop_smart_unblock()
         try:
             db.update_runtime(conn, status="stopped",
                               status_message="Stopped")
@@ -2376,6 +2940,7 @@ def main(argv=None):
     finally:
         stop_dashboard()
         stop_heartbeat()
+        stop_smart_unblock()
         release_singleton_lock()
         if conn is not None:
             conn.close()

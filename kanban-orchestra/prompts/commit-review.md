@@ -20,6 +20,7 @@ there instead of rebuilding context from scratch.
 
    What to check:
    - Does it accomplish what the title and description ask for?
+   - Do the structure of new code and its naming make sense? Does the diff preserve concrete domain meaning without introducing vague abstractions or generic terms?
    - Behavioral regressions vs the existing codebase
    - Logic errors in the new or modified code
    - Concrete quality or polish issues that affect maintainability,
@@ -31,6 +32,8 @@ there instead of rebuilding context from scratch.
      - screenshots or assets presented poorly
      - missing or inadequate tests when the change is testable
    - Anything that contradicts the maker's commit message or validation summary
+   - If the commit message includes `WHY`, whether it states the problem being
+     solved without repeating the implementation
    - On rework, does it address the prior round's feedback?
 
    What NOT to check:

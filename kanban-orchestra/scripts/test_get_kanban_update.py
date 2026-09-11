@@ -177,7 +177,7 @@ class TestBuildUpdate(unittest.TestCase):
         update = get_kanban_update.build_update(self.conn)
 
         self.assertIn("processes: none found", update)
-        self.assertIn("dashboard: not running", update)
+        self.assertIn("Dashboard: not running", update)
 
     def test_running_dashboard_url_is_shown(self):
         identity = db.get_instance_identity(self.db_path)
@@ -209,9 +209,58 @@ class TestBuildUpdate(unittest.TestCase):
             status_message="idle",
         )
 
-        update = get_kanban_update.build_update(self.conn)
+        with patch.object(
+            get_kanban_update.fleet,
+            "preferred_dashboard_url",
+            side_effect=lambda url, **kwargs: url,
+        ):
+            update = get_kanban_update.build_update(self.conn)
 
-        self.assertIn("dashboard: http://127.0.0.1:8432", update)
+        self.assertIn("Dashboard: http://127.0.0.1:8432", update)
+        self.assertNotIn("Remote:", update)
+        self.assertNotIn("dashboard:", update)
+
+    def test_running_dashboard_prefers_tailscale_url_when_serve_mapping_exists(self):
+        identity = db.get_instance_identity(self.db_path)
+        dashboard_path = Path(identity["runtime_root"]) / "dashboard.json"
+        dashboard_path.parent.mkdir(parents=True, exist_ok=True)
+        dashboard_path.write_text(
+            json.dumps(
+                {
+                    "role": "dashboard",
+                    "pid": os.getpid(),
+                    "repo_root": identity["repo_root"],
+                    "db_path": identity["db_path"],
+                    "runtime_root": identity["runtime_root"],
+                    "lock_path": identity["lock_path"],
+                    "url": "http://127.0.0.1:8432",
+                }
+            ),
+            encoding="utf-8",
+        )
+        db.upsert_runtime(
+            self.conn,
+            status="idle",
+            pid=os.getpid(),
+            started_at=None,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            current_task_id=None,
+            current_step="none",
+            active_agents=0,
+            status_message="idle",
+        )
+
+        with patch.object(
+            get_kanban_update.fleet,
+            "preferred_dashboard_url",
+            return_value="https://node.example.ts.net:8432/",
+        ):
+            update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn("Dashboard: https://node.example.ts.net:8432/", update)
+        self.assertNotIn("http://127.0.0.1:8432", update)
+        self.assertNotIn("Remote:", update)
+        self.assertNotIn("dashboard:", update)
 
     def test_missing_dashboard_metadata_reports_not_running(self):
         db.upsert_runtime(
@@ -228,7 +277,7 @@ class TestBuildUpdate(unittest.TestCase):
 
         update = get_kanban_update.build_update(self.conn)
 
-        self.assertIn("dashboard: not running", update)
+        self.assertIn("Dashboard: not running", update)
 
     def test_stale_dashboard_metadata_reports_not_running(self):
         identity = db.get_instance_identity(self.db_path)
@@ -262,23 +311,29 @@ class TestBuildUpdate(unittest.TestCase):
 
         update = get_kanban_update.build_update(self.conn)
 
-        self.assertIn("dashboard: not running", update)
-        self.assertNotIn("dashboard: http://127.0.0.1:8432", update)
+        self.assertIn("Dashboard: not running", update)
+        self.assertNotIn("Dashboard: http://127.0.0.1:8432", update)
 
     def test_fleet_configured_running_repo_appends_dashboard_summary(self):
         repo = self._fleet_repo()
 
         with patch.object(get_kanban_update.fleet, "load_status_repos", return_value=[repo]), \
              patch.object(get_kanban_update.fleet, "repo_process_state", return_value=("running/busy", "123", "456", "-")), \
-             patch.object(get_kanban_update.fleet, "dashboard_status_url", return_value="http://127.0.0.1:8427"):
+             patch.object(get_kanban_update.fleet, "dashboard_status_url", return_value="http://127.0.0.1:8427"), \
+             patch.object(
+                 get_kanban_update.fleet,
+                 "preferred_dashboard_url",
+                 return_value="https://node.example.ts.net:8427/",
+             ):
             update = get_kanban_update.build_update(self.conn)
 
         self.assertTrue(
             update.endswith(
                 "ATTENTION: start the orchestrator — no runtime row found\n\n"
-                "This repo (short-name) is running. Dash: http://127.0.0.1:8427"
+                "This repo (short-name) is running. Dashboard: https://node.example.ts.net:8427/"
             )
         )
+        self.assertNotIn("Dash:", update)
 
     def test_fleet_configured_stopped_repo_reports_dashboard_not_running(self):
         repo = self._fleet_repo()
@@ -289,7 +344,7 @@ class TestBuildUpdate(unittest.TestCase):
             update = get_kanban_update.build_update(self.conn)
 
         self.assertIn(
-            "\n\nThis repo (short-name) is stopped. Dash: dashboard not running",
+            "\n\nThis repo (short-name) is stopped. Dashboard: not running",
             update,
         )
 

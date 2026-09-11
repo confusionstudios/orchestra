@@ -1,4 +1,4 @@
-Use Kanban Orchestra in the current working repo.
+Use Kanban Orchestra in the current working repo. The Kanban Orchestra is a SERIAL task executor. You can queue many tasks in "ready" state: the Orchestra will execute them in order.
 
 ## Role check — read this first
 
@@ -6,7 +6,7 @@ Before doing anything else, determine which role applies:
 
 | Role | How to tell | What to do |
 |------|-------------|------------|
-| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for status. Use `task list/show/add/set` for task management. |
+| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for a one-shot status. Use `narrate` for a live feed that observes native orchestrator recovery. Use `task list/show/add/set` for task management. |
 | **Sticky coder** | The orchestrator explicitly spawned you as the designated build agent for a specific task | Follow the full workflow for that task. |
 
 Default role: observer.
@@ -99,9 +99,10 @@ A commit task moves through these steps:
 5. `commit-make` finalization — same coder considers approval notes and finalizes the commit after approval.
    Always runs.
 
-Supertasks substitute `commit-make-supertask` and `commit-review-supertask`
-for steps 3–4; the supertask itself never lands a commit.
-`commit-review-supertask` is *skippable*.
+Supertasks use `commit-make-supertask` to create an ordered child plan, execute
+all children and their follow-ups, then use `commit-review-supertask` for a
+final aggregate review. The supertask itself never lands a commit, and its
+final review is *skippable*.
 
 Pull request tasks use `pull-request-make` and `pull-request-review`.
 Other tasks use `other-make` and `other-review`, and must leave durable
@@ -116,10 +117,11 @@ Valid skip values: `commit-plan`, `commit-plan-review`, `commit-review`,
 
 ## Queueing semantics
 
-`ready` is the runnable backlog, not a concurrency request. Multiple tasks in
-`ready` are normal and expected. The orchestrator selects eligible `ready`
-tasks one at a time, applies branch, blocked-state, worktree, and lifecycle
-checks, and serializes execution through the configured `next_step`.
+Kanban Orchestra is a serialized work queue, not a task tree. `ready` is the
+runnable backlog, not a concurrency request. Multiple tasks in `ready` are
+normal and expected. The orchestrator selects eligible `ready` tasks one at a
+time, applies branch, blocked-state, worktree, and lifecycle checks, and
+serializes execution through the configured `next_step`.
 
 Operationally:
 - `none` means the task exists but is not queued yet.
@@ -129,6 +131,13 @@ Operationally:
 - Do not hold later tasks at `none` merely because earlier tasks should run
   first. Use ordering fields, explicit dependencies, blocked states, stop
   markers, or separate validation tasks when the workflow requires a gate.
+- Do not create child tasks or use a `supertask` to express normal sequencing.
+  Create independent tasks and set them `ready`. When priorities change,
+  reorder queued tasks with `task requeue <id> --before <other-id>` or
+  `task requeue <id> --after <other-id>`. New work can be added and positioned
+  while another task is running; it will be picked up later, one eligible task
+  at a time. Supertasks are optional grouping/reporting metadata and should be
+  used only when the user explicitly asks for that structure.
 
 Operator guidance:
 - If the user asks to queue or cue a batch of tasks, create or update them in
@@ -157,7 +166,7 @@ task add "<title>" \
     [--type <commit|pull_request|supertask|other>] [--kind <legacy-kind>] [--parent <task-id>] \
     [--sequence-index <n>] [--skip <step>] [--allow-when-blocked]
 
-task list [--status <status>] [--next-step <step>] [--branch <branch>] [--page <n>]
+task list [--status <status>] [--next-step <step>] [--branch <branch>] [--parent <task-id>] [--page <n>]
 task show <task-id>
 task show-comments <task-id>
 task show-run-log <task-id>
@@ -168,6 +177,12 @@ task set <task-id> \
     [--review-round <n>] [--last-review-decision <decision>] \
     [--commit-plan "<text>"] [--allow-when-blocked <bool>] \
     [--add-skip <step>] [--remove-skip <step>]
+
+# Resume a blocked task (review-cap extension or explicit recovery step):
+task continue <task-id> --add-review-rounds <n>
+task continue <task-id> --next-step <step>
+# Legacy pre-schema review-cap (no block_reason / resume_next_step):
+task continue <task-id> --add-review-rounds <n> --next-step commit-make
 
 # Comments (use --message-stdin for multi-line / shell-sensitive text):
 cat <<'EOF' | task comment <task-id> --message-stdin [--comment|--commit-message|--validation] [--author <name>]
@@ -208,13 +223,16 @@ Use status commands and repo-local metadata instead of PID hunting:
 "$ORCHESTRA_DIR/bin/ko-fleet" restart <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" attach <repo-label>
 "$ORCHESTRA_DIR/bin/ko-fleet" logs <repo-label>
+"$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
 Fleet config lives at `~/.config/orchestra/fleet.repos` by default. It is a
 private flat list: one git repo root per non-empty line, with `~`, environment
 variables, blank lines, and `#` comments supported. Every configured repo gets
-one orchestrator and one matching dashboard. `ko-fleet start` skips dirty
+one orchestrator and one matching dashboard. Fleet manages those running
+processes only; skill wrappers come from the one-time
+`ko-install-global-skills` install, not from Fleet. `ko-fleet start` skips dirty
 stopped repos, keeps launching clean stopped repos, and still treats invalid
 repo config as a hard failure.
 
@@ -229,14 +247,38 @@ at the top of the next polling loop after the current task finishes, logs the
 detection, deletes the file, and exits.
 
 Notes:
+- Use `ko-fleet dashboard` to start or open the Fleet Dashboard. Each card
+  shows the repo name, path, branch, status, current task, and ready /
+  recently done / icebox counts. Dashboard startup publishes an HTTPS
+  Tailscale Serve proxy to the chosen localhost port in the background when
+  the `tailscale` CLI is available: existing exact mappings are reused, a
+  same-port HTTPS listener is preferred when that port is free, a free
+  alternate HTTPS listener is used when it is not, and unrelated Serve routes
+  are left untouched. Mappings persist after the dashboard stops.
+  Tailscale absence, delay, or failure never blocks the localhost dashboard.
+  Startup output, `ko-get-update`, and the current-repo summary from
+  `ko-fleet status` present one **Dashboard:** URL: the exact HTTPS mapping
+  when it exists, otherwise localhost. The fleet table still shows localhost.
+  Each card has one Dashboard action: local Fleet views use localhost and
+  Tailscale Fleet views use the exact remote mapping, omitting the action when
+  that mapping is unavailable. Play on a stopped card is equivalent to
+  `ko-fleet start <configured-repo-label>`.
 - Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
+  It opens the preferred Tailscale URL when an exact mapping exists.
 - Use `ko-fleet dashboard-open <repo-label>` when a script wants an explicit
-  open verb; it is an alias for `dashboard`.
-- The dashboard chooses a free port at runtime and records it in
+  open verb; it requires a repo selector.
+- Pass `--local` on `ko-fleet dashboard` or `ko-fleet dashboard-open` to open
+  the localhost URL for debugging.
+- The repo dashboard chooses a free port at runtime and records it in
   `.kanban-orchestra/dashboard.json`.
-- The dashboard is the repo-scoped read-only status surface. For intervention,
-  stop or interrupt the repo instance, inspect with `ko-get-update`, use
-  `ko-task` to record or unblock the affected task, and restart explicitly.
+- The repo dashboard is the repo-scoped read-only status surface. For
+  intervention, stop or interrupt the repo instance, inspect with
+  `ko-get-update`, use `ko-task` to record or unblock the affected task, and
+  restart explicitly.
+- A running orchestrator reassesses blocked tasks natively about once a
+  minute. It consults `$ORCHESTRA_DEFAULT_UNBLOCKER` and either continues a
+  recoverable task or leaves a durable `smart-unblock` comment. Narration
+  observes those comments and does not start a separate recovery process.
 
 ## Default operating pattern
 
@@ -246,6 +288,22 @@ Notes:
 - Before setting a task to `ready`, set `next_step` to a meaningful step
   (typically `commit-make`); tasks left at `next_step: none` get picked up
   and immediately dropped with no work executed.
+- `task continue` to resume a blocked task safely:
+  - After a review-round cap block, use
+    `task continue <id> --add-review-rounds N`. This raises that task's
+    persisted `max_review_rounds` by N, preserves `review_round`, comments,
+    and `stash_ref`, and requeues at the stored maker step
+    (`commit-make`, `pull-request-make`, `other-make`, or
+    `commit-make-supertask`).
+  - For other blocks, use `task continue <id> --next-step <step>`. Do not
+    guess a recovery step; `--next-step` is required unless structured resume
+    metadata is already on the task. Review-cap blocks must use
+    `--add-review-rounds`, not `--next-step` alone. Do not use
+    `task set --status ready` to bypass a review-cap block.
+  - Legacy databases may have a pre-schema review-cap block with no
+    `block_reason` / `resume_next_step`. Recover those with
+    `task continue <id> --add-review-rounds N --next-step <maker-step>`
+    (operator-declared legacy recovery only).
 - `task add --branch master/main`, `task set --branch master/main`, and
   `task set --status ready` for a task whose branch resolves to `master` or
   `main` require the repo-local `ALLOW_TASKS_ON_MASTER` marker.
@@ -314,8 +372,9 @@ First choice: `ko-get-update`.
 "$ORCHESTRA_DIR/bin/ko-get-update"
 ```
 
-Use `ko-fleet dashboard <repo-label>` to open the HTML dashboard for a running
-fleet instance. The dashboard shows orchestrator status, the active task,
+Use `ko-fleet dashboard` to start or open the Fleet Dashboard. Use
+`ko-fleet dashboard <repo-label>` to open the HTML dashboard for a running
+repo instance. The repo dashboard shows orchestrator status, the active task,
 reviewer state, and current orchestrator output.
 
 CLI-level state check via `orchestrator_runtime`:
@@ -338,6 +397,13 @@ Read the result like this:
   check the blocked task comment and worktree before restarting.
 - `status = error` means an orchestrator-level failure.
 - List blocked tasks with `task list --status blocked`.
+- Native smart-unblock comments (author `smart-unblock`) record whether
+  recovery was safe or what the operator must decide.
+- Resume a review-cap block with
+  `task continue <id> --add-review-rounds N`, or resume other blocks with
+  `task continue <id> --next-step <step>`. Legacy pre-schema review-cap
+  blocks (no structured metadata):
+  `task continue <id> --add-review-rounds N --next-step commit-make`.
 
 When any task is `blocked`, only `ready` tasks with `allow_when_blocked`
 enabled remain eligible for pickup.

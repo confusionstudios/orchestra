@@ -11,12 +11,15 @@ Routes:
                        icebox, blocked tasks, recent done)
   GET /task/{id}     — task detail (metadata, edit form, comments, run log)
   POST /task/{id}/edit — update task title/description source text
+  POST /task/{id}/set-ready — queue a none/blocked task (not review-cap)
+  POST /task/{id}/continue-review-cap — continue a structured review-cap block
   GET /events        — SSE stream for overview fragments
   GET /events/{id}   — SSE stream for task-detail fragments
 """
 
 import atexit
 import errno
+import hashlib
 import json
 import os
 import re
@@ -25,10 +28,10 @@ import sqlite3
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
@@ -36,7 +39,9 @@ from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
+import dashboard_tailscale
 import db
+import fleet
 import task as task_cli
 
 
@@ -47,7 +52,169 @@ _FAVICON = Path(__file__).resolve().parent.parent / "favicon.ico"
 # ── Helpers ────────────────────────────────────────────────────────────
 
 STALE_SECONDS = 60  # heartbeat older than this → "stale"
+DONE_RECENCY_CUTOFF = timedelta(days=7)
 _REVIEW_ROUND_DISPLAY_RE = re.compile(r"\b((?:[Rr]eview round)|(?:[Rr]ound)) (\d+)\b")
+
+ACCENT_COOKIE_PREFIX = "orchestra_accent_"
+FLEET_ACCENT_SCOPE = "fleet"
+_ACCENT_IDENTITY_RE = re.compile(r"^[0-9a-f]{64}$")
+DEFAULT_ACCENT = "green"
+ACCENT_PALETTE = {
+    "green": {
+        "label": "Green",
+        "color": "#00cc44",
+        "dim": "#007a28",
+        "hover": "#33dd66",
+        "soft": "#001707",
+        "rgb": "0 204 68",
+    },
+    "violet": {
+        "label": "Violet",
+        "color": "#c084fc",
+        "dim": "#744f98",
+        "hover": "#d8b4fe",
+        "soft": "#160d20",
+        "rgb": "192 132 252",
+    },
+    "cyan": {
+        "label": "Cyan",
+        "color": "#22d3ee",
+        "dim": "#147f8f",
+        "hover": "#67e8f9",
+        "soft": "#07191c",
+        "rgb": "34 211 238",
+    },
+    "pink": {
+        "label": "Pink",
+        "color": "#f472b6",
+        "dim": "#93446d",
+        "hover": "#f9a8d4",
+        "soft": "#1e0b15",
+        "rgb": "244 114 182",
+    },
+    "gold": {
+        "label": "Gold",
+        "color": "#e6b450",
+        "dim": "#8a6c30",
+        "hover": "#f2cf7d",
+        "soft": "#1b1407",
+        "rgb": "230 180 80",
+    },
+}
+
+
+def accent_storage_identity(scope: str) -> str:
+    """Return a stable non-PII identity for dashboard-scoped accent storage."""
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+
+def repo_accent_identity(repo_root: str | Path | None = None) -> str:
+    """Return the accent-storage identity for a repo dashboard."""
+    if repo_root is None:
+        repo_root = db.get_instance_identity()["repo_root"]
+    return accent_storage_identity(f"repo:{Path(repo_root).expanduser().resolve()}")
+
+
+def fleet_accent_identity() -> str:
+    """Return the distinct accent-storage identity for the Fleet Dashboard."""
+    return accent_storage_identity(FLEET_ACCENT_SCOPE)
+
+
+def accent_cookie_name(identity: str) -> str:
+    """Return the host-only cookie name for a hashed dashboard identity."""
+    if not _ACCENT_IDENTITY_RE.fullmatch(identity):
+        raise ValueError("accent identity must be a SHA-256 hex digest")
+    return f"{ACCENT_COOKIE_PREFIX}{identity}"
+
+
+def _validated_accent(value: str | None) -> str:
+    """Return an allowlisted accent name, falling back to the default."""
+    return value if value in ACCENT_PALETTE else DEFAULT_ACCENT
+
+
+def _relative_luminance(color: str) -> float:
+    """Return WCAG relative luminance for a six-digit hex color."""
+    channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    """Return the WCAG contrast ratio between two six-digit hex colors."""
+    lighter, darker = sorted((_relative_luminance(first), _relative_luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def accent_bootstrap_script(identity: str) -> str:
+    """Return the early, identity-scoped host-cookie accent bootstrap."""
+    palette_json = json.dumps(ACCENT_PALETTE, separators=(",", ":"))
+    cookie_name = accent_cookie_name(identity)
+    return f"""(() => {{
+  const palette = {palette_json};
+  const match = document.cookie.split("; ").find((row) => row.startsWith("{cookie_name}="));
+  let requested = "{DEFAULT_ACCENT}";
+  if (match) {{
+    try {{ requested = decodeURIComponent(match.slice(match.indexOf("=") + 1)); }} catch (_) {{}}
+  }}
+  const name = Object.prototype.hasOwnProperty.call(palette, requested) ? requested : "{DEFAULT_ACCENT}";
+  const accent = palette[name];
+  const root = document.documentElement;
+  root.style.setProperty("--accent", accent.color);
+  root.style.setProperty("--accent-dim", accent.dim);
+  root.style.setProperty("--accent-hover", accent.hover);
+  root.style.setProperty("--accent-soft", accent.soft);
+  root.style.setProperty("--accent-rgb", accent.rgb);
+  root.dataset.accent = name;
+  window.__orchestraAccent = {{ name, palette }};
+}})();"""
+
+
+def accent_picker_html() -> str:
+    """Return the shared accessible accent picker markup."""
+    chits = []
+    for name, values in ACCENT_PALETTE.items():
+        label = _esc(values["label"])
+        color = _esc(values["color"])
+        chits.append(
+            f'<label class="accent-chit" title="{label}" style="--chit-color: {color}">'
+            f'<input type="radio" name="accent" value="{_esc(name)}" aria-label="{label}">'
+            '<span class="accent-chit-swatch" aria-hidden="true"></span>'
+            "</label>"
+        )
+    return (
+        '<div class="accent-picker" id="orchestra-accent-picker" '
+        'role="radiogroup" aria-label="Accent">'
+        + "".join(chits)
+        + "</div>"
+    )
+
+
+def accent_picker_script(identity: str) -> str:
+    """Return picker hydration and identity-scoped host-only cookie persistence."""
+    cookie_name = accent_cookie_name(identity)
+    return f"""(() => {{
+  const picker = document.getElementById("orchestra-accent-picker");
+  const state = window.__orchestraAccent;
+  if (!picker || !state) return;
+  const inputs = picker.querySelectorAll('input[name="accent"]');
+  const apply = (requested) => {{
+    const name = Object.prototype.hasOwnProperty.call(state.palette, requested)
+      ? requested : "{DEFAULT_ACCENT}";
+    inputs.forEach((input) => {{ input.checked = input.value === name; }});
+    return name;
+  }};
+  apply(state.name);
+  picker.addEventListener("change", (event) => {{
+    if (!event.target || event.target.name !== "accent") return;
+    const name = apply(event.target.value);
+    document.cookie = "{cookie_name}=" + encodeURIComponent(name)
+      + "; Path=/; Max-Age=31536000; SameSite=Lax";
+    window.location.reload();
+  }});
+}})();"""
 
 
 def _esc(v) -> str:
@@ -86,6 +253,19 @@ def _display_review_round_text(text: str | None) -> str:
     return _REVIEW_ROUND_DISPLAY_RE.sub(repl, text)
 
 
+def _display_review_round_count(review_round) -> int | None:
+    """Return the 1-based review-round count for UI, or None when not applicable."""
+    if review_round is None:
+        return None
+    try:
+        stored = int(review_round)
+    except (TypeError, ValueError):
+        return None
+    if stored < 0:
+        return None
+    return stored + 1
+
+
 def _age(dt_str: str | None) -> str:
     """Return a human-readable age string for a UTC datetime string."""
     if not dt_str:
@@ -116,15 +296,45 @@ def _format_duration_hhmmss(seconds: int) -> str:
 
 
 def _done_elapsed_runtime(task: dict) -> str:
-    """Return done-task runtime from latest ready time to done, or a placeholder."""
-    ready_dt = _parse_utc_datetime(task.get("last_ready_at") or task.get("ready_at"))
+    """Return done-task runtime from first pickup through completion, or a placeholder."""
+    start_dt = _parse_utc_datetime(task.get("first_started_at"))
     done_dt = _parse_utc_datetime(task.get("done_at"))
-    if ready_dt is None or done_dt is None:
+    if start_dt is None or done_dt is None:
         return "unknown"
-    elapsed = int((done_dt - ready_dt).total_seconds())
+    elapsed = int((done_dt - start_dt).total_seconds())
     if elapsed < 0:
         return "unknown"
     return _format_duration_hhmmss(elapsed)
+
+
+def _format_done_recency(dt_str: str | None) -> str:
+    """Format a completion timestamp as relative recency or YYYY-MM-DD.
+
+    Completions younger than DONE_RECENCY_CUTOFF use phrases such as
+    "2 hours ago". Older completions use an unambiguous UTC calendar date.
+    Missing or unparseable timestamps return an empty string so callers can
+    omit the Finished field.
+    """
+    dt = _parse_utc_datetime(dt_str)
+    if dt is None:
+        return ""
+    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if secs < 0:
+        secs = 0
+    if secs >= int(DONE_RECENCY_CUTOFF.total_seconds()):
+        return dt.strftime("%Y-%m-%d")
+    if secs < 60:
+        if secs <= 1:
+            return "just now" if secs == 0 else "1 second ago"
+        return f"{secs} seconds ago"
+    if secs < 3600:
+        count = secs // 60
+        return f"{count} minute ago" if count == 1 else f"{count} minutes ago"
+    if secs < 86400:
+        count = secs // 3600
+        return f"{count} hour ago" if count == 1 else f"{count} hours ago"
+    count = secs // 86400
+    return f"{count} day ago" if count == 1 else f"{count} days ago"
 
 
 def _parse_utc_datetime(dt_str: str | None) -> datetime | None:
@@ -290,6 +500,107 @@ def _task_done_reviewer(task: dict | None) -> str:
     return _task_reviewer(task)
 
 
+def _task_record_heading(task: dict) -> str:
+    """Render the leading ID + title line for a compact task record."""
+    glyph = _kind_glyph(task)
+    glyph_html = f'<span class="kind-glyph">{glyph}</span> ' if glyph else ""
+    return (
+        f'<div class="task-record-heading">'
+        f'<a class="task-record-id" href="/task/{_esc(task["id"])}">#{_esc(task["id"])}</a> '
+        f'{glyph_html}<span class="task-record-title">{_esc(task.get("title") or "")}</span>'
+        f"</div>"
+    )
+
+
+def _task_record_meta_item(html: str, *, css_class: str = "") -> str:
+    """Wrap one metadata fragment for a wrapping task-record meta row."""
+    classes = "task-record-meta-item"
+    if css_class:
+        classes = f"{classes} {css_class}"
+    return f'<span class="{classes}">{html}</span>'
+
+
+def _agents_meta_html(coder: str | None, reviewer: str | None) -> str:
+    """Natural 'by coder (reviewed by reviewer)' phrase for record metadata."""
+    coder = coder or ""
+    reviewer = reviewer or ""
+    if not coder and not reviewer:
+        return ""
+    if coder and reviewer:
+        body = (
+            f'by <span class="task-record-coder">{_esc(coder)}</span> '
+            f'<span class="task-record-reviewer">(reviewed by {_esc(reviewer)})</span>'
+        )
+    elif coder:
+        body = f'by <span class="task-record-coder">{_esc(coder)}</span>'
+    else:
+        body = f'<span class="task-record-reviewer">reviewed by {_esc(reviewer)}</span>'
+    return _task_record_meta_item(body, css_class="task-record-agents")
+
+
+def _branch_meta_html(branch: str | None, commit_hash: str | None = None) -> str:
+    """Branch code chip, optionally paired with a short commit hash."""
+    branch = branch or ""
+    short = _short_hash(commit_hash) if commit_hash else ""
+    if not branch and not short:
+        return ""
+    if branch and short:
+        body = f'<code>{_esc(branch)}</code> <code class="task-record-hash">{_esc(short)}</code>'
+    elif branch:
+        body = f'<code>{_esc(branch)}</code>'
+    else:
+        body = f'<code class="task-record-hash">{_esc(short)}</code>'
+    return _task_record_meta_item(body, css_class="task-record-branch")
+
+
+def _review_rounds_meta_html(review_round, *, reviewed: bool) -> str:
+    """Labeled 1-based review-round count, omitted unless a review occurred."""
+    if not reviewed:
+        return ""
+    count = _display_review_round_count(review_round)
+    if count is None:
+        return ""
+    return _labeled_meta_html(
+        "review rounds",
+        _esc(count),
+        css_class="task-record-review-rounds",
+    )
+
+
+def _labeled_meta_html(label: str, value_html: str, *, css_class: str = "", muted: bool = False) -> str:
+    """Labeled metadata fragment such as 'next step: commit-make'."""
+    if not value_html:
+        return ""
+    classes = "task-record-meta-item"
+    if css_class:
+        classes = f"{classes} {css_class}"
+    if muted:
+        classes = f"{classes} muted"
+    return (
+        f'<span class="{classes}">'
+        f'<span class="task-record-label">{_esc(label)}</span> {value_html}'
+        f"</span>"
+    )
+
+
+def _task_record_html(task: dict, meta_items: list[str], *, attrs: str = "") -> str:
+    """Assemble one compact responsive task record."""
+    meta = "".join(item for item in meta_items if item)
+    meta_block = f'<div class="task-record-meta">{meta}</div>' if meta else ""
+    attr_suffix = f" {attrs}" if attrs else ""
+    return (
+        f'<div class="task-record"{attr_suffix}>'
+        f"{_task_record_heading(task)}"
+        f"{meta_block}"
+        f"</div>"
+    )
+
+
+def _task_record_list_html(records: list[str]) -> str:
+    """Wrap task records in a responsive list container."""
+    return f'<div class="task-record-list">{"".join(records)}</div>'
+
+
 def _open_conn() -> sqlite3.Connection | None:
     """Return a connection to the DB, or None if the DB doesn't exist."""
     path = Path(db.get_db_path())
@@ -358,6 +669,22 @@ class ReadyActionNeedsConfirmation(ReadyActionError):
     """Raised when the inferred next_step must be confirmed before queueing."""
 
 
+REVIEW_CAP_SET_READY_REFUSAL = (
+    "This task is blocked at its review cap. Use Continue with additional "
+    "review rounds instead of Set to ready."
+)
+
+
+def _is_structured_review_cap_block(task: dict) -> bool:
+    """True when structured review-cap resume metadata is present."""
+    return task_cli.is_structured_review_cap_block(task)
+
+
+def _is_review_cap_continue_action(task: dict) -> bool:
+    """True when the dashboard should offer review-cap continuation."""
+    return task.get("status") == "blocked" and _is_structured_review_cap_block(task)
+
+
 def _meaningful_next_step(next_step: str | None) -> bool:
     return bool(next_step and next_step.strip() and next_step.strip() != "none")
 
@@ -374,6 +701,9 @@ def _normalize_task_type_for_ready(task: dict) -> str:
 
 
 def _infer_ready_next_step(task: dict) -> str:
+    resume = (task.get("resume_next_step") or "").strip()
+    if _meaningful_next_step(resume):
+        return resume
     task_type = _normalize_task_type_for_ready(task)
     return READY_ACTION_DEFAULT_NEXT_STEP[task_type]
 
@@ -404,10 +734,18 @@ def _ready_update_fields(
     if status not in READY_ACTION_STATUSES:
         raise ReadyActionError(f"Only tasks with status none or blocked can be set to ready; got '{status}'.")
 
+    if _is_structured_review_cap_block(task):
+        raise ReadyActionError(REVIEW_CAP_SET_READY_REFUSAL)
+
     task_type = _normalize_task_type_for_ready(task)
     fields = {}
+    used_resume = False
     if _meaningful_next_step(task.get("next_step")):
         next_step = task["next_step"].strip()
+    elif _meaningful_next_step(task.get("resume_next_step")):
+        next_step = task["resume_next_step"].strip()
+        fields["next_step"] = next_step
+        used_resume = True
     else:
         next_step = _infer_ready_next_step(task)
         if confirmed_next_step != next_step:
@@ -432,6 +770,9 @@ def _ready_update_fields(
     except task_cli.TaskValidationError as exc:
         raise ReadyActionError(str(exc)) from exc
     fields["status"] = "ready"
+    if used_resume or task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE:
+        fields["block_reason"] = None
+        fields["resume_next_step"] = None
     return fields
 
 
@@ -455,6 +796,8 @@ def _restore_parent_after_child_ready(conn, task: dict) -> None:
 def _ready_action_state(task: dict) -> dict | None:
     if task.get("status") not in READY_ACTION_STATUSES:
         return None
+    if _is_structured_review_cap_block(task):
+        return {"available": False, "error": REVIEW_CAP_SET_READY_REFUSAL}
     try:
         inferred_next_step = None
         if not _meaningful_next_step(task.get("next_step")):
@@ -505,7 +848,7 @@ def _child_ready_state(conn, task: dict) -> dict:
         if parent.get("status") == "ready" and step == "commit-make-supertask":
             reason = "waiting for supertask planning"
         elif parent.get("status") == "ready" and step == "commit-review-supertask":
-            reason = "waiting for supertask plan review"
+            reason = "waiting for final supertask review"
         elif parent.get("status") == "blocked":
             reason = "blocked by parent supertask"
         else:
@@ -819,42 +1162,45 @@ def render_ready_queue(conn, runtime: dict | None = None) -> str:
 
     runnable_html = '<p class="muted">No tasks are currently runnable.</p>'
     if runnable:
-        rows = "\n".join(
-            f"""<tr>
-              <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-              <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-              <td><code>{_esc(t['branch'] or '')}</code></td>
-              <td>{_esc(t['coder_agent'] or '')}</td>
-              <td>{_esc(_task_reviewer(t))}</td>
-              <td>{_esc(t['next_step'] or '')}</td>
-              <td>{_esc(_format_skips(t.get('skips'))) or '<span class="muted">-</span>'}</td>
-            </tr>"""
-            for t in runnable
-        )
-        runnable_html = (
-            "<table>"
-            "<thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-step'>Next Step</th><th class='col-skips'>Skips</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>"
-        )
+        records = []
+        for t in runnable:
+            skips = _format_skips(t.get("skips"))
+            meta = [
+                _agents_meta_html(t.get("coder_agent"), _task_reviewer(t)),
+                _branch_meta_html(t.get("branch")),
+                _labeled_meta_html(
+                    "next step",
+                    _esc(t.get("next_step") or "") or '<span class="muted">-</span>',
+                    css_class="task-record-step",
+                ),
+            ]
+            if skips:
+                meta.append(_labeled_meta_html("skips", _esc(skips), css_class="task-record-skips"))
+            records.append(_task_record_html(t, meta))
+        runnable_html = _task_record_list_html(records)
 
     gated_html = ""
     if gated:
-        rows = "\n".join(
-            f"""<tr>
-              <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-              <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-              <td>{f'<a href="/task/{_esc(t["_ready_state"]["parent"]["id"])}">#{_esc(t["_ready_state"]["parent"]["id"])}</a>' if t["_ready_state"].get("parent") else '<span class="muted">missing</span>'}</td>
-              <td><code>{_esc(t['branch'] or '')}</code></td>
-              <td class="muted">{_esc(t['_ready_state']['reason'])}</td>
-              <td>{_esc(_format_skips(t.get('skips'))) or '<span class="muted">-</span>'}</td>
-            </tr>"""
-            for t in gated
-        )
-        gated_html = (
-            "<table>"
-            "<thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-id'>Supertask</th><th class='col-branch'>Branch</th><th>Why Not Yet</th><th class='col-skips'>Skips</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>"
-        )
+        records = []
+        for t in gated:
+            parent = t["_ready_state"].get("parent")
+            if parent:
+                parent_html = f'<a href="/task/{_esc(parent["id"])}">#{_esc(parent["id"])}</a>'
+            else:
+                parent_html = '<span class="muted">missing</span>'
+            skips = _format_skips(t.get("skips"))
+            meta = [
+                _labeled_meta_html("supertask", parent_html, css_class="task-record-supertask"),
+                _branch_meta_html(t.get("branch")),
+                _task_record_meta_item(
+                    _esc(t["_ready_state"]["reason"]),
+                    css_class="task-record-reason muted",
+                ),
+            ]
+            if skips:
+                meta.append(_labeled_meta_html("skips", _esc(skips), css_class="task-record-skips"))
+            records.append(_task_record_html(t, meta))
+        gated_html = _task_record_list_html(records)
 
     return f"""
     <div class="card" id="ready-queue">
@@ -906,24 +1252,23 @@ def render_icebox(conn) -> str:
     if not tasks:
         return '<div class="card" id="icebox"><h2>Icebox</h2><p class="muted">No parked tasks.</p></div>'
 
-    rows = "\n".join(
-        f"""<tr>
-          <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-          <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-          <td><code>{_esc(t['branch'] or '')}</code></td>
-          <td>{_esc(t['coder_agent'] or '')}</td>
-          <td>{_esc(_task_reviewer(t))}</td>
-          <td class="muted">{_esc(_age(t.get('updated_at') or t.get('created_at')))}</td>
-        </tr>"""
-        for t in tasks
-    )
+    records = []
+    for t in tasks:
+        meta = [
+            _agents_meta_html(t.get("coder_agent"), _task_reviewer(t)),
+            _branch_meta_html(t.get("branch")),
+            _labeled_meta_html(
+                "updated",
+                _esc(_age(t.get("updated_at") or t.get("created_at"))),
+                css_class="task-record-age",
+                muted=True,
+            ),
+        ]
+        records.append(_task_record_html(t, meta))
     return f"""
     <div class="card" id="icebox">
       <h2>Icebox</h2>
-      <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-age'>Updated</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
+      {_task_record_list_html(records)}
     </div>"""
 
 
@@ -935,7 +1280,7 @@ def render_blocked_tasks(conn) -> str:
     if not tasks:
         return '<div class="card" id="blocked-tasks"><h2>Blocked Tasks</h2><p class="muted">No blocked tasks.</p></div>'
 
-    rows_html = []
+    records = []
     for t in tasks:
         # Fetch most recent comment for blocker summary
         last_comment = conn.execute(
@@ -947,24 +1292,26 @@ def render_blocked_tasks(conn) -> str:
         if len(summary) > 120:
             summary = summary[:117] + "..."
         age = _age(t.get("updated_at") or t.get("created_at"))
-        rows_html.append(f"""<tr>
-          <td><a href="/task/{_esc(t['id'])}">#{_esc(t['id'])}</a></td>
-          <td>{_kind_glyph(t) and f'<span class="kind-glyph">{_kind_glyph(t)}</span> ' or ''}{_esc(t['title'])}</td>
-          <td><code>{_esc(t['branch'] or '')}</code></td>
-          <td>{_esc(t.get('coder_agent') or '') or '<span class="muted">-</span>'}</td>
-          <td>{_esc(_task_reviewer(t))}</td>
-          <td class="muted">{_esc(age)}</td>
-          <td class="muted">{_esc(summary)}</td>
-          <td>{_esc(_format_skips(t.get('skips'))) or '<span class="muted">-</span>'}</td>
-        </tr>""")
+        skips = _format_skips(t.get("skips"))
+        meta = [
+            _agents_meta_html(t.get("coder_agent"), _task_reviewer(t)),
+            _branch_meta_html(t.get("branch")),
+            _labeled_meta_html("updated", _esc(age), css_class="task-record-age", muted=True),
+            _labeled_meta_html(
+                "last note",
+                _esc(summary),
+                css_class="task-record-note",
+                muted=True,
+            ),
+        ]
+        if skips:
+            meta.append(_labeled_meta_html("skips", _esc(skips), css_class="task-record-skips"))
+        records.append(_task_record_html(t, meta))
 
     return f"""
     <div class="card" id="blocked-tasks">
       <h2>Blocked Tasks</h2>
-      <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-age'>Updated</th><th>Last Note</th><th class='col-skips'>Skips</th></tr></thead>
-        <tbody>{"".join(rows_html)}</tbody>
-      </table>
+      {_task_record_list_html(records)}
     </div>"""
 
 
@@ -974,7 +1321,7 @@ def render_recently_done(conn) -> str:
         return '<div class="card" id="recently-done"><h2>Recently Done</h2><p class="muted">Database not available.</p></div>'
     rows_raw = [dict(r) for r in conn.execute(
         "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent, "
-        "ready_at, last_ready_at, done_at FROM tasks "
+        "review_round, ready_at, last_ready_at, first_started_at, done_at FROM tasks "
         "WHERE status = 'done' ORDER BY updated_at DESC, id DESC"
     ).fetchall()]
     for row in rows_raw:
@@ -985,19 +1332,37 @@ def render_recently_done(conn) -> str:
 
     initial_visible = 5
     increment = 10
-    rows = "\n".join(
-        f"""<tr data-show-more-row data-row-index="{idx}"{" hidden" if idx >= initial_visible else ""}>
-          <td><a href="/task/{_esc(r['id'])}">#{_esc(r['id'])}</a></td>
-          <td>{_kind_glyph(r) and f'<span class="kind-glyph">{_kind_glyph(r)}</span> ' or ''}{_esc(r['title'])}</td>
-          <td><code>{_esc(r['branch'] or '')}</code></td>
-          <td>{f'<code>{_esc(_short_hash(r["commit_hash"]))}</code>' if r['commit_hash'] else '-'}</td>
-          <td>{_esc(r.get('coder_agent') or '') or '<span class="muted">-</span>'}</td>
-          <td>{_esc(_task_done_reviewer(r))}</td>
-          <td>{_esc(r.get('rejection_count', 0))}</td>
-          <td>{_esc(_done_elapsed_runtime(r))}</td>
-        </tr>"""
-        for idx, r in enumerate(rows_raw)
-    )
+    records = []
+    for idx, r in enumerate(rows_raw):
+        rejection_count = int(r.get("rejection_count", 0) or 0)
+        runtime = _done_elapsed_runtime(r)
+        reviewed = bool(r.get("approvers")) or rejection_count > 0
+        meta = [
+            _agents_meta_html(r.get("coder_agent"), _task_done_reviewer(r)),
+            _branch_meta_html(r.get("branch"), r.get("commit_hash")),
+            _review_rounds_meta_html(r.get("review_round"), reviewed=reviewed),
+        ]
+        if runtime != "unknown":
+            meta.append(
+                _labeled_meta_html(
+                    "runtime",
+                    _esc(runtime),
+                    css_class="task-record-runtime",
+                )
+            )
+        finished = _format_done_recency(r.get("done_at"))
+        if finished:
+            meta.append(
+                _labeled_meta_html(
+                    "finished",
+                    _esc(finished),
+                    css_class="task-record-finished",
+                )
+            )
+        attrs = f'data-show-more-row data-row-index="{idx}"'
+        if idx >= initial_visible:
+            attrs += " hidden"
+        records.append(_task_record_html(r, meta, attrs=attrs))
     total_rows = len(rows_raw)
     controls_html = ""
     if total_rows > initial_visible:
@@ -1013,10 +1378,7 @@ def render_recently_done(conn) -> str:
     return f"""
     <div class="card" id="recently-done" data-show-more-root data-initial-visible="{initial_visible}" data-visible-count="{initial_visible}" data-increment="{increment}" data-total-rows="{total_rows}">
       <h2>Recently Done</h2>
-      <table>
-        <thead><tr><th class='col-id'>ID</th><th>Title</th><th class='col-branch'>Branch</th><th class='col-commit'>Commit</th><th class='col-agent'>Coder</th><th class='col-agent'>Reviewer</th><th class='col-count'>Rejections</th><th class='col-duration'>Runtime</th></tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
+      {_task_record_list_html(records)}
       {controls_html}
     </div>"""
 
@@ -1109,7 +1471,22 @@ def render_task_header(task: dict, conn=None, edit_error: str | None = None, *, 
     </div>"""
 
 
+def _continue_review_cap_form_html(task: dict) -> str:
+    """Render the dedicated continuation form for structured review-cap blocks."""
+    resume_step = task.get("resume_next_step") or ""
+    return f"""
+      <form class="action-form continue-review-cap-form" action="/task/{_esc(task['id'])}/continue-review-cap" method="post">
+        <p class="muted">Blocked at review cap. Resume at <code>{_esc(resume_step)}</code> with additional rounds.</p>
+        <label class="field-label" for="add-review-rounds-{_esc(task['id'])}">Additional review rounds</label>
+        <input class="text-input continue-rounds-input" id="add-review-rounds-{_esc(task['id'])}" type="number" name="add_review_rounds" min="1" value="3" required>
+        <button type="submit">Continue with additional rounds</button>
+      </form>"""
+
+
 def _set_ready_form_html(task: dict) -> str:
+    if _is_review_cap_continue_action(task):
+        return _continue_review_cap_form_html(task)
+
     state = _ready_action_state(task)
     if state is None:
         return ""
@@ -1365,11 +1742,16 @@ COMMON_CSS = """
   --muted: #585858;
   --accent: #00cc44;
   --accent-dim: #007a28;
+  --accent-hover: #33dd66;
+  --accent-soft: #001707;
+  --accent-rgb: 0 204 68;
   --border: #222222;
+  --border-bright: #303030;
   --green: #00cc44;
   --red: #ff4444;
   --blue: #4499ff;
   --orange: #ff8800;
+  --shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
 }
 
 * { box-sizing: border-box; }
@@ -1382,6 +1764,18 @@ body {
   color: var(--ink);
   font-size: 13.5px;
   line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgb(var(--accent-rgb) / 0.28);
+  color: #ffffff;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 main {
@@ -1397,10 +1791,65 @@ nav {
   display: flex;
   align-items: center;
   gap: 16px;
+  min-width: 0;
+  width: 100%;
+}
+
+.nav-start,
+.nav-end {
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.nav-start {
+  overflow: hidden;
+}
+
+.nav-end {
+  justify-content: flex-end;
 }
 
 .nav-title {
   flex: 0 0 auto;
+}
+
+.nav-fleet-dashboard {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 12rem;
+}
+
+.nav-fleet-dashboard-link {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 5px 7px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1.2;
+  text-align: center;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.nav-fleet-dashboard-link:hover,
+.nav-fleet-dashboard-link:focus-visible {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--bg);
+  text-decoration: none;
 }
 
 .nav-title::before {
@@ -1420,7 +1869,6 @@ nav a:hover { color: #ffffff; text-decoration: none; }
 .nav-repo-path {
   color: var(--muted);
   font-size: 0.82rem;
-  margin-left: auto;
   max-width: min(64vw, 760px);
   min-width: 0;
   overflow: hidden;
@@ -1429,8 +1877,78 @@ nav a:hover { color: #ffffff; text-decoration: none; }
   white-space: nowrap;
 }
 
-h1 { margin: 0 0 8px; font-size: 1.6rem; color: var(--accent); text-shadow: 0 0 18px rgba(0,204,68,0.28); }
-h2 { margin: 0 0 12px; font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; color: var(--accent); }
+.accent-picker {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.accent-chit {
+  position: relative;
+  display: block;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.accent-chit input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.accent-chit-swatch {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--chit-color);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.18);
+}
+
+.accent-chit input:checked + .accent-chit-swatch {
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.18),
+    0 0 0 2px #050505,
+    0 0 0 4px #f5f5f5;
+}
+
+.accent-chit input:checked + .accent-chit-swatch::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: 5px;
+  height: 8px;
+  border: solid #0c0c0c;
+  border-width: 0 2px 2px 0;
+  transform: translate(-50%, -55%) rotate(45deg);
+}
+
+.accent-chit input:focus-visible + .accent-chit-swatch {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+h1 {
+  margin: 0 0 14px;
+  font-size: 1.55rem;
+  letter-spacing: -0.01em;
+  color: var(--accent);
+  text-shadow: 0 0 18px rgb(var(--accent-rgb) / 0.22);
+}
+h2 { margin: 0 0 12px; font-size: 1.05rem; letter-spacing: -0.01em; border-bottom: 1px solid var(--border); padding-bottom: 8px; color: var(--accent); }
 h3 { margin: 12px 0 6px; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 p  { margin: 4px 0 8px; }
 
@@ -1440,21 +1958,28 @@ p  { margin: 4px 0 8px; }
   background: var(--panel);
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
-  border-radius: 2px;
-  padding: 18px 20px;
-  margin-bottom: 16px;
+  border-radius: 3px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
   overflow-x: auto;
 }
 
-a { color: var(--accent); }
-a:hover { color: #ffffff; text-decoration: none; }
+a {
+  color: var(--accent);
+  text-decoration-color: rgb(var(--accent-rgb) / 0.4);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  transition: color 120ms ease, text-decoration-color 120ms ease;
+}
+a:hover { color: #ffffff; text-decoration-color: currentColor; }
 
 code {
   font-family: "Menlo", "Monaco", "Courier New", monospace;
   font-size: 0.9em;
-  background: #1a1a1a;
-  border-radius: 2px;
-  padding: 1px 4px;
+  background: #141414;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 5px;
   color: #88c0d0;
 }
 
@@ -1475,8 +2000,8 @@ code {
 .inline-edit-display:hover,
 .inline-edit-display:focus,
 .inline-edit-display:focus-within {
-  background: rgba(0, 204, 68, 0.07);
-  box-shadow: inset 0 0 0 1px rgba(0, 204, 68, 0.25);
+  background: rgb(var(--accent-rgb) / 0.07);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.25);
   outline: none;
 }
 
@@ -1507,14 +2032,14 @@ code {
 
 .task-description p { margin: 4px 0 8px; }
 .task-description ul, .task-description ol { margin: 4px 0 8px; padding-left: 24px; }
-.task-description code { background: #1a1a1a; color: #88c0d0; border-radius: 2px; padding: 1px 4px; }
+.task-description code { background: #141414; color: #88c0d0; border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
 
 .task-plan { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
 .task-hierarchy { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
 .task-plan-heading { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 8px; }
 .task-plan-body p { margin: 4px 0 8px; }
 .task-plan-body ul, .task-plan-body ol { margin: 4px 0 8px; padding-left: 24px; }
-.task-plan-body code { background: #1a1a1a; color: #88c0d0; border-radius: 2px; padding: 1px 4px; }
+.task-plan-body code { background: #141414; color: #88c0d0; border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
 
 .edit-form {
   display: grid;
@@ -1565,14 +2090,15 @@ code {
   border: 1px solid var(--accent);
   background: var(--accent);
   color: #000000;
-  border-radius: 2px;
+  border-radius: 3px;
   padding: 8px 14px;
   font: inherit;
   font-weight: 700;
   cursor: pointer;
   text-transform: uppercase;
   font-size: 0.82em;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .edit-actions button:hover {
@@ -1585,18 +2111,29 @@ code {
   margin-top: 12px;
 }
 
+.continue-review-cap-form {
+  display: grid;
+  gap: 8px;
+  max-width: 320px;
+}
+
+.continue-rounds-input {
+  width: 8em;
+}
+
 .action-form button {
   border: 1px solid var(--accent);
   background: var(--accent);
   color: #000000;
-  border-radius: 2px;
+  border-radius: 3px;
   padding: 8px 14px;
   font: inherit;
   font-weight: 700;
   cursor: pointer;
   text-transform: uppercase;
   font-size: 0.82em;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .action-form button:hover {
@@ -1626,7 +2163,7 @@ code {
 
 .show-more-button {
   border: 1px solid var(--border);
-  border-radius: 2px;
+  border-radius: 3px;
   padding: 7px 12px;
   font: inherit;
   font-weight: 600;
@@ -1635,7 +2172,8 @@ code {
   color: var(--muted);
   text-transform: uppercase;
   font-size: 0.78em;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
+  transition: border-color 120ms ease, color 120ms ease;
 }
 
 .show-more-button:hover {
@@ -1687,12 +2225,8 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 
 .meta-table th { width: 100px; }
 
-/* Data table column width classes */
-#recently-done table,
-#ready-queue table,
+/* Comparative tables keep fixed columns; list sections use wrapping records. */
 #active-supertasks table,
-#icebox table,
-#blocked-tasks table,
 .hierarchy-table { table-layout: fixed; }
 
 .col-id     { width: 46px; }
@@ -1702,9 +2236,79 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .col-step   { width: 126px; }
 .col-age    { width: 72px; }
 .col-skips  { width: 72px; }
-.col-count  { width: 82px; }
+.col-count  { width: 82px; text-align: right; }
 .col-state  { width: 114px; }
 .col-duration { width: 86px; }
+
+.task-record-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.task-record {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.task-record:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.task-record-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+  margin-bottom: 4px;
+}
+
+.task-record-id {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.task-record-title {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  min-width: 0;
+  font-size: 0.88em;
+}
+
+.task-record-meta-item {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-record-agents,
+.task-record-coder,
+.task-record-reviewer {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-record-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.86em;
+}
 
 .muted { color: var(--muted); font-size: 0.88em; }
 .task-ref  { font-family: monospace; font-size: 0.82em; }
@@ -1719,9 +2323,21 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
     flex-wrap: wrap;
   }
 
+  .nav-end {
+    display: contents;
+  }
+
+  .nav-fleet-dashboard {
+    max-width: min(12rem, 100%);
+  }
+
   .nav-repo-path {
     flex-basis: 100%;
     max-width: 100%;
+  }
+
+  .accent-picker {
+    margin-left: auto;
   }
 
   .card {
@@ -1732,13 +2348,16 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 /* Status badges */
 .badge {
   display: inline-block;
-  padding: 2px 8px;
-  border-radius: 2px;
-  font-size: 0.75rem;
+  padding: 1px 8px;
+  border-radius: 3px;
+  font-size: 0.72rem;
   font-family: "Menlo", "Monaco", monospace;
   font-weight: 700;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
+  line-height: 1.7;
   text-transform: uppercase;
+  vertical-align: middle;
+  white-space: nowrap;
 }
 
 .badge-none     { background: #1a1a1a; color: #555555; border: 1px solid #333333; }
@@ -1838,11 +2457,78 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .log-row-picked-up, .log-output-line.log-row-picked-up { color: var(--blue); }
 .log-row-done, .log-output-line.log-row-done { color: var(--green); }
 .run-log .timestamp-absolute, .log-snippet .timestamp-absolute { color: #a0a0a0; }
+
+/* Scrollbars: keep the chrome as dark as the panels it sits in. */
+.run-log, .log-snippet, .card, .text-area {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2a transparent;
+}
+
+.run-log::-webkit-scrollbar,
+.log-snippet::-webkit-scrollbar,
+.card::-webkit-scrollbar,
+.text-area::-webkit-scrollbar { width: 10px; height: 10px; }
+
+.run-log::-webkit-scrollbar-track,
+.log-snippet::-webkit-scrollbar-track,
+.card::-webkit-scrollbar-track,
+.text-area::-webkit-scrollbar-track { background: transparent; }
+
+.run-log::-webkit-scrollbar-thumb,
+.log-snippet::-webkit-scrollbar-thumb,
+.card::-webkit-scrollbar-thumb,
+.text-area::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border: 3px solid transparent;
+  border-radius: 6px;
+  background-clip: content-box;
+}
+
+.run-log::-webkit-scrollbar-thumb:hover,
+.log-snippet::-webkit-scrollbar-thumb:hover,
+.card::-webkit-scrollbar-thumb:hover,
+.text-area::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); background-clip: content-box; }
 """
+
+
+FLEET_DASHBOARD_LABEL = "Fleet Dashboard"
+
+
+def live_fleet_dashboard_url() -> str | None:
+    """Return the preferred live Fleet Dashboard URL, or None if unavailable."""
+    try:
+        payload = fleet.fleet_dashboard_live_payload()
+    except Exception:
+        return None
+    if not payload:
+        return None
+    url = payload.get("url")
+    if not url:
+        return None
+    try:
+        preferred = fleet.preferred_dashboard_url(str(url))
+    except Exception:
+        return None
+    return preferred or None
+
+
+def fleet_dashboard_nav_html() -> str:
+    """Return the centered Fleet Dashboard nav control, or an empty slot."""
+    url = live_fleet_dashboard_url()
+    if not url:
+        return '<div class="nav-fleet-dashboard"></div>'
+    label = FLEET_DASHBOARD_LABEL
+    return (
+        '<div class="nav-fleet-dashboard">'
+        f'<a class="nav-fleet-dashboard-link" href="{_esc(url)}" '
+        f'title="{_esc(label)}">{_esc(label)}</a>'
+        "</div>"
+    )
 
 
 def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
     running_directory = _running_directory_display()
+    identity = repo_accent_identity()
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1850,18 +2536,26 @@ def _page_shell(title: str, body: str, nav_extra: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_esc(title)}</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <script>{accent_bootstrap_script(identity)}</script>
   <style>{COMMON_CSS}</style>
 </head>
 <body>
   <nav>
-    <a class="nav-title" href="/">Kanban Orchestra</a>
-    {nav_extra}
-    <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
+    <div class="nav-start">
+      <a class="nav-title" href="/">Kanban Orchestra</a>
+      {nav_extra}
+    </div>
+    {fleet_dashboard_nav_html()}
+    <div class="nav-end">
+      {accent_picker_html()}
+      <span class="nav-repo-path" title="{_esc(running_directory)}">{_esc(running_directory)}</span>
+    </div>
   </nav>
   <main>
     {body}
   </main>
   <script>
+    {accent_picker_script(identity)}
     (() => {{
       function formatRelativeAge(timestamp) {{
         const then = Date.parse(timestamp);
@@ -2153,10 +2847,14 @@ def task_detail(task_id: int):
 
 def _is_local_origin(request: Request) -> bool:
     """Reject cross-origin POST requests to prevent CSRF."""
+    host = request.headers.get("host")
     for header in ("origin", "referer"):
         value = request.headers.get(header)
         if value:
             if value.startswith("http://127.0.0.1:") or value.startswith("http://localhost:"):
+                return True
+            parsed = urlparse(value)
+            if host and parsed.netloc == host and parsed.scheme in {"http", "https"}:
                 return True
             return False
     return False
@@ -2225,6 +2923,21 @@ async def task_set_ready(task_id: int, request: Request):
         form_data = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
         confirmed_next_step = form_data.get("confirmed_next_step", [""])[0].strip() or None
 
+        if (
+            task.get("status") == "blocked"
+            and task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE
+        ):
+            try:
+                task_cli.continue_blocked_task(conn, task_id)
+            except task_cli.ContinueTaskError as exc:
+                return _task_detail_response(
+                    task_id,
+                    conn,
+                    ready_error=str(exc),
+                    status_code=400,
+                )
+            return RedirectResponse(url=f"/task/{task_id}", status_code=303)
+
         try:
             fields = _ready_update_fields(
                 conn,
@@ -2241,6 +2954,56 @@ async def task_set_ready(task_id: int, request: Request):
 
         db.update_task(conn, task_id, **fields)
         _restore_parent_after_child_ready(conn, task)
+    finally:
+        conn.close()
+
+    return RedirectResponse(url=f"/task/{task_id}", status_code=303)
+
+
+@app.post("/task/{task_id}/continue-review-cap")
+async def task_continue_review_cap(task_id: int, request: Request):
+    if not _is_local_origin(request):
+        return HTMLResponse("<p>Forbidden: cross-origin request.</p>", status_code=403)
+
+    conn = _open_conn()
+    if conn is None:
+        body = '<div class="card"><p class="muted">Database not available.</p></div>'
+        return HTMLResponse(_page_shell("Task Not Found", body), status_code=503)
+
+    try:
+        task = db.get_task(conn, task_id)
+        if task is None:
+            body = f'<div class="card"><p class="muted">Task #{task_id} not found.</p></div>'
+            return HTMLResponse(_page_shell("Task Not Found", body), status_code=404)
+
+        form_data = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+        raw_rounds = form_data.get("add_review_rounds", [""])[0].strip()
+        try:
+            add_rounds = int(raw_rounds)
+        except (TypeError, ValueError):
+            return _task_detail_response(
+                task_id,
+                conn,
+                ready_error="Additional review rounds must be a positive integer.",
+                status_code=400,
+            )
+
+        try:
+            task_cli.continue_blocked_task(
+                conn,
+                task_id,
+                add_review_rounds=add_rounds,
+            )
+        except task_cli.ContinueTaskError as exc:
+            message = str(exc)
+            if message.startswith("Error: "):
+                message = message[len("Error: "):]
+            return _task_detail_response(
+                task_id,
+                conn,
+                ready_error=message,
+                status_code=400,
+            )
     finally:
         conn.close()
 
@@ -2355,12 +3118,27 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
             raise SystemExit(1)
 
     port = _find_free_port(host, preferred_port)
-    _write_dashboard_metadata(host, port)
+    _write_dashboard_metadata(host, port, remote_url=None)
     if port != preferred_port:
         print(
             f"Port {preferred_port} is in use; dashboard starting on port {port}.",
             flush=True,
         )
+    announce = dashboard_tailscale.announce_startup_dashboard_url(
+        f"http://{host}:{port}"
+    )
+
+    def _record_remote(remote_url: str | None) -> None:
+        if remote_url:
+            _write_dashboard_metadata(host, port, remote_url=remote_url)
+        announce(remote_url)
+
+    dashboard_tailscale.schedule_publish_dashboard(
+        host,
+        port,
+        on_resolved=_record_remote,
+    )
+    dashboard_tailscale.schedule_startup_dashboard_fallback(announce)
     try:
         _uvicorn.run(
             "dashboard:app",
@@ -2373,7 +3151,7 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
         pass
 
 
-def _write_dashboard_metadata(host: str, port: int) -> None:
+def _write_dashboard_metadata(host: str, port: int, remote_url: str | None = None) -> None:
     """Write optional repo-local dashboard metadata for orchestrator/fleet status."""
     metadata_path = os.environ.get("KO_DASHBOARD_METADATA_PATH")
     if not metadata_path:
@@ -2387,6 +3165,7 @@ def _write_dashboard_metadata(host: str, port: int) -> None:
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}",
+        "remote_url": remote_url,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     temp = path.with_suffix(path.suffix + ".tmp")
