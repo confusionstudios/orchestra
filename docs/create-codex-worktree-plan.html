@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Create a Codex Worktree — Implementation Plan</title>
+  <style>
+    :root {
+      --ink: #20201d;
+      --muted: #54534d;
+      --paper: #f7f3ea;
+      --card: #fffdf8;
+      --line: #d8d1c2;
+      --green: #245c48;
+      --green-soft: #e6f0e9;
+      --gold: #a76119;
+      --gold-soft: #f8ead7;
+      --red: #9b3d32;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 0%, #fff9e9 0, transparent 34rem),
+        var(--paper);
+      font: 16px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(100% - 32px, 1040px);
+      margin: 44px auto 80px;
+    }
+
+    header {
+      padding: 36px;
+      color: #fff;
+      background: var(--green);
+      border-radius: 22px;
+      box-shadow: 0 18px 48px rgb(42 48 38 / 14%);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: #e0eee6;
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.15; }
+    h1 { margin: 0; max-width: 760px; font-size: clamp(34px, 7vw, 60px); letter-spacing: -.04em; }
+    header p { max-width: 720px; margin: 16px 0 0; color: #f0f6f2; font-size: 19px; }
+
+    section {
+      margin-top: 22px;
+      padding: 28px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    h2 { margin: 0 0 16px; font-size: 25px; letter-spacing: -.02em; }
+    h3 { margin: 0 0 8px; font-size: 18px; }
+    p { margin: 8px 0; }
+
+    .callout {
+      margin-top: 18px;
+      padding: 16px 18px;
+      background: var(--gold-soft);
+      border-left: 5px solid var(--gold);
+      border-radius: 10px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      align-items: stretch;
+      margin-top: 22px;
+    }
+
+    .flow > div {
+      position: relative;
+      min-height: 118px;
+      padding: 16px;
+      background: var(--green-soft);
+      border: 1px solid #bed1c5;
+      border-radius: 13px;
+    }
+
+    .flow > div:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      z-index: 2;
+      top: 42px;
+      right: -18px;
+      color: var(--green);
+      font-size: 22px;
+      font-weight: 800;
+    }
+
+    .step {
+      display: inline-grid;
+      width: 25px;
+      height: 25px;
+      margin-bottom: 10px;
+      color: white;
+      background: var(--green);
+      border-radius: 50%;
+      place-items: center;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .branch-grid, .task-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .branch-card, .task-card {
+      padding: 20px;
+      background: #fbfaf6;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+    }
+
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code {
+      padding: .06em .3em;
+      color: #153f32;
+      background: #e8f1eb;
+      border: 1px solid #cfdfd4;
+      border-radius: 4px;
+    }
+    header code {
+      color: #fff;
+      background: rgb(255 255 255 / 14%);
+      border-color: rgb(255 255 255 / 28%);
+    }
+    pre {
+      overflow-x: auto;
+      margin: 14px 0 0;
+      padding: 16px;
+      color: #ecf4ef;
+      background: #1f2b26;
+      border-radius: 11px;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    pre code {
+      padding: 0;
+      color: #f2faf5;
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+    }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+    ul, ol { margin: 10px 0 0; padding-left: 22px; }
+    li + li { margin-top: 7px; }
+    .yes { color: var(--green); font-weight: 750; }
+    .no { color: var(--red); font-weight: 750; }
+    .meta { color: var(--muted); font-size: 14px; }
+
+    @media (max-width: 760px) {
+      main { width: min(100% - 20px, 1040px); margin-top: 12px; }
+      header, section { padding: 22px; border-radius: 14px; }
+      .flow, .branch-grid, .task-grid { grid-template-columns: 1fr; }
+      .flow > div { min-height: auto; }
+      .flow > div:not(:last-child)::after { content: "↓"; top: auto; right: 18px; bottom: -21px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Small, Personal Workflow · Final Plan</p>
+    <h1>Create a Codex Chat in a Fresh Worktree</h1>
+    <p>A strict companion to <code>close-worktree</code>: start from a clean checkout with an explicit dotfile-copy manifest, handle an existing or new branch, initialize an independent Kanban database, and use native Codex worktrees from end to end.</p>
+  </header>
+
+  <section>
+    <h2>The Decision</h2>
+    <p>Add one canonical Orchestra skill named <code>create-codex-worktree</code>. It creates a native, user-visible Codex worktree chat. The user supplies every branch decision.</p>
+    <div class="callout"><strong>Hard Preflight:</strong> the invoking worktree must be clean and must contain <code>.worktreeinclude</code> at its repository root. If either condition fails, stop. Do not stash, commit, discard changes, create the file, or continue with a guess.</div>
+
+    <div class="flow" aria-label="Worktree creation flow">
+      <div><span class="step">1</span><h3>Gate</h3><p>Require a clean worktree and an existing <code>.worktreeinclude</code>, or stop.</p></div>
+      <div><span class="step">2</span><h3>Choose</h3><p>Use the explicitly supplied mode, branch, and base or parking branch.</p></div>
+      <div><span class="step">3</span><h3>Create Chat</h3><p>Ask the Codex app for a native worktree thread from the selected revision.</p></div>
+      <div><span class="step">4</span><h3>Prepare</h3><p>Attach/create the branch and copy the explicitly listed local files.</p></div>
+      <div><span class="step">5</span><h3>Bootstrap</h3><p>Create a pristine Kanban database, then begin the requested work.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Preflight Is a Stop Gate</h2>
+    <p>The skill resolves the current repository root and runs exactly these checks before switching a branch or creating a Codex thread:</p>
+    <pre><code>current_root="$(git rev-parse --show-toplevel)" || exit 1
+test -z "$(git -C "$current_root" status --short)" || exit 1
+test -f "$current_root/.worktreeinclude" || exit 1</code></pre>
+    <table>
+      <thead><tr><th>Failure</th><th>Required response</th></tr></thead>
+      <tbody>
+        <tr><td>The current worktree has tracked, staged, or untracked changes</td><td>Stop and report that it must be made clean. Do not modify its state.</td></tr>
+        <tr><td><code>.worktreeinclude</code> is absent or is anything other than a regular file</td><td>Stop and report that it must be created and reviewed first. Do not create it.</td></tr>
+        <tr><td>Existing/new mode, branch name, or required base/parking branch was not supplied</td><td>Stop and ask for the missing value. Do not choose a default.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Two Explicit Branch Paths</h2>
+    <div class="branch-grid">
+      <article class="branch-card">
+        <h3>Existing Branch</h3>
+        <ol>
+          <li>If the main checkout currently holds that branch, switch main to the user-selected parking branch.</li>
+          <li>Create the Codex worktree from the existing branch.</li>
+          <li>In the new worktree, run <code>git switch &lt;branch&gt;</code> so it owns the named branch.</li>
+        </ol>
+        <pre><code>target_branch="&lt;existing-branch&gt;"
+parking_branch="&lt;parking-branch&gt;"
+
+git -C "$current_root" show-ref --verify --quiet \
+  "refs/heads/$target_branch" || exit 1
+git -C "$current_root" show-ref --verify --quiet \
+  "refs/heads/$parking_branch" || exit 1
+
+if [ "$(git -C "$current_root" branch --show-current)" = "$target_branch" ]; then
+  git -C "$current_root" switch "$parking_branch" || exit 1
+fi
+
+# Run inside the Codex-created worktree:
+git switch "$target_branch" || exit 1</code></pre>
+      </article>
+      <article class="branch-card">
+        <h3>New Branch</h3>
+        <ol>
+          <li>Leave or switch the main checkout to the user-selected base branch.</li>
+          <li>Create the Codex worktree from that base.</li>
+          <li>In the new worktree, run <code>git switch -c &lt;branch&gt;</code>.</li>
+        </ol>
+        <pre><code>target_branch="&lt;new-branch&gt;"
+base_branch="&lt;base-branch&gt;"
+
+git -C "$current_root" check-ref-format \
+  --branch "$target_branch" || exit 1
+git -C "$current_root" show-ref --verify --quiet \
+  "refs/heads/$base_branch" || exit 1
+if git -C "$current_root" show-ref --verify --quiet \
+  "refs/heads/$target_branch"; then
+  exit 1
+fi
+
+git -C "$current_root" switch "$base_branch" || exit 1
+
+# Run inside the Codex-created worktree:
+git switch -c "$target_branch" || exit 1</code></pre>
+      </article>
+    </div>
+    <p class="meta">The user explicitly names <code>develop</code>, <code>master</code>, or another branch as the base/parking branch.</p>
+  </section>
+
+  <section>
+    <h2>Hidden Files Use an Explicit Manifest</h2>
+    <p>Use the target repository’s existing <code>.worktreeinclude</code> as the complete source of truth. Tracked dotfiles arrive through Git already. The manifest remains user-owned and unchanged by the skill.</p>
+    <pre><code># Example .worktreeinclude
+.env
+.env.*
+fastlane/.env*
+fastlane/*.json</code></pre>
+    <p>The worktree copy follows that manifest. The skill verifies the copy and reports a failure. The manifest supplies the complete file set and credential policy.</p>
+    <table>
+      <thead><tr><th>Copy</th><th>Keep Isolated</th></tr></thead>
+      <tbody>
+        <tr><td><span class="yes">Yes:</span> explicit entries from <code>.worktreeinclude</code>, including Fastlane environment/config files</td><td><span class="no">No:</span> <code>.git</code></td></tr>
+        <tr><td><span class="yes">Yes:</span> other project-local ignored credentials Dan deliberately lists</td><td><span class="no">No:</span> <code>.kanban-orchestra/</code>, <code>kanban-orchestra.db*</code>, SQL dumps, or locks</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>New-Thread Bootstrap Contract</h2>
+    <p>Only after preflight succeeds, the initial prompt sent to the new Codex chat performs these steps before the user’s actual task:</p>
+    <pre><code>1. Confirm the worktree path and invoking-worktree source path.
+2. Switch to the supplied existing branch, or create the supplied new branch.
+3. Verify the .worktreeinclude copy; stop on failure.
+4. Confirm no Kanban database/runtime was copied; stop if one exists.
+5. Run "$ORCHESTRA_DIR/bin/ko-kanban".
+6. Require: "Status: created kanban database".
+7. Report branch, worktree path, and database path.
+8. Continue with the user's requested work.</code></pre>
+    <div class="callout"><strong>Native Codex Runtime:</strong> the Codex app owns the chat and worktree throughout the workflow.</div>
+  </section>
+
+  <section>
+    <h2>Implementation Chunks</h2>
+    <div class="task-grid">
+      <article class="task-card"><h3>1 · Canonical Skill</h3><p>Add <code>AI-skills/create-codex-worktree.md</code> with the hard preflight, two explicit branch paths, native Codex thread creation, manifest-copy verification, and Kanban bootstrap.</p></article>
+      <article class="task-card"><h3>2 · Installed Wrapper</h3><p>Run the existing global-skill installer so Codex receives <code>orch-adhoc-create-codex-worktree</code>. The existing installer generates the wrapper.</p></article>
+      <article class="task-card"><h3>3 · Focused Verification</h3><p>Exercise once with a new branch and once with an existing branch that initially occupies the main checkout. Verify each worktree receives the listed Fastlane files and a different, empty Kanban database.</p></article>
+      <article class="task-card"><h3>4 · Close the Loop</h3><p>Run the existing <code>close-worktree</code> skill on one disposable result to prove branch attachment and Kanban-history import are compatible.</p></article>
+    </div>
+  </section>
+
+  <section>
+    <h2>Acceptance Criteria</h2>
+    <ul>
+      <li>A new native Codex chat opens already associated with its own worktree.</li>
+      <li>A dirty invoking worktree stops the workflow without stashing, committing, discarding, switching, or creating anything.</li>
+      <li>A missing <code>.worktreeinclude</code> stops the workflow and tells the user to create it; the skill does not create it.</li>
+      <li>The user supplies every branch-mode and branch-name input.</li>
+      <li>An existing branch works after the main checkout is parked on the specified integration branch.</li>
+      <li>A new branch is created from the explicitly supplied base.</li>
+      <li>Fastlane’s listed ignored files are available in the new worktree.</li>
+      <li>The new worktree has a newly created Kanban database with no imported tasks.</li>
+      <li>The main checkout’s Kanban database and runtime directory are never copied.</li>
+      <li>The resulting worktree is accepted by the existing close-worktree workflow.</li>
+      <li>Worktree creation and chat lifecycle use native Codex.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Verification and Scope</h2>
+    <table>
+      <thead><tr><th>Check</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>Preflight stops</td><td>Dirty-worktree and missing-manifest fixtures create no branch, worktree, or Codex thread</td></tr>
+        <tr><td>Branch ownership</td><td><code>git worktree list --porcelain</code> and <code>git symbolic-ref --short HEAD</code></td></tr>
+        <tr><td>Local files</td><td>Each explicit <code>.worktreeinclude</code> entry exists in the new worktree</td></tr>
+        <tr><td>Kanban isolation</td><td><code>ko-kanban</code> reports <code>created</code>; database paths and files differ</td></tr>
+        <tr><td>Skill installation</td><td><code>bin/ko-install-global-skills --check</code> succeeds</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Implementation Scope:</strong> preflight validation, explicit branch handling, native Codex worktree creation, manifest-driven local-file copying, and pristine Kanban initialization.</p>
+    <p><strong>Open Decision:</strong> none. The user must state “existing” or “new,” provide the branch, and explicitly name the base/parking branch when required.</p>
+  </section>
+</main>
+</body>
+</html>
