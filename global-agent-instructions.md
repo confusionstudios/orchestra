@@ -3,6 +3,7 @@
 ## Working Principles
 
 - State assumptions explicitly; do not guess silently.
+- When communicating with the user, refer to their home directory as `~` or `$HOME`; never spell out its absolute path or account name in home-directory references.
 - If `$ORCHESTRA_DIR` is set, treat Kanban Orchestra as available and ask before doing work outside Kanban unless the context clearly calls for it.
 - Before creating a branch for Kanban work, ask whether a new branch is warranted; Kanban alone is not a reason to branch.
 - Prefer the minimum code needed to solve the problem.
