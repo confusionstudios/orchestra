@@ -77,10 +77,6 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
     if dashboard_url is not None:
         tailscale_url = fleet.tailscale_dashboard_url(dashboard_url)
 
-    last_start_failure = None
-    if status == "stopped" and fleet.dirty_lines(repo):
-        last_start_failure = "Worktree dirty"
-
     return FleetCard(
         name=repo.label,
         path=fleet.display_path(repo.root or repo.path),
@@ -93,7 +89,7 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
         icebox_count=icebox_count,
         dashboard_url=dashboard_url,
         tailscale_url=tailscale_url,
-        last_start_failure=last_start_failure,
+        last_start_failure=None,
     )
 
 
@@ -125,6 +121,8 @@ def _product_status(process_status: str, conn: sqlite3.Connection | None) -> str
         if _blocked_by_gate(conn):
             return "blocked"
         return "idle"
+    if activity == "waiting-dirty":
+        return "waiting-dirty"
     if activity == "starting":
         return "starting"
     if activity in {"error", "hard-break"}:

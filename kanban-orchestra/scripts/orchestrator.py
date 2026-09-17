@@ -260,6 +260,21 @@ def set_runtime_idle(conn, status_message="Waiting for ready tasks"):
     _run_idle_maintenance(conn)
 
 
+def set_runtime_waiting_dirty(conn):
+    """Expose a live service that is waiting for a clean worktree."""
+    db.update_runtime(
+        conn,
+        status="waiting-dirty",
+        current_task_id=None,
+        current_step="none",
+        current_branch=None,
+        review_round=None,
+        active_agents=0,
+        status_message="Worktree is dirty; waiting for it to become clean",
+        last_heartbeat_at="CURRENT_TIMESTAMP",
+    )
+
+
 def _run_idle_maintenance(conn):
     """Purge expired runtime history while the orchestrator is idle."""
     try:
@@ -503,11 +518,11 @@ _OWN_ARTIFACTS = {
 }
 
 
-def is_worktree_dirty():
+def is_worktree_dirty(repo_root=None):
     """Return True if the worktree has uncommitted changes (staged, unstaged, or untracked) beyond orchestrator artifacts."""
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain"], cwd=repo_root,
             capture_output=True, text=True, check=True,
         )
         for line in result.stdout.splitlines():
@@ -1451,18 +1466,6 @@ def handle_commit_review_supertask(task, conn):
     return "reject"
 
 
-def commit_make_requires_clean_worktree(task):
-    """
-    Return True when commit-make should block on pre-existing dirtiness.
-
-    Fresh commit-make pickup must start from a clean repo so unrelated local
-    changes do not contaminate the task. Once the same task has already gone
-    through review, its own staged work is expected to remain in the worktree
-    for rework or finalization.
-    """
-    return task.get("last_review_decision") == "none"
-
-
 def handle_commit_plan(task, conn):
     """Execute a commit-plan step. Returns True on success."""
     # Always uses DEFAULT_PLANNER rather than task-level coder_agent. This is intentional to ensure
@@ -2037,25 +2040,6 @@ def advance(task, conn):
     is_other_step = step in ("other-make", "other-review")
 
     if not is_supertask_step and not is_plan_step and not is_other_step:
-        # Only the first commit-make pickup requires a clean worktree. Rework
-        # after review rejection and finalization after approval both expect
-        # the task's own staged changes to still be present.
-        if (
-            step == "commit-make"
-            and commit_make_requires_clean_worktree(task)
-            and is_worktree_dirty()
-        ):
-            mark_blocked(
-                task_id,
-                conn,
-                "commit-make blocked at pickup: worktree was already dirty. "
-                "Resolve the dirty state before re-queueing. No stash was created.",
-                f"Blocked: dirty worktree at pickup for task {task_id}",
-                log_message="Blocked at pickup: worktree dirty before commit-make started",
-                preserve_wip=False,
-            )
-            return False
-
         # Switch to task branch
         if not ensure_branch(task, conn):
             mark_blocked(
@@ -2804,13 +2788,14 @@ def main_loop(conn, *, db_path=None):
 
     # Initialize runtime and start heartbeat
     init_runtime(conn)
-    recover_running_tasks(conn)
     start_heartbeat(db.get_db_path())
-    start_smart_unblock(db.get_db_path())
-    set_runtime_idle(conn)
 
     stop_file = Path(db.get_db_path()).parent / STOP_AFTER_TASK_FILE
+    repo_root = Path(db_path or db.get_db_path()).resolve().parent
     blocked_gate_logged_task_ids = set()
+    startup_recovered = False
+    smart_unblock_started = False
+    waiting_dirty = False
 
     while True:
         check_dashboard_process(conn, db_path)
@@ -2821,10 +2806,35 @@ def main_loop(conn, *, db_path=None):
             db.update_runtime(conn, status="stopping", active_agents=0,
                               status_message="Stop-after-task requested")
             stop_heartbeat()
-            stop_smart_unblock()
+            if smart_unblock_started:
+                stop_smart_unblock()
             db.update_runtime(conn, status="stopped",
                               status_message="Stopped")
             break
+
+        if is_worktree_dirty(repo_root):
+            if smart_unblock_started:
+                stop_smart_unblock()
+                smart_unblock_started = False
+            if not waiting_dirty:
+                log("Worktree is dirty; waiting for it to become clean before recovery or task pickup.")
+            set_runtime_waiting_dirty(conn)
+            waiting_dirty = True
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if waiting_dirty:
+            log("Worktree is clean; resuming orchestrator scheduling.")
+            waiting_dirty = False
+        if not startup_recovered:
+            recover_running_tasks(conn)
+            startup_recovered = True
+        if not smart_unblock_started:
+            start_smart_unblock(db.get_db_path())
+            smart_unblock_started = True
+        runtime = db.get_runtime(conn)
+        if runtime and runtime.get("status") == "waiting-dirty":
+            set_runtime_idle(conn)
 
         gated_tasks = db.list_ready_tasks_blocked_by_blocked_gate(conn)
         current_gated_ids = {gated_task["id"] for gated_task in gated_tasks}
@@ -2841,7 +2851,15 @@ def main_loop(conn, *, db_path=None):
 
         task = smart_unblock.find_dispatchable_task(conn)
         if not task:
+            runtime = db.get_runtime(conn)
+            if runtime and runtime.get("status") not in ("idle", "error", "hard-break"):
+                set_runtime_idle(conn)
             time.sleep(POLL_INTERVAL)
+            continue
+
+        # Recheck immediately before claiming. The task remains ready if
+        # unrelated changes appeared during this poll iteration.
+        if is_worktree_dirty(repo_root):
             continue
 
         task_id = task["id"]
@@ -2878,10 +2896,6 @@ def main(argv=None):
     conn = None
     try:
         lock_path = acquire_singleton_lock(db_path=db_path)
-
-        if is_worktree_dirty():
-            log("Refusing to start: git worktree is dirty. Commit, stash, or clean it before starting the orchestrator.")
-            return 2
 
         log_path = db.get_orchestrator_log_path(db_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)

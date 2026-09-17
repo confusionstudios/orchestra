@@ -370,6 +370,14 @@ def _attention_summary(runtime, ready_tasks, blocked_tasks) -> str:
     if display_status == "hard-break":
         return "hard BREAK completed — inspect blocked task/worktree before restarting"
 
+    if display_status == "waiting-dirty":
+        if ready_tasks:
+            return (
+                f"worktree is dirty; {len(ready_tasks)} ready task(s) remain queued "
+                "and will start automatically once clean"
+            )
+        return "worktree is dirty; orchestrator is live and waiting for it to become clean"
+
     if blocked_tasks:
         return f"{len(blocked_tasks)} task(s) are blocked — review and unblock them"
 

@@ -632,6 +632,7 @@ STATUS_BADGE_CLASS = {
     "blocked":  "badge-blocked",
     "pending_subtasks": "badge-pending-subtasks",
     "idle":     "badge-idle",
+    "waiting-dirty": "badge-waiting-dirty",
     "starting": "badge-starting",
     "stopping": "badge-stopping",
     "stopped":  "badge-stopped",
@@ -765,10 +766,6 @@ def _ready_update_fields(
         _validate_branch_for_ready(branch)
         fields["branch"] = branch
 
-    try:
-        task_cli.validate_ready_worktree(conn)
-    except task_cli.TaskValidationError as exc:
-        raise ReadyActionError(str(exc)) from exc
     fields["status"] = "ready"
     if used_resume or task.get("block_reason") == db.BLOCK_REASON_REVIEWER_UNAVAILABLE:
         fields["block_reason"] = None
@@ -1069,11 +1066,16 @@ def _log_class_attr(message: str | None, base_class: str) -> str:
 def render_current_task_card(runtime: dict | None, conn) -> str:
     """Render the active task card (with a small run log snippet)."""
     if runtime is None or not runtime.get("current_task_id"):
+        message = (
+            "Worktree is dirty; queued work will start automatically once clean."
+            if runtime and runtime.get("status") == "waiting-dirty"
+            else "Orchestrator is idle — no active task."
+        )
         return """
         <div class="card" id="current-task-card">
           <h2>Current Task</h2>
-          <p class="muted">Orchestrator is idle — no active task.</p>
-        </div>"""
+          <p class="muted">%s</p>
+        </div>""" % _esc(message)
 
     tid = runtime["current_task_id"]
     task = db.get_task(conn, tid) if conn else None
@@ -1635,6 +1637,11 @@ def _latest_agent_transcript_for_step(
 def current_agent_output_state(runtime: dict | None, conn) -> dict:
     """Return dashboard data for the current phase's latest agent transcript."""
     if runtime is None or not runtime.get("current_task_id"):
+        if runtime and runtime.get("status") == "waiting-dirty":
+            return {
+                "state": "waiting-dirty",
+                "message": "Worktree is dirty; no agent will start until it is clean.",
+            }
         return {"state": "idle", "message": "Orchestrator is idle — no active task."}
     if conn is None:
         return {"state": "unavailable", "message": "Database not available."}
@@ -2367,6 +2374,7 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .badge-blocked  { background: #1a0000; color: var(--red); border: 1px solid var(--red); }
 .badge-pending-subtasks { background: #1a0f00; color: var(--orange); border: 1px solid var(--orange); }
 .badge-idle     { background: #1a1a1a; color: var(--muted); border: 1px solid #333333; }
+.badge-waiting-dirty { background: #30230f; color: #f2bd68; border: 1px solid #714d18; }
 .badge-starting { background: #001020; color: var(--blue); border: 1px solid var(--blue); }
 .badge-stopping { background: #1a0d00; color: var(--orange); border: 1px solid var(--orange); }
 .badge-stopped  { background: #1a1a1a; color: #555555; border: 1px solid #333333; }

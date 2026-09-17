@@ -357,6 +357,22 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertEqual(columns[-2], "managed")
             self.assertEqual(columns[-1], str(root))
 
+    def test_status_prints_waiting_dirty_as_running_service(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            (root / "kanban-orchestra.lock").write_text(
+                f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
+                encoding="utf-8",
+            )
+            write_runtime(root, status="waiting-dirty", current_step="none", active_agents=0)
+            repo = fleet.FleetRepo("repo", root, root)
+            out = io.StringIO()
+
+            with patch.object(fleet, "tmux_has_session", return_value=False), redirect_stdout(out):
+                fleet.print_status([repo])
+
+            self.assertIn("running/waiting-dirty", out.getvalue())
+
     def test_status_prints_invalid_repo_error_outside_tmux_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir).resolve() / "missing"
@@ -544,12 +560,11 @@ class TestFleetOperatorFlows(unittest.TestCase):
         self.assertIn(["--dashboard-port", "8427"], [cmd[-2:] for cmd in commands])
         self.assertIn(["--dashboard-port", "8428"], [cmd[-2:] for cmd in commands])
 
-    def test_start_prechecks_only_repos_that_will_launch(self):
+    def test_start_launches_only_stopped_repos(self):
         running = fleet.FleetRepo("running", Path("/tmp/running"), Path("/tmp/running"))
         stopped = fleet.FleetRepo("stopped", Path("/tmp/stopped"), Path("/tmp/stopped"))
 
         with patch.object(fleet, "require_tool"), \
-             patch.object(fleet, "dirty_lines", return_value=[]) as dirty_lines, \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(
                  fleet,
@@ -565,34 +580,24 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet, "print_status"):
             fleet.start([running, stopped])
 
-        dirty_lines.assert_called_once_with(stopped)
         run.assert_called_once()
 
-    def test_start_skips_dirty_stopped_repos_and_launches_clean_ones(self):
+    def test_start_launches_dirty_and_clean_stopped_repos(self):
         dirty = fleet.FleetRepo("dirty", Path("/tmp/dirty"), Path("/tmp/dirty"))
         clean = fleet.FleetRepo("clean", Path("/tmp/clean"), Path("/tmp/clean"))
-        err = io.StringIO()
-
-        def fake_dirty_lines(repo):
-            return [" M file.txt"] if repo.label == "dirty" else []
-
         with patch.object(fleet, "require_tool"), \
-             patch.object(fleet, "dirty_lines", side_effect=fake_dirty_lines), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
-             patch.object(fleet, "print_status"), \
-             redirect_stderr(err):
+             patch.object(fleet, "print_status"):
             fleet.start([dirty, clean])
 
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0][commands[0].index("-c") + 1], "/tmp/clean")
-        self.assertIn("skipped dirty repo", err.getvalue())
-        self.assertIn("dirty", err.getvalue())
-        self.assertIn("M file.txt", err.getvalue())
+        self.assertEqual(len(commands), 2)
+        roots = {command[command.index("-c") + 1] for command in commands}
+        self.assertEqual(roots, {"/tmp/dirty", "/tmp/clean"})
 
     def test_start_reports_all_invalid_repos_before_launching(self):
         repos = [

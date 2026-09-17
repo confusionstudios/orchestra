@@ -460,6 +460,20 @@ class TestHealthCard(unittest.TestCase):
         self.assertIn("Waiting for ready tasks", html)
         self.assertNotIn("stale", html)
 
+    def test_waiting_dirty_is_visible_as_live_state(self):
+        runtime = {
+            "status": "waiting-dirty",
+            "last_heartbeat_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "status_message": "Worktree is dirty; waiting for it to become clean",
+            "current_task_id": None,
+        }
+
+        html = dashboard.render_health_card(runtime)
+
+        self.assertIn("badge-waiting-dirty", html)
+        self.assertIn("waiting-dirty", html)
+        self.assertIn("waiting for it to become clean", html)
+
     def test_stale_heartbeat_shows_stale(self):
         ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
         runtime = {
@@ -567,6 +581,13 @@ class TestCurrentTaskCard(unittest.TestCase):
         html = dashboard.render_current_task_card(None, self.conn)
         self.assertIn("idle", html)
         self.assertIn("current-task-card", html)
+
+    def test_waiting_dirty_has_no_active_task(self):
+        runtime = {"status": "waiting-dirty", "current_task_id": None}
+
+        html = dashboard.render_current_task_card(runtime, self.conn)
+
+        self.assertIn("queued work will start automatically once clean", html)
 
     def test_active_task_shown(self):
         tid = db.add_task(
@@ -2144,7 +2165,7 @@ class TestReadyActionHelpers(unittest.TestCase):
         with self.assertRaisesRegex(dashboard.ReadyActionError, "not valid for commit"):
             dashboard._ready_update_fields(self.conn, task)
 
-    def test_idle_dirty_worktree_refused(self):
+    def test_waiting_dirty_worktree_allows_queueing(self):
         task = {
             "id": 1,
             "status": "blocked",
@@ -2152,11 +2173,9 @@ class TestReadyActionHelpers(unittest.TestCase):
             "kind": "commit",
             "branch": "feat-ready",
         }
-        with patch.object(dashboard.task_cli, "_is_orchestrator_idle", return_value=True), \
-             patch.object(dashboard.task_cli, "_is_worktree_dirty", return_value=True), \
-             patch.object(dashboard.task_cli, "_repo_root_for_policy", return_value=Path("/tmp/repo")):
-            with self.assertRaisesRegex(dashboard.ReadyActionError, "worktree is dirty"):
-                dashboard._ready_update_fields(self.conn, task)
+        fields = dashboard._ready_update_fields(self.conn, task)
+
+        self.assertEqual(fields["status"], "ready")
 
     def test_structured_review_cap_refused_by_helper(self):
         task = {

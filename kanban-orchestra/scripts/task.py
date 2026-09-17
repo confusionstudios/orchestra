@@ -116,33 +116,6 @@ def _repo_root_for_policy():
     return Path(db.get_db_path()).resolve().parent
 
 
-def _is_worktree_dirty(repo_root):
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "status", "--porcelain"],
-            capture_output=True, text=True, check=True,
-        )
-        return bool(result.stdout.strip())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
-def _is_orchestrator_idle(conn):
-    runtime = db.get_runtime(conn)
-    return bool(runtime and runtime.get("status") == "idle")
-
-
-def _reject_ready_when_idle_worktree_dirty(conn):
-    try:
-        validate_ready_worktree(conn)
-    except TaskValidationError as exc:
-        print(
-            f"Error: {exc}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
 def _is_master_branch(branch):
     return branch in MASTER_BRANCHES
 
@@ -288,12 +261,7 @@ def validate_master_branch_policy(branch):
 
 
 def validate_ready_worktree(conn):
-    repo_root = _repo_root_for_policy()
-    if _is_orchestrator_idle(conn) and _is_worktree_dirty(repo_root):
-        raise TaskValidationError(
-            "cannot set task status to ready while the orchestrator is idle "
-            "and the worktree is dirty. Resolve or stash the worktree changes first."
-        )
+    """Deprecated compatibility hook; dirtiness gates dispatch, not admission."""
 
 
 # ── Subcommands ────────────────────────────────────────────────────────
@@ -537,7 +505,6 @@ def cmd_set(args, conn):
                 _validate_branch_name(branch)
                 _reject_master_branch_without_marker(branch)
                 fields["branch"] = branch
-            _reject_ready_when_idle_worktree_dirty(conn)
         fields["status"] = args.status
 
     if not fields and not args.add_skip and not args.remove_skip:

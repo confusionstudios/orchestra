@@ -232,9 +232,10 @@ private flat list: one git repo root per non-empty line, with `~`, environment
 variables, blank lines, and `#` comments supported. Every configured repo gets
 one orchestrator and one matching dashboard. Fleet manages those running
 processes only; skill wrappers come from the one-time
-`ko-install-global-skills` install, not from Fleet. `ko-fleet start` skips dirty
-stopped repos, keeps launching clean stopped repos, and still treats invalid
-repo config as a hard failure.
+`ko-install-global-skills` install, not from Fleet. `ko-fleet start` launches
+every valid selected stopped repo. A dirty repo starts in `waiting-dirty` with
+its dashboard and heartbeat live, while invalid repo config remains a hard
+failure.
 
 Graceful stop after the current task finishes:
 
@@ -334,13 +335,17 @@ This queues all three tasks for serialized pickup. Do not use `master` or
 
 ## Important notes
 
-- Orchestra is sensitive to dirty worktrees. The orchestrator refuses to
-  launch when the work repo is dirty, and active queue processing can block if
-  unexpected uncommitted changes appear.
+- Dirtiness gates recovery and new-task pickup, not service startup. A dirty
+  orchestrator remains live in `waiting-dirty` and resumes automatically once
+  clean. It does not claim tasks, switch branches, launch agents, run
+  smart-unblock, or alter interrupted-task recovery state while waiting.
+- An already-pinned task continues across review, rework, and finalization with
+  its own edits. After a restart, any dirty tree waits instead of assuming the
+  edits belong to the interrupted task.
 - A task needs a branch and a meaningful `next_step` before it can be set
   to `ready`.
-- If the orchestrator is idle and the work repo is dirty, `task set --status
-  ready` is rejected. Clean or stash the worktree before queueing more work.
+- Otherwise-valid tasks may be set to `ready` while the orchestrator is
+  `waiting-dirty`; they remain queued until the worktree is clean.
 - Pass `--branch` explicitly when creating tasks; do not rely on prompts.
 - Use feature branches by default. The `ALLOW_TASKS_ON_MASTER` `AGENTS.md`
   marker is an explicit opt-in for repos that intentionally operate on
@@ -389,6 +394,9 @@ Read the result like this:
   launching the orchestrator.
 - `status = idle` with a fresh heartbeat means the orchestrator is healthy
   and waiting.
+- `status = waiting-dirty` with a fresh heartbeat means the service and
+  dashboard are healthy, but recovery and new-task pickup are paused until the
+  worktree becomes clean.
 - `status_message` starting with `STALLED:` means the orchestrator is
   waiting for an agent ping acknowledgment and retries every 60 seconds.
 - An old `last_heartbeat_at` means stale or dead.

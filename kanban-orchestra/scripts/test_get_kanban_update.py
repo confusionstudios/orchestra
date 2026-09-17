@@ -136,6 +136,26 @@ class TestBuildUpdate(unittest.TestCase):
         self.assertIn("ORCHESTRATOR: stale", update)
         self.assertIn("orchestrator heartbeat is stale", update)
 
+    def test_waiting_dirty_reports_live_wait_and_queued_work(self):
+        task_id = db.add_task(self.conn, "Queued", branch="feat", status="ready")
+        db.update_task(self.conn, task_id, next_step="commit-make")
+        db.upsert_runtime(
+            self.conn,
+            status="waiting-dirty",
+            pid=123,
+            last_heartbeat_at="CURRENT_TIMESTAMP",
+            current_task_id=None,
+            current_step="none",
+            active_agents=0,
+            status_message="Worktree is dirty; waiting for it to become clean",
+        )
+
+        update = get_kanban_update.build_update(self.conn)
+
+        self.assertIn("ORCHESTRATOR: waiting-dirty", update)
+        self.assertIn("remain queued", update)
+        self.assertIn("automatically once clean", update)
+
     def test_process_pids_ignore_metadata_for_other_repo_identity(self):
         identity = db.get_instance_identity(self.db_path)
         lock_path = Path(identity["lock_path"])
