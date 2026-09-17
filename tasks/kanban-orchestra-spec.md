@@ -121,7 +121,10 @@ These rules define the system.
 - A task should have a meaningful `next_step` before it is set to `ready`.
 - Tasks on `master` or `main` are disabled by default unless the work repo
   explicitly opts in with `ALLOW_TASKS_ON_MASTER` in `AGENTS.md`.
-- A dirty worktree blocks pickup of a normal `commit-make` task.
+- A dirty worktree pauses startup recovery and all new-task pickup without
+  changing task state. Ready work remains queued until the tree is clean.
+- Once a task is pinned, its uninterrupted lifecycle may proceed with its own
+  edits through review, rework, and finalization.
 - The orchestrator processes one pinned task at a time through its full local loop.
 - No other task may leapfrog between phases while a pinned task is still active.
 
@@ -264,6 +267,7 @@ Important fields:
 Runtime status values:
 
 - `idle`
+- `waiting-dirty`
 - `running`
 - `starting`
 - `stopping`
@@ -475,8 +479,8 @@ task restore
 - `master` and `main` branches require `ALLOW_TASKS_ON_MASTER` as a standalone
   line in the work repo `AGENTS.md` before tasks can be added, retargeted, or
   set to `ready` on those branches.
-- `task set --status ready` fails when the orchestrator runtime is `idle` and
-  the work repo is dirty. Clean or stash the worktree before queueing more work.
+- Otherwise-valid tasks may be set to `ready` while the work repo is dirty.
+  Dirtiness gates dispatch, so those tasks remain queued until the tree is clean.
 - In agent or non-interactive mode, missing branch on `status=ready` is an error.
 - `task comment --message-stdin` reads the full message from stdin and is the preferred form for multi-line or shell-sensitive text.
 - `task delete` only works for tasks still in `status=none`.
@@ -800,7 +804,7 @@ names are derived from the basename of the resolved repo path.
 `ko-fleet start`:
 - starts the orchestrator/dashboard pair for every selected configured repo
 - refuses duplicates when the repo singleton lock is already live
-- skips dirty selected repos while continuing to start clean selected repos
+- starts dirty selected repos in the observable `waiting-dirty` state
 - refuses selected starts when any selected repo configuration is invalid
 - keeps process-supervision details behind the fleet command
 
@@ -869,7 +873,9 @@ pre-flight ping for the assigned agent.
 
 Before non-supertask steps:
 
-- if the worktree is dirty at pickup for `commit-make`, the task is blocked immediately
+- the outer scheduler verifies that the worktree is clean before claiming any
+  new task; dirtiness leaves the task ready and returns the runtime to
+  `waiting-dirty`
 - the orchestrator switches to the task branch
 - if the branch does not exist, it may be created only when the base is unambiguous
 - otherwise the task is blocked with a durable comment
@@ -929,7 +935,8 @@ process-manager UI.
 Primary questions:
 
 - Is the orchestrator alive?
-- Is it idle, running, starting, stopped, in `hard-break`, stalled, stale, or in error?
+- Is it idle, waiting on a dirty worktree, running, starting, stopped, in
+  `hard-break`, stalled, stale, or in error?
 - What task is active?
 - What branch and step is active?
 - What does recent task activity look like?
@@ -939,6 +946,17 @@ Primary questions:
 ### Runtime Semantics
 
 - The orchestrator writes a singleton runtime row on startup.
+- Startup acquires the singleton lock and initializes logging, database access,
+  dashboard, and heartbeat even when the worktree is dirty.
+- `waiting-dirty` has a fresh heartbeat and no active task. While in that state,
+  the orchestrator does not recover interrupted tasks, inspect blocked gates,
+  run smart-unblock, switch branches, claim work, or launch agents. Its normal
+  poll loop detects cleanliness and resumes recovery and dispatch automatically.
+- Dirty restart never stashes, restores, discards, commits, resets, switches,
+  or requeues interrupted work. Recovery metadata and tracked, staged, and
+  untracked files remain untouched until clean.
+- The dirty gate is not applied between phases of an uninterrupted pinned task;
+  edits created by that task may proceed through review, rework, and finalization.
 - When runtime becomes `idle`, the orchestrator runs automatic runtime-history
   retention: old eligible `run_log` rows and completed-task transcripts are
   removed, and SQLite is compacted only when rows were deleted. One maintenance
@@ -1083,7 +1101,8 @@ Rules:
 
 Typical cases:
 
-- If the repo is dirty before pickup, clean it up outside the task before requeueing.
+- If the repo is dirty before pickup, leave ready work queued and clean up the
+  unrelated changes; the live orchestrator resumes automatically.
 - If the task branch was wrong or missing, fix the branch situation first, then set the task back to `ready`.
 - If stashed WIP is no longer usable, clear `stash_ref`, leave a comment, and requeue the task for a rebuild.
 

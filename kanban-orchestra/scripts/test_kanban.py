@@ -3311,25 +3311,24 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(updated["review_round"], round_num)
         self.assertNotEqual(updated["block_reason"], db.BLOCK_REASON_REVIEW_CAP)
 
-    def test_dirty_at_pickup_blocks_without_starting_agent(self):
-        """If the worktree is dirty before commit-make starts, block without running the agent."""
-        tid = db.add_task(self.conn, "Dirty pickup", coder_agent="claude")
+    def test_pinned_commit_make_continues_with_task_edits(self):
+        """A pinned task is not re-gated by its own worktree edits."""
+        tid = db.add_task(self.conn, "Pinned rework", coder_agent="claude")
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-make")
         task = db.get_task(self.conn, tid)
 
         with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
-             patch.object(orchestrator, "run_agent") as mock_agent, \
+             patch.object(orchestrator, "handle_commit_make", return_value=(True, False, False)) as mock_agent, \
              patch.object(orchestrator, "ensure_branch", return_value=True) as mock_ensure_branch:
             result = orchestrator.advance(task, self.conn)
 
-        self.assertFalse(result)
-        mock_agent.assert_not_called()
-        mock_ensure_branch.assert_not_called()
+        self.assertTrue(result)
+        mock_agent.assert_called_once()
+        mock_ensure_branch.assert_called_once()
         updated = db.get_task(self.conn, tid)
-        self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(updated["status"], "ready")
+        self.assertEqual(updated["next_step"], "commit-review")
         self.assertIsNone(updated["stash_ref"])
-        comments = db.get_comments(self.conn, tid)
-        self.assertTrue(any("dirty" in c["message"].lower() for c in comments))
 
     def test_blocked_with_wip_stash_preserved_by_orchestrator(self):
         """When agent fails after a clean start and leaves changes, orchestrator stashes them."""
@@ -3337,8 +3336,7 @@ class TestStateMachine(unittest.TestCase):
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-make")
         task = db.get_task(self.conn, tid)
 
-        # Worktree clean at pickup, dirty after agent fails
-        with patch.object(orchestrator, "is_worktree_dirty", side_effect=[False, True]), \
+        with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
              patch.object(orchestrator, "run_agent", return_value=1), \
              patch.object(orchestrator, "stash_task_wip", return_value="stash@{0}") as mock_stash, \
              patch.object(orchestrator, "ensure_branch", return_value=True):
@@ -3357,7 +3355,7 @@ class TestStateMachine(unittest.TestCase):
         db.update_task(self.conn, tid, status="running", branch="b", next_step="commit-make")
         task = db.get_task(self.conn, tid)
 
-        with patch.object(orchestrator, "is_worktree_dirty", side_effect=[False, True]), \
+        with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
              patch.object(orchestrator, "run_agent", return_value=0), \
              patch.object(orchestrator, "stash_task_wip", return_value="stash@{0}") as mock_stash, \
              patch.object(orchestrator, "ensure_branch", return_value=True):
@@ -3679,17 +3677,16 @@ class TestTaskCLI(unittest.TestCase):
         task = json.loads(r.stdout)
         self.assertEqual(task["status"], "none")
 
-    def test_set_status_ready_rejects_dirty_worktree_when_orchestrator_idle(self):
+    def test_set_status_ready_allows_dirty_worktree_when_orchestrator_waits(self):
         self._make_temp_repo_dirty()
-        self._set_orchestrator_runtime("idle")
-        r = self._run("add", "Dirty idle task", "--branch", "my-branch")
+        self._set_orchestrator_runtime("waiting-dirty")
+        r = self._run("add", "Dirty waiting task", "--branch", "my-branch")
         tid = json.loads(r.stdout)["id"]
 
         r2 = self._run("set", str(tid), "--status", "ready")
 
-        self.assertNotEqual(r2.returncode, 0)
-        self.assertIn("cannot set task status to ready", r2.stderr)
-        self.assertIn("orchestrator is idle", r2.stderr)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["status"], "ready")
 
     def test_set_status_ready_allows_clean_worktree_when_orchestrator_idle(self):
         self._make_temp_repo_clean()
@@ -5701,12 +5698,15 @@ class TestOrchestratorRuntime(unittest.TestCase):
         self.assertEqual(rt["status"], "hard-break")
         self.assertEqual(rt["status_message"], "break complete")
 
+        db.update_runtime(self.conn, status="waiting-dirty", status_message="waiting")
+        self.assertEqual(db.get_runtime(self.conn)["status"], "waiting-dirty")
+
     def test_stale_runtime_status_constraint_is_migrated_preserving_row(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.close()
         try:
             legacy_sql = db.SCHEMA_SQL.replace(
-                "CHECK(status IN ('idle', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error'))",
+                "CHECK(status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error'))",
                 "CHECK(status IN ('idle', 'running', 'stopping', 'stopped', 'error'))",
             )
             legacy = sqlite3.connect(tmp.name)
@@ -5731,6 +5731,8 @@ class TestOrchestratorRuntime(unittest.TestCase):
                 self.assertEqual(rt["status_message"], "preserved")
                 db.update_runtime(migrated, status="starting")
                 self.assertEqual(db.get_runtime(migrated)["status"], "starting")
+                db.update_runtime(migrated, status="waiting-dirty")
+                self.assertEqual(db.get_runtime(migrated)["status"], "waiting-dirty")
             finally:
                 migrated.close()
         finally:
@@ -5876,7 +5878,9 @@ class TestMainLoop(unittest.TestCase):
             patch.object(orchestrator, "init_runtime"),
             patch.object(orchestrator, "recover_running_tasks"),
             patch.object(orchestrator, "start_heartbeat"),
+            patch.object(orchestrator, "start_smart_unblock"),
             patch.object(orchestrator, "set_runtime_idle"),
+            patch.object(orchestrator, "is_worktree_dirty", return_value=False),
             patch.object(orchestrator.db, "get_db_path", return_value=self.tmp.name),
             patch.object(orchestrator.db, "find_ready_task", return_value=None),
             patch.object(
@@ -5912,7 +5916,9 @@ class TestMainLoop(unittest.TestCase):
             patch.object(orchestrator, "init_runtime"),
             patch.object(orchestrator, "recover_running_tasks"),
             patch.object(orchestrator, "start_heartbeat"),
+            patch.object(orchestrator, "start_smart_unblock"),
             patch.object(orchestrator, "set_runtime_idle"),
+            patch.object(orchestrator, "is_worktree_dirty", return_value=False),
             patch.object(orchestrator.db, "get_db_path", return_value=self.tmp.name),
             patch.object(
                 orchestrator.db,
@@ -5938,6 +5944,123 @@ class TestMainLoop(unittest.TestCase):
             log_messages,
         )
         self.assertIn((8, "Picked up: 'Allowed task' (step=commit-make)"), log_messages)
+
+    def test_dirty_start_waits_without_recovery_or_dispatch(self):
+        tid = db.add_task(self.conn, "Interrupted", branch="feat", status="running")
+        db.update_task(self.conn, tid, next_step="commit-make", stash_ref="stash@{0}")
+
+        def stop_after_wait(_seconds):
+            runtime = db.get_runtime(self.conn)
+            self.assertEqual(runtime["status"], "waiting-dirty")
+            self.assertIsNone(runtime["current_task_id"])
+            raise RuntimeError("stop loop")
+
+        with (
+            patch.object(orchestrator, "is_worktree_dirty", return_value=True),
+            patch.object(orchestrator, "recover_running_tasks") as recover,
+            patch.object(orchestrator, "start_heartbeat"),
+            patch.object(orchestrator, "start_smart_unblock") as start_unblock,
+            patch.object(orchestrator, "process_pinned_task") as process,
+            patch.object(orchestrator, "ensure_branch") as ensure_branch,
+            patch.object(orchestrator.time, "sleep", side_effect=stop_after_wait),
+            patch.object(orchestrator.db, "get_db_path", return_value=self.tmp.name),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop loop"):
+                orchestrator.main_loop(self.conn)
+
+        recover.assert_not_called()
+        start_unblock.assert_not_called()
+        process.assert_not_called()
+        ensure_branch.assert_not_called()
+        task = db.get_task(self.conn, tid)
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["stash_ref"], "stash@{0}")
+
+    def test_dirty_start_preserves_tracked_staged_and_untracked_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / ".gitignore").write_text("kanban-orchestra.db*\n", encoding="utf-8")
+            (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+            (repo / "staged.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test User", "-c", "user.email=test@example.com", "commit", "-m", "base"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            (repo / "tracked.txt").write_text("unstaged\n", encoding="utf-8")
+            (repo / "staged.txt").write_text("staged\n", encoding="utf-8")
+            subprocess.run(["git", "add", "staged.txt"], cwd=repo, check=True, capture_output=True)
+            (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+            db_path = str(repo / "kanban-orchestra.db")
+            conn = db.connect(db_path)
+            try:
+                tid = db.add_task(conn, "Interrupted", branch="feat", status="running")
+                db.update_task(conn, tid, next_step="commit-review", stash_ref="stash@{0}")
+                before = subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=repo,
+                    check=True, capture_output=True, text=True,
+                ).stdout
+
+                with (
+                    patch.object(orchestrator, "start_heartbeat"),
+                    patch.object(orchestrator, "recover_running_tasks") as recover,
+                    patch.object(orchestrator, "start_smart_unblock") as start_unblock,
+                    patch.object(orchestrator, "stash_task_wip") as stash,
+                    patch.object(orchestrator.time, "sleep", side_effect=RuntimeError("stop loop")),
+                    patch.object(orchestrator.db, "get_db_path", return_value=db_path),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "stop loop"):
+                        orchestrator.main_loop(conn, db_path=db_path)
+
+                after = subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=repo,
+                    check=True, capture_output=True, text=True,
+                ).stdout
+                self.assertEqual(after, before)
+                self.assertEqual((repo / "tracked.txt").read_text(), "unstaged\n")
+                self.assertEqual((repo / "staged.txt").read_text(), "staged\n")
+                self.assertEqual((repo / "untracked.txt").read_text(), "untracked\n")
+                task = db.get_task(conn, tid)
+                self.assertEqual(task["status"], "running")
+                self.assertEqual(task["stash_ref"], "stash@{0}")
+                recover.assert_not_called()
+                start_unblock.assert_not_called()
+                stash.assert_not_called()
+            finally:
+                conn.close()
+
+    def test_dirty_to_clean_transition_recovers_once_and_dispatches(self):
+        tid = db.add_task(
+            self.conn,
+            "Queued while dirty",
+            branch="feat",
+            status="ready",
+        )
+        db.update_task(self.conn, tid, next_step="commit-make")
+
+        def continue_poll(_seconds):
+            return None
+
+        def stop_after_pick(task, _conn):
+            self.assertEqual(task["id"], tid)
+            raise RuntimeError("dispatched")
+
+        with (
+            patch.object(orchestrator, "is_worktree_dirty", side_effect=[True, False, False]),
+            patch.object(orchestrator, "recover_running_tasks") as recover,
+            patch.object(orchestrator, "start_heartbeat"),
+            patch.object(orchestrator, "start_smart_unblock") as start_unblock,
+            patch.object(orchestrator, "process_pinned_task", side_effect=stop_after_pick),
+            patch.object(orchestrator.time, "sleep", side_effect=continue_poll),
+            patch.object(orchestrator.db, "get_db_path", return_value=self.tmp.name),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dispatched"):
+                orchestrator.main_loop(self.conn)
+
+        recover.assert_called_once_with(self.conn)
+        start_unblock.assert_called_once_with(self.tmp.name)
+        self.assertEqual(db.get_task(self.conn, tid)["status"], "ready")
 
 
 class TestRuntimeAfterTask(unittest.TestCase):
@@ -6147,7 +6270,7 @@ class TestSmartUnblockThread(unittest.TestCase):
             log_messages,
         )
 
-    def test_main_loop_starts_and_stops_it_around_stop_after_task(self):
+    def test_main_loop_honors_stop_before_starting_smart_unblock(self):
         stop_file = self.repo_root / config.STOP_AFTER_TASK_FILE
         stop_file.write_text("")
 
@@ -6163,8 +6286,8 @@ class TestSmartUnblockThread(unittest.TestCase):
         ):
             orchestrator.main_loop(self.conn)
 
-        self.assertEqual(start_calls, [self.db_path])
-        self.assertEqual(stop_calls, [True])
+        self.assertEqual(start_calls, [])
+        self.assertEqual(stop_calls, [])
 
 
 class TestSmartUnblockNativeRecovery(unittest.TestCase):
@@ -6825,19 +6948,23 @@ class TestSingletonLock(unittest.TestCase):
 
         self.assertEqual(orchestrator._read_dashboard_start_request(db_path), 8433)
 
-    def test_main_refuses_to_start_on_dirty_worktree(self):
+    def test_main_starts_service_on_dirty_worktree(self):
         with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
              patch.object(orchestrator, "acquire_singleton_lock") as mock_lock, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
+             patch.object(orchestrator, "main_loop") as main_loop, \
+             patch.object(orchestrator, "start_dashboard"), \
+             patch.object(orchestrator, "stop_dashboard"), \
+             patch.object(orchestrator.db, "get_orchestrator_log_path", return_value=self.lock_path.parent / "orchestrator.log"), \
              patch.object(orchestrator.os, "setpgrp"), \
              patch.object(orchestrator.signal, "signal"):
             exit_code = orchestrator.main()
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
         mock_lock.assert_called_once()
-        mock_connect.assert_not_called()
-        self.assertTrue(any("dirty" in str(c).lower() for c in mock_log.call_args_list))
+        mock_connect.assert_called_once()
+        main_loop.assert_called_once_with(mock_connect.return_value, db_path=orchestrator.db.get_db_path())
 
     def test_start_dashboard_uses_repo_runtime_metadata_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7133,7 +7260,7 @@ class TestFleetConfig(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 exit_code = fleet.precheck([repo])
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
 
     def test_precheck_abbreviates_home_dirty_repo_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7149,7 +7276,7 @@ class TestFleetConfig(unittest.TestCase):
                 exit_code = fleet.precheck([repo])
 
             text = out.getvalue()
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
             self.assertIn("~/repo", text)
             self.assertNotIn(str(root), text)
 
@@ -7844,8 +7971,7 @@ class TestSupertaskStateMachine(unittest.TestCase):
         self.assertEqual(blocked["resume_next_step"], "commit-review-supertask")
 
         db.update_task(self.conn, child_id, follow_up_task_id=None)
-        with patch.object(orchestrator.task_cli, "validate_ready_worktree"):
-            resumed = orchestrator.task_cli.continue_blocked_task(self.conn, parent["id"])
+        resumed = orchestrator.task_cli.continue_blocked_task(self.conn, parent["id"])
         self.assertEqual(resumed["status"], "ready")
         self.assertEqual(resumed["next_step"], "commit-review-supertask")
 

@@ -307,6 +307,8 @@ def runtime_activity(runtime: dict | None) -> str | None:
     status = runtime.get("status")
     if status == "idle":
         return "idle"
+    if status == "waiting-dirty":
+        return "waiting-dirty"
     if status == "running":
         return "busy"
     if status in {"starting", "stopping", "hard-break", "error"}:
@@ -572,49 +574,14 @@ def invalid_repos(repos: list[FleetRepo]) -> list[FleetRepo]:
 
 def require_startable(repos: list[FleetRepo]) -> None:
     invalid = invalid_repos(repos)
-    dirty = []
-    for repo in repos:
-        if repo.error:
-            continue
-        lines = dirty_lines(repo)
-        if lines:
-            dirty.append((repo, lines))
-    if not invalid and not dirty:
+    if not invalid:
         return
 
     print("Fleet precheck failed; not starting anything.", file=sys.stderr)
     for repo in invalid:
         print(f"\n{repo.label}: {display_path(repo.path)}", file=sys.stderr)
         print(f"  {repo.error}", file=sys.stderr)
-    for repo, lines in dirty:
-        print(f"\n{repo.label}: {display_path(repo.root)}", file=sys.stderr)
-        for line in lines[:12]:
-            print(f"  {line}", file=sys.stderr)
-        if len(lines) > 12:
-            print(f"  ... {len(lines) - 12} more", file=sys.stderr)
     raise SystemExit(1)
-
-
-def clean_start_repos(repos: list[FleetRepo]) -> list[FleetRepo]:
-    """Return stopped repos that can be launched, reporting dirty skips."""
-    clean = []
-    dirty = []
-    for repo in repos:
-        lines = dirty_lines(repo)
-        if lines:
-            dirty.append((repo, lines))
-        else:
-            clean.append(repo)
-
-    if dirty:
-        print("Fleet start skipped dirty repo(s); clean repos will still start.", file=sys.stderr)
-        for repo, lines in dirty:
-            print(f"\n{repo.label}: {display_path(repo.root)}", file=sys.stderr)
-            for line in lines[:12]:
-                print(f"  {line}", file=sys.stderr)
-            if len(lines) > 12:
-                print(f"  ... {len(lines) - 12} more", file=sys.stderr)
-    return clean
 
 
 def current_repo_root() -> Path | None:
@@ -713,7 +680,6 @@ def precheck(repos: list[FleetRepo]) -> int:
         if lines:
             rows.append((repo.label, "dirty", str(len(lines)), display_path(repo.root)))
             dirty.append((repo, lines))
-            exit_code = 1
         else:
             rows.append((repo.label, "clean", "0", display_path(repo.root)))
 
@@ -753,8 +719,7 @@ def start_tmux_session(repo: FleetRepo, *, preferred_port: int, orchestrator: Pa
 def try_start_repo(repo: FleetRepo, *, preferred_port: int | None = None) -> str | None:
     """Start one configured repo without exiting.
 
-    Return None on success, or a concise failure reason. Dirty worktrees are
-    reported as ``Worktree dirty`` instead of being skipped silently.
+    Return None on success, or a concise failure reason.
     """
     if preferred_port is None:
         preferred_port = dashboard_port_for_index(0)
@@ -771,8 +736,6 @@ def try_start_repo(repo: FleetRepo, *, preferred_port: int | None = None) -> str
         return None
     if session != "-":
         return f"tmux session already exists without a live orchestrator ({session})"
-    if dirty_lines(repo):
-        return "Worktree dirty"
     if shutil.which("tmux") is None:
         return "required tool not found on PATH: tmux"
 
@@ -803,7 +766,6 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
     if precheck:
         if invalid:
             require_startable(invalid)
-        repos_to_start = clean_start_repos(repos_to_start)
     elif invalid:
         for repo in invalid:
             print(f"{repo.label}: invalid config ({repo.error})", file=sys.stderr)

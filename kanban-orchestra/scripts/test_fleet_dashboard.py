@@ -149,13 +149,13 @@ class TestCollectCardStatuses(FleetDashboardRepoTest):
         self.assertFalse(card.invalid)
         self.assertIsNone(card.last_start_failure)
 
-    def test_stopped_dirty_worktree_reports_last_start_failure(self):
+    def test_stopped_dirty_worktree_remains_startable(self):
         (self.root / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
 
         card = _collect(self.repo)
 
         self.assertEqual(card.status, "stopped")
-        self.assertEqual(card.last_start_failure, "Worktree dirty")
+        self.assertIsNone(card.last_start_failure)
 
     def test_idle_card_uses_idle_status(self):
         _write_lock(self.root)
@@ -165,6 +165,15 @@ class TestCollectCardStatuses(FleetDashboardRepoTest):
 
         self.assertEqual(card.status, "idle")
         self.assertFalse(card.invalid)
+
+    def test_waiting_dirty_card_exposes_live_waiting_status(self):
+        _write_lock(self.root)
+        _insert_runtime(self.conn, status="waiting-dirty")
+
+        card = _collect(self.repo)
+
+        self.assertEqual(card.status, "waiting-dirty")
+        self.assertIsNone(card.current_task)
 
     def test_running_card_uses_running_status(self):
         task_id = db.add_task(self.conn, "Device synchronization", branch="feature/device-sync")
@@ -819,23 +828,20 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
         self.assertEqual(invalid_resp.status_code, 400)
         self.assertEqual(invalid_resp.json()["error"], "Invalid config")
 
-    def test_dirty_start_reports_worktree_dirty_without_launching(self):
+    def test_dirty_start_launches_orchestrator(self):
         (self.root / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
 
         with patch.object(fleet, "load_repos", return_value=[self.repo]), \
-             patch.object(fleet, "start_tmux_session") as launch_mock, \
+             patch.object(fleet, "try_start_repo", return_value=None) as launch_mock, \
              patch.object(fleet, "tmux_has_session", return_value=False):
             response = _post_start("midi")
 
-        launch_mock.assert_not_called()
-        self.assertEqual(response.status_code, 409)
+        launch_mock.assert_called_once_with(self.repo)
+        self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["error"], "Worktree dirty")
+        self.assertTrue(payload["ok"])
         self.assertEqual(payload["card"]["status"], "stopped")
-        self.assertEqual(payload["card"]["last_start_failure"], "Worktree dirty")
-        self.assertIn("Worktree dirty", payload["html"])
-        self.assertIn("Last start failed", payload["html"])
+        self.assertIsNone(payload["card"]["last_start_failure"])
         self.assertIn("data-start-repo", payload["html"])
 
     def test_successful_start_refreshes_card_from_collector_state(self):
@@ -932,6 +938,7 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
 
         (self.root / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
         with patch.object(fleet, "load_repos", return_value=[self.repo]), \
+             patch.object(fleet, "try_start_repo", return_value="Start failed"), \
              patch.object(fleet, "tmux_has_session", return_value=False):
             failure = _post_start("midi")
 
@@ -941,7 +948,7 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
         self.assertIn("html", success.json())
         self.assertIn("card", success.json())
         self.assertFalse(failure.json()["ok"])
-        self.assertEqual(failure.json()["error"], "Worktree dirty")
+        self.assertEqual(failure.json()["error"], "Start failed")
         self.assertIn("html", failure.json())
 
 

@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE TABLE IF NOT EXISTS orchestrator_runtime (
     singleton            INTEGER PRIMARY KEY CHECK(singleton = 1),
     status               TEXT NOT NULL
-        CHECK(status IN ('idle', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')),
+        CHECK(status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')),
     pid                  INTEGER,
     started_at           DATETIME,
     last_heartbeat_at    DATETIME,
@@ -352,7 +352,7 @@ def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
         CREATE TABLE orchestrator_runtime_migrated (
             singleton            INTEGER PRIMARY KEY CHECK(singleton = 1),
             status               TEXT NOT NULL
-                CHECK(status IN ('idle', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')),
+                CHECK(status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')),
             pid                  INTEGER,
             started_at           DATETIME,
             last_heartbeat_at    DATETIME,
@@ -380,7 +380,7 @@ def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
         SELECT
             singleton,
             CASE
-                WHEN status IN ('idle', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')
+                WHEN status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')
                 THEN status ELSE 'error'
             END,
             pid,
@@ -775,6 +775,7 @@ def _check_schema_compatible(conn: sqlite3.Connection) -> None:
             "'other-make'",
             "'other-review'",
             "'starting'",
+            "'waiting-dirty'",
             "'hard-break'",
         )
         if any(token not in runtime_schema[0] for token in required_runtime_tokens):

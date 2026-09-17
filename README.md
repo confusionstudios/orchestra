@@ -291,10 +291,15 @@ These files are local runtime state and ignored by git. `ORCHESTRA_DIR` supplies
 the shared tools; it may point at the same checkout when Orchestra works on
 itself.
 
-The orchestrator expects exclusive access to a clean worktree. It refuses to
-launch dirty and blocks rather than continuing through unexpected uncommitted
-changes. Tasks on `master` or `main` are disabled by default; a repo must opt in
-with a standalone `ALLOW_TASKS_ON_MASTER` line in its root `AGENTS.md`.
+The orchestrator expects exclusive access to the worktree while executing. It
+can launch while dirty, keeps its dashboard and heartbeat available in
+`waiting-dirty`, and automatically begins eligible queued work once the tree is
+clean. Tasks may be queued while it waits. Startup recovery is also deferred so
+tracked, staged, and untracked changes and interrupted-task metadata remain
+untouched. An uninterrupted active task may carry its own edits through review,
+rework, and finalization. Tasks on `master` or `main` are disabled by default;
+a repo must opt in with a standalone `ALLOW_TASKS_ON_MASTER` line in its root
+`AGENTS.md`.
 
 Useful operator rules:
 
