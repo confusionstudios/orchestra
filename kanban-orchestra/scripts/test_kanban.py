@@ -4587,7 +4587,8 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "claude-opus-4-8-high",
@@ -4616,7 +4617,8 @@ class TestAgentTranscriptCapture(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "composer-2.5",
@@ -11169,7 +11171,8 @@ agents:
         self.assertEqual(
             agent_registry.resolve_agent_command("grok"),
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "cursor-grok-4.6-high",
@@ -11375,7 +11378,8 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_agent_command("cursor:claude-opus-4-8-high"),
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "claude-opus-4-8-high",
@@ -11384,6 +11388,31 @@ class TestCommitFooter(unittest.TestCase):
                 "{prompt}",
             ],
         )
+
+    def test_named_cursor_agent_command_resolution(self):
+        expected_models = {
+            "cursor-auto": "auto",
+            "cursor-composer-2.5": "composer-2.5",
+            "cursor-grok-4.5": "cursor-grok-4.5-high",
+            "cursor-opus-4.6": "claude-4.6-opus-high",
+            "cursor-opus-4.7": "claude-opus-4-7-high",
+            "cursor-sonnet-4.6": "claude-4.6-sonnet-medium",
+        }
+        for key, model in expected_models.items():
+            with self.subTest(agent=key):
+                self.assertEqual(
+                    agent_registry.resolve_agent_command(key),
+                    [
+                        "remote-control-cursor",
+                        "run",
+                        "-p",
+                        "--model",
+                        model,
+                        "--yolo",
+                        "--trust",
+                        "{prompt}",
+                    ],
+                )
 
     def test_dynamic_provider_model_attribution_preserves_explicit_model(self):
         self.assertEqual(
@@ -11414,7 +11443,8 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor-composer-2.5"),
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "composer-2.5",
@@ -11430,7 +11460,8 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("cursor:claude-opus-4-8-high"),
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "claude-opus-4-8-high",
@@ -11860,7 +11891,8 @@ class TestAgentPingACKGate(unittest.TestCase):
         self.assertEqual(
             mock_popen.call_args.args[0],
             [
-                "agent",
+                "remote-control-cursor",
+                "run",
                 "-p",
                 "--model",
                 "claude-opus-4-8-high",
