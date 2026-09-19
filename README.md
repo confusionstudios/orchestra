@@ -251,7 +251,7 @@ and dynamic provider/model specs:
 | `haiku`, `sonnet`, `opus`, `fable`, `claude` | Claude Code | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
 | `codex` | OpenAI Codex CLI | Default reviewer, plan reviewer, and supertask reviewer |
 | `antigravity` | Antigravity (`agy`) | Runs through its non-interactive print mode |
-| `cursor:<model>` | Cursor Agent | Passes the exact model string to Cursor; `grok` currently aliases `cursor:cursor-grok-4.6-high` |
+| `cursor:<model>` | Cursor Agent via GUI relay | Routes through `remote-control-cursor run` and passes the exact model string to Cursor; `grok` currently aliases `cursor:cursor-grok-4.6-high` |
 | `kilo:<model>` | Kilo Code | Passes the exact model string to Kilo; `kilo` uses its auto/free model |
 
 `shared_scripts/agent_registry.yaml` is the source of truth for built-in keys,
