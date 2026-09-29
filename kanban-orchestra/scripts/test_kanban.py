@@ -11475,7 +11475,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_review_agent_command("codex"),
             [
-                "codex", "exec", "--model", "gpt-5.6-sol",
+                "codex", "exec", "--model", "gpt-6-sol",
                 "-c", 'model_reasoning_effort="medium"',
                 "review", "{prompt}",
             ],
@@ -11517,7 +11517,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(
             agent_registry.resolve_agent_command("codex"),
             [
-                "codex", "exec", "--model", "gpt-5.6-sol",
+                "codex", "exec", "--model", "gpt-6-sol",
                 "-c", 'model_reasoning_effort="medium"',
                 "--yolo", "{prompt}",
             ],
@@ -11526,7 +11526,7 @@ class TestCommitFooter(unittest.TestCase):
     def test_codex_review_attribution_uses_explicit_command_configuration(self):
         self.assertEqual(
             agent_registry.resolve_agent_attribution("codex", review=True),
-            "codex (model: gpt-5.6-sol; reasoning effort: medium)",
+            "codex (model: gpt-6-sol; reasoning effort: medium)",
         )
 
     def test_review_command_falls_back_to_normal_command(self):
@@ -11556,7 +11556,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
+            f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
     def test_get_commit_footer_default_agent(self):
@@ -11587,7 +11587,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: codex (model: gpt-5.6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)",
+            f"Task {tid} (coder: codex (model: gpt-6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)",
         )
 
     def test_get_commit_footer_provider_model_agent(self):
@@ -11675,7 +11675,7 @@ class TestCommitFooter(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(
             r2.stdout.strip(),
-            f"Task {tid} (coder: haiku (model: haiku); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)",
+            f"Task {tid} (coder: haiku (model: haiku); reviewer: codex (model: gpt-6-sol; reasoning effort: medium); review rejections: 0)",
         )
 
 
@@ -11781,7 +11781,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-5.6-sol; reasoning effort: medium); review rejections: 0)"
+                f"Task {tid} (coder: sonnet (model: sonnet); reviewer: codex (model: gpt-6-sol; reasoning effort: medium); review rejections: 0)"
             ),
             repr(result),
         )
@@ -11805,7 +11805,7 @@ class TestFinalizationFooter(unittest.TestCase):
         result = task_module.normalize_commit_message_footer(message, tid, self.conn)
         self.assertTrue(
             result.endswith(
-                f"Task {tid} (coder: codex (model: gpt-5.6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)"
+                f"Task {tid} (coder: codex (model: gpt-6-sol; reasoning effort: medium); reviewer: pending; review rejections: 0)"
             ),
             repr(result),
         )
