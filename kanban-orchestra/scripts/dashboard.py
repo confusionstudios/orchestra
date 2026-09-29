@@ -379,6 +379,75 @@ def _running_directory_display() -> str:
     return _abbreviate_home(db.get_repo_root())
 
 
+def _short_computer_name(hostname: str | None = None) -> str:
+    """Return a short host label without a domain suffix."""
+    if hostname is None:
+        try:
+            hostname = _socket.gethostname()
+        except OSError:
+            hostname = ""
+    short = (hostname or "").strip().split(".")[0].strip()
+    return short or "localhost"
+
+
+def _fleet_label_for_repo_root(repo_root: str | Path | None) -> str | None:
+    """Return the Fleet short label for a repo root, if one is configured."""
+    if not repo_root:
+        return None
+    try:
+        resolved = Path(repo_root).expanduser().resolve()
+        repos = fleet.load_status_repos()
+    except (OSError, RuntimeError):
+        return None
+    for repo in repos:
+        if repo.root is None:
+            continue
+        try:
+            if repo.root.expanduser().resolve() == resolved:
+                label = (repo.label or "").strip()
+                if label:
+                    return label
+        except OSError:
+            continue
+    return None
+
+
+def _short_instance_name(identity: dict | None = None) -> str:
+    """Return the Fleet label for this instance, or the repository directory name."""
+    if identity is None:
+        try:
+            identity = db.get_instance_identity()
+        except RuntimeError:
+            identity = {}
+    identity = identity or {}
+    fleet_label = _fleet_label_for_repo_root(identity.get("repo_root"))
+    if fleet_label:
+        return fleet_label
+    label = str(identity.get("repo_label") or "").strip()
+    if label:
+        return label
+    root = identity.get("repo_root")
+    if root:
+        name = Path(root).name
+        if name:
+            return name
+        return str(root)
+    return Path.cwd().name
+
+
+def _dashboard_heading_html(
+    computer_name: str | None = None,
+    instance_name: str | None = None,
+) -> str:
+    """Return the escaped main dashboard heading with host and instance names."""
+    computer = computer_name if computer_name is not None else _short_computer_name()
+    instance = instance_name if instance_name is not None else _short_instance_name()
+    return (
+        "<h1>Kanban Orchestra "
+        f'<span class="heading-context">({_esc(computer)} | {_esc(instance)})</span></h1>'
+    )
+
+
 def _display_timestamp(dt_str: str | None) -> str:
     """Render a stable server-side timestamp in YYYY-MM-DD HH:MM format (server local timezone)."""
     if not dt_str:
@@ -1954,6 +2023,13 @@ h1 {
   letter-spacing: -0.01em;
   color: var(--accent);
   text-shadow: 0 0 18px rgb(var(--accent-rgb) / 0.22);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.heading-context {
+  font-weight: 400;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 h2 { margin: 0 0 12px; font-size: 1.05rem; letter-spacing: -0.01em; border-bottom: 1px solid var(--border); padding-bottom: 8px; color: var(--accent); }
 h3 { margin: 12px 0 6px; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
@@ -2349,6 +2425,10 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 
   .card {
     padding: 14px 12px;
+  }
+
+  .heading-context {
+    font-size: 0.82em;
   }
 }
 
@@ -2789,7 +2869,7 @@ def index():
             conn.close()
 
     body = f"""
-    <h1>Kanban Orchestra</h1>
+    {_dashboard_heading_html()}
     <div id="health-wrap">{health_html}</div>
     <div id="current-task-wrap">{current_html}</div>
     <div id="agent-output-wrap">{agent_output_html}</div>
