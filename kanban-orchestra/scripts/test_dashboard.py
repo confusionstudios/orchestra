@@ -211,6 +211,54 @@ class TestHelpers(unittest.TestCase):
         self.assertIsNone(dashboard._display_review_round_count("legacy"))
 
 
+class TestDashboardHeading(unittest.TestCase):
+    """Tests for host/instance name resolution and heading escaping."""
+
+    def test_short_computer_name_strips_domain_suffix(self):
+        self.assertEqual(dashboard._short_computer_name("host.example.com"), "host")
+        self.assertEqual(dashboard._short_computer_name("mbp.local"), "mbp")
+        self.assertEqual(dashboard._short_computer_name("testhost"), "testhost")
+
+    def test_short_computer_name_falls_back_when_empty_or_unreadable(self):
+        self.assertEqual(dashboard._short_computer_name(""), "localhost")
+        self.assertEqual(dashboard._short_computer_name("   "), "localhost")
+        with patch.object(dashboard._socket, "gethostname", side_effect=OSError("no host")):
+            self.assertEqual(dashboard._short_computer_name(), "localhost")
+
+    def test_short_instance_name_prefers_fleet_label(self):
+        identity = {"repo_root": "/tmp/work-repo", "repo_label": "work-repo"}
+        with patch.object(dashboard, "_fleet_label_for_repo_root", return_value="fleet-short"):
+            self.assertEqual(dashboard._short_instance_name(identity), "fleet-short")
+
+    def test_short_instance_name_falls_back_to_directory_name(self):
+        identity = {"repo_root": "/tmp/work-repo", "repo_label": "work-repo"}
+        with patch.object(dashboard, "_fleet_label_for_repo_root", return_value=None):
+            self.assertEqual(dashboard._short_instance_name(identity), "work-repo")
+        with patch.object(dashboard, "_fleet_label_for_repo_root", return_value=""):
+            self.assertEqual(
+                dashboard._short_instance_name({"repo_root": "/tmp/work-repo", "repo_label": ""}),
+                "work-repo",
+            )
+
+    def test_fleet_label_for_repo_root_matches_configured_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            repo = dashboard.fleet.FleetRepo("short-label", root, root)
+            other = dashboard.fleet.FleetRepo("other-repo", root / "other", root / "other")
+            with patch.object(dashboard.fleet, "load_status_repos", return_value=[other, repo]):
+                self.assertEqual(dashboard._fleet_label_for_repo_root(root), "short-label")
+                self.assertIsNone(dashboard._fleet_label_for_repo_root(root / "missing"))
+
+    def test_dashboard_heading_html_escapes_names(self):
+        html = dashboard._dashboard_heading_html("<host>", "repo&name")
+        self.assertIn("&lt;host&gt;", html)
+        self.assertIn("repo&amp;name", html)
+        self.assertNotIn("<host>", html)
+        self.assertNotIn("repo&name", html)
+        self.assertIn('<span class="heading-context">', html)
+        self.assertTrue(html.startswith("<h1>Kanban Orchestra "))
+
+
 class TestPageShell(unittest.TestCase):
     """Tests for shared page shell timestamp formatting."""
 
