@@ -25,13 +25,26 @@ Registry `aliases` are Orchestra semantic names. They target an existing fixed
 key or `provider:model` spec and do not define their own commands. `grok` is
 the current preferred Cursor Grok model.
 
-`agent --list-models` is authoritative for live, account-specific Cursor model
-IDs. Explicit `provider:<exact-model-id>` works for Codex, Claude, Cursor,
+Use `"$ORCHESTRA_DIR/bin/ko-task" models refresh [provider]` to update local
+CLI model metadata explicitly. `models status` shows freshness, the last
+successful refresh, and a concise failure reason. `models list [provider]`
+shows exact IDs, labels, capability metadata, and baseline/discovery sources.
+The generated cache is `.kanban-orchestra/model-cache.json` in the launched
+work repository; it is ignored by Git and scoped to the local configuration
+and authentication context. A missing or corrupt cache uses baseline choices;
+refresh to recover. Failed refreshes keep the last good list. A configured
+model absent from the latest listing remains selectable and is flagged by
+`ko-task agents`; listing absence does not prove the CLI will reject it.
+Execution errors, including missing binaries and rejected models, fail the
+task without changing the selected provider or model.
+
+Explicit `provider:<exact-model-id>` works for Codex, Claude, Cursor,
 Kilo, and Antigravity without a registry entry. Each launched work repository
 may set `.kanban-orchestra/agents.yaml`; use `"$ORCHESTRA_DIR/bin/ko-task" agents`
 to inspect the effective registry and role defaults. The local file is ignored
-by Git. Restart the worker and dashboard after editing it; admitted tasks keep
-their saved command snapshots.
+by Git. Restart the worker and dashboard after editing it or refreshing the
+cache; admitted tasks keep their saved command snapshots. Ordinary task runs
+do not query provider CLIs for models.
 
 ## Current Role Defaults
 

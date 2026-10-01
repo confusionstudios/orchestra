@@ -39,6 +39,7 @@ from pathlib import Path
 import db
 import config
 import repo_policy
+import model_registry
 
 
 AGENTS = config.AGENTS
@@ -1286,6 +1287,13 @@ def build_parser():
     p_gcf.add_argument("task_id", type=int)
 
     sub.add_parser("agents", help="Show effective agents, aliases, defaults, and command sources")
+    p_models = sub.add_parser("models", help="Refresh or inspect cached CLI models")
+    model_commands = p_models.add_subparsers(dest="models_command", required=True)
+    p_refresh = model_commands.add_parser("refresh", help="Discover models from installed CLIs")
+    p_refresh.add_argument("provider", nargs="?", choices=model_registry.PROVIDERS)
+    model_commands.add_parser("status", help="Show cache freshness and errors")
+    p_model_list = model_commands.add_parser("list", help="Show baseline and discovered model choices")
+    p_model_list.add_argument("provider", nargs="?", choices=model_registry.PROVIDERS)
 
     return parser
 
@@ -1319,6 +1327,30 @@ def main():
             config.agent_snapshot("supertask")
         except ValueError as exc:
             parser.error(str(exc))
+        if args.command == "models":
+            providers = [args.provider] if getattr(args, "provider", None) else model_registry.PROVIDERS
+            if args.models_command == "refresh":
+                for provider in providers:
+                    model_registry.refresh(registry.path.parent.parent, provider)
+            for provider in providers:
+                state = (registry.model_choices(provider) if args.models_command == "list"
+                         else model_registry.view(registry.path.parent.parent, provider))
+                print(f"{provider}: {state['state']} | last successful refresh: {state['last_success'] or 'never'}"
+                      + (f" | {state['reason']}" if state.get('reason') else ""))
+                if args.models_command == "list":
+                    for model in state["models"]:
+                        raw_capabilities = model.get("capabilities", {})
+                        capability_keys = ("isDefault", "defaultReasoningEffort", "supportedReasoningEfforts",
+                                           "supportsEffort", "supportedEffortLevels", "supportsAdaptiveThinking",
+                                           "supportsFastMode", "inputModalities", "resolvedModel")
+                        capabilities = {key: raw_capabilities[key] for key in capability_keys if key in raw_capabilities}
+                        if "supportedReasoningEfforts" in capabilities:
+                            capabilities["supportedReasoningEfforts"] = [
+                                value.get("reasoningEffort", value) if isinstance(value, dict) else value
+                                for value in capabilities["supportedReasoningEfforts"]]
+                        capabilities = json.dumps(capabilities, sort_keys=True)
+                        print(f"  {model['id']} | {model['label']} | {','.join(model['sources'])} | {capabilities}")
+            return
         if args.command == "agents":
             _json_out({
                 "config": str(registry.path), "fingerprint": registry.fingerprint,
@@ -1341,6 +1373,8 @@ def main():
                                                       patch=registry.role(role)["patch"])}
                     for role in config.agent_registry.ROLE_FALLBACKS
                 },
+                "model_choices": {name: registry.model_choices(name) for name in model_registry.PROVIDERS},
+                "model_warnings": registry.model_warnings(),
             })
             return
         dispatch = {

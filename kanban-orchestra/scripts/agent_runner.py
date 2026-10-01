@@ -421,8 +421,9 @@ def run_agent(
             text=True, bufsize=1, start_new_session=True, cwd=proc_cwd,
         )
     except FileNotFoundError:
-        log(f"Agent binary not found for '{agent_name}'", task_id)
-        db.add_run_log(conn, task_id, f"Agent binary not found: {agent_name}", verb=verb, author="orchestrator")
+        message = f"Agent CLI executable not found: {cmd[0]} (selected agent: {agent_name})"
+        log(message, task_id)
+        db.add_run_log(conn, task_id, message, verb=verb, author="orchestrator")
         return 127
 
     try:

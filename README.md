@@ -291,10 +291,18 @@ after restarting the worker and dashboard, and do not retarget queued work.
 respective saved choice for later steps. Existing tasks receive a snapshot at
 their next dispatch. Each work repository has its own configuration.
 
-`.kanban-orchestra/model-cache.json` is reserved for optional generated model
-discovery. A future version may use its version 1 JSON shape:
-`{"version":1,"generated_at":"RFC3339 UTC","providers":{"codex":[{"id":"gpt-6.1-sol","label":"GPT-6.1 Sol","reasoning":["low","medium","high"]}]}}`.
-The cache is optional and never limits explicit `provider:model` IDs.
+Run `ko-task models refresh [provider]` to discover installed CLI models on
+demand. `ko-task models status` shows freshness, last successful refresh, and
+failure reasons; `ko-task models list [provider]` merges discovered models
+with tracked baseline choices. The generated, Git-ignored
+`.kanban-orchestra/model-cache.json` is scoped to this work repository and a
+nonsecret hash of the local user, configuration, and authentication context.
+Its version 1 `providers` entries store `scope`, `models` (exact `id`, `label`,
+and `capabilities`), `state`, `reason`, `last_attempt`, and `last_success`.
+Failed refreshes retain the last good list. Missing or corrupt cache data
+falls back to baseline choices; refresh to recover. The cache never changes
+local preferences or limits explicit `provider:model` IDs. Restart long-lived
+workers to observe refreshed choices; active task selections remain fixed.
 
 Default roles can be changed without editing the registry:
 

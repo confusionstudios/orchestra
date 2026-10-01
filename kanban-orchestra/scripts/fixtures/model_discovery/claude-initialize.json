@@ -1,0 +1,1 @@
+{"type": "control_response", "response": {"subtype": "success", "request_id": "models", "response": {"models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-5", "displayName": "Sonnet", "supportsEffort": true}]}}}

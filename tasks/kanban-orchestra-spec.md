@@ -125,11 +125,28 @@ from the active worker. `ko-task agents` reports effective commands and
 sources. Missing local configuration is normal. Each work repository resolves
 its own file from its database workspace, not from the tooling checkout.
 
-The optional `.kanban-orchestra/model-cache.json` is reserved for a later
-discovery task. Its version 1 JSON contract is `{version: 1, generated_at:
-"RFC3339 UTC", providers: {codex: [{id: "...", label: "...", reasoning:
-["low", "medium", "high"]}]}}`. This task does not read that file. Discovery
-is advisory and never rejects an explicit `provider:model` specification.
+`ko-task models refresh [provider]` explicitly discovers models through the
+installed CLI's metadata interface. `ko-task models status` reports each
+provider's fresh, stale, or unavailable state, last successful refresh, and
+failure reason. `ko-task models list [provider]` merges discovered choices with
+the tracked baseline, displaying exact IDs, labels, capability metadata, and
+source. `ko-task agents` includes these choices and warns when a configured
+model is absent from the latest successful listing. Absence is advisory: an
+explicit `provider:model` choice remains valid and execution uses its exact ID.
+
+The generated, Git-ignored `.kanban-orchestra/model-cache.json` is scoped to
+the launched work repository and stores a nonsecret hash of user and provider
+configuration context. Version 1 has `providers` entries with `scope`,
+`models`, `state`, `reason`, `last_attempt`, and `last_success`. Each model has
+`id`, `label`, and `capabilities`. Successful refreshes atomically replace a
+provider's validated list. Failures preserve its last good list and record a
+short diagnostic. Successful lists older than seven days show as stale. A
+missing or corrupt cache falls back to baseline choices;
+run `ko-task models refresh` to recover. Refresh never writes `agents.yaml`.
+Task execution and startup read the cache without launching discovery CLIs.
+Long-lived workers load cache changes when restarted; admitted tasks retain
+their saved command snapshots. A missing CLI or rejected model fails the task
+with its CLI error and does not switch provider or model.
 
 ### Review Round
 

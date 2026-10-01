@@ -16,6 +16,7 @@ import subprocess
 from typing import Any
 
 import yaml
+import model_registry
 
 
 REGISTRY_PATH = Path(__file__).with_name("agent_registry.yaml")
@@ -675,6 +676,47 @@ class EffectiveRegistry:
         if self.command(spec) is None:
             raise ValueError(f"{source}: {name} agent {spec!r} is invalid; choose an agent or provider:model")
         return {"agent": spec, "patch": {key: value for key, value in patch.items() if key != "agent"}, "source": source}
+
+    def model_choices(self, provider: str) -> dict[str, Any]:
+        """Merge the tracked command IDs with an advisory discovery snapshot."""
+        status = model_registry.view(self.path.parent.parent, provider)
+        choices = {}
+        for name, command in AGENT_CMD.items():
+            if _provider_for(command) != provider:
+                continue
+            model = _command_option(command, "-m", "--model")
+            if model:
+                choices[model] = {"id": model, "label": AGENT_DISPLAY_LABELS[name], "capabilities": {}, "sources": ["baseline"]}
+        for name, command in self.agents.items():
+            if _provider_for(command) != provider:
+                continue
+            model = _command_option(command, "-m", "--model")
+            if model:
+                if self.sources[name] != "product":
+                    choices[model] = {"id": model, "label": self.labels[name], "capabilities": {}, "sources": ["local"]}
+        for model in status["models"]:
+            previous = choices.get(model["id"])
+            choices[model["id"]] = {**model, "label": previous["label"] if previous and "local" in previous["sources"] else model["label"],
+                                     "sources": ([*previous["sources"], "discovered"] if previous else ["discovered"])}
+        return {**status, "models": list(choices.values())}
+
+    def model_warnings(self) -> list[str]:
+        warnings = []
+        for name, command in self.agents.items():
+            provider = _provider_for(command)
+            model = _command_option(command, "-m", "--model")
+            listing = model_registry.view(self.path.parent.parent, provider)
+            if model and listing["state"] == "fresh" and model not in {item["id"] for item in listing["models"]}:
+                warnings.append(f"{name}: configured {provider}:{model} absent from latest discovery; selection retained")
+        for role in ROLE_FALLBACKS:
+            selection = self.role(role)
+            command = self.command(selection["agent"], patch=selection["patch"])
+            provider = _provider_for(command)
+            model = _command_option(command, "-m", "--model")
+            listing = model_registry.view(self.path.parent.parent, provider)
+            if model and listing["state"] == "fresh" and model not in {item["id"] for item in listing["models"]}:
+                warnings.append(f"{role} default: configured {provider}:{model} absent from latest discovery; selection retained")
+        return warnings
 
 
 _ACTIVE: EffectiveRegistry | None = None
