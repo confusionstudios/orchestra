@@ -235,3 +235,74 @@ def test_cli_add_and_set_keep_explicit_agent_separate_from_local_role_patch():
             assert db.get_task(connection, task_id)["coder_agent"] == "claude:sonnet-next"
         finally:
             connection.close()
+
+
+@pytest.mark.parametrize('replacement', ['second', '--literal-value', False, None])
+def test_role_option_replaces_or_removes_inherited_value(replacement):
+    with TemporaryDirectory() as root:
+        write_config(root, 'version: 1\nagents: {codex: {options: {--profile: first}}}\n')
+        registry = agent_registry.EffectiveRegistry(Path(root))
+        for review in (False, True):
+            command = registry.command('codex', review=review, patch={'options': {'--profile': replacement}})
+            assert 'first' not in command
+            assert command.count('{prompt}') == 1
+            if isinstance(replacement, str):
+                assert command[command.index('--profile') + 1] == replacement
+            else:
+                assert '--profile' not in command
+
+
+def test_option_like_model_value_is_not_removed_as_a_flag():
+    with TemporaryDirectory() as root:
+        registry = agent_registry.EffectiveRegistry(Path(root))
+        command = registry.command('codex:--yolo', patch={'options': {'--yolo': False}})
+        assert command == ['codex', 'exec', '--model', '--yolo', '{prompt}']
+
+
+def test_attribution_reports_role_model_override_for_provider_spec():
+    with TemporaryDirectory() as root:
+        registry = agent_registry.EffectiveRegistry(Path(root))
+        command = registry.command('codex:original', patch={'model': 'selected'})
+        assert agent_registry.attribution_from_command('codex:original', command) == 'codex:original (model: selected)'
+
+
+def test_legacy_task_dispatch_keeps_resolved_local_defaults(tmp_path, monkeypatch):
+    # Importing a second orchestrator module registers callbacks on the shared runner.
+    monkeypatch.setattr(agent_runner, '_repo_root_func', agent_runner._repo_root_func)
+    monkeypatch.setattr(agent_runner, 'log', agent_runner.log)
+    import orchestrator
+    for role in agent_registry.ROLE_FALLBACKS:
+        monkeypatch.delenv('ORCHESTRA_DEFAULT_' + role.upper(), raising=False)
+    write_config(tmp_path, 'version: 1\ndefaults: {coder: {agent: "codex:local-model"}, reviewer: {agent: "claude:local-review"}}\n')
+    monkeypatch.setattr(agent_registry, '_ACTIVE', agent_registry.EffectiveRegistry(tmp_path))
+    connection = db.connect(str(tmp_path / 'kanban-orchestra.db'))
+    try:
+        task_id = db.add_task(connection, 'Legacy', branch='feature', status='ready')
+        monkeypatch.setattr(orchestrator.smart_unblock, 'is_consultation_gated', lambda *_: False)
+        monkeypatch.setattr(orchestrator, 'update_runtime_after_task', lambda *_: None)
+
+        def advance(task, conn):
+            assert task['coder_agent'] == 'codex:local-model'
+            assert task['reviewer_agent'] == 'claude:local-review'
+            command = agent_runner._resolve_command_template(task['coder_agent'], conn=conn, task_id=task_id, verb='commit-make')
+            assert command[3] == 'local-model'
+            db.update_task(conn, task_id, status='done', next_step='none')
+            return True
+
+        monkeypatch.setattr(orchestrator, 'advance', advance)
+        assert orchestrator.process_pinned_task(db.get_task(connection, task_id), connection)
+    finally:
+        connection.close()
+
+
+def test_worktree_import_preserves_saved_agent_commands(tmp_path):
+    source = db.connect(str(tmp_path / 'source.db'))
+    target = db.connect(str(tmp_path / 'target.db'))
+    try:
+        snapshot = {'version': 1, 'roles': {'coder': {'spec': 'custom', 'run': ['cli', 'saved-model', '{prompt}']}}}
+        task_id = db.add_task(source, 'Saved', agent_snapshot=snapshot)
+        result = db.import_worktree_database(target, tmp_path / 'source.db')
+        assert db.get_agent_snapshot(target, result['id_map'][str(task_id)]) == snapshot
+    finally:
+        source.close()
+        target.close()

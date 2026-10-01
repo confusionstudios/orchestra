@@ -2689,6 +2689,11 @@ def process_pinned_task(task, conn):
             except ValueError as exc:
                 log(f"Agent configuration for task {task_id}: {exc}", task_id)
                 return False
+            primary = "super_planner" if current.get("kind") == "supertask" else "coder"
+            reviewer = "super_reviewer" if current.get("kind") == "supertask" else "reviewer"
+            db.update_task(conn, task_id, commit=False,
+                           coder_agent=snapshot["roles"][primary]["spec"],
+                           reviewer_agent=snapshot["roles"][reviewer]["spec"])
             db.save_agent_snapshot(conn, task_id, snapshot)
         db.update_task(conn, task_id, status="running")
         current = db.get_task(conn, task_id)

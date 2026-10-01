@@ -194,3 +194,72 @@ def test_task_cli_reads_cache_without_discovery(tmp_path, monkeypatch):
     assert listed.returncode == 0, listed.stderr
     assert 'codex: fresh' in listed.stdout and 'first | First' in listed.stdout
     assert 'supportedReasoningEfforts' in listed.stdout
+
+
+@pytest.mark.parametrize('provider', ['codex', 'claude'])
+@pytest.mark.parametrize('payload', ['[]', 'null', '"unexpected"'])
+def test_wrong_protocol_shape_retains_last_good(tmp_path, monkeypatch, provider, payload):
+    fake_path(tmp_path, monkeypatch, provider)
+    good = model_registry.refresh(tmp_path, provider, timeout=2)
+    executable = tmp_path / 'bin' / model_registry.EXECUTABLES[provider]
+    executable.write_text('#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nprint(' + repr(payload) + ', flush=True)\n')
+    result = model_registry.refresh(tmp_path, provider, timeout=2)
+    assert result['state'] == 'stale'
+    assert result['models'] == good['models']
+    assert 'malformed' in result['reason']
+
+
+def test_malformed_cache_diagnostic_falls_back_to_baseline(tmp_path, monkeypatch):
+    fake_path(tmp_path, monkeypatch, 'codex')
+    model_registry.refresh(tmp_path, 'codex', timeout=2)
+    path = tmp_path / model_registry.CACHE
+    data = json.loads(path.read_text())
+    data['providers']['codex']['scope'] = 'other-account'
+    data['diagnostics'] = {'codex': []}
+    path.write_text(json.dumps(data))
+    assert 'cache corrupt' in model_registry.view(tmp_path, 'codex')['reason']
+    assert agent_registry.EffectiveRegistry(tmp_path).model_choices('codex')['models']
+
+
+def test_cleanup_targets_group_even_after_leader_exits(monkeypatch):
+    from unittest.mock import Mock
+    import signal
+    process = Mock(pid=12345, stdin=None, stdout=None)
+    process.poll.return_value = 0
+    killed = []
+    monkeypatch.setattr(model_registry.os, 'killpg', lambda pid, sig: killed.append((pid, sig)))
+    model_registry._stop(process)
+    assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+    assert process.wait.called
+
+
+def test_model_choices_include_aliases_and_local_role_selections(tmp_path, monkeypatch):
+    for role in agent_registry.ROLE_FALLBACKS:
+        monkeypatch.delenv('ORCHESTRA_DEFAULT_' + role.upper(), raising=False)
+    local = tmp_path / '.kanban-orchestra' / 'agents.yaml'
+    local.parent.mkdir()
+    local.write_text('version: 1\naliases: {custom: "cursor:local-choice"}\ndefaults: {coder: {agent: "cursor:role-choice"}}\n')
+    registry = agent_registry.EffectiveRegistry(tmp_path)
+    models = {item['id']: item for item in registry.model_choices('cursor')['models']}
+    assert models['cursor-grok-4.6-high']['sources'] == ['baseline']
+    assert models['local-choice']['sources'] == ['local']
+    assert models['role-choice']['sources'] == ['local']
+
+
+def test_auth_change_during_discovery_is_not_saved_as_new_account(tmp_path, monkeypatch):
+    fake_path(tmp_path, monkeypatch, 'codex')
+    monkeypatch.setenv('OPENAI_API_KEY', 'before')
+    good = model_registry.refresh(tmp_path, 'codex', timeout=2)
+    original = model_registry._codex
+
+    def changed(timeout):
+        result = original(timeout)
+        monkeypatch.setenv('OPENAI_API_KEY', 'after')
+        return result
+
+    monkeypatch.setattr(model_registry, '_codex', changed)
+    result = model_registry.refresh(tmp_path, 'codex', timeout=2)
+    assert result['state'] == 'unavailable'
+    assert 'changed during discovery' in result['reason']
+    monkeypatch.setenv('OPENAI_API_KEY', 'before')
+    assert model_registry.view(tmp_path, 'codex')['models'] == good['models']

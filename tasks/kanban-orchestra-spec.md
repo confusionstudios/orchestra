@@ -143,8 +143,8 @@ provider's validated list. Failures preserve its last good list and record a
 short diagnostic. Successful lists older than seven days show as stale. A
 missing or corrupt cache falls back to baseline choices;
 run `ko-task models refresh` to recover. Refresh never writes `agents.yaml`.
-Task execution and startup read the cache without launching discovery CLIs.
-Long-lived workers load cache changes when restarted; admitted tasks retain
+Model listings read the cache on demand. Task execution and startup never launch discovery CLIs.
+Cache listings are read on demand and reflect refreshes immediately; admitted tasks retain
 their saved command snapshots. A missing CLI or rejected model fails the task
 with its CLI error and does not switch provider or model.
 

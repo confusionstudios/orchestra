@@ -2008,6 +2008,9 @@ def import_worktree_database(
             "SELECT * FROM run_log WHERE task_id IS NOT NULL ORDER BY id ASC"
         ).fetchall()
 
+        source_snapshots = (source_conn.execute("SELECT * FROM task_agent_snapshots").fetchall()
+                            if "task_agent_snapshots" in _list_user_tables(source_conn) else [])
+
         # Snapshot after reads so callers can verify we never wrote the source.
         source_mtime_ns = source_db.stat().st_mtime_ns
 
@@ -2046,6 +2049,12 @@ def import_worktree_database(
                     "UPDATE tasks SET parent_task_id = ?, follow_up_task_id = ? WHERE id = ?",
                     (parent_new, follow_new, new_id),
                 )
+
+            for snapshot in source_snapshots:
+                new_task_id = id_map.get(snapshot["task_id"])
+                if new_task_id is None:
+                    raise ValueError("Source agent snapshot references a missing task")
+                save_agent_snapshot(target_conn, new_task_id, json.loads(snapshot["snapshot"]), commit=False)
 
             for skip in source_skips:
                 new_task_id = id_map.get(skip["task_id"])

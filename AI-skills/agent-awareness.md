@@ -42,8 +42,9 @@ Explicit `provider:<exact-model-id>` works for Codex, Claude, Cursor,
 Kilo, and Antigravity without a registry entry. Each launched work repository
 may set `.kanban-orchestra/agents.yaml`; use `"$ORCHESTRA_DIR/bin/ko-task" agents`
 to inspect the effective registry and role defaults. The local file is ignored
-by Git. Restart the worker and dashboard after editing it or refreshing the
-cache; admitted tasks keep their saved command snapshots. Ordinary task runs
+by Git. Restart the worker and dashboard after editing local preferences; admitted
+tasks keep their saved command snapshots. Cache listings are read on demand
+and reflect a refresh without a restart. Ordinary task runs
 do not query provider CLIs for models.
 
 ## Current Role Defaults

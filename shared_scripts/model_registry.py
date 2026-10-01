@@ -75,15 +75,25 @@ def read(root: Path):
         return {"version": 1, "providers": {}}, "cache missing; run ko-task models refresh"
     try:
         data = json.loads(path.read_text())
-        if (not isinstance(data, dict) or data.get("version") != 1
+        if (not isinstance(data, dict) or type(data.get("version")) is not int or data.get("version") != 1
                 or not isinstance(data.get("providers"), dict)
                 or not isinstance(data.get("diagnostics", {}), dict)):
             raise ValueError("invalid cache version or structure")
         for name, entry in data["providers"].items():
             if name not in PROVIDERS or not isinstance(entry, dict) or not isinstance(entry.get("scope"), str):
                 raise ValueError("invalid provider entry")
+            if entry.get("state") not in ("fresh", "stale", "unavailable"):
+                raise ValueError("invalid provider state")
+            for field in ("reason", "last_success", "last_attempt"):
+                if entry.get(field) is not None and not isinstance(entry[field], str):
+                    raise ValueError(f"invalid provider {field}")
             if "models" in entry:
                 _validated(entry["models"])
+        for name, diagnostic in data.get("diagnostics", {}).items():
+            if name not in PROVIDERS or not isinstance(diagnostic, dict):
+                raise ValueError("invalid provider diagnostic")
+            if any(not isinstance(diagnostic.get(field), str) for field in ("scope", "reason", "last_attempt")):
+                raise ValueError("invalid provider diagnostic fields")
         return data, None
     except (OSError, ValueError, TypeError, KeyError) as exc:
         return {"version": 1, "providers": {}}, f"cache corrupt ({exc}); run ko-task models refresh"
@@ -169,17 +179,30 @@ def _store(root, provider, models, reason):
 
 
 def _stop(proc):
-    if proc.poll() is None:
+    # The group can outlive its leader, including when a CLI spawns helpers.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if proc.poll() is None:
+            raise
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=1)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-    for pipe in (proc.stdin, proc.stdout):
-        if pipe:
-            pipe.close()
+                raise
+        proc.wait()
+        for pipe in (proc.stdin, proc.stdout):
+            if pipe:
+                pipe.close()
 
 
 def _lines(command, messages=(), timeout=TIMEOUT):
@@ -243,13 +266,18 @@ def _codex(timeout):
         buffer = b""
         def request(message):
             nonlocal buffer
-            proc.stdin.write((json.dumps(message) + "\n").encode()); proc.stdin.flush()
+            proc.stdin.write((json.dumps(message) + "\n").encode())
+            proc.stdin.flush()
             while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Codex model discovery timed out")
                 if b"\n" in buffer:
                     raw, buffer = buffer.split(b"\n", 1)
                     if not raw.strip():
                         continue
                     event = json.loads(raw)
+                    if not isinstance(event, dict):
+                        raise ValueError("malformed Codex protocol event")
                     if event.get("id") == message["id"]:
                         if "error" in event:
                             raise RuntimeError(str(event["error"])[:300])
@@ -267,7 +295,8 @@ def _codex(timeout):
                     raise ValueError("Codex response too large")
         try:
             request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "kanban-orchestra", "version": "1"}, "capabilities": {}}})
-            proc.stdin.write(b'{"jsonrpc":"2.0","method":"initialized","params":{}}\n'); proc.stdin.flush()
+            proc.stdin.write(b'{"jsonrpc":"2.0","method":"initialized","params":{}}\n')
+            proc.stdin.flush()
             models, cursor, seen = [], None, set()
             for page in range(100):
                 result = request({"jsonrpc": "2.0", "id": page + 2, "method": "model/list", "params": {"cursor": cursor} if cursor else {}})
@@ -291,6 +320,8 @@ def _claude(timeout):
     with closing(_lines(command, [message], timeout)) as lines:
         for line in lines:
             event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("malformed Claude protocol event")
             envelope = event.get("response", {})
             if event.get("type") == "control_response" and isinstance(envelope, dict) and envelope.get("request_id") == "models":
                 response = envelope.get("response", {})
@@ -342,7 +373,10 @@ def refresh(root: Path, provider: str, timeout=TIMEOUT):
         try:
             if not shutil.which(EXECUTABLES[provider]):
                 raise FileNotFoundError(f"{EXECUTABLES[provider]} executable missing")
+            initial_scope = scope(provider)
             models = _codex(timeout) if provider == "codex" else _claude(timeout) if provider == "claude" else _listing(provider, timeout)
+            if scope(provider) != initial_scope:
+                raise RuntimeError("authentication/configuration changed during discovery; refresh again")
             _store(root, provider, models, None)
         except (FileNotFoundError, TimeoutError, ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
             reason = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))

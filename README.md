@@ -301,8 +301,8 @@ Its version 1 `providers` entries store `scope`, `models` (exact `id`, `label`,
 and `capabilities`), `state`, `reason`, `last_attempt`, and `last_success`.
 Failed refreshes retain the last good list. Missing or corrupt cache data
 falls back to baseline choices; refresh to recover. The cache never changes
-local preferences or limits explicit `provider:model` IDs. Restart long-lived
-workers to observe refreshed choices; active task selections remain fixed.
+local preferences or limits explicit `provider:model` IDs. Cached listings reflect refreshes immediately;
+active task selections remain fixed.
 
 Default roles can be changed without editing the registry:
 

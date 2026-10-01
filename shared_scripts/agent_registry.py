@@ -409,7 +409,7 @@ def attribution_from_command(spec: str, command: list[str] | None) -> str:
     effort = _command_reasoning_effort(command)
 
     facts = []
-    if model and _split_provider_model(spec) is None:
+    if model and (_split_provider_model(spec) is None or _split_provider_model(spec)[1] != model):
         facts.append(f"model: {model}")
     if effort:
         facts.append(f"reasoning effort: {effort}")
@@ -482,8 +482,10 @@ def _patch_reasoning(command: list[str], provider: str, value: str | None) -> li
     return result
 
 
-def _patch_options(command: list[str], options: dict[str, Any]) -> list[str]:
+def _patch_options(command: list[str], options: dict[str, Any], *, value_options=()) -> list[str]:
     result = list(command)
+    # Track arity rather than guessing from the next token: values may look like flags.
+    valued = {"--model", "-m", "-c", "--config", "--output-format", "--mode", "--timeout", *value_options}
     for option, value in options.items():
         if not isinstance(option, str) or not re.fullmatch(r"--?[A-Za-z][A-Za-z0-9-]*", option):
             raise ValueError(f"invalid option name {option!r}; use a CLI flag such as --trust")
@@ -491,14 +493,21 @@ def _patch_options(command: list[str], options: dict[str, Any]) -> list[str]:
             raise ValueError(f"{option} is configured through model or reasoning, not options")
         if value is not None and type(value) is not bool and (not isinstance(value, str) or not value or "{prompt}" in value):
             raise ValueError(f"invalid value for option {option}; use a nonempty string, true, false, or null")
-        indexes = [i for i, part in enumerate(result) if part == option]
+        indexes = []
+        index = 1
+        while index < len(result):
+            token = result[index]
+            if token == option:
+                indexes.append(index)
+            index += 2 if token in valued else 1
         for index in reversed(indexes):
-            del result[index]
-            if option in ("--output-format", "--mode", "--timeout") and index < len(result) and result[index] != "{prompt}":
-                del result[index]
+            del result[index:index + (2 if option in valued else 1)]
         if value is not None and value is not False:
             insertion = _option_insertion_point(result)
             result[insertion:insertion] = [option] + ([] if value is True else [value])
+        valued.discard(option)
+        if isinstance(value, str):
+            valued.add(option)
     return result
 
 
@@ -512,6 +521,7 @@ class EffectiveRegistry:
         self.labels = dict(AGENT_DISPLAY_LABELS)
         self.aliases = dict(AGENT_ALIASES)
         self.defaults: dict[str, dict[str, Any]] = {}
+        self.option_values: dict[str, set[str]] = {}
         self.sources: dict[str, str] = {name: "product" for name in self.agents}
         self.field_sources: dict[str, dict[str, str]] = {
             name: {field: "product" for field in ("provider", "model", "reasoning", "options", "label")}
@@ -570,6 +580,8 @@ class EffectiveRegistry:
                 command = _patch_options(command, patch["options"])
                 if review:
                     review = _patch_options(review, patch["options"])
+            self.option_values[name] = {key for key, value in patch.get("options", {}).items()
+                                        if isinstance(value, str)}
             self.agents[name] = command
             if review:
                 self.reviews[name] = review
@@ -653,7 +665,7 @@ class EffectiveRegistry:
             if "reasoning" in patch:
                 command = _patch_reasoning(command, provider, patch["reasoning"])
             if "options" in patch:
-                command = _patch_options(command, patch["options"])
+                command = _patch_options(command, patch["options"], value_options=self.option_values.get(target, ()))
         return command
 
     def label(self, spec: str) -> str | None:
@@ -687,13 +699,27 @@ class EffectiveRegistry:
             model = _command_option(command, "-m", "--model")
             if model:
                 choices[model] = {"id": model, "label": AGENT_DISPLAY_LABELS[name], "capabilities": {}, "sources": ["baseline"]}
-        for name, command in self.agents.items():
+        for name in AGENT_ALIASES:
+            target = _deref_alias(name)
+            parsed = _split_provider_model(target)
+            if parsed and parsed[0] == provider:
+                model = parsed[1]
+                choices.setdefault(model, {"id": model, "label": name, "capabilities": {}, "sources": ["baseline"]})
+        for name in (*self.agents, *self.aliases):
+            command = self.command(name)
             if _provider_for(command) != provider:
                 continue
             model = _command_option(command, "-m", "--model")
-            if model:
-                if self.sources[name] != "product":
-                    choices[model] = {"id": model, "label": self.labels[name], "capabilities": {}, "sources": ["local"]}
+            source = self.alias_sources[name] if name in self.aliases else self.sources[name]
+            if model and source != "product":
+                choices[model] = {"id": model, "label": self.label(name), "capabilities": {}, "sources": ["local"]}
+        for role in ROLE_FALLBACKS:
+            selection = self.role(role)
+            command = self.command(selection["agent"], patch=selection["patch"])
+            model = _command_option(command, "-m", "--model")
+            if model and _provider_for(command) == provider and selection["source"] != "product":
+                source = "environment" if selection["source"] == "environment" else "local"
+                choices.setdefault(model, {"id": model, "label": model, "capabilities": {}, "sources": [source]})
         for model in status["models"]:
             previous = choices.get(model["id"])
             choices[model["id"]] = {**model, "label": previous["label"] if previous and "local" in previous["sources"] else model["label"],
@@ -702,7 +728,8 @@ class EffectiveRegistry:
 
     def model_warnings(self) -> list[str]:
         warnings = []
-        for name, command in self.agents.items():
+        for name in (*self.agents, *self.aliases):
+            command = self.command(name)
             provider = _provider_for(command)
             model = _command_option(command, "-m", "--model")
             listing = model_registry.view(self.path.parent.parent, provider)

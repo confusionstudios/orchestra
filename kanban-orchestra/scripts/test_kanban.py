@@ -6953,7 +6953,7 @@ class TestSingletonLock(unittest.TestCase):
     def test_main_starts_service_on_dirty_worktree(self):
         with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
              patch.object(orchestrator, "acquire_singleton_lock") as mock_lock, \
-             patch.object(orchestrator, "log") as mock_log, \
+             patch.object(orchestrator, "log"), \
              patch.object(orchestrator.db, "connect") as mock_connect, \
              patch.object(orchestrator, "main_loop") as main_loop, \
              patch.object(orchestrator, "start_dashboard"), \
