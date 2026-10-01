@@ -253,10 +253,48 @@ and dynamic provider/model specs:
 | `antigravity` | Antigravity (`agy`) | Runs through its non-interactive print mode |
 | `cursor:<model>` | Cursor Agent via GUI relay | Routes through `remote-control-cursor run` and passes the exact model string to Cursor; `grok` currently aliases `cursor:cursor-grok-4.6-high` |
 | `kilo:<model>` | Kilo Code | Passes the exact model string to Kilo; `kilo` uses its auto/free model |
+| `codex:<model>`, `claude:<model>`, `antigravity:<model>` | Respective CLIs | Use the provider's normal invocation flags with the supplied model ID |
 
 `shared_scripts/agent_registry.yaml` is the source of truth for built-in keys,
 aliases, display labels, and command templates. Orchestra does not provide API
 keys, accounts, or model billing.
+
+Each work repository can add `.kanban-orchestra/agents.yaml` (ignored by Git):
+
+```yaml
+version: 1
+agents:
+  codex: {model: gpt-6.1-sol, reasoning: high}
+  quick: {provider: cursor, model: composer-next, options: {--trust: false}}
+aliases: {my-reviewer: codex}
+defaults:
+  coder: {agent: codex, model: gpt-6.1-sol}
+  reviewer: {agent: my-reviewer}
+```
+
+`agents` patches a built-in entry by name. Omitted fields, provider flags, and
+options remain. A new entry needs `provider` and `model`; switching provider
+uses that provider's template. `reasoning: null` removes inherited Codex
+reasoning. In `options`, `true` adds a flag, a string supplies a value, and
+`false` or `null` removes it. Unknown fields, providers, aliases, and cycles
+are errors. Model IDs are passed as literal CLI arguments; the CLI decides
+whether they exist.
+
+Precedence is explicit task agent, then an explicit `ORCHESTRA_DEFAULT_*`
+environment agent, then the local role entry, then the product fallback.
+An explicit task or environment choice suppresses that role's local model,
+reasoning, and options. Local agent and alias entries override same-named
+product entries. `ko-task agents` shows effective commands and their sources.
+New tasks save the selected commands; edits to `agents.yaml` affect new tasks
+after restarting the worker and dashboard, and do not retarget queued work.
+`ko-task set --coder-agent` and `--reviewer-agent` explicitly replace the
+respective saved choice for later steps. Existing tasks receive a snapshot at
+their next dispatch. Each work repository has its own configuration.
+
+`.kanban-orchestra/model-cache.json` is reserved for optional generated model
+discovery. A future version may use its version 1 JSON shape:
+`{"version":1,"generated_at":"RFC3339 UTC","providers":{"codex":[{"id":"gpt-6.1-sol","label":"GPT-6.1 Sol","reasoning":["low","medium","high"]}]}}`.
+The cache is optional and never limits explicit `provider:model` IDs.
 
 Default roles can be changed without editing the registry:
 

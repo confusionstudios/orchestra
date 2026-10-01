@@ -87,8 +87,8 @@ The reviewer is the agent assigned to `commit-review` for a task.
 ### Default Role Overrides
 
 Default agent roles can be overridden at runtime with Unix environment variables.
-If the variable is unset, empty, whitespace-only, or names an unknown agent, the
-hard-coded default is used.
+If the variable is unset, the work-repository local role entry applies, then
+the product fallback. An explicitly set but invalid value is an error.
 
 | Environment variable              | Constant overridden    | Hard-coded default |
 |-----------------------------------|------------------------|--------------------|
@@ -98,6 +98,38 @@ hard-coded default is used.
 | `ORCHESTRA_DEFAULT_PLAN_REVIEWER` | `DEFAULT_PLAN_REVIEWER`| `codex`            |
 | `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `sonnet`           |
 | `ORCHESTRA_DEFAULT_REVIEWER`      | `DEFAULT_REVIEWER`     | `codex`            |
+
+The tracked `shared_scripts/agent_registry.yaml` remains the product baseline.
+The launched work repository may define Git-ignored
+`.kanban-orchestra/agents.yaml` with `version: 1` and optional `agents`,
+`aliases`, and `defaults` mappings. `agents.<name>` accepts `provider`,
+`model`, `reasoning`, `options`, and `label`. Existing names inherit omitted
+command fields and provider flags; new names require `provider` and `model`.
+Changing provider starts from its template. `reasoning` changes Codex's
+reasoning argument independently; `null` removes it. `options` maps CLI flags
+to a string value, `true` to add a flag, or `false`/`null` to remove it.
+`defaults` accepts `coder`, `reviewer`, `planner`, `plan_reviewer`,
+`super_planner`, `super_reviewer`, and `unblocker`, each with optional `agent`,
+`model`, `reasoning`, and `options` fields. Local aliases override the baseline;
+collisions and alias cycles are errors. Explicit task agent selection and an
+explicit environment role agent each suppress the entire local role patch.
+
+New task admission records a version 1 snapshot of selected role specs, run
+and review command arrays, attribution facts, and their sources. This makes
+queued and in-flight commands stable across local configuration edits and
+worker restarts. An explicit task agent edit replaces that role's snapshot for
+later steps. Older task rows get a snapshot before their next dispatch. Worker
+and dashboard processes load configuration at startup; restart them after
+editing the local file. The CLI rejects admission if its local file differs
+from the active worker. `ko-task agents` reports effective commands and
+sources. Missing local configuration is normal. Each work repository resolves
+its own file from its database workspace, not from the tooling checkout.
+
+The optional `.kanban-orchestra/model-cache.json` is reserved for a later
+discovery task. Its version 1 JSON contract is `{version: 1, generated_at:
+"RFC3339 UTC", providers: {codex: [{id: "...", label: "...", reasoning:
+["low", "medium", "high"]}]}}`. This task does not read that file. Discovery
+is advisory and never rejects an explicit `provider:model` specification.
 
 ### Review Round
 

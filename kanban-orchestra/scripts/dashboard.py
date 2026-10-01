@@ -556,7 +556,7 @@ def _task_reviewer(task: dict | None) -> str:
     """Return the configured code-reviewer agent for display."""
     if not task:
         return ""
-    return task.get("reviewer_agent") or config.DEFAULT_REVIEWER
+    return task.get("reviewer_agent") or config.agent_registry.effective().role("reviewer")["agent"]
 
 
 def _task_done_reviewer(task: dict | None) -> str:
@@ -3195,6 +3195,9 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
     *_uvicorn* is the uvicorn module to use; if None the real uvicorn is
     imported at call time.  The parameter exists solely for test injection.
     """
+    config.configure_agents(Path(db.get_db_path()).resolve().parent)
+    config.agent_snapshot()
+    config.agent_snapshot("supertask")
     if _uvicorn is None:
         try:
             import uvicorn as _uvicorn  # type: ignore[no-redef]

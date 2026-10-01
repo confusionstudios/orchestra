@@ -27,6 +27,7 @@ Policy:
 """
 
 import argparse
+from copy import deepcopy
 import fcntl
 import json
 import os
@@ -223,7 +224,8 @@ def _validate_next_step_for_type(task_type, next_step):
 
 
 def _agent_error(role):
-    aliases = ", ".join(list(AGENTS) + list(AGENT_ALIASES))
+    registry = config.agent_registry.effective()
+    aliases = ", ".join(list(registry.agents) + list(registry.aliases))
     providers = ", ".join(AGENT_PROVIDERS)
     provider_text = f" (providers: {providers})" if providers else ""
     return (
@@ -267,16 +269,18 @@ def validate_ready_worktree(conn):
 # ── Subcommands ────────────────────────────────────────────────────────
 
 def cmd_add(args, conn):
+    config.check_worker_config(conn)
+    if args.coder_agent is not None:
+        _validate_agent_arg("coder-agent", args.coder_agent)
+    if args.reviewer_agent is not None:
+        _validate_agent_arg("reviewer-agent", args.reviewer_agent)
     kind = _resolve_add_task_type(args)
-    default_coder = (
-        config.DEFAULT_SUPER_PLANNER if kind == "supertask" else config.DEFAULT_CODER
-    )
-    default_reviewer = (
-        config.DEFAULT_SUPER_REVIEWER if kind == "supertask" else config.DEFAULT_REVIEWER
-    )
-    agent = args.coder_agent or default_coder
+    snapshot = config.agent_snapshot(kind, coder=args.coder_agent, reviewer=args.reviewer_agent)
+    primary_role = "super_planner" if kind == "supertask" else "coder"
+    review_role = "super_reviewer" if kind == "supertask" else "reviewer"
+    agent = snapshot["roles"][primary_role]["spec"]
     _validate_agent_arg("coder-agent", agent)
-    reviewer_agent = args.reviewer_agent or default_reviewer
+    reviewer_agent = snapshot["roles"][review_role]["spec"]
     _validate_agent_arg("reviewer-agent", reviewer_agent)
 
     parent_task_id = args.parent
@@ -335,6 +339,7 @@ def cmd_add(args, conn):
         kind=kind, parent_task_id=parent_task_id, sequence_index=sequence_index,
         status="ready" if parent_task_id is not None else None, skips=skips,
         allow_when_blocked=args.allow_when_blocked,
+        agent_snapshot=snapshot,
     )
 
     if parent_task_id is not None:
@@ -417,6 +422,8 @@ def _reject_if_smart_unblock_consultation(command: str, task_id: int | None = No
 
 def cmd_set(args, conn):
     _reject_if_smart_unblock_consultation("set", args.task_id)
+    if args.coder_agent is not None or args.reviewer_agent is not None:
+        config.check_worker_config(conn)
     task = db.get_task(conn, args.task_id)
     if not task:
         print(f"Error: task {args.task_id} not found", file=sys.stderr)
@@ -451,6 +458,23 @@ def cmd_set(args, conn):
     if args.reviewer_agent is not None:
         _validate_agent_arg("reviewer-agent", args.reviewer_agent)
         fields["reviewer_agent"] = args.reviewer_agent
+    new_snapshot = None
+    if args.coder_agent is not None or args.reviewer_agent is not None:
+        existing = db.get_agent_snapshot(conn, args.task_id)
+        primary = "super_planner" if task_type == "supertask" else "coder"
+        review_role = "super_reviewer" if task_type == "supertask" else "reviewer"
+        if existing:
+            new_snapshot = deepcopy(existing)
+            if args.coder_agent is not None:
+                new_snapshot["roles"][primary] = config.role_snapshot(primary, args.coder_agent)
+            if args.reviewer_agent is not None:
+                new_snapshot["roles"][review_role] = config.role_snapshot(review_role, args.reviewer_agent)
+        else:
+            new_snapshot = config.agent_snapshot(
+                task_type,
+                coder=args.coder_agent if args.coder_agent is not None else task.get("coder_agent"),
+                reviewer=args.reviewer_agent if args.reviewer_agent is not None else task.get("reviewer_agent"),
+            )
     if args.review_round is not None:
         fields["review_round"] = args.review_round
     if args.last_review_decision is not None:
@@ -513,7 +537,9 @@ def cmd_set(args, conn):
 
     old_branch = task.get("branch")
     if fields:
-        db.update_task(conn, args.task_id, **fields)
+        db.update_task(conn, args.task_id, commit=new_snapshot is None, **fields)
+    if new_snapshot:
+        db.save_agent_snapshot(conn, args.task_id, new_snapshot)
 
     # Propagate branch change to children that still carry the old branch
     if args.branch is not None and task.get("kind") == "supertask" and old_branch:
@@ -916,6 +942,7 @@ def cmd_follow_up(args, conn):
         parent_task_id=parent_task_id,
         sequence_index=sequence_index,
         skips=["commit-plan"],
+        agent_snapshot=db.get_agent_snapshot(conn, args.task_id),
     )
 
     if parent_task_id is not None:
@@ -976,13 +1003,21 @@ def get_commit_footer(task_id, conn):
     if not task:
         return None
     agent = task.get("coder_agent") or config.DEFAULT_CODER
-    coder_attribution = config.get_agent_attribution(agent)
+    snapshot = db.get_agent_snapshot(conn, task_id)
+    primary = "super_planner" if task.get("kind") == "supertask" else "coder"
+    coder_attribution = (snapshot["roles"][primary]["attribution"]
+                         if snapshot and snapshot["roles"][primary]["spec"] == agent
+                         else config.get_agent_attribution(agent))
 
     comments = db.get_comments(conn, task_id)
     approval_comments = [c for c in comments if c.get("kind") == "approval"]
     final_approval = approval_comments[-1] if approval_comments else None
     reviewer = final_approval.get("author") if final_approval else None
-    reviewer_attribution = config.get_agent_attribution(reviewer, review=True) if reviewer else "pending"
+    review_role = "super_reviewer" if task.get("kind") == "supertask" else "reviewer"
+    if reviewer and snapshot and reviewer == snapshot["roles"][review_role]["spec"]:
+        reviewer_attribution = snapshot["roles"][review_role]["review_attribution"]
+    else:
+        reviewer_attribution = config.get_agent_attribution(reviewer, review=True) if reviewer else "pending"
     rejection_count = sum(1 for c in comments if c.get("kind") == "rejection")
 
     attribution = (
@@ -1250,6 +1285,8 @@ def build_parser():
     p_gcf = sub.add_parser("get-commit-footer")
     p_gcf.add_argument("task_id", type=int)
 
+    sub.add_parser("agents", help="Show effective agents, aliases, defaults, and command sources")
+
     return parser
 
 
@@ -1276,6 +1313,36 @@ def main():
 
     conn = db.connect()
     try:
+        try:
+            registry = config.configure_agents(Path(db.get_connection_db_path(conn)).parent)
+            config.agent_snapshot()
+            config.agent_snapshot("supertask")
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.command == "agents":
+            _json_out({
+                "config": str(registry.path), "fingerprint": registry.fingerprint,
+                "agents": {name: {"source": registry.sources[name], "field_sources": registry.field_sources[name],
+                                    "label": registry.labels[name],
+                                    "run": registry.command(name), "review": registry.command(name, review=True)}
+                           for name in registry.agents},
+                "aliases": {name: {"target": target, "source": registry.alias_sources[name],
+                                   "label": registry.label(name), "run": registry.command(name),
+                                   "review": registry.command(name, review=True)}
+                            for name, target in registry.aliases.items()},
+                "providers": {name: {"label": config.agent_registry.PROVIDER_DISPLAY_LABELS[name],
+                                     "run": config.agent_registry.PROVIDER_CMD[name],
+                                     "review": config.agent_registry.PROVIDER_REVIEW_CMD.get(name)}
+                              for name in config.agent_registry.AGENT_PROVIDERS},
+                "defaults": {
+                    role: {**registry.role(role),
+                           "run": registry.command(registry.role(role)["agent"], patch=registry.role(role)["patch"]),
+                           "review": registry.command(registry.role(role)["agent"], review=True,
+                                                      patch=registry.role(role)["patch"])}
+                    for role in config.agent_registry.ROLE_FALLBACKS
+                },
+            })
+            return
         dispatch = {
             "add": cmd_add,
             "set": cmd_set,
@@ -1293,7 +1360,11 @@ def main():
             "follow-up": cmd_follow_up,
             "get-commit-footer": cmd_get_commit_footer,
         }
-        dispatch[args.command](args, conn)
+        try:
+            dispatch[args.command](args, conn)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
     finally:
         conn.close()
 

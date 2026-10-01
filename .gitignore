@@ -24,7 +24,7 @@ eraseme/
 orchestra
 test_workspace/
 
-# Local Kanban Orchestra runtime
+# Local Kanban Orchestra runtime, including agents.yaml and model-cache.json
 .kanban-orchestra/
 
 # Local Claude settings

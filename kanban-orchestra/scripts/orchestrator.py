@@ -216,7 +216,7 @@ def _smart_unblock_loop(db_path):
     try:
         smart_unblock.run_watcher(
             db_path,
-            agent=config.DEFAULT_UNBLOCKER,
+            agent=config.agent_registry.effective().role("unblocker")["agent"],
             interval=SMART_UNBLOCK_INTERVAL,
             stop_event=_smart_unblock_stop,
         )
@@ -741,7 +741,7 @@ def _ensure_reviewer_acked(task, conn, reviewer, *, step):
     content rejection. Callers return 'error' so `_run_review_with_infra_retries`
     can apply the bounded retry policy instead of stalling forever.
     """
-    if ensure_agent_acked(reviewer, task["id"], conn, purpose="review"):
+    if ensure_agent_acked(reviewer, task["id"], conn, purpose="review", verb=step):
         return True
     log(
         f"Reviewer '{reviewer}' did not acknowledge the review/tool path before {step}",
@@ -1468,10 +1468,9 @@ def handle_commit_review_supertask(task, conn):
 
 def handle_commit_plan(task, conn):
     """Execute a commit-plan step. Returns True on success."""
-    # Always uses DEFAULT_PLANNER rather than task-level coder_agent. This is intentional to ensure
-    # consistent commit planning across all tasks - agent-specific override is not supported.
-    agent = DEFAULT_PLANNER
-    db.update_task(conn, task["id"], coder_agent=agent)
+    # Planning has its own agent; retain the selected coder for implementation.
+    snapshot = db.get_agent_snapshot(conn, task["id"])
+    agent = snapshot["roles"]["planner"]["spec"] if snapshot else DEFAULT_PLANNER
     ensure_agent_acked(agent, task["id"], conn)
     comments = db.get_comments(conn, task["id"])
     prompt = prompt_builder.build_prompt(task, "commit-plan", agent, comments)
@@ -1522,7 +1521,8 @@ def handle_commit_plan_review(task, conn):
     by the reviewer during this run — not filtered by review_round, so review_round
     is not incremented for planning rejections.
     """
-    reviewer = DEFAULT_PLAN_REVIEWER
+    snapshot = db.get_agent_snapshot(conn, task["id"])
+    reviewer = snapshot["roles"]["plan_reviewer"]["spec"] if snapshot else DEFAULT_PLAN_REVIEWER
     if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-plan-review"):
         return "error"
     comments = db.get_comments(conn, task["id"])
@@ -2680,6 +2680,16 @@ def process_pinned_task(task, conn):
             update_runtime_after_task(conn, task_id, False)
             return False
 
+        if db.get_agent_snapshot(conn, task_id) is None:
+            try:
+                snapshot = config.agent_snapshot(
+                    current.get("kind", "commit"),
+                    coder=current.get("coder_agent"), reviewer=current.get("reviewer_agent"),
+                )
+            except ValueError as exc:
+                log(f"Agent configuration for task {task_id}: {exc}", task_id)
+                return False
+            db.save_agent_snapshot(conn, task_id, snapshot)
         db.update_task(conn, task_id, status="running")
         current = db.get_task(conn, task_id)
 
@@ -2892,6 +2902,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     db_path = db.get_db_path()
+    try:
+        config.configure_agents(Path(db_path).resolve().parent)
+        config.agent_snapshot()
+        config.agent_snapshot("supertask")
+    except ValueError as exc:
+        print(f"Agent configuration error: {exc}", file=sys.stderr)
+        return 1
 
     conn = None
     try:
@@ -2921,6 +2938,10 @@ def main(argv=None):
             start_dashboard(db_path, preferred_port=args.dashboard_port)
 
         conn = db.connect(db_path)
+        conn.execute("INSERT INTO agent_worker_config(singleton, fingerprint) VALUES (1, ?) "
+                     "ON CONFLICT(singleton) DO UPDATE SET fingerprint=excluded.fingerprint",
+                     (config.agent_registry.effective().fingerprint,))
+        conn.commit()
         global _log_conn
         _log_conn = conn
         main_loop(conn, db_path=db_path)
