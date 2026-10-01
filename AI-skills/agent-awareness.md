@@ -12,20 +12,11 @@ The canonical registry is:
 $ORCHESTRA_DIR/shared_scripts/agent_registry.yaml
 ```
 
-Do not infer agent identity from model self-reporting. Use registry keys and
-labels from that file. The Python loader exposes the same data. Use Orchestra's
-virtualenv via `$ORCHESTRA_DIR`; do not fall back to the current worktree.
+Do not infer agent identity from model self-reporting. Inspect effective keys,
+labels, and commands for the launched work repository with:
 
 ```bash
-: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
-PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
-from agent_registry import AGENTS, AGENT_ALIASES, AGENT_PROVIDERS, resolve_agent_command, resolve_agent_label
-for key in AGENTS:
-    print(f"{key}: {resolve_agent_label(key)} -> {resolve_agent_command(key)}")
-for name, target in AGENT_ALIASES.items():
-    print(f"{name} -> {target}: {resolve_agent_label(name)} -> {resolve_agent_command(name)}")
-print("Dynamic providers:", ", ".join(AGENT_PROVIDERS))
-PY
+"$ORCHESTRA_DIR/bin/ko-task" agents
 ```
 
 ## Registry Aliases vs Live Model IDs
@@ -34,9 +25,27 @@ Registry `aliases` are Orchestra semantic names. They target an existing fixed
 key or `provider:model` spec and do not define their own commands. `grok` is
 the current preferred Cursor Grok model.
 
-`agent --list-models` is authoritative for live, account-specific Cursor model
-IDs. Dynamic `cursor:<exact-model-id>` remains supported when you need a model
-that is not named in the registry.
+Use `"$ORCHESTRA_DIR/bin/ko-task" models refresh [provider]` to update local
+CLI model metadata explicitly. `models status` shows freshness, the last
+successful refresh, and a concise failure reason. `models list [provider]`
+shows exact IDs, labels, capability metadata, and baseline/discovery sources.
+The generated cache is `.kanban-orchestra/model-cache.json` in the launched
+work repository; it is ignored by Git and scoped to the local configuration
+and authentication context. A missing or corrupt cache uses baseline choices;
+refresh to recover. Failed refreshes keep the last good list. A configured
+model absent from the latest listing remains selectable and is flagged by
+`ko-task agents`; listing absence does not prove the CLI will reject it.
+Execution errors, including missing binaries and rejected models, fail the
+task without changing the selected provider or model.
+
+Explicit `provider:<exact-model-id>` works for Codex, Claude, Cursor,
+Kilo, and Antigravity without a registry entry. Each launched work repository
+may set `.kanban-orchestra/agents.yaml`; use `"$ORCHESTRA_DIR/bin/ko-task" agents`
+to inspect the effective registry and role defaults. The local file is ignored
+by Git. Restart the worker and dashboard after editing local preferences; admitted
+tasks keep their saved command snapshots. Cache listings are read on demand
+and reflect a refresh without a restart. Ordinary task runs
+do not query provider CLIs for models.
 
 ## Current Role Defaults
 
@@ -54,31 +63,19 @@ ORCHESTRA_DEFAULT_REVIEWER
 `ORCHESTRA_DEFAULT_REVIEWER` is the default commit-review agent. If the user
 asks for the configured commit-review reviewer, use that value when it names a
 valid fixed alias, registry alias, or provider/model spec such as
-`cursor:<model>`. If it is unset or invalid, use the Orchestra fallback from
-`$ORCHESTRA_DIR/kanban-orchestra/scripts/config.py`.
+`cursor:<model>`. If unset, use the local reviewer role default, then the
+Orchestra fallback. An explicitly invalid value is an error.
 
-Resolve defaults from the active environment like this:
+Resolve effective defaults for the launched work repository like this:
 
 ```bash
-: "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
-PYTHONPATH="$ORCHESTRA_DIR/shared_scripts:$ORCHESTRA_DIR/kanban-orchestra/scripts" "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
-import config
-for name in (
-    "DEFAULT_SUPER_PLANNER",
-    "DEFAULT_SUPER_REVIEWER",
-    "DEFAULT_PLANNER",
-    "DEFAULT_PLAN_REVIEWER",
-    "DEFAULT_CODER",
-    "DEFAULT_REVIEWER",
-):
-    key = getattr(config, name)
-    print(f"{name}={key} ({config.get_agent_display_label(key)})")
-PY
+"$ORCHESTRA_DIR/bin/ko-task" agents
 ```
 
 ## Calling An Agent
 
 When you need to call an agent, resolve the command through
+`agent_registry.configure(work_repo_root)` followed by
 `agent_registry.resolve_agent_command(agent_spec)`, then replace the single
 `{prompt}` placeholder with the prompt text. This supports fixed aliases,
 registry aliases such as `grok`, and provider/model specs such as

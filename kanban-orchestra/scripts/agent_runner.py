@@ -134,13 +134,37 @@ def _probe_comment_conn(conn):
     return db.connect(db.get_db_path()), True
 
 
-def _resolve_command_template(agent_name, *, use_review_command=False):
+def _snapshot_role(verb):
+    if verb == "commit-plan":
+        return "planner"
+    if verb == "commit-plan-review":
+        return "plan_reviewer"
+    if verb == "commit-make-supertask":
+        return "super_planner"
+    if verb == "commit-review-supertask":
+        return "super_reviewer"
+    if verb and verb.endswith("review"):
+        return "reviewer"
+    return "coder"
+
+
+def _resolve_command_template(agent_name, *, use_review_command=False, conn=None, task_id=None, verb=None):
+    if conn is not None and task_id is not None:
+        snapshot = db.get_agent_snapshot(conn, task_id)
+        if snapshot:
+            if verb is None:
+                row = conn.execute("SELECT next_step FROM tasks WHERE id=?", (task_id,)).fetchone()
+                verb = row[0] if row else None
+            role = _snapshot_role(verb or ("commit-review" if use_review_command else "commit-make"))
+            choice = snapshot["roles"].get(role)
+            if choice and choice["spec"] == agent_name:
+                return list(choice["review" if use_review_command else "run"])
     if use_review_command:
         return config.resolve_review_agent_command(agent_name)
     return config.resolve_agent_command(agent_name)
 
 
-def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, conn=None):
+def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, conn=None, verb=None):
     """Send a ping prompt. Returns True if the agent produced a usable response.
 
     A shallow CLI banner or any-text response is enough for ordinary run pings.
@@ -149,7 +173,9 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
     prior run-ping cache hit cannot prove that review/tool path is usable.
     """
     purpose = purpose or ("review" if use_review_command else "run")
-    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command)
+    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command or purpose == "review",
+                                             conn=conn, task_id=task_id,
+                                             verb=verb or ("commit-review" if purpose == "review" else None))
     if cmd_template is None:
         log(f"Unknown agent '{agent_name}', cannot ping", task_id)
         return False
@@ -278,7 +304,7 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
     return acked
 
 
-def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, purpose=None):
+def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, purpose=None, verb=None):
     """
     Ensure the agent has ACKed for this task before running a real step.
 
@@ -294,7 +320,7 @@ def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, p
     instead of stalling forever.
     """
     purpose = purpose or ("review" if use_review_command else "run")
-    cache_key = (task_id, agent_name, purpose)
+    cache_key = (task_id, agent_name, purpose) if verb is None else (task_id, agent_name, purpose, verb)
     if cache_key in _agent_ack_cache:
         return True
 
@@ -305,9 +331,10 @@ def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, p
                 use_review_command=use_review_command,
                 purpose="review",
                 conn=conn,
+                verb=verb,
             )
         else:
-            acked = ping_agent(agent_name, task_id)
+            acked = ping_agent(agent_name, task_id, conn=conn, verb=verb)
         if acked:
             _agent_ack_cache.add(cache_key)
             return True
@@ -375,7 +402,9 @@ def run_agent(
     proc_registry: dict — if provided, register the Popen object under agent_name
                    so the caller can kill it on interrupt.
     """
-    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command)
+    review_invocation = use_review_command or verb.endswith("review") or verb == "commit-review-supertask"
+    cmd_template = _resolve_command_template(agent_name, use_review_command=review_invocation,
+                                             conn=conn, task_id=task_id, verb=verb)
     if cmd_template is None:
         log(f"Unknown agent '{agent_name}', skipping", task_id)
         return 1
@@ -392,8 +421,9 @@ def run_agent(
             text=True, bufsize=1, start_new_session=True, cwd=proc_cwd,
         )
     except FileNotFoundError:
-        log(f"Agent binary not found for '{agent_name}'", task_id)
-        db.add_run_log(conn, task_id, f"Agent binary not found: {agent_name}", verb=verb, author="orchestrator")
+        message = f"Agent CLI executable not found: {cmd[0]} (selected agent: {agent_name})"
+        log(message, task_id)
+        db.add_run_log(conn, task_id, message, verb=verb, author="orchestrator")
         return 127
 
     try:

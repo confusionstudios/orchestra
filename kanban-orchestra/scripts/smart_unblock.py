@@ -567,6 +567,9 @@ def invoke_unblock_agent(
     an orphan that acts on the task after `stop` reported success.
     """
     cmd_template = config.resolve_agent_command(agent)
+    role = config.agent_registry.effective().role("unblocker")
+    if role["agent"] == agent and role["patch"]:
+        cmd_template = config.agent_registry.effective().command(agent, patch=role["patch"])
     if cmd_template is None:
         return {
             "agent": agent,
@@ -806,7 +809,7 @@ def poll_once(
     stop_event: threading.Event | None = None,
 ) -> list[dict]:
     """Consider every blocked task once and return one result per task."""
-    agent = agent or config.DEFAULT_UNBLOCKER
+    agent = agent or config.agent_registry.effective().role("unblocker")["agent"]
     state = read_state(db_path)
     blocked = db.list_tasks(conn, status="blocked", page_size=None)
     results = []
@@ -1016,7 +1019,7 @@ def run_watcher(
     stop_event: threading.Event | None = None,
 ) -> int:
     """Hold the repo lock and poll for blocked tasks until stopped."""
-    agent = agent or config.DEFAULT_UNBLOCKER
+    agent = agent or config.agent_registry.effective().role("unblocker")["agent"]
     stop_event = stop_event or threading.Event()
     handle = acquire_watcher_lock(db_path, agent=agent, interval=interval)
 

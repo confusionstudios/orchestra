@@ -1,0 +1,4 @@
+[
+  {"data": [{"id": "first", "displayName": "First", "isDefault": true}], "nextCursor": "page2"},
+  {"data": [{"id": "second", "displayName": "Second", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}], "nextCursor": null}
+]

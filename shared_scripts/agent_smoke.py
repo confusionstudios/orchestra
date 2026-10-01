@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from agent_registry import resolve_agent_command, resolve_agent_label
+from agent_registry import configure, resolve_agent_command, resolve_agent_label, work_repo_root
 
 
 @dataclass(frozen=True)
@@ -173,6 +173,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    configure(work_repo_root())
     agents = selected_agents(args.agent, set(args.skip))
 
     if args.list:

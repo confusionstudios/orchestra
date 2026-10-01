@@ -18,6 +18,50 @@ from agent_registry import (  # type: ignore  # noqa: E402
     resolve_agent_label,
     resolve_review_agent_command as resolve_review_agent_command,
 )
+import agent_registry
+
+
+def configure_agents(repo_root):
+    return agent_registry.configure(Path(repo_root))
+
+
+def agent_snapshot(kind="commit", *, coder=None, reviewer=None):
+    registry = agent_registry.effective()
+    primary = "super_planner" if kind == "supertask" else "coder"
+    review_role = "super_reviewer" if kind == "supertask" else "reviewer"
+    roles = {}
+    for role in (primary, review_role, "planner", "plan_reviewer", "unblocker"):
+        explicit = coder if role == primary else reviewer if role == review_role else None
+        roles[role] = role_snapshot(role, explicit)
+    return {"version": 1, "roles": roles, "fingerprint": registry.fingerprint}
+
+
+def role_snapshot(role, explicit=None):
+    registry = agent_registry.effective()
+    choice = registry.role(role, explicit)
+    spec, patch = choice["agent"], choice["patch"]
+    run = registry.command(spec, patch=patch)
+    review = registry.command(spec, review=True, patch=patch)
+    return {
+        "spec": spec, "source": choice["source"],
+        "run": run, "review": review,
+        "label": registry.label(spec),
+        "attribution": agent_registry.attribution_from_command(spec, run),
+        "review_attribution": agent_registry.attribution_from_command(spec, review),
+    }
+
+
+def check_worker_config(conn):
+    worker = conn.execute("SELECT fingerprint FROM agent_worker_config WHERE singleton=1").fetchone()
+    runtime = conn.execute("SELECT pid, status FROM orchestrator_runtime WHERE singleton=1").fetchone()
+    if not worker or not runtime or runtime["status"] in ("stopped", "error", "hard-break"):
+        return
+    try:
+        os.kill(runtime["pid"], 0)
+    except (OSError, TypeError):
+        return
+    if worker["fingerprint"] != agent_registry.effective().fingerprint:
+        raise ValueError("local agents.yaml changed while the worker is running; restart the worker before admitting or editing agents")
 
 
 def _agent_default(env_key: str, fallback: str) -> str:
