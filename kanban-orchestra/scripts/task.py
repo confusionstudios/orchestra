@@ -1353,7 +1353,8 @@ def main():
             return
         if args.command == "agents":
             _json_out({
-                "config": str(registry.path), "fingerprint": registry.fingerprint,
+                "config": str(registry.path), "shared_config": str(registry.shared_config_path),
+                "fingerprint": registry.fingerprint,
                 "agents": {name: {"source": registry.sources[name], "field_sources": registry.field_sources[name],
                                     "label": registry.labels[name],
                                     "run": registry.command(name), "review": registry.command(name, review=True)}

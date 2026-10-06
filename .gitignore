@@ -27,5 +27,8 @@ test_workspace/
 # Local Kanban Orchestra runtime, including agents.yaml and model-cache.json
 .kanban-orchestra/
 
+# Installation-wide agent aliases and role defaults
+/shared_scripts/agents.local.yaml
+
 # Local Claude settings
 .claude/settings.local.json

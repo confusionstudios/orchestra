@@ -306,3 +306,148 @@ def test_worktree_import_preserves_saved_agent_commands(tmp_path):
     finally:
         source.close()
         target.close()
+
+
+def test_shared_alias_override_applies_to_multiple_work_repos(tmp_path, monkeypatch):
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('version: 1\naliases: {grok: "cursor:grok-4.7-high", audit: "codex:new-review-model"}\n')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    monkeypatch.setattr(agent_registry, '_ACTIVE', None)
+    baseline = dict(agent_registry.AGENT_ALIASES)
+    for root in (tmp_path / 'first', tmp_path / 'second'):
+        registry = agent_registry.configure(root)
+        command = registry.command('grok')
+        assert command[command.index('--model') + 1] == 'grok-4.7-high'
+        assert registry.alias_sources['grok'] == str(shared)
+        assert agent_registry.resolve_agent_command('grok') == command
+        assert agent_registry.resolve_agent_label('grok') == 'Cursor grok-4.7-high'
+        assert agent_registry.has_review_agent_command('audit')
+        assert 'review' in agent_registry.resolve_review_agent_command('audit')
+        choice = next(m for m in registry.model_choices('cursor')['models'] if m['id'] == 'grok-4.7-high')
+        assert 'shared' in choice['sources']
+    assert agent_registry.AGENT_ALIASES == baseline
+
+
+def test_repo_alias_overrides_shared_alias(tmp_path, monkeypatch):
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('version: 1\naliases: {grok: "cursor:shared-model"}\n')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    root = tmp_path / 'work'
+    root.mkdir()
+    local = write_config(root, 'version: 1\naliases: {grok: "cursor:repo-model"}\n')
+    registry = agent_registry.EffectiveRegistry(root)
+    assert registry.command('grok')[4] == 'repo-model'
+    assert registry.alias_sources['grok'] == str(local)
+
+
+def test_shared_alias_change_preserves_saved_task_and_changes_fingerprint(tmp_path, monkeypatch):
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('version: 1\naliases: {grok: "cursor:before"}\n')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    monkeypatch.setattr(agent_registry, '_ACTIVE', None)
+    monkeypatch.setenv('ORCHESTRA_DEFAULT_CODER', 'grok')
+    before = config.configure_agents(tmp_path)
+    snapshot = config.agent_snapshot()
+    connection = db.connect(str(tmp_path / 'kanban-orchestra.db'))
+    try:
+        task_id = db.add_task(connection, 'Saved', coder_agent='grok', agent_snapshot=snapshot)
+        db.upsert_runtime(connection, status='running', pid=os.getpid())
+        connection.execute('INSERT INTO agent_worker_config(singleton,fingerprint) VALUES(1,?)', (before.fingerprint,))
+        connection.commit()
+        shared.write_text('version: 1\naliases: {grok: "cursor:after"}\n')
+        after = config.configure_agents(tmp_path)
+        assert after.fingerprint != before.fingerprint
+        assert config.agent_snapshot()['roles']['coder']['run'][4] == 'after'
+        assert agent_runner._resolve_command_template('grok', conn=connection, task_id=task_id, verb='commit-make')[4] == 'before'
+        with pytest.raises(ValueError, match='restart the worker'):
+            config.check_worker_config(connection)
+        shared.unlink()
+        restored = config.configure_agents(tmp_path)
+        assert restored.fingerprint == 'missing'
+        assert restored.command('grok')[4] == 'cursor-grok-4.6-high'
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('text', [
+    'version: 1\naliases: {grok: grok}\n',
+    'version: 1\naliases: {grok: "missing:model"}\n',
+    'version: 1\ndefaults: {unknown: {agent: codex}}\n',
+    'version: 1\naliases: [broken\n',
+])
+def test_malformed_shared_alias_configuration_is_actionable(tmp_path, monkeypatch, text):
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text(text)
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    with pytest.raises(ValueError, match=r'agents.local.yaml'):
+        agent_registry.EffectiveRegistry(tmp_path / 'work')
+
+
+def test_unconfigured_resolver_honors_shared_alias(tmp_path, monkeypatch):
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('version: 1\naliases: {grok: "cursor:shared-model"}\n')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    monkeypatch.setattr(agent_registry, '_ACTIVE', None)
+    def reject_git(*args, **kwargs):
+        pytest.fail('Unconfigured alias resolution must not invoke Git')
+    monkeypatch.setattr(agent_registry.subprocess, 'run', reject_git)
+    assert agent_registry.resolve_agent_command('grok')[4] == 'shared-model'
+
+
+def test_repo_agent_patch_restores_baseline_over_shared_alias(tmp_path, monkeypatch):
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('version: 1\naliases: {codex: "claude:shared-model"}\n')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    root = tmp_path / 'work'
+    root.mkdir()
+    write_config(root, 'version: 1\nagents: {codex: {model: repo-model}}\n')
+    registry = agent_registry.EffectiveRegistry(root)
+    assert 'codex' not in registry.aliases
+    assert registry.command('codex')[:4] == ['codex', 'exec', '--model', 'repo-model']
+    assert 'review' in registry.command('codex', review=True)
+    assert registry.label('codex') == 'Codex'
+
+
+def test_shared_role_defaults_and_repo_environment_task_precedence(tmp_path, monkeypatch):
+    for role in agent_registry.ROLE_FALLBACKS:
+        monkeypatch.delenv('ORCHESTRA_DEFAULT_' + role.upper(), raising=False)
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('''version: 1
+aliases: {grok: "cursor:shared-model"}
+defaults:
+  coder: {agent: grok}
+  planner: {agent: codex, model: shared-planner, reasoning: high}
+''')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    for root in (tmp_path / 'first', tmp_path / 'second'):
+        root.mkdir()
+        registry = agent_registry.EffectiveRegistry(root)
+        assert registry.role('coder') == {'agent': 'grok', 'patch': {}, 'source': str(shared)}
+        assert registry.role('reviewer')['source'] == 'product'
+        model = next(m for m in registry.model_choices('codex')['models'] if m['id'] == 'shared-planner')
+        assert model['sources'] == ['shared']
+    local = write_config(root, 'version: 1\ndefaults: {planner: {agent: sonnet}}\n')
+    registry = agent_registry.configure(root)
+    assert registry.role('planner') == {'agent': 'sonnet', 'patch': {}, 'source': str(local)}
+    assert registry.role('coder')['source'] == str(shared)
+    snapshot = config.agent_snapshot()
+    assert snapshot['roles']['coder']['run'][4] == 'shared-model'
+    monkeypatch.setenv('ORCHESTRA_DEFAULT_CODER', 'codex')
+    assert registry.role('coder') == {'agent': 'codex', 'patch': {}, 'source': 'environment'}
+    assert registry.role('coder', 'sonnet') == {'agent': 'sonnet', 'patch': {}, 'source': 'task'}
+
+
+def test_shared_role_change_updates_fingerprint_and_keeps_snapshot(tmp_path, monkeypatch):
+    monkeypatch.delenv('ORCHESTRA_DEFAULT_CODER', raising=False)
+    shared = tmp_path / 'agents.local.yaml'
+    shared.write_text('version: 1\ndefaults: {coder: {agent: grok}}\n')
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', shared)
+    before = agent_registry.configure(tmp_path)
+    snapshot = config.agent_snapshot()
+    shared.write_text('version: 1\ndefaults: {coder: {agent: codex}}\n')
+    after = agent_registry.configure(tmp_path)
+    assert after.fingerprint != before.fingerprint
+    assert after.role('coder')['agent'] == 'codex'
+    assert snapshot['roles']['coder']['spec'] == 'grok'
+    shared.unlink()
+    assert agent_registry.EffectiveRegistry(tmp_path).role('coder')['source'] == 'product'

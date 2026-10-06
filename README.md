@@ -259,6 +259,31 @@ and dynamic provider/model specs:
 aliases, display labels, and command templates. Orchestra does not provide API
 keys, accounts, or model billing.
 
+An installation can set aliases and role defaults for all its work repositories in
+`$ORCHESTRA_DIR/shared_scripts/agents.local.yaml` (ignored by Git):
+
+```yaml
+version: 1
+aliases:
+  grok: cursor:grok-4.7-high
+defaults:
+  coder: {agent: grok}
+  planner: {agent: codex}
+```
+
+This shared file accepts `version`, `aliases`, and `defaults`. It overrides the
+product baseline; work-repository aliases, agents, and role entries take
+precedence over it. A repo role entry replaces that shared role entry in full.
+An environment setting such as `ORCHESTRA_DEFAULT_CODER=grok` keeps selecting
+`grok` and uses its effective target. Editing the shared file does not require
+a commit or shell-configuration change. Restart workers and dashboards after
+editing it; saved task commands remain fixed. The file is local to the Orchestra
+installation and is not distributed by Git. `ko-task agents` shows its path and
+reports each alias and role's source. Shared defaults can replace persistent
+`ORCHESTRA_DEFAULT_*` shell exports; remove those exports to use file-based
+defaults. Existing shells and workers retain inherited environment settings
+until restarted.
+
 Each work repository can add `.kanban-orchestra/agents.yaml` (ignored by Git):
 
 ```yaml
@@ -281,8 +306,9 @@ are errors. Model IDs are passed as literal CLI arguments; the CLI decides
 whether they exist.
 
 Precedence is explicit task agent, then an explicit `ORCHESTRA_DEFAULT_*`
-environment agent, then the local role entry, then the product fallback.
-An explicit task or environment choice suppresses that role's local model,
+environment agent, then the repo role entry, then the shared role entry, then
+the product fallback.
+An explicit task or environment choice suppresses that role's configured model,
 reasoning, and options. Local agent and alias entries override same-named
 product entries. `ko-task agents` shows effective commands and their sources.
 New tasks save the selected commands; edits to `agents.yaml` affect new tasks

@@ -61,7 +61,7 @@ def check_worker_config(conn):
     except (OSError, TypeError):
         return
     if worker["fingerprint"] != agent_registry.effective().fingerprint:
-        raise ValueError("local agents.yaml changed while the worker is running; restart the worker before admitting or editing agents")
+        raise ValueError("shared or repo-local agent configuration changed while the worker is running; restart the worker before admitting or editing agents")
 
 
 def _agent_default(env_key: str, fallback: str) -> str:

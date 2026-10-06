@@ -21,6 +21,16 @@ labels, and commands for the launched work repository with:
 
 ## Registry Aliases vs Live Model IDs
 
+Shared Git-ignored overrides live at
+`$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`. Its `version: 1`
+and `aliases` and `defaults` mappings can redefine names and role choices for
+every work repo using that installation, without a Git commit or shell edit. Repo-local aliases
+and agents take precedence; repo role entries replace shared role entries.
+Explicit task choices and `ORCHESTRA_DEFAULT_*` exports take priority over
+file-based role defaults. Remove persistent exports to use shared defaults.
+Use `ko-task agents` to inspect the source and resolved command. Restart workers and dashboards after editing either layer;
+existing task snapshots retain their selected commands.
+
 Registry `aliases` are Orchestra semantic names. They target an existing fixed
 key or `provider:model` spec and do not define their own commands. `grok` is
 the current preferred Cursor Grok model.
@@ -134,7 +144,7 @@ At the time this skill was written, useful keys included:
 - `opus` — Claude Opus
 - `fable` — Claude Fable
 - `antigravity`
-- `grok` — current preferred Cursor Grok model (`cursor:cursor-grok-4.6-high`)
+- `grok` — preferred Cursor Grok model; inspect the effective alias target and overrides
 - `cursor-composer-2.5`
 - `cursor-grok-4.5`
 - `cursor-opus-4.6`

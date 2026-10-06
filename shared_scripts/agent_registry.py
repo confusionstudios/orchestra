@@ -20,6 +20,7 @@ import model_registry
 
 
 REGISTRY_PATH = Path(__file__).with_name("agent_registry.yaml")
+SHARED_CONFIG_PATH = Path(__file__).with_name("agents.local.yaml")
 _PROVIDER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -294,8 +295,9 @@ def _deref_alias(spec: str) -> str:
 
 def resolve_agent_command(spec: str) -> list[str] | None:
     """Return a command template for an alias or provider:model agent spec."""
-    if _ACTIVE is not None and _ACTIVE.fingerprint != "missing":
-        return _ACTIVE.command(spec)
+    registry = _configured_registry()
+    if registry is not None:
+        return registry.command(spec)
     spec = _deref_alias(spec)
     if spec in AGENT_CMD:
         return list(AGENT_CMD[spec])
@@ -312,10 +314,11 @@ def resolve_agent_command(spec: str) -> list[str] | None:
 
 def has_review_agent_command(spec: str) -> bool:
     """Return True when an alias/provider:model spec has an explicit review command."""
-    if _ACTIVE is not None and _ACTIVE.fingerprint != "missing":
-        target = _ACTIVE._target(spec)
+    registry = _configured_registry()
+    if registry is not None:
+        target = registry._target(spec)
         parsed = _split_provider_model(target)
-        return target in _ACTIVE.reviews or bool(parsed and parsed[0] in PROVIDER_REVIEW_CMD)
+        return target in registry.reviews or bool(parsed and parsed[0] in PROVIDER_REVIEW_CMD)
     spec = _deref_alias(spec)
     if spec in AGENT_REVIEW_CMD:
         return True
@@ -329,8 +332,9 @@ def has_review_agent_command(spec: str) -> bool:
 
 def resolve_review_agent_command(spec: str) -> list[str] | None:
     """Return the review command for an agent spec, falling back to the normal command."""
-    if _ACTIVE is not None and _ACTIVE.fingerprint != "missing":
-        return _ACTIVE.command(spec, review=True)
+    registry = _configured_registry()
+    if registry is not None:
+        return registry.command(spec, review=True)
     spec = _deref_alias(spec)
     if spec in AGENT_REVIEW_CMD:
         return list(AGENT_REVIEW_CMD[spec])
@@ -349,8 +353,9 @@ def resolve_review_agent_command(spec: str) -> list[str] | None:
 
 def resolve_agent_label(spec: str) -> str | None:
     """Return a display label for an alias or provider:model agent spec."""
-    if _ACTIVE is not None and _ACTIVE.fingerprint != "missing":
-        return _ACTIVE.label(spec)
+    registry = _configured_registry()
+    if registry is not None:
+        return registry.label(spec)
     spec = _deref_alias(spec)
     if spec in AGENT_DISPLAY_LABELS:
         return AGENT_DISPLAY_LABELS[spec]
@@ -521,6 +526,7 @@ class EffectiveRegistry:
         self.labels = dict(AGENT_DISPLAY_LABELS)
         self.aliases = dict(AGENT_ALIASES)
         self.defaults: dict[str, dict[str, Any]] = {}
+        self.default_sources: dict[str, str] = {}
         self.option_values: dict[str, set[str]] = {}
         self.sources: dict[str, str] = {name: "product" for name in self.agents}
         self.field_sources: dict[str, dict[str, str]] = {
@@ -528,18 +534,36 @@ class EffectiveRegistry:
             for name in self.agents
         }
         self.alias_sources: dict[str, str] = {name: "product" for name in self.aliases}
-        if not self.path.exists():
+        self.shared_config_path = SHARED_CONFIG_PATH
+        shared = self._read_config(self.shared_config_path, shared=True)
+        local = self._read_config(self.path)
+        if shared is None and local is None:
             self.fingerprint = "missing"
-            return
-        contents = self.path.read_bytes()
-        self.fingerprint = hashlib.sha256(contents).hexdigest()
+        elif shared is None:
+            self.fingerprint = hashlib.sha256(local).hexdigest()
+        else:
+            digest = hashlib.sha256()
+            for contents in (shared, local):
+                digest.update(b"missing" if contents is None else str(len(contents)).encode() + b":" + contents)
+            self.fingerprint = digest.hexdigest()
+
+    def _read_config(self, path: Path, *, shared: bool = False) -> bytes | None:
+        try:
+            contents = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError(f"{path}: cannot read configuration: {exc}") from exc
         try:
             raw = yaml.safe_load(contents)
-            self._load(raw)
+            if shared and (not isinstance(raw, dict) or set(raw) - {"version", "aliases", "defaults"}):
+                raise ValueError("shared overrides accept only version, aliases, and defaults")
+            self._load(raw, source=path)
         except (ValueError, yaml.YAMLError) as exc:
-            raise ValueError(f"{self.path}: {exc}") from exc
+            raise ValueError(f"{path}: {exc}") from exc
+        return contents
 
-    def _load(self, raw: Any) -> None:
+    def _load(self, raw: Any, *, source: Path) -> None:
         if (not isinstance(raw, dict) or set(raw) - {"version", "agents", "aliases", "defaults"}
                 or type(raw.get("version")) is not int or raw["version"] != 1):
             raise ValueError("expected version: 1 and only agents, aliases, defaults mappings")
@@ -552,7 +576,7 @@ class EffectiveRegistry:
             self._validate_patch(patch, f"agents.{name}", agent=True)
             if name in self.aliases and name not in self.agents:
                 del self.aliases[name]
-            baseline = self.agents.get(name)
+            baseline = self.agents.get(name) or AGENT_CMD.get(name)
             baseline_provider = _provider_for(baseline) if baseline else None
             provider = patch.get("provider", baseline_provider)
             if provider not in PROVIDER_CMD:
@@ -567,7 +591,8 @@ class EffectiveRegistry:
                 review = [part.replace("{model}", patch["model"]) for part in review_base] if review_base else None
             else:
                 command = list(baseline)
-                review = list(self.reviews[name]) if name in self.reviews else None
+                review_template = self.reviews.get(name, AGENT_REVIEW_CMD.get(name))
+                review = list(review_template) if review_template else None
                 if "model" in patch:
                     command = _replace_model(command, patch["model"])
                     if review:
@@ -587,11 +612,11 @@ class EffectiveRegistry:
                 self.reviews[name] = review
             else:
                 self.reviews.pop(name, None)
-            self.labels[name] = patch.get("label", self.labels.get(name) if provider == baseline_provider else PROVIDER_DISPLAY_LABELS[provider].replace("{model}", patch["model"]))
-            self.sources[name] = str(self.path)
+            self.labels[name] = patch.get("label", self.labels.get(name, AGENT_DISPLAY_LABELS.get(name)) if provider == baseline_provider else PROVIDER_DISPLAY_LABELS[provider].replace("{model}", patch["model"]))
+            self.sources[name] = str(source)
             self.field_sources[name] = dict(self.field_sources.get(name, {}))
             for field in patch:
-                self.field_sources[name][field] = str(self.path)
+                self.field_sources[name][field] = str(source)
         self.aliases.update(raw.get("aliases", {}))
         for name in raw.get("aliases", {}):
             if not isinstance(name, str) or not _PROVIDER_RE.fullmatch(name):
@@ -600,7 +625,7 @@ class EffectiveRegistry:
                 self.agents.pop(name)
                 self.reviews.pop(name, None)
                 self.labels.pop(name, None)
-            self.alias_sources[name] = str(self.path)
+            self.alias_sources[name] = str(source)
         for name, target in self.aliases.items():
             if name in self.agents:
                 raise ValueError(f"aliases.{name}: collides with an agent")
@@ -620,6 +645,7 @@ class EffectiveRegistry:
             except ValueError as exc:
                 raise ValueError(f"defaults.{role}: {exc}") from exc
             self.defaults[role] = patch
+            self.default_sources[role] = str(source)
 
     @staticmethod
     def _validate_patch(patch: Any, field: str, *, agent: bool = False) -> None:
@@ -684,7 +710,7 @@ class EffectiveRegistry:
         else:
             patch = self.defaults.get(name, {})
             spec = patch.get("agent", ROLE_FALLBACKS[name])
-            source = str(self.path) if patch else "product"
+            source = self.default_sources.get(name, "product") if patch else "product"
         if self.command(spec) is None:
             raise ValueError(f"{source}: {name} agent {spec!r} is invalid; choose an agent or provider:model")
         return {"agent": spec, "patch": {key: value for key, value in patch.items() if key != "agent"}, "source": source}
@@ -712,17 +738,19 @@ class EffectiveRegistry:
             model = _command_option(command, "-m", "--model")
             source = self.alias_sources[name] if name in self.aliases else self.sources[name]
             if model and source != "product":
-                choices[model] = {"id": model, "label": self.label(name), "capabilities": {}, "sources": ["local"]}
+                choices[model] = {"id": model, "label": self.label(name), "capabilities": {},
+                                  "sources": ["shared" if source == str(self.shared_config_path) else "local"]}
         for role in ROLE_FALLBACKS:
             selection = self.role(role)
             command = self.command(selection["agent"], patch=selection["patch"])
             model = _command_option(command, "-m", "--model")
             if model and _provider_for(command) == provider and selection["source"] != "product":
-                source = "environment" if selection["source"] == "environment" else "local"
+                source = ("environment" if selection["source"] == "environment" else
+                          "shared" if selection["source"] == str(self.shared_config_path) else "local")
                 choices.setdefault(model, {"id": model, "label": model, "capabilities": {}, "sources": [source]})
         for model in status["models"]:
             previous = choices.get(model["id"])
-            choices[model["id"]] = {**model, "label": previous["label"] if previous and "local" in previous["sources"] else model["label"],
+            choices[model["id"]] = {**model, "label": previous["label"] if previous and set(previous["sources"]) & {"local", "shared"} else model["label"],
                                      "sources": ([*previous["sources"], "discovered"] if previous else ["discovered"])}
         return {**status, "models": list(choices.values())}
 
@@ -747,6 +775,19 @@ class EffectiveRegistry:
 
 
 _ACTIVE: EffectiveRegistry | None = None
+
+
+def _configured_registry() -> EffectiveRegistry | None:
+    if _ACTIVE is not None:
+        return _ACTIVE if _ACTIVE.fingerprint != "missing" else None
+    # Import-time consumers also honor installation-wide aliases, without requiring
+    # callers to initialize a work-repository view first.
+    if not SHARED_CONFIG_PATH.exists():
+        return None
+    # Configuration imports must not invoke Git (e.g. import-worktree has not
+    # resolved its database yet). Explicit configure() establishes the repo later.
+    root = Path(os.environ["KANBAN_DB"]).expanduser().resolve().parent if os.environ.get("KANBAN_DB") else Path.cwd()
+    return EffectiveRegistry(root)
 
 
 def configure(repo_root: Path) -> EffectiveRegistry:

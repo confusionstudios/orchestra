@@ -88,7 +88,8 @@ The reviewer is the agent assigned to `commit-review` for a task.
 
 Default agent roles can be overridden at runtime with Unix environment variables.
 If the variable is unset, the work-repository local role entry applies, then
-the product fallback. An explicitly set but invalid value is an error.
+the installation-wide shared role entry, then the product fallback. An explicitly
+set but invalid value is an error.
 
 | Environment variable              | Constant overridden    | Hard-coded default |
 |-----------------------------------|------------------------|--------------------|
@@ -100,6 +101,19 @@ the product fallback. An explicitly set but invalid value is an error.
 | `ORCHESTRA_DEFAULT_REVIEWER`      | `DEFAULT_REVIEWER`     | `codex`            |
 
 The tracked `shared_scripts/agent_registry.yaml` remains the product baseline.
+A Git-ignored `shared_scripts/agents.local.yaml` beside that registry
+provides installation-wide overrides with `version: 1`, `aliases`, and `defaults`.
+Its aliases and role defaults apply to all work repos using the same installation.
+A repo role entry replaces the shared role entry in full; omitted roles inherit
+the shared selection. Role inspection reports the winning file or environment
+source. Persistent shell exports can be removed once shared defaults are set.
+Repo-local agents and aliases take precedence over shared aliases. Both files
+participate in the worker configuration fingerprint and require worker/dashboard
+restart after changes. Missing shared overrides preserve the baseline; malformed
+files and alias cycles are actionable errors. Explicit environment or task
+selection of an alias uses its effective target; direct `provider:model`
+selections remain explicit. Snapshotting preserves previously admitted commands.
+Shared overrides are local configuration and are never part of the model cache.
 The launched work repository may define Git-ignored
 `.kanban-orchestra/agents.yaml` with `version: 1` and optional `agents`,
 `aliases`, and `defaults` mappings. `agents.<name>` accepts `provider`,
@@ -112,7 +126,7 @@ to a string value, `true` to add a flag, or `false`/`null` to remove it.
 `super_planner`, `super_reviewer`, and `unblocker`, each with optional `agent`,
 `model`, `reasoning`, and `options` fields. Local aliases override the baseline;
 collisions and alias cycles are errors. Explicit task agent selection and an
-explicit environment role agent each suppress the entire local role patch.
+explicit environment role agent each suppress the entire configured role patch.
 
 New task admission records a version 1 snapshot of selected role specs, run
 and review command arrays, attribution facts, and their sources. This makes

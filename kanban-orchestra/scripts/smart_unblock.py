@@ -567,9 +567,10 @@ def invoke_unblock_agent(
     an orphan that acts on the task after `stop` reported success.
     """
     cmd_template = config.resolve_agent_command(agent)
-    role = config.agent_registry.effective().role("unblocker")
-    if role["agent"] == agent and role["patch"]:
-        cmd_template = config.agent_registry.effective().command(agent, patch=role["patch"])
+    if cmd_template is not None:
+        role = config.agent_registry.effective().role("unblocker")
+        if role["agent"] == agent and role["patch"]:
+            cmd_template = config.agent_registry.effective().command(agent, patch=role["patch"])
     if cmd_template is None:
         return {
             "agent": agent,
