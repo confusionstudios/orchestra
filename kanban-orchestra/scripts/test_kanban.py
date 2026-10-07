@@ -6953,7 +6953,7 @@ class TestSingletonLock(unittest.TestCase):
     def test_main_starts_service_on_dirty_worktree(self):
         with patch.object(orchestrator, "is_worktree_dirty", return_value=True), \
              patch.object(orchestrator, "acquire_singleton_lock") as mock_lock, \
-             patch.object(orchestrator, "log") as mock_log, \
+             patch.object(orchestrator, "log"), \
              patch.object(orchestrator.db, "connect") as mock_connect, \
              patch.object(orchestrator, "main_loop") as main_loop, \
              patch.object(orchestrator, "start_dashboard"), \
@@ -11853,7 +11853,7 @@ class TestAgentPingACKGate(unittest.TestCase):
         with patch.object(agent_runner, "ping_agent", return_value=True) as mock_ping:
             agent_runner.ensure_agent_acked("sonnet", 1, self.conn)
         # ensure_agent_acked delegates to ping_agent; verify it was called
-        mock_ping.assert_called_once_with("sonnet", 1)
+        mock_ping.assert_called_once_with("sonnet", 1, conn=self.conn, verb=None)
 
     def test_ping_log_on_failure_mentions_unavailable(self):
         """The run-log entry for a failed ping tells the operator the agent may be
@@ -12056,7 +12056,7 @@ class TestAgentPingACKGate(unittest.TestCase):
         ping_results = [False, False, True]
         call_count = []
 
-        def fake_ping(agent, task_id):
+        def fake_ping(agent, task_id, **_kwargs):
             call_count.append(1)
             return ping_results.pop(0)
 
@@ -12075,7 +12075,7 @@ class TestAgentPingACKGate(unittest.TestCase):
         ping_results = [False, True]
 
         with (
-            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a, **kw: ping_results.pop(0)),
             patch.object(agent_runner, "time") as mock_time,
             patch.object(agent_runner.db, "update_runtime"),
         ):
@@ -12095,7 +12095,7 @@ class TestAgentPingACKGate(unittest.TestCase):
                 captured_messages.append(kwargs["status_message"])
 
         with (
-            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a, **kw: ping_results.pop(0)),
             patch.object(agent_runner, "time"),
             patch.object(agent_runner.db, "update_runtime", side_effect=fake_update_runtime),
         ):
@@ -12116,7 +12116,7 @@ class TestAgentPingACKGate(unittest.TestCase):
                 captured.append(kwargs["status_message"])
 
         with (
-            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a, **kw: ping_results.pop(0)),
             patch.object(agent_runner, "time"),
             patch.object(agent_runner.db, "update_runtime", side_effect=fake_update_runtime),
         ):
@@ -12135,7 +12135,7 @@ class TestAgentPingACKGate(unittest.TestCase):
                 captured.append(kwargs["status_message"])
 
         with (
-            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a, **kw: ping_results.pop(0)),
             patch.object(agent_runner, "time"),
             patch.object(agent_runner.db, "update_runtime", side_effect=fake_update_runtime),
         ):
@@ -12156,7 +12156,7 @@ class TestAgentPingACKGate(unittest.TestCase):
             log_messages.append(msg)
 
         with (
-            patch.object(agent_runner, "ping_agent", side_effect=lambda *a: ping_results.pop(0)),
+            patch.object(agent_runner, "ping_agent", side_effect=lambda *a, **kw: ping_results.pop(0)),
             patch.object(agent_runner, "log", side_effect=capture_log),
             patch.object(agent_runner, "time"),
             patch.object(agent_runner.db, "update_runtime"),

@@ -253,10 +253,102 @@ and dynamic provider/model specs:
 | `antigravity` | Antigravity (`agy`) | Runs through its non-interactive print mode |
 | `cursor:<model>` | Cursor Agent via GUI relay | Routes through `remote-control-cursor run` and passes the exact model string to Cursor; `grok` currently aliases `cursor:cursor-grok-4.6-high` |
 | `kilo:<model>` | Kilo Code | Passes the exact model string to Kilo; `kilo` uses its auto/free model |
+| `codex:<model>`, `claude:<model>`, `antigravity:<model>` | Respective CLIs | Use the provider's normal invocation flags with the supplied model ID |
 
 `shared_scripts/agent_registry.yaml` is the source of truth for built-in keys,
 aliases, display labels, and command templates. Orchestra does not provide API
 keys, accounts, or model billing.
+
+An installation can set aliases and role defaults for all its work repositories in
+`$ORCHESTRA_DIR/shared_scripts/agents.local.yaml` (ignored by Git):
+
+```yaml
+version: 1
+aliases:
+  grok: cursor:grok-4.7-high
+defaults:
+  coder: {agent: grok}
+  planner: {agent: codex}
+```
+
+This shared file accepts `version`, `aliases`, and `defaults`. It overrides the
+product baseline; work-repository aliases, agents, and role entries take
+precedence over it. A repo role entry replaces that shared role entry in full.
+An environment setting such as `ORCHESTRA_DEFAULT_CODER=grok` keeps selecting
+`grok` and uses its effective target. Editing the shared file does not require
+a commit or shell-configuration change. Restart workers and dashboards after
+editing it; saved task commands remain fixed. The file is local to the Orchestra
+installation and is not distributed by Git. `ko-task agents` shows its path and
+reports each alias and role's source. Shared defaults can replace persistent
+`ORCHESTRA_DEFAULT_*` shell exports; remove those exports to use file-based
+defaults. Existing shells and workers retain inherited environment settings
+until restarted.
+
+To copy literal role exports from `~/.zshrc` into shared preferences, preview:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-migrate-agent-defaults"
+# Save the proposed settings explicitly:
+"$ORCHESTRA_DIR/bin/ko-migrate-agent-defaults" --write
+```
+
+The helper reads the shell file as text and never executes or modifies it.
+It preserves existing aliases and other roles, refuses conflicting defaults
+(including existing model/reasoning patches), and rejects dynamic or ambiguous
+role declarations or carriage-return line endings. Files containing comments or `#` text require manual editing
+when migration would change them, so rewriting cannot discard annotations.
+It reads literal declarations, not evaluated shell state;
+conditional logic and sourced files require manual inspection. `--zshrc <path>`
+and `--config <path>` select alternate files. Repeated writes are idempotent.
+Shell exports continue to take precedence until optionally removed manually
+and cleared from the launch environment. Restart workers and dashboards after
+writing preferences. The helper does not change alias targets or refresh models.
+
+Each work repository can add `.kanban-orchestra/agents.yaml` (ignored by Git):
+
+```yaml
+version: 1
+agents:
+  codex: {model: gpt-6.1-sol, reasoning: high}
+  quick: {provider: cursor, model: composer-next, options: {--trust: false}}
+aliases: {my-reviewer: codex}
+defaults:
+  coder: {agent: codex, model: gpt-6.1-sol}
+  reviewer: {agent: my-reviewer}
+```
+
+`agents` patches a built-in entry by name. Omitted fields, provider flags, and
+options remain. A new entry needs `provider` and `model`; switching provider
+uses that provider's template. `reasoning: null` removes inherited Codex
+reasoning. In `options`, `true` adds a flag, a string supplies a value, and
+`false` or `null` removes it. Unknown fields, providers, aliases, and cycles
+are errors. Model IDs are passed as literal CLI arguments; the CLI decides
+whether they exist.
+
+Precedence is explicit task agent, then an explicit `ORCHESTRA_DEFAULT_*`
+environment agent, then the repo role entry, then the shared role entry, then
+the product fallback.
+An explicit task or environment choice suppresses that role's configured model,
+reasoning, and options. Local agent and alias entries override same-named
+product entries. `ko-task agents` shows effective commands and their sources.
+New tasks save the selected commands; edits to `agents.yaml` affect new tasks
+after restarting the worker and dashboard, and do not retarget queued work.
+`ko-task set --coder-agent` and `--reviewer-agent` explicitly replace the
+respective saved choice for later steps. Existing tasks receive a snapshot at
+their next dispatch. Each work repository has its own configuration.
+
+Run `ko-task models refresh [provider]` to discover installed CLI models on
+demand. `ko-task models status` shows freshness, last successful refresh, and
+failure reasons; `ko-task models list [provider]` merges discovered models
+with tracked baseline choices. The generated, Git-ignored
+`.kanban-orchestra/model-cache.json` is scoped to this work repository and a
+nonsecret hash of the local user, configuration, and authentication context.
+Its version 1 `providers` entries store `scope`, `models` (exact `id`, `label`,
+and `capabilities`), `state`, `reason`, `last_attempt`, and `last_success`.
+Failed refreshes retain the last good list. Missing or corrupt cache data
+falls back to baseline choices; refresh to recover. The cache never changes
+local preferences or limits explicit `provider:model` IDs. Cached listings reflect refreshes immediately;
+active task selections remain fixed.
 
 Default roles can be changed without editing the registry:
 

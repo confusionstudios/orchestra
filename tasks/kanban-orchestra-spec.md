@@ -87,8 +87,9 @@ The reviewer is the agent assigned to `commit-review` for a task.
 ### Default Role Overrides
 
 Default agent roles can be overridden at runtime with Unix environment variables.
-If the variable is unset, empty, whitespace-only, or names an unknown agent, the
-hard-coded default is used.
+If the variable is unset, the work-repository local role entry applies, then
+the installation-wide shared role entry, then the product fallback. An explicitly
+set but invalid value is an error.
 
 | Environment variable              | Constant overridden    | Hard-coded default |
 |-----------------------------------|------------------------|--------------------|
@@ -98,6 +99,75 @@ hard-coded default is used.
 | `ORCHESTRA_DEFAULT_PLAN_REVIEWER` | `DEFAULT_PLAN_REVIEWER`| `codex`            |
 | `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `sonnet`           |
 | `ORCHESTRA_DEFAULT_REVIEWER`      | `DEFAULT_REVIEWER`     | `codex`            |
+
+The tracked `shared_scripts/agent_registry.yaml` remains the product baseline.
+A Git-ignored `shared_scripts/agents.local.yaml` beside that registry
+provides installation-wide overrides with `version: 1`, `aliases`, and `defaults`.
+Its aliases and role defaults apply to all work repos using the same installation.
+A repo role entry replaces the shared role entry in full; omitted roles inherit
+the shared selection. Role inspection reports the winning file or environment
+source. Persistent shell exports can be removed once shared defaults are set.
+Repo-local agents and aliases take precedence over shared aliases. Both files
+participate in the worker configuration fingerprint and require worker/dashboard
+restart after changes. Missing shared overrides preserve the baseline; malformed
+files and alias cycles are actionable errors. Explicit environment or task
+selection of an alias uses its effective target; direct `provider:model`
+selections remain explicit. Snapshotting preserves previously admitted commands.
+Shared overrides are local configuration and are never part of the model cache.
+`ko-migrate-agent-defaults` previews literal `ORCHESTRA_DEFAULT_*` exports
+from `~/.zshrc`; `--write` copies them into the shared ignored configuration.
+It never executes or modifies the shell file. Existing aliases and unrelated
+roles are preserved; conflicting defaults, malformed configuration, and
+unsupported declarations prevent writing. Existing files with comments or `#`
+text cannot be rewritten automatically. Repeated writes are idempotent.
+Shell exports retain precedence until removed and cleared manually.
+The launched work repository may define Git-ignored
+`.kanban-orchestra/agents.yaml` with `version: 1` and optional `agents`,
+`aliases`, and `defaults` mappings. `agents.<name>` accepts `provider`,
+`model`, `reasoning`, `options`, and `label`. Existing names inherit omitted
+command fields and provider flags; new names require `provider` and `model`.
+Changing provider starts from its template. `reasoning` changes Codex's
+reasoning argument independently; `null` removes it. `options` maps CLI flags
+to a string value, `true` to add a flag, or `false`/`null` to remove it.
+`defaults` accepts `coder`, `reviewer`, `planner`, `plan_reviewer`,
+`super_planner`, `super_reviewer`, and `unblocker`, each with optional `agent`,
+`model`, `reasoning`, and `options` fields. Local aliases override the baseline;
+collisions and alias cycles are errors. Explicit task agent selection and an
+explicit environment role agent each suppress the entire configured role patch.
+
+New task admission records a version 1 snapshot of selected role specs, run
+and review command arrays, attribution facts, and their sources. This makes
+queued and in-flight commands stable across local configuration edits and
+worker restarts. An explicit task agent edit replaces that role's snapshot for
+later steps. Older task rows get a snapshot before their next dispatch. Worker
+and dashboard processes load configuration at startup; restart them after
+editing the local file. The CLI rejects admission if its local file differs
+from the active worker. `ko-task agents` reports effective commands and
+sources. Missing local configuration is normal. Each work repository resolves
+its own file from its database workspace, not from the tooling checkout.
+
+`ko-task models refresh [provider]` explicitly discovers models through the
+installed CLI's metadata interface. `ko-task models status` reports each
+provider's fresh, stale, or unavailable state, last successful refresh, and
+failure reason. `ko-task models list [provider]` merges discovered choices with
+the tracked baseline, displaying exact IDs, labels, capability metadata, and
+source. `ko-task agents` includes these choices and warns when a configured
+model is absent from the latest successful listing. Absence is advisory: an
+explicit `provider:model` choice remains valid and execution uses its exact ID.
+
+The generated, Git-ignored `.kanban-orchestra/model-cache.json` is scoped to
+the launched work repository and stores a nonsecret hash of user and provider
+configuration context. Version 1 has `providers` entries with `scope`,
+`models`, `state`, `reason`, `last_attempt`, and `last_success`. Each model has
+`id`, `label`, and `capabilities`. Successful refreshes atomically replace a
+provider's validated list. Failures preserve its last good list and record a
+short diagnostic. Successful lists older than seven days show as stale. A
+missing or corrupt cache falls back to baseline choices;
+run `ko-task models refresh` to recover. Refresh never writes `agents.yaml`.
+Model listings read the cache on demand. Task execution and startup never launch discovery CLIs.
+Cache listings are read on demand and reflect refreshes immediately; admitted tasks retain
+their saved command snapshots. A missing CLI or rejected model fails the task
+with its CLI error and does not switch provider or model.
 
 ### Review Round
 

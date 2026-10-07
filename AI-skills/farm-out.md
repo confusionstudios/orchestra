@@ -41,19 +41,17 @@ fi
 
 PYTHONPATH="$ORCHESTRA_DIR/shared_scripts:$ORCHESTRA_DIR/kanban-orchestra/scripts" \
 "$ko_python" - <<'PY'
+import json
 import os
-from agent_registry import resolve_agent_command
-from config import DEFAULT_CODER
+from agent_registry import configure, effective, work_repo_root
 
-spec = (
-    os.environ.get("USER_SPEC")
-    or os.environ.get("ORCHESTRA_DEFAULT_CODER")
-    or DEFAULT_CODER
-)
-cmd = resolve_agent_command(spec)
+configure(work_repo_root())
+choice = effective().role("coder", os.environ.get("USER_SPEC"))
+spec = choice["agent"]
+cmd = effective().command(spec, patch=choice["patch"])
 if not cmd:
     raise SystemExit(f"no command for spec: {spec!r}")
-print(" ".join(cmd))  # substitute {prompt}, run from repo root
+print(json.dumps(cmd))  # substitute {prompt} as one argv element; run from repo root
 PY
 ```
 

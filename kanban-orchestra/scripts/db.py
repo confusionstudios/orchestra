@@ -6,6 +6,7 @@ and all queries used by task.py and orchestrator.py.
 """
 
 import sqlite3
+import json
 import os
 import subprocess
 import time
@@ -62,6 +63,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     allow_when_blocked      INTEGER NOT NULL DEFAULT 0,
     block_reason            TEXT,
     resume_next_step        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_agent_snapshots (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    snapshot TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_worker_config (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    fingerprint TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_skips (
@@ -926,6 +937,7 @@ def add_task(
     status=None,
     skips=None,
     allow_when_blocked=False,
+    agent_snapshot=None,
 ):
     if kind == "task":
         kind = "commit"
@@ -972,8 +984,27 @@ def add_task(
                 "INSERT INTO task_skips (task_id, step) VALUES (?, ?)",
                 (task_id, step),
             )
+    if agent_snapshot is not None:
+        save_agent_snapshot(conn, task_id, agent_snapshot, commit=False)
     conn.commit()
     return task_id
+
+
+def save_agent_snapshot(conn, task_id, snapshot, *, commit=True):
+    conn.execute(
+        "INSERT INTO task_agent_snapshots(task_id, snapshot) VALUES (?, ?) "
+        "ON CONFLICT(task_id) DO UPDATE SET snapshot=excluded.snapshot",
+        (task_id, json.dumps(snapshot)),
+    )
+    if commit:
+        conn.commit()
+
+
+def get_agent_snapshot(conn, task_id):
+    row = conn.execute(
+        "SELECT snapshot FROM task_agent_snapshots WHERE task_id=?", (task_id,)
+    ).fetchone()
+    return json.loads(row[0]) if row else None
 
 
 def should_skip_step(conn, task_id, step):
@@ -1078,7 +1109,7 @@ def list_tasks(
     return tasks
 
 
-def update_task(conn, task_id, **fields):
+def update_task(conn, task_id, *, commit=True, **fields):
     """Update task fields and maintain queue/completion timestamps."""
     if not fields:
         return
@@ -1129,7 +1160,8 @@ def update_task(conn, task_id, **fields):
             params.append(v)
     params.append(task_id)
     conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def delete_task(conn, task_id):
@@ -1976,6 +2008,9 @@ def import_worktree_database(
             "SELECT * FROM run_log WHERE task_id IS NOT NULL ORDER BY id ASC"
         ).fetchall()
 
+        source_snapshots = (source_conn.execute("SELECT * FROM task_agent_snapshots").fetchall()
+                            if "task_agent_snapshots" in _list_user_tables(source_conn) else [])
+
         # Snapshot after reads so callers can verify we never wrote the source.
         source_mtime_ns = source_db.stat().st_mtime_ns
 
@@ -2014,6 +2049,12 @@ def import_worktree_database(
                     "UPDATE tasks SET parent_task_id = ?, follow_up_task_id = ? WHERE id = ?",
                     (parent_new, follow_new, new_id),
                 )
+
+            for snapshot in source_snapshots:
+                new_task_id = id_map.get(snapshot["task_id"])
+                if new_task_id is None:
+                    raise ValueError("Source agent snapshot references a missing task")
+                save_agent_snapshot(target_conn, new_task_id, json.loads(snapshot["snapshot"]), commit=False)
 
             for skip in source_skips:
                 new_task_id = id_map.get(skip["task_id"])
