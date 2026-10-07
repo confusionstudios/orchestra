@@ -114,6 +114,13 @@ files and alias cycles are actionable errors. Explicit environment or task
 selection of an alias uses its effective target; direct `provider:model`
 selections remain explicit. Snapshotting preserves previously admitted commands.
 Shared overrides are local configuration and are never part of the model cache.
+`ko-migrate-agent-defaults` previews literal `ORCHESTRA_DEFAULT_*` exports
+from `~/.zshrc`; `--write` copies them into the shared ignored configuration.
+It never executes or modifies the shell file. Existing aliases and unrelated
+roles are preserved; conflicting defaults, malformed configuration, and
+unsupported declarations prevent writing. Existing files with comments or `#`
+text cannot be rewritten automatically. Repeated writes are idempotent.
+Shell exports retain precedence until removed and cleared manually.
 The launched work repository may define Git-ignored
 `.kanban-orchestra/agents.yaml` with `version: 1` and optional `agents`,
 `aliases`, and `defaults` mappings. `agents.<name>` accepts `provider`,

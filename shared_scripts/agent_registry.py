@@ -519,7 +519,7 @@ def _patch_options(command: list[str], options: dict[str, Any], *, value_options
 class EffectiveRegistry:
     """Validated, immutable-for-one-process view of one work repository."""
 
-    def __init__(self, repo_root: Path):
+    def __init__(self, repo_root: Path, *, shared_config_path: Path | None = None):
         self.path = Path(repo_root).resolve() / LOCAL_CONFIG_NAME
         self.agents = dict(AGENT_CMD)
         self.reviews = dict(AGENT_REVIEW_CMD)
@@ -534,7 +534,7 @@ class EffectiveRegistry:
             for name in self.agents
         }
         self.alias_sources: dict[str, str] = {name: "product" for name in self.aliases}
-        self.shared_config_path = SHARED_CONFIG_PATH
+        self.shared_config_path = Path(shared_config_path) if shared_config_path is not None else SHARED_CONFIG_PATH
         shared = self._read_config(self.shared_config_path, shared=True)
         local = self._read_config(self.path)
         if shared is None and local is None:

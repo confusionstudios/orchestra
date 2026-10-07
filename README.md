@@ -284,6 +284,26 @@ reports each alias and role's source. Shared defaults can replace persistent
 defaults. Existing shells and workers retain inherited environment settings
 until restarted.
 
+To copy literal role exports from `~/.zshrc` into shared preferences, preview:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-migrate-agent-defaults"
+# Save the proposed settings explicitly:
+"$ORCHESTRA_DIR/bin/ko-migrate-agent-defaults" --write
+```
+
+The helper reads the shell file as text and never executes or modifies it.
+It preserves existing aliases and other roles, refuses conflicting defaults
+(including existing model/reasoning patches), and rejects dynamic or ambiguous
+role declarations or carriage-return line endings. Files containing comments or `#` text require manual editing
+when migration would change them, so rewriting cannot discard annotations.
+It reads literal declarations, not evaluated shell state;
+conditional logic and sourced files require manual inspection. `--zshrc <path>`
+and `--config <path>` select alternate files. Repeated writes are idempotent.
+Shell exports continue to take precedence until optionally removed manually
+and cleared from the launch environment. Restart workers and dashboards after
+writing preferences. The helper does not change alias targets or refresh models.
+
 Each work repository can add `.kanban-orchestra/agents.yaml` (ignored by Git):
 
 ```yaml
