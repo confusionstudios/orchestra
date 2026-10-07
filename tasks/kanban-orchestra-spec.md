@@ -70,7 +70,7 @@ A supertask is a planning container.
 
 The sticky coder is the agent assigned to `commit-make`.
 
-- Default: `sonnet`
+- Product fallback: `sonnet`; effective role preferences may override it
 - Stored on the task as `coder_agent`
 - Reused for the life of the task unless a human changes it
 
@@ -78,9 +78,10 @@ The sticky coder is the agent assigned to `commit-make`.
 
 The reviewer is the agent assigned to `commit-review` for a task.
 
-- Default: `codex`
+- Product fallback: `codex`; effective role preferences may override it
 - Stored on the task as `reviewer_agent`
-- If the field is missing or null in an older database row, runtime code falls back to `DEFAULT_REVIEWER`
+- Older rows receive a resolved reviewer and command snapshot before dispatch;
+  explicit stored reviewer choices are retained
 - Review is sequential
 - Review produces exactly one approval or rejection for the current round
 
@@ -91,14 +92,15 @@ If the variable is unset, the work-repository local role entry applies, then
 the installation-wide shared role entry, then the product fallback. An explicitly
 set but invalid value is an error.
 
-| Environment variable              | Constant overridden    | Hard-coded default |
-|-----------------------------------|------------------------|--------------------|
-| `ORCHESTRA_DEFAULT_SUPER_PLANNER` | `DEFAULT_SUPER_PLANNER`| `opus`             |
-| `ORCHESTRA_DEFAULT_SUPER_REVIEWER`| `DEFAULT_SUPER_REVIEWER`| `codex`           |
-| `ORCHESTRA_DEFAULT_PLANNER`       | `DEFAULT_PLANNER`      | `sonnet`           |
-| `ORCHESTRA_DEFAULT_PLAN_REVIEWER` | `DEFAULT_PLAN_REVIEWER`| `codex`            |
-| `ORCHESTRA_DEFAULT_CODER`         | `DEFAULT_CODER`        | `sonnet`           |
-| `ORCHESTRA_DEFAULT_REVIEWER`      | `DEFAULT_REVIEWER`     | `codex`            |
+| Role | Environment Override | Product Fallback |
+|------|----------------------|------------------|
+| `super_planner` | `ORCHESTRA_DEFAULT_SUPER_PLANNER` | `opus` |
+| `super_reviewer` | `ORCHESTRA_DEFAULT_SUPER_REVIEWER` | `codex` |
+| `planner` | `ORCHESTRA_DEFAULT_PLANNER` | `sonnet` |
+| `plan_reviewer` | `ORCHESTRA_DEFAULT_PLAN_REVIEWER` | `codex` |
+| `coder` | `ORCHESTRA_DEFAULT_CODER` | `sonnet` |
+| `reviewer` | `ORCHESTRA_DEFAULT_REVIEWER` | `codex` |
+| `unblocker` | `ORCHESTRA_DEFAULT_UNBLOCKER` | `sonnet` |
 
 The tracked `shared_scripts/agent_registry.yaml` remains the product baseline.
 A Git-ignored `shared_scripts/agents.local.yaml` beside that registry
@@ -141,9 +143,9 @@ queued and in-flight commands stable across local configuration edits and
 worker restarts. An explicit task agent edit replaces that role's snapshot for
 later steps. Older task rows get a snapshot before their next dispatch. Worker
 and dashboard processes load configuration at startup; restart them after
-editing the local file. The CLI rejects admission if its local file differs
-from the active worker. `ko-task agents` reports effective commands and
-sources. Missing local configuration is normal. Each work repository resolves
+editing either preference file. The CLI rejects admission or explicit task
+agent edits if the shared or repo-local configuration differs from the active
+worker. `ko-task agents` reports effective commands and sources. Missing local configuration is normal. Each work repository resolves
 its own file from its database workspace, not from the tooling checkout.
 
 `ko-task models refresh [provider]` explicitly discovers models through the
@@ -383,7 +385,7 @@ Runtime status values:
 - `commit-review`: reviewer inspects the staged diff for a commit task
 - `commit-make-supertask`: coder plans a supertask
 - `commit-review-supertask`: reviewer performs final aggregate supertask review
-- `commit-plan`: coder drafts an implementation plan for a normal task
+- `commit-plan`: planner drafts an implementation plan for a normal task
 - `commit-plan-review`: reviewer approves or rejects the drafted plan
 - `none`: no pending step
 
@@ -517,6 +519,9 @@ task list [--status <status>] [--next-step <step>] [--branch <branch>] [--parent
 task show <task-id>
 task show-comments <task-id>
 task show-run-log <task-id>
+task agents
+task models status
+task models list [provider]
 ```
 
 ### Mutation Commands
@@ -530,11 +535,14 @@ task delete <task-id>
 task purge [--before <date> | --days <n>]
 task dump
 task restore
+task models refresh [provider]
 ```
 
 ### CLI Rules
 
-- `task add` defaults to `type=commit`, `coder_agent=sonnet`, and `reviewer_agent=codex`. `--kind task` remains a legacy alias for `--type commit`.
+- `task add` defaults to `type=commit` and resolves coder/reviewer through
+  effective role preferences, saving their commands. Product fallbacks are
+  `sonnet` and `codex`. `--kind task` remains a legacy alias for `--type commit`.
 - `task set --reviewer-agent <agent>` changes the configured code reviewer for future `commit-review` runs.
 - `allow_when_blocked` defaults to `false`.
 - Task descriptions are Markdown source. Agents creating or editing tasks should
@@ -564,6 +572,13 @@ Commit tasks use a two-step loop:
 
 1. `commit-make`
 2. `commit-review`
+
+### Planning Roles
+
+When enabled, `commit-plan` uses the saved `planner` role and
+`commit-plan-review` uses `plan_reviewer`. Planning does not replace the task's
+sticky implementation coder. An invalid legacy agent selection blocks the task
+with a durable repair explanation rather than repeatedly entering dispatch.
 
 ### `commit-make`
 
@@ -626,7 +641,9 @@ Required behavior:
 
 ### `commit-review`
 
-Agent: the task's `reviewer_agent`, falling back to `DEFAULT_REVIEWER` for old/null rows.
+Agent: the task's resolved `reviewer_agent`, using its saved normal command.
+Legacy rows receive a command snapshot before dispatch. Review templates are
+opt-in; a review step name alone does not switch the invocation template.
 
 Required behavior:
 
@@ -693,8 +710,8 @@ changes begin.
 
 ### Task Planning Flow
 
-1. `commit-plan`: coder drafts an implementation plan and stores it via `task set <id> --commit-plan "<text>"`.
-2. `commit-plan-review`: reviewer approves or rejects the plan.
+1. `commit-plan`: planner drafts an implementation plan and stores it via `task set <id> --commit-plan "<text>"`.
+2. `commit-plan-review`: plan reviewer approves or rejects the plan.
 3. On approval: task advances to `commit-make`.
 4. On rejection: task returns to `commit-plan`. `review_round` is **not** incremented.
 
@@ -825,8 +842,8 @@ The file is a one-shot signal: deletion is the acknowledgment, so the orchestrat
 While the orchestrator is running, a background thread reassesses each
 `blocked` task about once a minute. It collects current evidence (task row,
 durable comments, run log, latest transcript, git stash list, and worktree
-status) and asks the configured unblocker agent (`ORCHESTRA_DEFAULT_UNBLOCKER`,
-default `sonnet`) whether recovery is safe.
+status) and asks the effective `unblocker` role (environment, repo-local, shared,
+then product fallback `sonnet`) whether recovery is safe.
 
 The agent records exactly one durable comment authored as `smart-unblock`,
 starting with either `RESUME` or `BLOCKED`. The orchestrator then either
@@ -909,9 +926,9 @@ otherwise the localhost URL. The fleet table remains localhost. Each Fleet
 card has one Dashboard action: local Fleet views use localhost and Tailscale
 Fleet views use the exact remote mapping, omitting the action when that mapping
 is unavailable. Play on a stopped card is equivalent to
-`ko-fleet start <configured-repo-label>`. Each repo dashboard is read-only,
-repo-scoped, and attached to the matching orchestrator instance. The old
-process-manager UI and its heartbeat/request/response JSON files are removed,
+`ko-fleet start <configured-repo-label>`. Each repo dashboard primarily displays
+status and offers ready and review-cap continuation actions. It is repo-scoped and attached to the matching
+orchestrator instance. The old process-manager UI and its heartbeat/request/response JSON files are removed,
 not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
 `ko-task`, and `ko-get-update`; active child process metadata is maintained
 independently in `.kanban-orchestra/active-agent-processes.json`. The old
@@ -998,7 +1015,9 @@ On unrecoverable internal exceptions:
 
 ## Runtime and Dashboard Contract
 
-The dashboard is read-only. It exists to answer operational questions quickly.
+The dashboard primarily answers operational questions. Its supported task
+actions queue ready work and continue review-cap blocks through the same
+validation used by the CLI.
 It is the per-repo dashboard started by the orchestrator, not the removed
 process-manager UI.
 
@@ -1050,6 +1069,7 @@ Primary questions:
 The dashboard should expose:
 
 - orchestrator health
+- heading context `(short computer name | short instance name)`
 - current task summary
 - orchestrator output
 - ready queue
@@ -1110,17 +1130,17 @@ intervention, triage, and requeue decisions.
 Typical flow:
 
 ```bash
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py add "Task title" --description "## Goal
+"$ORCHESTRA_DIR/bin/ko-task" add "Task title" --description "## Goal
 
 What should happen" --branch my-branch
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py set <task-id> --status ready
+"$ORCHESTRA_DIR/bin/ko-task" set <task-id> --status ready
 ```
 
 To create a task with the default `commit-make` starting step:
 
 ```bash
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py add "Task title" --branch my-branch
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py set <task-id> --status ready
+"$ORCHESTRA_DIR/bin/ko-task" add "Task title" --branch my-branch
+"$ORCHESTRA_DIR/bin/ko-task" set <task-id> --status ready
 ```
 
 Rules:
@@ -1137,10 +1157,10 @@ Rules:
 Useful commands:
 
 ```bash
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py list
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py show <task-id>
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py show-comments <task-id>
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py show-run-log <task-id>
+"$ORCHESTRA_DIR/bin/ko-task" list
+"$ORCHESTRA_DIR/bin/ko-task" show <task-id>
+"$ORCHESTRA_DIR/bin/ko-task" show-comments <task-id>
+"$ORCHESTRA_DIR/bin/ko-task" show-run-log <task-id>
 sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
 ```
 
@@ -1153,11 +1173,11 @@ A running orchestrator may have already explained the block or resumed it.
 To intervene by hand:
 
 ```bash
-cat <<'EOF' | python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py comment <task-id> --message-stdin --comment
+cat <<'EOF' | "$ORCHESTRA_DIR/bin/ko-task" comment <task-id> --message-stdin --comment
 CONTINUE
 Here is the missing decision or context
 EOF
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py continue <task-id>
+"$ORCHESTRA_DIR/bin/ko-task" continue <task-id>
 ```
 
 For a `review_cap` block, grant extra rounds with `task continue <id> --add-review-rounds N` instead of a bare continue. `task set --status ready` is refused for `review_cap` and `reviewer_unavailable` blocks so `resume_next_step` is restored without racing dispatch. A durable `CONTINUE`/`RESUME` comment is also observed by smart-unblock.
@@ -1181,10 +1201,10 @@ Typical cases:
 If landed work needs follow-up changes, reuse the same task:
 
 ```bash
-cat <<'EOF' | python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py comment <task-id> --message-stdin --comment
+cat <<'EOF' | "$ORCHESTRA_DIR/bin/ko-task" comment <task-id> --message-stdin --comment
 Follow-up changes needed: ...
 EOF
-python3 "$ORCHESTRA_DIR"/kanban-orchestra/scripts/task.py set <task-id> --status ready --next-step commit-make --last-review-decision none
+"$ORCHESTRA_DIR/bin/ko-task" set <task-id> --status ready --next-step commit-make --last-review-decision none
 ```
 
 The task will re-enter the normal make/review/finalize loop and refresh

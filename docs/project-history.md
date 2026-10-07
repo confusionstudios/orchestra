@@ -3,6 +3,9 @@
 A concise retrospective of how Kanban Orchestra evolved from an extraction
 out of a larger codebase into a standalone AI-agent orchestration harness.
 
+This is a historical snapshot through May 2026. See [README](../README.md)
+and the [canonical spec](../tasks/kanban-orchestra-spec.md) for current behavior.
+
 ## Origin (March 2026)
 
 Orchestra began as an orchestration workflow embedded inside a larger

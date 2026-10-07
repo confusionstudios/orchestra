@@ -1,4 +1,4 @@
-Understand Orchestra agent aliases/specs, labels, commands, and default role env vars.
+Understand Orchestra agent aliases, commands, and effective role preferences.
 
 Use this skill when you need to identify available Orchestra agents, choose an
 agent alias or provider/model spec for a role, explain which model/tool it
@@ -24,11 +24,12 @@ labels, and commands for the launched work repository with:
 Shared Git-ignored overrides live at
 `$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`. Its `version: 1`
 and `aliases` and `defaults` mappings can redefine names and role choices for
-every work repo using that installation, without a Git commit or shell edit. Repo-local aliases
-and agents take precedence; repo role entries replace shared role entries.
+every work repo using that installation, without a Git commit or shell edit.
+Repo-local aliases and agents take precedence; repo role entries replace shared role entries.
 Explicit task choices and `ORCHESTRA_DEFAULT_*` exports take priority over
 file-based role defaults. Remove persistent exports to use shared defaults.
-Use `ko-task agents` to inspect the source and resolved command. Restart workers and dashboards after editing either layer;
+Use `ko-task agents` to inspect the source and resolved command. Restart workers
+and dashboards after editing either layer;
 existing task snapshots retain their selected commands.
 
 Registry `aliases` are Orchestra semantic names. They target an existing fixed
@@ -57,9 +58,16 @@ tasks keep their saved command snapshots. Cache listings are read on demand
 and reflect a refresh without a restart. Ordinary task runs
 do not query provider CLIs for models.
 
+Preview migration of literal shell defaults with
+`"$ORCHESTRA_DIR/bin/ko-migrate-agent-defaults"`; `--write` saves them into the
+shared ignored file without executing or editing the shell file. Existing
+exports retain priority until optionally removed and cleared manually.
+
 ## Current Role Defaults
 
-Orchestra role defaults are environment-driven:
+Resolve role defaults in this order: explicit task/user choice, an explicit
+`ORCHESTRA_DEFAULT_*` environment value, repo-local role entry, shared role
+entry, then the product fallback. Environment overrides remain optional:
 
 ```text
 ORCHESTRA_DEFAULT_SUPER_PLANNER
@@ -68,13 +76,14 @@ ORCHESTRA_DEFAULT_PLANNER
 ORCHESTRA_DEFAULT_PLAN_REVIEWER
 ORCHESTRA_DEFAULT_CODER
 ORCHESTRA_DEFAULT_REVIEWER
+ORCHESTRA_DEFAULT_UNBLOCKER
 ```
 
 `ORCHESTRA_DEFAULT_REVIEWER` is the default commit-review agent. If the user
 asks for the configured commit-review reviewer, use that value when it names a
 valid fixed alias, registry alias, or provider/model spec such as
-`cursor:<model>`. If unset, use the local reviewer role default, then the
-Orchestra fallback. An explicitly invalid value is an error.
+`cursor:<model>`. If unset, use the repo-local reviewer role, then the shared
+reviewer role, then the product fallback. An explicitly invalid value is an error.
 
 Resolve effective defaults for the launched work repository like this:
 
@@ -86,8 +95,11 @@ Resolve effective defaults for the launched work repository like this:
 
 When you need to call an agent, resolve the command through
 `agent_registry.configure(work_repo_root)` followed by
-`agent_registry.resolve_agent_command(agent_spec)`, then replace the single
-`{prompt}` placeholder with the prompt text. This supports fixed aliases,
+`choice = agent_registry.effective().role(role, explicit_spec)` and
+`agent_registry.effective().command(choice["agent"], patch=choice["patch"])`, then replace the
+single `{prompt}` placeholder. This retains role-specific model, reasoning,
+and option settings. For a direct spec with no role patch,
+`resolve_agent_command(agent_spec)` also works. This supports fixed aliases,
 registry aliases such as `grok`, and provider/model specs such as
 `cursor:claude-opus-4-8-high`. Keep the call
 non-interactive, run it from the repo root, and include task-specific context
@@ -101,7 +113,9 @@ Skill-specific instructions override the generic registry command. In
 particular, `cross-review-converge` uses `codex exec review {prompt}` for Codex
 review. Current Codex cannot combine `--uncommitted` with a custom prompt; the
 prompt (including an explicit untracked-file list) is what scopes the review to
-staged, unstaged, and untracked changes.
+staged, unstaged, and untracked changes. Ad-hoc review explicitly chooses the
+review template; Kanban review steps use the saved normal command unless a
+caller explicitly requests the review template.
 
 For reviews, explicitly say:
 
@@ -115,8 +129,8 @@ If an approval includes non-blocking requested changes, the reviewer should add
 `OUTCOME: rejected`.
 
 If the user names a specific agent alias or provider/model spec, use that
-value. Otherwise use the role default that matches the work, especially
-`ORCHESTRA_DEFAULT_REVIEWER` for commit-review or convergence review.
+value. Otherwise use the role default that matches the work, using the effective
+`reviewer` role for commit-review or convergence review.
 
 ## Verify Agent Output
 

@@ -126,7 +126,9 @@ local Fleet view links cards to localhost.
 The repo dashboard exposes the active task, queues, recent completions,
 review-round count, durable comments, and run history. The task-detail view
 keeps the goal, acceptance criteria, orchestration state, review evidence, and
-logs together.
+logs together. Its heading identifies `(short computer name | short instance
+name)`. Supported task actions include queueing ready work and continuing
+review-cap blocks.
 
 When a live Fleet Dashboard is discoverable, repo overview and task-detail
 pages show a compact **Fleet Dashboard** action in the top bar. It uses the
@@ -143,8 +145,8 @@ preferred Tailscale-or-local URL and returns to Fleet in the same tab.
   </tr>
 </table>
 
-Both dashboard types include a dark-safe **Accent** picker. The Fleet Dashboard
-and each repo persist their own tint by dashboard identity, so a new dashboard
+Both dashboard types include an **Accent** picker with horizontal tint chits.
+The Fleet Dashboard and each repo persist their own tint by dashboard identity, so a new dashboard
 does not inherit another dashboard's color. Localhost and Tailscale are separate
 browser origins and therefore retain separate browser-local choices.
 
@@ -241,6 +243,13 @@ per line; blank lines and `#` comments are allowed. Fleet provides `status`,
 Dashboard commands prefer the exact Tailscale URL. Pass `--local` when you
 specifically want localhost for debugging.
 
+## Upgrading An Existing Installation
+
+See [Agent Configuration Upgrade](docs/agent-configuration-upgrade.md) for
+pulling an update, restarting instances, optional local preferences, shell-default
+migration, and model discovery. Existing shell defaults continue to work;
+ignored preferences and caches do not travel with Git.
+
 ## Agent Configuration
 
 Orchestra shells out to local agent CLIs. The registry supports named agents
@@ -248,10 +257,10 @@ and dynamic provider/model specs:
 
 | Key or syntax | Agent CLI | Notes |
 |---|---|---|
-| `haiku`, `sonnet`, `opus`, `fable`, `claude` | Claude Code | `sonnet` is the default coder and planner; `opus` is the default supertask planner |
-| `codex` | OpenAI Codex CLI | Default reviewer, plan reviewer, and supertask reviewer |
+| `haiku`, `sonnet`, `opus`, `fable`, `claude` | Claude Code | Product fallbacks: `sonnet` for coder/planner; `opus` for supertask planner |
+| `codex` | OpenAI Codex CLI | Product fallback for reviewer, plan reviewer, and supertask reviewer |
 | `antigravity` | Antigravity (`agy`) | Runs through its non-interactive print mode |
-| `cursor:<model>` | Cursor Agent via GUI relay | Routes through `remote-control-cursor run` and passes the exact model string to Cursor; `grok` currently aliases `cursor:cursor-grok-4.6-high` |
+| `cursor:<model>` | Cursor Agent via GUI relay | Routes through `remote-control-cursor run` and passes the exact model string to Cursor; `grok` has a tracked baseline target; use `ko-task agents` to inspect its effective model |
 | `kilo:<model>` | Kilo Code | Passes the exact model string to Kilo; `kilo` uses its auto/free model |
 | `codex:<model>`, `claude:<model>`, `antigravity:<model>` | Respective CLIs | Use the provider's normal invocation flags with the supplied model ID |
 

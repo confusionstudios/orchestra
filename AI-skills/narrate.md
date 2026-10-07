@@ -164,11 +164,11 @@ progress.
 The running orchestrator owns every recovery decision. About once a minute it
 collects current evidence for each blocked task — task row, durable comments,
 run log, latest transcript, `git stash list`, and worktree status — and hands
-that evidence to the configured LLM (`$ORCHESTRA_DEFAULT_UNBLOCKER`, falling
-back to `sonnet`). The LLM records exactly one durable comment explaining
-whether recovery is safe. The orchestrator then either continues the task or
-leaves that explanation for the operator. Nothing in that loop hard-codes a
-clean-worktree or resume-step rule.
+that evidence to the effective `unblocker` role (environment, repo-local,
+shared, then product fallback `sonnet`). The LLM records exactly one durable
+comment explaining whether recovery is safe. The orchestrator then either
+continues the task or leaves that explanation for the operator. The assessment uses current evidence;
+the orchestrator suspends consultations and task dispatch while `waiting-dirty`.
 
 Repeats are suppressed: unchanged evidence is skipped until something in the
 task's evidence changes. Everything the loop produced — comments authored as
