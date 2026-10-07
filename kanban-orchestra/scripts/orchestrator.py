@@ -2687,7 +2687,11 @@ def process_pinned_task(task, conn):
                     coder=current.get("coder_agent"), reviewer=current.get("reviewer_agent"),
                 )
             except ValueError as exc:
-                log(f"Agent configuration for task {task_id}: {exc}", task_id)
+                message = f"Agent configuration for task {task_id}: {exc}. Repair the task agent selection before resuming."
+                db.update_task(conn, task_id, status="blocked", next_step="none")
+                db.add_comment(conn, task_id, message, kind="comment", author="orchestrator")
+                log(message, task_id)
+                update_runtime_after_task(conn, task_id, False)
                 return False
             primary = "super_planner" if current.get("kind") == "supertask" else "coder"
             reviewer = "super_reviewer" if current.get("kind") == "supertask" else "reviewer"

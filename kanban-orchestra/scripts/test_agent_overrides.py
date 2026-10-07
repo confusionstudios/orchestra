@@ -130,10 +130,18 @@ defaults:
             agent_registry._ACTIVE = None
 
 
-def test_supertask_review_probe_and_execution_use_saved_review_command(monkeypatch):
+@pytest.mark.parametrize('verb,kind,role', [
+    ('commit-review', 'commit', 'reviewer'),
+    ('commit-plan-review', 'commit', 'plan_reviewer'),
+    ('pull-request-review', 'pull_request', 'reviewer'),
+    ('other-review', 'other', 'reviewer'),
+    ('commit-review-supertask', 'supertask', 'super_reviewer'),
+])
+@pytest.mark.parametrize('use_review_command', [False, True])
+def test_review_probe_and_execution_preserve_command_opt_in(monkeypatch, verb, kind, role, use_review_command):
     with TemporaryDirectory() as root:
         config.configure_agents(root)
-        snapshot = config.agent_snapshot(kind="supertask", coder="codex", reviewer="codex")
+        snapshot = config.agent_snapshot(kind=kind, coder="codex", reviewer="codex")
         connection = db.connect(str(Path(root) / "kanban-orchestra.db"))
         try:
             task_id = db.add_task(connection, "Review", coder_agent="codex", reviewer_agent="codex",
@@ -147,14 +155,15 @@ def test_supertask_review_probe_and_execution_use_saved_review_command(monkeypat
 
             monkeypatch.setattr(agent_runner.subprocess, "Popen", capture_command)
             assert not agent_runner.ping_agent("codex", task_id, purpose="review", conn=connection,
-                                               verb="commit-review-supertask")
+                                               verb=verb, use_review_command=use_review_command)
             assert agent_runner.run_agent("codex", "prompt", task_id, connection,
-                                          "commit-review-supertask") == 127
-            review = snapshot["roles"]["super_reviewer"]["review"]
+                                          verb, use_review_command=use_review_command) == 127
+            review = snapshot["roles"][role]["review" if use_review_command else "run"]
             assert commands == [[part.replace("{prompt}", agent_runner.review_ping_prompt(task_id))
                                  for part in review],
                                 [part.replace("{prompt}", "prompt") for part in review]]
-            assert "review" in commands[0] and "review" in commands[1]
+            assert ("review" in commands[0]) == use_review_command
+            assert ("--yolo" in commands[0]) != use_review_command
         finally:
             connection.close()
             agent_registry._ACTIVE = None
@@ -451,3 +460,39 @@ def test_shared_role_change_updates_fingerprint_and_keeps_snapshot(tmp_path, mon
     assert snapshot['roles']['coder']['spec'] == 'grok'
     shared.unlink()
     assert agent_registry.EffectiveRegistry(tmp_path).role('coder')['source'] == 'product'
+
+
+@pytest.mark.parametrize('invalid_role', ['coder_agent', 'reviewer_agent'])
+def test_invalid_legacy_agent_blocks_once_and_preserves_following_task(tmp_path, monkeypatch, invalid_role):
+    monkeypatch.setattr(agent_runner, '_repo_root_func', agent_runner._repo_root_func)
+    monkeypatch.setattr(agent_runner, 'log', agent_runner.log)
+    import orchestrator
+    config.configure_agents(tmp_path)
+    connection = db.connect(str(tmp_path / 'kanban-orchestra.db'))
+    try:
+        bad_id = db.add_task(connection, 'Invalid Legacy', branch='feature', status='ready',
+                             **{invalid_role: 'removed-local-alias'})
+        later_id = db.add_task(connection, 'Later', branch='feature', status='ready', allow_when_blocked=True)
+        db.upsert_runtime(connection, status='running', current_task_id=bad_id)
+        monkeypatch.setattr(orchestrator.smart_unblock, 'is_consultation_gated', lambda *_: False)
+        monkeypatch.setattr(orchestrator, 'log', lambda *_: None)
+        def reject_advance(*args):
+            pytest.fail('An invalid legacy agent must never execute')
+        monkeypatch.setattr(orchestrator, 'advance', reject_advance)
+        assert not orchestrator.process_pinned_task(db.get_task(connection, bad_id), connection)
+        blocked = db.get_task(connection, bad_id)
+        assert blocked['status'] == 'blocked'
+        assert blocked['next_step'] == 'none'
+        assert db.get_agent_snapshot(connection, bad_id) is None
+        comments = db.get_comments(connection, bad_id)
+        assert len(comments) == 1
+        assert comments[0]['author'] == 'orchestrator'
+        assert 'removed-local-alias' in comments[0]['message']
+        assert 'before resuming' in comments[0]['message']
+        runtime = db.get_runtime(connection)
+        assert runtime['current_task_id'] is None
+        assert 'continuing to next ready task' in runtime['status_message']
+        assert orchestrator.smart_unblock.find_dispatchable_task(connection)['id'] == later_id
+        assert db.get_task(connection, later_id)['status'] == 'ready'
+    finally:
+        connection.close()

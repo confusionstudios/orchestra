@@ -173,7 +173,7 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
     prior run-ping cache hit cannot prove that review/tool path is usable.
     """
     purpose = purpose or ("review" if use_review_command else "run")
-    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command or purpose == "review",
+    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command,
                                              conn=conn, task_id=task_id,
                                              verb=verb or ("commit-review" if purpose == "review" else None))
     if cmd_template is None:
@@ -402,8 +402,7 @@ def run_agent(
     proc_registry: dict — if provided, register the Popen object under agent_name
                    so the caller can kill it on interrupt.
     """
-    review_invocation = use_review_command or verb.endswith("review") or verb == "commit-review-supertask"
-    cmd_template = _resolve_command_template(agent_name, use_review_command=review_invocation,
+    cmd_template = _resolve_command_template(agent_name, use_review_command=use_review_command,
                                              conn=conn, task_id=task_id, verb=verb)
     if cmd_template is None:
         log(f"Unknown agent '{agent_name}', skipping", task_id)
