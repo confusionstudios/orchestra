@@ -349,6 +349,8 @@ def _listing(provider, timeout):
         stripped = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
         if not stripped or stripped.lower().startswith(("available models", "model id", "provider")):
             continue
+        if provider == "cursor" and stripped.lower().startswith("tip:"):
+            continue
         if re.match(r"(?i)^(error|unknown|unsupported|unauthorized|please|login|log in|authentication|failed|no models?|none|not found|unable|cannot|could not)\b", stripped):
             raise RuntimeError(stripped[:300])
         # Labels need a column delimiter; ordinary diagnostic prose is not a model row.
