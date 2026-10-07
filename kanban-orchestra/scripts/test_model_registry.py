@@ -50,6 +50,8 @@ else:
  if mode == 'diagnostic': print('Please log in to list models'); sys.exit()
  if mode == 'prose': print('Models are unavailable'); sys.exit()
  print((fixtures / 'listing.txt').read_text(), end='')
+ if name == 'agent' and mode == 'tip':
+  print("Tip: use --model <id> (or /model <id> in interactive mode) to switch.")
 '''
 
 
@@ -78,6 +80,14 @@ def test_successful_discovery(tmp_path, monkeypatch, provider, expected):
         assert result['models'][1]['capabilities']['supportedReasoningEfforts'] == [{'reasoningEffort': 'high'}]
     if provider == 'claude':
         assert result['models'][0]['capabilities']['resolvedModel'] == 'claude-sonnet-5'
+
+
+def test_cursor_discovery_ignores_trailing_tip(tmp_path, monkeypatch):
+    fake_path(tmp_path, monkeypatch, 'cursor')
+    monkeypatch.setenv('FAKE_MODE_AGENT', 'tip')
+    result = model_registry.refresh(tmp_path, 'cursor', timeout=2)
+    assert result['state'] == 'fresh'
+    assert [item['id'] for item in result['models']] == ['new-model']
 
 
 @pytest.mark.parametrize('mode', ['fail', 'sleep', 'malformed', 'empty', 'partial'])
@@ -113,6 +123,7 @@ def test_missing_executable_keeps_last_good(tmp_path, monkeypatch):
     fake_path(tmp_path, monkeypatch, 'kilo')
     assert model_registry.refresh(tmp_path, 'kilo', timeout=2)['state'] == 'fresh'
     (tmp_path / 'bin' / 'kilo').unlink()
+    monkeypatch.setenv('PATH', str(tmp_path / 'bin'))
     result = model_registry.refresh(tmp_path, 'kilo', timeout=2)
     assert result['state'] == 'unavailable'
     assert [item['id'] for item in result['models']] == ['new-model']
