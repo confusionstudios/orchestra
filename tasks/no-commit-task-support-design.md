@@ -2,8 +2,9 @@
 
 ## Status
 
-Proposed design. This document records the intended shape of first-class
-no-commit tasks before implementation.
+Historical design, implemented through first-class `other` tasks. This
+document records the pre-implementation proposal; the current contract lives
+in [kanban-orchestra-spec.md](kanban-orchestra-spec.md).
 
 ## Problem
 

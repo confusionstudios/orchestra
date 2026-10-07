@@ -33,7 +33,19 @@ or checkout root. That installation provides the wrapper commands, including
 `ko-kanban`, `ko-task`, `ko-orchestrator`, `ko-fleet`, and `ko-get-update`. Invoke them through
 `"$ORCHESTRA_DIR/bin/..."`; do not assume they are on `PATH`.
 
-## Task CLI shorthand
+## Agent Preferences
+
+Use `"$ORCHESTRA_DIR/bin/ko-task" agents` to inspect effective defaults and their
+sources. Selection follows explicit task agent -> environment -> repo-local
+role -> shared role -> product fallback. Shared aliases/defaults live in
+`$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`; repo overrides live in
+`.kanban-orchestra/agents.yaml`. Both are optional and ignored by Git.
+Restart workers and dashboards after edits; saved task commands remain fixed.
+`ko-task models refresh` updates an advisory local catalog, not preferences.
+See [agent-awareness.md](agent-awareness.md) for model selection and optional
+shell-default migration.
+
+## Task CLI Shorthand
 
 The CLI is exposed through the `ko-task` wrapper. Define `task` once in your shell:
 
@@ -272,12 +284,12 @@ Notes:
   the localhost URL for debugging.
 - The repo dashboard chooses a free port at runtime and records it in
   `.kanban-orchestra/dashboard.json`.
-- The repo dashboard is the repo-scoped read-only status surface. For
-  intervention, stop or interrupt the repo instance, inspect with
-  `ko-get-update`, use `ko-task` to record or unblock the affected task, and
-  restart explicitly.
+- The repo dashboard is primarily a status surface, with supported ready and
+  review-cap continuation actions. For broader intervention, inspect with
+  `ko-get-update` and use `ko-task`; stop the instance before manual workspace
+  repairs that could conflict with a running task.
 - A running orchestrator reassesses blocked tasks natively about once a
-  minute. It consults `$ORCHESTRA_DEFAULT_UNBLOCKER` and either continues a
+  minute. It consults the effective `unblocker` role and either continues a
   recoverable task or leaves a durable `smart-unblock` comment. Narration
   observes those comments and does not start a separate recovery process.
 

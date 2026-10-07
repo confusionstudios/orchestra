@@ -11,40 +11,28 @@ assistant's model family.
 
 Priority:
 
-1. If the user specifies a reviewer agent alias or provider/model spec, use it.
-2. Otherwise use the configured commit-review agent from
-   `ORCHESTRA_DEFAULT_REVIEWER` when it names a valid fixed alias or
-   provider/model spec such as `cursor:<model>`.
-3. If the env var is unset or invalid, use the Orchestra fallback exposed as
-   `config.DEFAULT_REVIEWER`.
+1. Use the reviewer agent alias or provider/model spec explicitly requested by the user.
+2. Otherwise resolve the `reviewer` role: explicit `ORCHESTRA_DEFAULT_REVIEWER`,
+   repo-local role entry, shared role entry, then the product fallback.
+3. Invalid explicit settings are errors; do not silently substitute a fallback.
 
-Require `$ORCHESTRA_DIR`. Do not fall back to the current worktree as the
-Orchestra checkout. Resolve the default reviewer:
+Require `$ORCHESTRA_DIR`. Resolve preferences from the launched work repo,
+including the role's model, reasoning, and option patch. Inspect the default:
 
 ```bash
 : "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
-reviewer="$(
-  PYTHONPATH="$ORCHESTRA_DIR/shared_scripts:$ORCHESTRA_DIR/kanban-orchestra/scripts" \
-  "$ORCHESTRA_DIR/bin/ko-python" - <<'PY'
-import config
-print(config.DEFAULT_REVIEWER)
-PY
-)"
-PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" "$ORCHESTRA_DIR/bin/ko-python" - "$reviewer" <<'PY'
-import sys
-from agent_registry import is_valid_agent_spec
-
-reviewer = sys.argv[1]
-if not is_valid_agent_spec(reviewer):
-    raise SystemExit(f"unknown reviewer agent alias or provider/model spec: {reviewer}")
-PY
+PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" "$ORCHESTRA_DIR/bin/ko-python" -c '
+from agent_registry import configure, effective, work_repo_root
+configure(work_repo_root())
+print(effective().role("reviewer"))
+'
 ```
 
-Run only the review command for the selected `$reviewer`.
+Run only the selected reviewer's command.
 
 Resolve the command through
-`agent_registry.resolve_review_agent_command(reviewer)`, then replace the
+`effective().command(choice["agent"], review=True, patch=choice["patch"])`, then replace the
 single `{prompt}` placeholder with the review prompt. The shared resolver uses
 review-specific forms only when they are known to be sufficiently permissive.
 Codex uses `exec review {prompt}`: current Codex treats `--uncommitted` and
@@ -58,6 +46,7 @@ ASK/read-only modes for agent CLIs; they tend to block necessary tool access.
 : "${ORCHESTRA_DIR:?ORCHESTRA_DIR is not set}"
 repo_root="$(git rev-parse --show-toplevel)" || exit 1
 cd "$repo_root" || exit 1
+# REVIEWER_SPEC=opus  # optional explicit user choice; unset uses the reviewer role
 
 prompt_file="$(mktemp -t cross-review-prompt.XXXXXX)"
 trap 'rm -f "$prompt_file"' EXIT
@@ -67,16 +56,17 @@ PYTHONPATH="$ORCHESTRA_DIR/shared_scripts" \
 import os
 import sys
 from pathlib import Path
-from agent_registry import resolve_review_agent_command
+from agent_registry import configure, effective, work_repo_root
 
-reviewer = sys.argv[1]
+configure(work_repo_root())
+choice = effective().role("reviewer", sys.argv[1] or None)
 prompt = Path(sys.argv[2]).read_text(encoding="utf-8")
-cmd_template = resolve_review_agent_command(reviewer)
+cmd_template = effective().command(choice["agent"], review=True, patch=choice["patch"])
 if cmd_template is None:
-    raise SystemExit(f"unknown reviewer agent alias or provider/model spec: {reviewer}")
+    raise SystemExit("unknown reviewer agent: " + choice["agent"])
 cmd = [part.replace("{prompt}", prompt) for part in cmd_template]
 os.execvp(cmd[0], cmd)
-' "$reviewer" "$prompt_file"
+' "${REVIEWER_SPEC:-}" "$prompt_file"
 ```
 
 Use `-c` rather than feeding the resolver program through stdin. Agent CLIs
