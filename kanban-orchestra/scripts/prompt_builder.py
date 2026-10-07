@@ -34,13 +34,15 @@ def _repo_root():
 
 def _task_coder(task):
     """Return the maker/planner agent configured for a task."""
-    fallback = DEFAULT_SUPER_PLANNER if task.get("kind") == "supertask" else DEFAULT_CODER
+    role = "super_planner" if task.get("kind") == "supertask" else "coder"
+    fallback = config.agent_registry.effective().role(role)["agent"]
     return task.get("coder_agent") or fallback
 
 
 def _task_reviewer(task):
     """Return the reviewer agent configured for a task."""
-    fallback = DEFAULT_SUPER_REVIEWER if task.get("kind") == "supertask" else DEFAULT_REVIEWER
+    role = "super_reviewer" if task.get("kind") == "supertask" else "reviewer"
+    fallback = config.agent_registry.effective().role(role)["agent"]
     return task.get("reviewer_agent") or fallback
 
 

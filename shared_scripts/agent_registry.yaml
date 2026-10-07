@@ -1,10 +1,20 @@
 providers:
+  codex:
+    label: Codex {model}
+    command: ["codex", "exec", "--model", "{model}", "--yolo", "{prompt}"]
+    review_command: ["codex", "exec", "--model", "{model}", "review", "{prompt}"]
+  claude:
+    label: Claude {model}
+    command: ["claude", "--model", "{model}", "-p", "{prompt}", "--dangerously-skip-permissions", "--output-format", "text", "--no-session-persistence"]
   cursor:
     label: Cursor {model}
     command: ["remote-control-cursor", "run", "-p", "--model", "{model}", "--yolo", "--trust", "{prompt}"]
   kilo:
     label: Kilo {model}
     command: ["kilo", "--model", "{model}", "run", "{prompt}"]
+  antigravity:
+    label: Antigravity {model}
+    command: ["agy", "--model", "{model}", "--print", "{prompt}", "--dangerously-skip-permissions"]
 
 agents:
   - key: haiku
