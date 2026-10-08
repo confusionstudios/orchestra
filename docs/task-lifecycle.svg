@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="840" viewBox="0 0 1240 840" role="img" aria-labelledby="title desc">
   <title id="title">One Ticket, One Commit</title>
-  <desc id="desc">A ready ticket follows the required path through Implement and Finalize, which creates one commit. Planning and plan review are optional: skip planning entirely, or plan and skip its review. A rejected plan returns to Plan. Commit review is also optional; a rejected change returns to the same coder at Implement. Approved reviews move forward. Dashed cards mark optional steps.</desc>
+  <desc id="desc">Two peer cycles carry a ready ticket to one commit. The entire Plan cycle is optional, including Draft Plan and Plan Review. A rejected plan returns to Draft Plan; approval advances to Commit-Make. Either planning or just plan review can be skipped. The required Commit-Make cycle contains Implement, optional Commit Review, and required Finalize. A rejected change returns to the same coder at Implement. Approval or skipping commit review proceeds to Finalize, which creates one commit. Dashed outlines mark optional groups and steps.</desc>
   <defs>
     <linearGradient id="required-fill" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#1b2e24"/>
@@ -26,17 +26,18 @@
     .return { stroke: #9bacaa; stroke-width: 2.2; }
     .optional-card { fill: #1b232b; stroke: #708b7d; stroke-width: 1.6; stroke-dasharray: 6 6; }
     .required-card { fill: url(#required-fill); stroke: #00d25a; stroke-width: 1.7; }
-    .card-title { font-size: 28px; font-weight: 600; letter-spacing: -.5px; }
+    .group-title { font-size: 32px; font-weight: 650; letter-spacing: -.7px; }
+    .card-title { font-size: 26px; font-weight: 600; letter-spacing: -.5px; }
     .state { font-size: 17px; font-weight: 500; }
-    .route-label { font-size: 19px; fill: #b3c4bb; }
+    .route-label { font-size: 20px; fill: #b3c4bb; }
   </style>
 
-  <rect x=".5" y=".5" width="1199" height="639" rx="22" fill="#161b22" stroke="#303d36"/>
+  <rect x=".5" y=".5" width="1239" height="839" rx="22" fill="#161b22" stroke="#303d36"/>
   <rect x="48" y="30" width="42" height="3" rx="1.5" fill="#00d25a"/>
   <text x="48" y="80" font-size="40" font-weight="650" letter-spacing="-1.2">One Ticket, One Commit</text>
-  <text x="48" y="114" font-size="21" class="muted">Two feedback loops. One finished change.</text>
+  <text x="48" y="114" font-size="21" class="muted">Plan the approach. Make the commit.</text>
 
-  <g transform="translate(1010 54)" stroke="#00d25a" stroke-width="2.7" stroke-linecap="round">
+  <g transform="translate(1050 54)" stroke="#00d25a" stroke-width="2.7" stroke-linecap="round">
     <path d="M0 2h16M0 10h8M0 18h12" opacity=".65"/>
     <g fill="#00d25a" stroke="none">
       <rect x="21" y="-.5" width="5" height="5" rx="1"/>
@@ -44,69 +45,84 @@
       <rect x="17" y="15.5" width="5" height="5" rx="1"/>
     </g>
   </g>
-  <text x="1152" y="71" text-anchor="end" font-size="16" letter-spacing="1" class="mono muted">ORCHESTRA</text>
-  <path d="M48 143H1152" stroke="#303d36"/>
+  <text x="1192" y="71" text-anchor="end" font-size="16" letter-spacing="1" class="mono muted">ORCHESTRA</text>
+  <path d="M48 143H1192" stroke="#303d36"/>
 
-  <!-- Forward motion stays on the lower spine when optional stages are skipped. -->
-  <path d="M74 492H546" class="forward" marker-end="url(#forward-arrow)"/>
-  <path d="M742 492H990" class="forward" marker-end="url(#forward-arrow)"/>
-  <text x="315" y="477" text-anchor="middle" class="route-label">Skip Planning</text>
-  <text x="876" y="477" text-anchor="middle" class="route-label">Skip Commit Review</text>
+  <!-- Plan and Commit-Make are the two peer lifecycle groups. -->
+  <g id="plan-cycle" aria-label="Plan: optional cycle">
+    <rect x="72" y="176" width="472" height="504" rx="18" fill="#141c23" stroke="#708b7d" stroke-width="1.6" stroke-dasharray="7 7"/>
+    <text x="104" y="226" class="group-title">Plan</text>
+    <rect x="421" y="200" width="91" height="28" rx="7" fill="#24312c"/>
+    <text x="466.5" y="220" text-anchor="middle" class="state" style="fill:#b4cabb">Optional</text>
+    <text x="104" y="253" font-size="19" class="muted">Draft, review, and revise</text>
+    <path d="M104 274H512" stroke="#303d36"/>
 
-  <!-- The optional planning branch includes a direct route past plan review. -->
-  <path d="M84 492V305Q84 291 98 291H104" class="optional" marker-end="url(#optional-arrow)"/>
-  <circle cx="84" cy="492" r="3.5" fill="#00d25a"/>
-  <path d="M270 291H304" class="optional" marker-end="url(#optional-arrow)"/>
-  <path d="M500 291H599Q613 291 613 305V426" class="optional" marker-end="url(#optional-arrow)"/>
-  <text x="553" y="276" text-anchor="middle" class="route-label">Approved</text>
-  <path d="M190 347V375Q190 389 204 389H613" class="optional"/>
-  <circle cx="613" cy="389" r="3" fill="#81b695"/>
-  <text x="395" y="376" text-anchor="middle" class="route-label">Skip Plan Review</text>
-  <path d="M405 235V204Q405 190 391 190H204Q190 190 190 204V229" class="return" marker-end="url(#return-arrow)"/>
-  <text x="298" y="177" text-anchor="middle" class="route-label">Rejected: Revise Plan</text>
+    <path d="M256 409H322" class="optional" marker-end="url(#optional-arrow)"/>
+    <text x="292" y="394" text-anchor="middle" font-size="18" class="muted">Review</text>
+    <path d="M420 354V324Q420 310 406 310H194Q180 310 180 324V348" class="return" marker-end="url(#return-arrow)"/>
+    <text x="300" y="297" text-anchor="middle" class="route-label">Reject: Revise</text>
+    <path d="M180 464V582Q180 596 194 596H578Q592 596 592 582V409" class="optional"/>
+    <text x="369" y="582" text-anchor="middle" class="route-label">Skip Review</text>
 
-  <!-- Review approval advances to Finalize; rejection returns to the same coder. -->
-  <path d="M698 432V305Q698 291 712 291H770" class="optional" marker-end="url(#optional-arrow)"/>
-  <text x="736" y="276" text-anchor="middle" class="route-label">Review</text>
-  <path d="M996 291H1120Q1134 291 1134 305V426" class="optional" marker-end="url(#optional-arrow)"/>
-  <text x="1068" y="276" text-anchor="middle" class="route-label">Approved</text>
-  <path d="M896 347V375Q896 389 882 389H736Q722 389 722 403V426" class="return" marker-end="url(#return-arrow)"/>
-  <text x="807" y="376" text-anchor="middle" class="route-label">Rejected: Rework</text>
-  <text x="818" y="415" text-anchor="middle" font-size="17" class="muted">Same coder</text>
+    <rect x="104" y="354" width="152" height="110" rx="13" class="optional-card"/>
+    <text x="124" y="384" class="state muted">Optional</text>
+    <text x="124" y="428" class="card-title">Draft Plan</text>
+    <rect x="328" y="354" width="184" height="110" rx="13" class="optional-card"/>
+    <text x="348" y="384" class="state muted">Optional</text>
+    <text x="348" y="428" class="card-title">Plan Review</text>
+  </g>
 
-  <!-- Optional stages retain the dashed outline used in the README legend. -->
-  <rect x="110" y="235" width="160" height="112" rx="14" class="optional-card"/>
-  <text x="130" y="266" class="state muted">Optional</text>
-  <text x="130" y="314" class="card-title">Plan</text>
+  <g id="commit-make-cycle" aria-label="Commit-Make: required cycle, including finalization">
+    <rect x="632" y="176" width="536" height="504" rx="18" fill="#141d20" stroke="#41624e" stroke-width="1.7"/>
+    <text x="664" y="226" class="group-title">Commit-Make</text>
+    <rect x="1047" y="200" width="89" height="28" rx="7" fill="#1b3b28"/>
+    <text x="1091.5" y="220" text-anchor="middle" class="state" style="fill:#8fdfa9">Required</text>
+    <text x="664" y="253" font-size="19" class="muted">Build, review, and finalize</text>
+    <path d="M664 274H1136" stroke="#303d36"/>
 
-  <rect x="310" y="235" width="190" height="112" rx="14" class="optional-card"/>
-  <text x="330" y="266" class="state muted">Optional</text>
-  <text x="330" y="314" font-size="26" font-weight="600" letter-spacing="-.5">Plan Review</text>
+    <path d="M850 409H918" class="optional" marker-end="url(#optional-arrow)"/>
+    <text x="887" y="394" text-anchor="middle" font-size="18" class="muted">Review</text>
+    <path d="M1030 354V324Q1030 310 1016 310H771Q757 310 757 324V348" class="return" marker-end="url(#return-arrow)"/>
+    <text x="894" y="297" text-anchor="middle" class="route-label">Reject: Rework</text>
+    <text x="894" y="338" text-anchor="middle" font-size="17" class="muted">Same coder</text>
+    <path d="M1030 464V538" class="optional" marker-end="url(#optional-arrow)"/>
+    <text x="1046" y="511" class="route-label">Approve</text>
+    <path d="M757 464V582Q757 596 771 596H900" class="forward" marker-end="url(#forward-arrow)"/>
+    <text x="829" y="582" text-anchor="middle" class="route-label">Skip Review</text>
 
-  <rect x="776" y="235" width="220" height="112" rx="14" class="optional-card"/>
-  <text x="796" y="266" class="state muted">Optional</text>
-  <text x="796" y="314" font-size="25" font-weight="600" letter-spacing="-.5">Commit Review</text>
+    <rect x="664" y="354" width="186" height="110" rx="13" class="required-card"/>
+    <text x="684" y="384" class="state" style="fill:#8fdfa9">Required</text>
+    <text x="684" y="428" class="card-title">Implement</text>
+    <rect x="924" y="354" width="212" height="110" rx="13" class="optional-card"/>
+    <text x="944" y="384" class="state muted">Optional</text>
+    <text x="944" y="428" font-size="25" font-weight="600" letter-spacing="-.5">Commit Review</text>
 
-  <!-- The required stages anchor the spine. Only finalization creates a commit. -->
-  <rect x="552" y="432" width="190" height="132" rx="14" class="required-card"/>
-  <text x="572" y="461" class="state" style="fill:#8fdfa9">Required</text>
-  <text x="572" y="500" class="card-title">Implement</text>
-  <text x="572" y="538" font-size="18" class="muted">Build and validate</text>
+    <!-- Finalize is inside Commit-Make, not a third peer lifecycle group. -->
+    <rect x="906" y="544" width="230" height="104" rx="13" class="required-card"/>
+    <text x="926" y="568" class="state" style="fill:#8fdfa9">Required</text>
+    <text x="926" y="600" class="card-title">Finalize</text>
+    <rect x="926" y="614" width="116" height="23" rx="5" fill="#00d25a"/>
+    <path d="M934 626h5m7 0h5" stroke="#12331f" stroke-width="1.6" stroke-linecap="round"/>
+    <circle cx="942.5" cy="626" r="3" fill="none" stroke="#12331f" stroke-width="1.6"/>
+    <text x="958" y="632" font-size="17" font-weight="600" style="fill:#12331f">1 Commit</text>
+  </g>
 
-  <rect x="996" y="432" width="164" height="132" rx="14" class="required-card"/>
-  <text x="1016" y="461" class="state" style="fill:#8fdfa9">Required</text>
-  <text x="1016" y="500" font-size="27" font-weight="600" letter-spacing="-.5">Finalize</text>
-  <rect x="1013" y="516" width="130" height="30" rx="6" fill="#00d25a"/>
-  <path d="M1021 531h6m8 0h6" stroke="#12331f" stroke-width="1.8" stroke-linecap="round"/>
-  <circle cx="1031" cy="531" r="3.5" fill="none" stroke="#12331f" stroke-width="1.8"/>
-  <text x="1048" y="538" font-size="19" font-weight="600" style="fill:#12331f">1 Commit</text>
+  <!-- Planning approval and either planning bypass converge at Commit-Make. -->
+  <path d="M512 409H658" class="optional" marker-end="url(#optional-arrow)"/>
+  <text x="586" y="394" text-anchor="middle" class="route-label">Approve</text>
+  <circle cx="592" cy="409" r="3" fill="#81b695"/>
+  <path d="M61 728V423Q61 409 75 409H98" class="optional" marker-end="url(#optional-arrow)"/>
+  <path d="M182 750H598Q612 750 612 736V409" class="forward"/>
+  <circle cx="612" cy="409" r="3.5" fill="#00d25a"/>
+  <text x="388" y="735" text-anchor="middle" class="route-label">Skip Plan</text>
 
-  <path d="M49 474h21v37l-5-3-5 3-5-3-6 3Z" fill="#1b2e24" stroke="#00d25a" stroke-width="1.6" stroke-linejoin="round"/>
-  <path d="M55 483h9m-9 6h9m-9 6h6" stroke="#8fdfa9" stroke-width="1.6" stroke-linecap="round"/>
-  <text x="48" y="544" font-size="19" font-weight="500" class="muted">Ready Ticket</text>
+  <rect x="24" y="728" width="158" height="44" rx="10" fill="#1b2e24" stroke="#00d25a" stroke-width="1.6"/>
+  <path d="M40 739h14v23l-3.5-2-3.5 2-3.5-2-3.5 2Z" fill="none" stroke="#8fdfa9" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M44 745h6m-6 5h6" stroke="#8fdfa9" stroke-width="1.4" stroke-linecap="round"/>
+  <text x="64" y="757" font-size="18" font-weight="500">Ready Ticket</text>
 
-  <path d="M48 589H1152" stroke="#303d36"/>
-  <rect x="48" y="606" width="19" height="15" rx="3" fill="#1b232b" stroke="#708b7d" stroke-width="1.3" stroke-dasharray="3 3"/>
-  <text x="79" y="620" font-size="18" class="muted">Dashed cards are optional</text>
-  <text x="1152" y="620" text-anchor="end" font-size="18" class="muted">Finalization creates the commit.</text>
+  <path d="M48 790H1192" stroke="#303d36"/>
+  <rect x="48" y="806" width="19" height="15" rx="3" fill="#1b232b" stroke="#708b7d" stroke-width="1.3" stroke-dasharray="3 3"/>
+  <text x="79" y="821" font-size="18" class="muted">Dashed outlines are optional</text>
+  <text x="1192" y="821" text-anchor="end" font-size="18" class="muted">Finalize creates the commit.</text>
 </svg>

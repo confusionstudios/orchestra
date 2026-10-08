@@ -40,25 +40,28 @@ so it remains free to talk, plan, and queue more. Orchestra is designed for a
 single developer and is deliberately not a team issue tracker, distributed
 worker system, or cloud build service.
 
-For a normal commit task, Orchestra manages two feedback loops:
+A normal commit task has two peer cycles: **Plan** and **Commit-Make**.
+Each can review, reject, and revise its candidate; Commit-Make also includes
+finalization.
 
 <p align="center">
-  <img src="docs/task-lifecycle.svg" alt="A commit task can optionally plan and review its plan, implement and optionally review the change, then finalize one commit. Rejections return to planning or implementation; bypasses skip optional steps." width="100%" />
+  <img src="docs/task-lifecycle.svg" alt="Two peer cycles: optional Plan contains drafting and optional plan review; required Commit-Make contains implementation, optional commit review, and finalization. Each review can approve or return its candidate for revision. Finalization creates one commit." width="100%" />
 </p>
 
-Dashed boxes mark optional steps. A plan rejection returns to the planner; a
-commit rejection returns to the same sticky coder. Approval moves forward, and
-the actual git commit is not created until finalization.
+Dashed outlines mark optional groups and steps. Plan review rejects back to
+the planner; commit review rejects back to the same sticky coder. An approved
+plan advances to Commit-Make. An approved change advances to finalization
+inside Commit-Make, where the actual git commit is created.
 
-- **Plan** and **plan review** are optional. Normal tasks skip planning by
-  default; enable it when implementation deserves a reviewed approach before
-  files change.
-- **Commit-make** (Implement) is required. The assigned coder builds or reworks
-  the staged candidate and records validation evidence and the proposed commit
-  message.
-- **Commit review** is optional. When enabled, a separate reviewer inspects the
-  staged diff. Rejections return to the same coder; approval returns to that
-  coder for finalization.
+- **Plan** is entirely optional, including **drafting** and **plan review**.
+  Normal tasks skip planning by default; enable it when implementation deserves
+  a reviewed approach before files change. A drafted plan can also skip review.
+- **Commit-Make** is required and includes **implementation**, optional
+  **commit review**, and **finalization**. The coder builds or reworks the staged
+  candidate and records validation evidence and the proposed commit message.
+  When review is enabled, a separate reviewer inspects the staged diff;
+  rejection returns to the same coder for rework. Approval or skipping review
+  proceeds to finalization by that coder, producing one commit.
 - Reviewer infrastructure failures are not content rejections. Orchestra
   retries them without spending a review round, then blocks with the candidate
   preserved if the reviewer remains unavailable.
