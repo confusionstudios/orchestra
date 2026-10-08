@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="680" viewBox="0 0 1140 680" role="img" aria-labelledby="title desc">
+<title id="title">Worktree Queues</title><desc id="desc">You discuss work with a conversational agent that remains available. It routes ready tickets into two independent worktree queues. Each worktree has one serial orchestrator and its own durable ticket history. Commit tasks produce commits. Dashed lines return status to the conversational agent.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1L9 5L1 9" fill="none" stroke="#00d25a" stroke-width="1.8" stroke-linejoin="round"/></marker><marker id="status" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1L9 5L1 9" fill="none" stroke="#8b949e" stroke-width="1.8" stroke-linejoin="round"/></marker></defs>
+<style>text{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;fill:#e6edf3}.wire{fill:none;stroke:#00d25a;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}.status{fill:none;stroke:#8b949e;stroke-width:1.5;stroke-dasharray:5 6;stroke-linejoin:round}.conversation{fill:none;stroke:#8b949e;stroke-width:1.5}.muted{fill:#a6b2bd}</style>
+<rect x=".5" y=".5" width="1139" height="679" rx="16" fill="#161b22" stroke="#30363d"/>
+<text x="50" y="48" font-size="28" text-anchor="start">Worktree Queues</text>
+<text x="1090" y="48" font-size="18" text-anchor="end" class="muted">One machine · commit tasks</text>
+<rect x="70" y="85" width="155" height="76" rx="10" fill="#1d252e" stroke="#30363d" stroke-width="2"/>
+<text x="147" y="132" font-size="26" text-anchor="middle">You</text>
+<rect x="400" y="78" width="350" height="102" rx="10" fill="#1d252e" stroke="#00d25a" stroke-width="2"/>
+<text x="575" y="116" font-size="21" text-anchor="middle">Your conversational agent</text>
+<text x="575" y="150" font-size="18" text-anchor="middle" class="muted">Queue · refine · observe</text>
+<path d="M242 123H382" class="conversation" marker-start="url(#status)" marker-end="url(#status)"/>
+<text x="311" y="105" font-size="18" text-anchor="middle" class="muted">Discuss</text>
+<text x="575" y="212" font-size="19" text-anchor="middle" style="fill:#00d25a">Available for your next request</text>
+<text x="275" y="267" font-size="18" text-anchor="start" class="muted">Queue work</text>
+<rect x="50" y="300" width="1000" height="145" rx="10" fill="#111820" stroke="#30363d" stroke-width="2"/>
+<text x="80" y="340" font-size="22" text-anchor="start">Worktree A</text>
+<text x="80" y="411" font-size="17" text-anchor="start" class="muted">Own history</text>
+<text x="300" y="329" font-size="21" text-anchor="start">Ready queue</text>
+<rect x="290" y="343" width="260" height="62" rx="10" fill="#15241c" stroke="#28543a" stroke-width="2"/>
+<rect x="306" y="354" width="43" height="39" rx="5" fill="#1e4930" stroke="#00d25a" stroke-width="1.5"/>
+<path d="M315 366h25M315 377h17" stroke="#83cba2" stroke-width="2"/>
+<rect x="368" y="354" width="43" height="39" rx="5" fill="#1e4930" stroke="#00d25a" stroke-width="1.5"/>
+<path d="M377 366h25M377 377h17" stroke="#83cba2" stroke-width="2"/>
+<rect x="430" y="354" width="43" height="39" rx="5" fill="#1e4930" stroke="#00d25a" stroke-width="1.5"/>
+<path d="M439 366h25M439 377h17" stroke="#83cba2" stroke-width="2"/>
+<text x="290" y="427" font-size="16" text-anchor="start" class="muted">Tickets · comments · history</text>
+<path d="M255 373H285" class="wire" marker-end="url(#arrow)"/>
+<path d="M550 373H610" class="wire" marker-end="url(#arrow)"/>
+<rect x="620" y="342" width="250" height="64" rx="10" fill="#1d252e" stroke="#00d25a" stroke-width="2"/>
+<text x="745" y="369" font-size="22" text-anchor="middle">Orchestrator</text>
+<text x="745" y="394" font-size="16" text-anchor="middle" class="muted">One task at a time</text>
+<path d="M870 373H925" class="wire" marker-end="url(#arrow)"/>
+<rect x="935" y="352" width="100" height="44" rx="10" fill="#15241c" stroke="#28543a" stroke-width="2"/>
+<text x="985" y="380" font-size="18" text-anchor="middle">Commit</text>
+<path d="M800 342V322H1095" class="status"/>
+<rect x="50" y="475" width="1000" height="145" rx="10" fill="#111820" stroke="#30363d" stroke-width="2"/>
+<text x="80" y="515" font-size="22" text-anchor="start">Worktree B</text>
+<text x="80" y="586" font-size="17" text-anchor="start" class="muted">Own history</text>
+<text x="300" y="504" font-size="21" text-anchor="start">Ready queue</text>
+<rect x="290" y="518" width="260" height="62" rx="10" fill="#15241c" stroke="#28543a" stroke-width="2"/>
+<rect x="306" y="529" width="43" height="39" rx="5" fill="#1e4930" stroke="#00d25a" stroke-width="1.5"/>
+<path d="M315 541h25M315 552h17" stroke="#83cba2" stroke-width="2"/>
+<rect x="368" y="529" width="43" height="39" rx="5" fill="#1e4930" stroke="#00d25a" stroke-width="1.5"/>
+<path d="M377 541h25M377 552h17" stroke="#83cba2" stroke-width="2"/>
+<rect x="430" y="529" width="43" height="39" rx="5" fill="#1e4930" stroke="#00d25a" stroke-width="1.5"/>
+<path d="M439 541h25M439 552h17" stroke="#83cba2" stroke-width="2"/>
+<text x="290" y="602" font-size="16" text-anchor="start" class="muted">Tickets · comments · history</text>
+<path d="M255 548H285" class="wire" marker-end="url(#arrow)"/>
+<path d="M550 548H610" class="wire" marker-end="url(#arrow)"/>
+<rect x="620" y="517" width="250" height="64" rx="10" fill="#1d252e" stroke="#00d25a" stroke-width="2"/>
+<text x="745" y="544" font-size="22" text-anchor="middle">Orchestrator</text>
+<text x="745" y="569" font-size="16" text-anchor="middle" class="muted">One task at a time</text>
+<path d="M870 548H925" class="wire" marker-end="url(#arrow)"/>
+<rect x="935" y="527" width="100" height="44" rx="10" fill="#15241c" stroke="#28543a" stroke-width="2"/>
+<text x="985" y="555" font-size="18" text-anchor="middle">Commit</text>
+<path d="M800 517V497H1095" class="status"/>
+<path d="M1095 497V126H765" class="status" marker-end="url(#status)"/>
+<text x="926" y="108" font-size="18" text-anchor="middle" class="muted">Observe status</text>
+<path d="M400 160H255V548" class="wire"/>
+<text x="570" y="654" font-size="19" text-anchor="middle" class="muted">Serial within a worktree · parallel across worktrees</text>
+</svg>

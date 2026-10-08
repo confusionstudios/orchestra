@@ -1,4 +1,6 @@
-# Orchestra
+<p align="center">
+  <img src="docs/orchestra-wordmark.svg" alt="Orchestra" width="680" />
+</p>
 
 **Durable task queues, one per worktree, so your conversational agent stays available.**
 
@@ -17,7 +19,7 @@ from your desk, phone, or iPad without turning Orchestra into a hosted or
 multi-user service.
 
 <p align="center">
-  <img src="docs/fleet-dashboard.png" alt="Fleet Dashboard showing repositories running Orchestra on one machine" width="100%" />
+  <img src="docs/worktree-queues.svg" alt="Your conversational agent stays available while independent worktree queues each run one task at a time and return status." width="100%" />
 </p>
 
 ## Status
@@ -40,25 +42,20 @@ worker system, or cloud build service.
 
 For a normal commit task, Orchestra manages two feedback loops:
 
-```text
-ticket
-  ↓
-[ plan  ⇄  plan review ]
-  ↓
-commit-make  ⇄  [ commit review ]
-  ↓
-commit-make (finalize)  →  one landed commit
-```
+<p align="center">
+  <img src="docs/task-lifecycle.svg" alt="A commit task can optionally plan and review its plan, implement and optionally review the change, then finalize one commit. Rejections return to planning or implementation; bypasses skip optional steps." width="100%" />
+</p>
 
-Brackets mark optional steps. A plan rejection returns to the planner; a commit
-rejection returns to the same sticky coder. Approval continues downward, and
+Dashed boxes mark optional steps. A plan rejection returns to the planner; a
+commit rejection returns to the same sticky coder. Approval moves forward, and
 the actual git commit is not created until finalization.
 
 - **Plan** and **plan review** are optional. Normal tasks skip planning by
   default; enable it when implementation deserves a reviewed approach before
   files change.
-- **Commit-make** is required. The assigned coder builds or reworks the staged
-  candidate and records validation evidence and the proposed commit message.
+- **Commit-make** (Implement) is required. The assigned coder builds or reworks
+  the staged candidate and records validation evidence and the proposed commit
+  message.
 - **Commit review** is optional. When enabled, a separate reviewer inspects the
   staged diff. Rejections return to the same coder; approval returns to that
   coder for finalization.
@@ -132,6 +129,10 @@ Recently Done, and Icebox counts, plus its Dashboard action and any known
 startup failure. An eligible stopped repo gets a play action that uses the same
 validation and startup path as `ko-fleet start <repo>`.
 
+<p align="center">
+  <img src="docs/fleet-dashboard.png" alt="Fleet Dashboard showing repositories running Orchestra on one machine" width="100%" />
+</p>
+
 Repo dashboards open in a new tab so the Fleet view stays put. A Fleet view
 reached through Tailscale links cards to their exact Tailscale mappings; a
 local Fleet view links cards to localhost.
@@ -159,11 +160,6 @@ preferred Tailscale-or-local URL and returns to Fleet in the same tab.
     <td><img src="docs/dashboard-task.png" alt="Task dashboard with acceptance criteria, review state, comments, and run history" width="100%" /></td>
   </tr>
 </table>
-
-Both dashboard types include an **Accent** picker with horizontal tint chits.
-The Fleet Dashboard and each repo persist their own tint by dashboard identity, so a new dashboard
-does not inherit another dashboard's color. Localhost and Tailscale are separate
-browser origins and therefore retain separate browser-local choices.
 
 ## Getting Started
 

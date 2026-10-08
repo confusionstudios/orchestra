@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="430" viewBox="0 0 1240 430" role="img" aria-labelledby="title desc">
+<title id="title">One Ticket, One Commit</title><desc id="desc">A ready commit task can use optional planning and optional plan review. Plan rejection returns to the planner. Implementation is required. Optional commit review returns rejections to the same coder. Approval or skipping review proceeds to finalization, which creates one commit. Bypass arrows show how optional steps can be skipped.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1L9 5L1 9" fill="none" stroke="#00d25a" stroke-width="1.8" stroke-linejoin="round"/></marker><marker id="status" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1L9 5L1 9" fill="none" stroke="#8b949e" stroke-width="1.8" stroke-linejoin="round"/></marker></defs>
+<style>text{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;fill:#e6edf3}.wire{fill:none;stroke:#00d25a;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}.status{fill:none;stroke:#8b949e;stroke-width:1.5;stroke-dasharray:5 6;stroke-linejoin:round}.conversation{fill:none;stroke:#8b949e;stroke-width:1.5}.muted{fill:#a6b2bd}</style>
+<rect x=".5" y=".5" width="1239" height="429" rx="16" fill="#161b22" stroke="#30363d"/>
+<text x="40" y="45" font-size="28" text-anchor="start">One Ticket, One Commit</text>
+<text x="1200" y="45" font-size="18" text-anchor="end" class="muted">Commit-task lifecycle</text>
+<path d="M290 210V110H117V210" class="wire" marker-end="url(#arrow)"/>
+<text x="204" y="94" font-size="19" text-anchor="middle" class="muted">Revise plan</text>
+<path d="M732 210V110H512V210" class="wire" marker-end="url(#arrow)"/>
+<text x="622" y="94" font-size="19" text-anchor="middle" class="muted">Rework</text>
+<path d="M16 246H55" class="wire" marker-end="url(#arrow)"/>
+<path d="M180 246H210" class="wire" marker-end="url(#arrow)"/>
+<path d="M370 246H435" class="wire" marker-end="url(#arrow)"/>
+<path d="M590 246H670" class="wire" marker-end="url(#arrow)"/>
+<path d="M795 246H865" class="wire" marker-end="url(#arrow)"/>
+<path d="M1020 246H1085" class="wire" marker-end="url(#arrow)"/>
+<path d="M117 282V320H402V246" class="wire"/>
+<text x="262" y="311" font-size="18" text-anchor="middle" class="muted">Skip plan review</text>
+<path d="M16 246V360H402V246" class="wire"/>
+<text x="202" y="385" font-size="19" text-anchor="middle" class="muted">Skip planning</text>
+<path d="M512 282V360H835V246" class="wire"/>
+<text x="683" y="385" font-size="19" text-anchor="middle" class="muted">Skip commit review</text>
+<rect x="55" y="210" width="125" height="72" rx="10" fill="#1d252e" stroke="#809389" stroke-width="2" stroke-dasharray="6 5"/>
+<text x="117.5" y="253" font-size="23" text-anchor="middle">Plan</text>
+<rect x="210" y="210" width="160" height="72" rx="10" fill="#1d252e" stroke="#809389" stroke-width="2" stroke-dasharray="6 5"/>
+<text x="290.0" y="239" font-size="22" text-anchor="middle">Plan</text>
+<text x="290.0" y="265" font-size="22" text-anchor="middle">review</text>
+<rect x="435" y="210" width="155" height="72" rx="10" fill="#1d252e" stroke="#00d25a" stroke-width="2"/>
+<text x="512.5" y="253" font-size="23" text-anchor="middle">Implement</text>
+<rect x="670" y="210" width="125" height="72" rx="10" fill="#1d252e" stroke="#809389" stroke-width="2" stroke-dasharray="6 5"/>
+<text x="732.5" y="239" font-size="22" text-anchor="middle">Commit</text>
+<text x="732.5" y="265" font-size="22" text-anchor="middle">review</text>
+<rect x="865" y="210" width="155" height="72" rx="10" fill="#1d252e" stroke="#00d25a" stroke-width="2"/>
+<text x="942.5" y="253" font-size="23" text-anchor="middle">Finalize</text>
+<rect x="1085" y="210" width="120" height="72" rx="10" fill="#15241c" stroke="#00d25a" stroke-width="2"/>
+<text x="1145.0" y="253" font-size="23" text-anchor="middle">1 commit</text>
+<text x="620" y="416" font-size="18" text-anchor="middle" class="muted">Dashed boxes are optional · finalization creates the commit</text>
+</svg>

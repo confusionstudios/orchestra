@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="136" viewBox="0 0 680 136" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestra</title>
+  <desc id="desc">A monospace Orchestra wordmark beside three independent queues, each with its own execution head.</desc>
+  <rect x=".5" y=".5" width="679" height="135" rx="14" fill="#161b22" stroke="#30363d"/>
+  <g transform="translate(134 32) scale(1.5)">
+    <g stroke="#00d25a" stroke-width="4" stroke-linecap="round" opacity=".65">
+      <path d="M11 14h18"/><path d="M11 24h8"/><path d="M11 34h14"/>
+    </g>
+    <g fill="#00d25a">
+      <rect x="35" y="10" width="8" height="8" rx="1"/>
+      <rect x="25" y="20" width="8" height="8" rx="1"/>
+      <rect x="31" y="30" width="8" height="8" rx="1"/>
+    </g>
+  </g>
+  <text x="228" y="91" fill="#e6edf3" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="60" font-weight="500" letter-spacing="-1">Orchestra</text>
+</svg>
