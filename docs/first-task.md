@@ -123,11 +123,11 @@ A good task says what to change, what to leave alone, and how to check it:
 ```
 
 This prints the new task as JSON, with `"id": 1` and `"status": "none"`. A task
-in `none` is a draft. New tasks skip commit review by default, so turn review
-on and mark the task ready to run:
+in `none` is a draft. New commit tasks skip planning and enable commit review
+by default. Mark the task ready to run:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-task" set 1 --remove-skip commit-review --status ready
+"$ORCHESTRA_DIR/bin/ko-task" set 1 --status ready
 "$ORCHESTRA_DIR/bin/ko-get-update"
 ```
 

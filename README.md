@@ -61,8 +61,10 @@ change advances to finalization, where the actual git commit is created.
   **commit review**, and **finalization**. The coder builds or reworks the staged
   candidate and records validation evidence and the proposed commit message.
   When review is enabled, a separate reviewer inspects the staged diff;
-  rejection returns to the same coder for rework. Approval or skipping review
-  proceeds to finalization by that coder, producing one commit.
+  rejection returns to the same coder for rework. Approval returns to that coder
+  for finalization. When review is skipped, the orchestrator normally commits
+  the staged candidate directly using the recorded message; a deferred-build
+  policy can require another coder validation pass first.
 - Reviewer infrastructure failures are not content rejections. Orchestra
   retries them without spending a review round, then blocks with the candidate
   preserved if the reviewer remains unavailable.
