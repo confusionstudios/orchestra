@@ -1,11 +1,16 @@
-# Orchestra
+<p align="center">
+  <img src="docs/orchestra-wordmark.svg" alt="Orchestra" width="680" />
+</p>
 
-**One developer. One machine. A durable queue of coherent coding tickets.**
+**Durable task queues, one per worktree, so your conversational agent stays available.**
 
-Orchestra coordinates the AI coding CLIs already installed on your machine. You
-describe a piece of work once; Orchestra queues it, assigns agents to plan,
-build, and review it, records the complete decision trail, and lands the
-approved commit in your repo.
+Orchestra gives each worktree on your machine its own durable queue of coding
+tickets. You describe work to your main conversational agent; it queues the
+ticket and observes progress, then stays available for the next conversation
+instead of being tied up implementing. Behind each queue, one worker executes
+tickets serially: it assigns the AI coding CLIs already installed on your
+machine to plan, build, and review each one, records the complete decision
+trail, and lands the approved commit in your repo.
 
 The machine remains the execution boundary. Git state, task history, agent
 processes, credentials, and builds stay local. Tailscale makes the dashboards
@@ -14,47 +19,60 @@ from your desk, phone, or iPad without turning Orchestra into a hosted or
 multi-user service.
 
 <p align="center">
-  <img src="docs/fleet-dashboard.png" alt="Fleet Dashboard showing repositories running Orchestra on one machine" width="100%" />
+  <img src="docs/worktree-queues.svg" alt="Your conversational agent stays available while independent worktree queues each run one task at a time and return status." width="100%" />
 </p>
+
+## Status
+
+Orchestra is maintained personal tooling, used in real development workflows.
+It is still evolving: agent CLI integrations, configuration formats, and
+defaults change as the underlying tools do, so an update can mean adjusting
+local settings. To try it without touching a real project, start with
+[Your First Orchestra Task](docs/first-task.md).
 
 ## The Point
 
-Orchestra is designed for a single developer who wants to queue several
-well-specified tickets and let local coding agents carry each one through a
-coherent lifecycle. It is deliberately not a team issue tracker, distributed
+The queues are the point. Each worktree has a ready funnel: you and your
+conversational agent drop well-specified tickets into it, and a single worker
+carries them, one at a time, through a coherent lifecycle. The conversational
+agent queues, refines, and observes; it does not do the queued implementation,
+so it remains free to talk, plan, and queue more. Orchestra is designed for a
+single developer and is deliberately not a team issue tracker, distributed
 worker system, or cloud build service.
 
-For a normal commit task, Orchestra manages two feedback loops:
+A normal task has two peer cycles: **Plan** and **Commit**. Each can review,
+reject, and revise its candidate, then finalize its result. The same work cycle
+also supports non-commit tasks.
 
-```text
-ticket
-  ↓
-[ plan  ⇄  plan review ]
-  ↓
-commit-make  ⇄  [ commit review ]
-  ↓
-commit-make (finalize)  →  one landed commit
-```
+<p align="center">
+  <img src="docs/task-lifecycle.svg" alt="Two horizontal cycles, Plan and Commit, each contain Make, optional Review, and Finalize. Planning is optional. Rejections return to the maker; approval or skipping review advances to a ready plan or a completed commit or other result." width="100%" />
+</p>
 
-Brackets mark optional steps. A plan rejection returns to the planner; a commit
-rejection returns to the same sticky coder. Approval continues downward, and
-the actual git commit is not created until finalization.
+Dashed outlines mark optional groups and steps. Plan review rejects back to
+the planner; commit review rejects back to the same sticky coder. An approved
+plan is ready for the work cycle; the diagram’s Plan finalization represents
+that outcome, not another agent execution. For a commit task, an approved
+change advances to finalization, where the actual git commit is created.
 
-- **Plan** and **plan review** are optional. Normal tasks skip planning by
-  default; enable it when implementation deserves a reviewed approach before
-  files change.
-- **Commit-make** is required. The assigned coder builds or reworks the staged
+- **Plan** is entirely optional, including **drafting** and **plan review**.
+  Normal tasks skip planning by default; enable it when implementation deserves
+  a reviewed approach before files change. A drafted plan can also skip review.
+- **Commit** is the work cycle and includes **implementation**, optional
+  **commit review**, and **finalization**. The coder builds or reworks the staged
   candidate and records validation evidence and the proposed commit message.
-- **Commit review** is optional. When enabled, a separate reviewer inspects the
-  staged diff. Rejections return to the same coder; approval returns to that
-  coder for finalization.
+  When review is enabled, a separate reviewer inspects the staged diff;
+  rejection returns to the same coder for rework. Approval returns to that coder
+  for finalization. When review is skipped, the orchestrator normally commits
+  the staged candidate directly using the recorded message; a deferred-build
+  policy can require another coder validation pass first.
 - Reviewer infrastructure failures are not content rejections. Orchestra
   retries them without spending a review round, then blocks with the candidate
   preserved if the reviewer remains unavailable.
 
-Each repo instance processes one task at a time, so agents cannot trample one
-another in the same worktree. Fleet can run several repo instances side by side
-on the same machine.
+Each worktree's queue runs one task at a time, so agents cannot trample one
+another in the same worktree; there is no concurrent execution within a
+worktree. For parallel work, use several worktrees: Fleet runs their queues
+side by side on the same machine.
 
 ## How You Use It
 
@@ -117,6 +135,10 @@ Recently Done, and Icebox counts, plus its Dashboard action and any known
 startup failure. An eligible stopped repo gets a play action that uses the same
 validation and startup path as `ko-fleet start <repo>`.
 
+<p align="center">
+  <img src="docs/fleet-dashboard.png" alt="Fleet Dashboard showing repositories running Orchestra on one machine" width="100%" />
+</p>
+
 Repo dashboards open in a new tab so the Fleet view stays put. A Fleet view
 reached through Tailscale links cards to their exact Tailscale mappings; a
 local Fleet view links cards to localhost.
@@ -145,12 +167,12 @@ preferred Tailscale-or-local URL and returns to Fleet in the same tab.
   </tr>
 </table>
 
-Both dashboard types include an **Accent** picker with horizontal tint chits.
-The Fleet Dashboard and each repo persist their own tint by dashboard identity, so a new dashboard
-does not inherit another dashboard's color. Localhost and Tailscale are separate
-browser origins and therefore retain separate browser-local choices.
-
 ## Getting Started
+
+The quickest way to see Orchestra work is
+[Your First Orchestra Task](docs/first-task.md): a throwaway repo, one agent
+CLI, and one small task from queue to landed commit. The steps below cover a
+regular installation.
 
 ### Prerequisites
 
@@ -159,6 +181,10 @@ browser origins and therefore retain separate browser-local choices.
 - macOS or Linux (Windows is untested)
 - at least one supported coding-agent CLI installed and authenticated
 - Tailscale when remote dashboard access is desired
+
+The built-in role defaults use both Claude Code and Codex. With only one of
+them installed, point every role at that CLI; see
+[Agent Configuration](#agent-configuration) or the first-task guide.
 
 ### Install Orchestra
 
@@ -388,9 +414,14 @@ Kanban state belongs to the launched work repo:
 - `.kanban-orchestra/` — runtime metadata, transcripts, and logs
 - `kanban-orchestra.lock` — repo-scoped orchestrator ownership
 
-These files are local runtime state and ignored by git. `ORCHESTRA_DIR` supplies
-the shared tools; it may point at the same checkout when Orchestra works on
-itself.
+These files are local runtime state and belong in the work repo's
+`.gitignore`; coders stage with `git add .`, so unignored runtime files can end
+up in a commit. `"$ORCHESTRA_DIR/bin/ko-kanban"` appends most of them when it
+first creates the database; you can also add them yourself as in the
+[first-task guide](docs/first-task.md#2-create-a-throwaway-repo).
+
+`ORCHESTRA_DIR` supplies the shared tools; it may point at the same checkout
+when Orchestra works on itself.
 
 The orchestrator expects exclusive access to the worktree while executing. It
 can launch while dirty, keeps its dashboard and heartbeat available in
@@ -450,6 +481,12 @@ export ORCHESTRA_DIR="/path/to/orchestra"
 When Orchestra is working on its own checkout, restart the running repo or
 Fleet instance after code changes. Long-lived Python processes continue using
 the code they loaded at startup.
+
+## Feedback
+
+The most useful contribution is using Orchestra on real work and saying where
+it got confusing, got stuck, or could work better. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for what to include in a report.
 
 ## License
 
