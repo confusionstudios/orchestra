@@ -40,23 +40,24 @@ so it remains free to talk, plan, and queue more. Orchestra is designed for a
 single developer and is deliberately not a team issue tracker, distributed
 worker system, or cloud build service.
 
-A normal commit task has two peer cycles: **Plan** and **Commit-Make**.
-Each can review, reject, and revise its candidate; Commit-Make also includes
-finalization.
+A normal task has two peer cycles: **Plan** and **Commit**. Each can review,
+reject, and revise its candidate, then finalize its result. The same work cycle
+also supports non-commit tasks.
 
 <p align="center">
-  <img src="docs/task-lifecycle.svg" alt="Two peer cycles: optional Plan contains drafting and optional plan review; required Commit-Make contains implementation, optional commit review, and finalization. Each review can approve or return its candidate for revision. Finalization creates one commit." width="100%" />
+  <img src="docs/task-lifecycle.svg" alt="Two horizontal cycles, Plan and Commit, each contain Make, optional Review, and Finalize. Planning is optional. Rejections return to the maker; approval or skipping review advances to a ready plan or a completed commit or other result." width="100%" />
 </p>
 
 Dashed outlines mark optional groups and steps. Plan review rejects back to
 the planner; commit review rejects back to the same sticky coder. An approved
-plan advances to Commit-Make. An approved change advances to finalization
-inside Commit-Make, where the actual git commit is created.
+plan is ready for the work cycle; the diagram’s Plan finalization represents
+that outcome, not another agent execution. For a commit task, an approved
+change advances to finalization, where the actual git commit is created.
 
 - **Plan** is entirely optional, including **drafting** and **plan review**.
   Normal tasks skip planning by default; enable it when implementation deserves
   a reviewed approach before files change. A drafted plan can also skip review.
-- **Commit-Make** is required and includes **implementation**, optional
+- **Commit** is the work cycle and includes **implementation**, optional
   **commit review**, and **finalization**. The coder builds or reworks the staged
   candidate and records validation evidence and the proposed commit message.
   When review is enabled, a separate reviewer inspects the staged diff;
