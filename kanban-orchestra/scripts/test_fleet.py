@@ -1258,6 +1258,40 @@ class TestFleetOperatorFlows(unittest.TestCase):
         self.assertIn("left untouched", out.getvalue())
         self.assertNotIn(repo.session, run.call_args.args[0] if run.call_args else [])
 
+    def test_selected_worktree_start_does_not_include_the_primary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+            primary = base / "primary"
+            worktree = base / "linked"
+            _init_repo(primary)
+            write_runtime(primary)
+            _git(primary, "worktree", "add", "-q", "-b", "linked", str(worktree))
+            write_runtime(worktree)
+            config = base / "fleet.repos"
+            config.write_text(f"{primary}\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"ORCHESTRA_FLEET_REPOS": str(config)}):
+                selected = fleet.select_repos([str(worktree)])
+
+            self.assertEqual([repo.root for repo in selected], [worktree])
+            primary_session = fleet.FleetRepo("primary", primary, primary).session
+            self.assertNotEqual(selected[0].session, primary_session)
+
+            with patch.object(fleet, "require_tool"), \
+                 patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
+                 patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
+                 patch.object(fleet.subprocess, "run") as run, \
+                 patch.object(fleet, "wait_dashboard_ready", return_value=True), \
+                 patch.object(fleet.time, "sleep"), \
+                 patch.object(fleet, "print_status"):
+                fleet.start(selected)
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-c") + 1], str(worktree))
+            self.assertEqual(command[command.index("-s") + 1], selected[0].session)
+            self.assertNotIn(primary_session, command)
+            self.assertNotIn(str(primary), command)
+
     def test_stop_signals_only_the_selected_owned_session(self):
         primary = fleet.FleetRepo("proj", Path("/tmp/proj-a"), Path("/tmp/proj-a"))
         worktree = fleet.FleetRepo(

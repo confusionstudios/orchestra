@@ -445,6 +445,86 @@ _PROVIDER_EXECUTABLES = {
 }
 
 
+def _linked_gitdir(root: Path) -> Path | None:
+    """Return the gitdir path from a linked-worktree .git file."""
+    git_path = root / ".git"
+    try:
+        if not git_path.is_file():
+            return None
+        text = git_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    raw = text.split(":", 1)[1].strip()
+    if not raw:
+        return None
+    gitdir = Path(raw)
+    if not gitdir.is_absolute():
+        gitdir = root / gitdir
+    return gitdir.resolve()
+
+
+def _main_from_gitdir(gitdir: Path) -> Path | None:
+    """Return the main checkout implied by a worktrees gitdir, if this is one."""
+    parts = gitdir.parts
+    if "worktrees" not in parts:
+        return None
+    index = len(parts) - 1 - parts[::-1].index("worktrees")
+    if index < 1:
+        return None
+    return Path(*parts[:index]).parent
+
+
+def linked_worktree_parent(root: Path) -> Path | None:
+    """Return the main checkout when root is a linked worktree.
+
+    Ordinary repositories and submodule checkouts return None. A linked
+    worktree's .git file points at the common git dir's worktrees entry, and
+    that entry's commondir file must resolve to the same common git dir.
+    The lookup only reads Git metadata; it does not copy preferences or
+    runtime files.
+    """
+    root = Path(root).resolve()
+    git_path = root / ".git"
+    try:
+        if not git_path.exists() or not git_path.is_file():
+            return None
+    except OSError:
+        return None
+    gitdir = _linked_gitdir(root)
+    if gitdir is None:
+        raise ValueError(f"{root}: linked worktree parent could not be resolved")
+    derived = _main_from_gitdir(gitdir)
+    if derived is None:
+        return None
+    try:
+        relative = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"{root}: linked worktree parent could not be resolved") from exc
+    if not relative or gitdir.parent.name != "worktrees":
+        raise ValueError(f"{root}: linked worktree parent could not be resolved")
+    common = (gitdir / relative).resolve()
+    if common != gitdir.parent.parent.resolve():
+        raise ValueError(f"{root}: linked worktree parent could not be resolved")
+    main = derived.resolve()
+    if main != common.parent or main == root or not (main / ".git").exists():
+        raise ValueError(f"{root}: linked worktree parent could not be resolved")
+    return main
+
+
+def _fingerprint_layers(*layers: bytes | None) -> str:
+    if all(layer is None for layer in layers):
+        return "missing"
+    digest = hashlib.sha256()
+    for contents in layers:
+        if contents is None:
+            digest.update(b"missing\0")
+        else:
+            digest.update(str(len(contents)).encode() + b":" + contents + b"\0")
+    return digest.hexdigest()
+
+
 def _provider_for(command: list[str]) -> str:
     for provider, executable in _PROVIDER_EXECUTABLES.items():
         if command and command[0] == executable:
@@ -519,7 +599,7 @@ def _patch_options(command: list[str], options: dict[str, Any], *, value_options
 class EffectiveRegistry:
     """Validated, immutable-for-one-process view of one work repository."""
 
-    def __init__(self, repo_root: Path, *, shared_config_path: Path | None = None):
+    def __init__(self, repo_root: Path, *, shared_config_path: Path | None = None, inherit: bool = True):
         self.path = Path(repo_root).resolve() / LOCAL_CONFIG_NAME
         self.agents = dict(AGENT_CMD)
         self.reviews = dict(AGENT_REVIEW_CMD)
@@ -527,6 +607,7 @@ class EffectiveRegistry:
         self.aliases = dict(AGENT_ALIASES)
         self.defaults: dict[str, dict[str, Any]] = {}
         self.default_sources: dict[str, str] = {}
+        self.default_field_sources: dict[str, dict[str, str]] = {}
         self.option_values: dict[str, set[str]] = {}
         self.sources: dict[str, str] = {name: "product" for name in self.agents}
         self.field_sources: dict[str, dict[str, str]] = {
@@ -535,19 +616,35 @@ class EffectiveRegistry:
         }
         self.alias_sources: dict[str, str] = {name: "product" for name in self.aliases}
         self.shared_config_path = Path(shared_config_path) if shared_config_path is not None else SHARED_CONFIG_PATH
+        parent = linked_worktree_parent(Path(repo_root)) if inherit else None
+        self.inherited_config_path = None if parent is None else parent / LOCAL_CONFIG_NAME
         shared = self._read_config(self.shared_config_path, shared=True)
-        local = self._read_config(self.path)
-        if shared is None and local is None:
-            self.fingerprint = "missing"
-        elif shared is None:
-            self.fingerprint = hashlib.sha256(local).hexdigest()
-        else:
-            digest = hashlib.sha256()
-            for contents in (shared, local):
-                digest.update(b"missing" if contents is None else str(len(contents)).encode() + b":" + contents)
-            self.fingerprint = digest.hexdigest()
+        inherited = None if self.inherited_config_path is None else self._read_config(self.inherited_config_path)
+        local = self._read_config(self.path, merge_defaults=parent is not None)
+        self._validate_effective_aliases()
+        self.fingerprint = _fingerprint_layers(shared, inherited, local)
 
-    def _read_config(self, path: Path, *, shared: bool = False) -> bytes | None:
+    def _model_choice_source(self, name: str) -> str:
+        """Source of the model id in effect, not the latest layer that touched another field."""
+        if name in self.aliases:
+            target = self._target(name)
+            if target not in self.field_sources:
+                return self.alias_sources[name]
+            name = target
+        return self.field_sources.get(name, {}).get("model", self.sources.get(name, "product"))
+
+    def _layer_label(self, source: str) -> str:
+        if source == "environment":
+            return "environment"
+        if source == "task":
+            return "task"
+        if source == str(self.shared_config_path):
+            return "shared"
+        if self.inherited_config_path is not None and source == str(self.inherited_config_path):
+            return "inherited"
+        return "local"
+
+    def _read_config(self, path: Path, *, shared: bool = False, merge_defaults: bool = False) -> bytes | None:
         try:
             contents = path.read_bytes()
         except FileNotFoundError:
@@ -558,12 +655,12 @@ class EffectiveRegistry:
             raw = yaml.safe_load(contents)
             if shared and (not isinstance(raw, dict) or set(raw) - {"version", "aliases", "defaults"}):
                 raise ValueError("shared overrides accept only version, aliases, and defaults")
-            self._load(raw, source=path)
+            self._load(raw, source=path, merge_defaults=merge_defaults)
         except (ValueError, yaml.YAMLError) as exc:
             raise ValueError(f"{path}: {exc}") from exc
         return contents
 
-    def _load(self, raw: Any, *, source: Path) -> None:
+    def _load(self, raw: Any, *, source: Path, merge_defaults: bool = False) -> None:
         if (not isinstance(raw, dict) or set(raw) - {"version", "agents", "aliases", "defaults"}
                 or type(raw.get("version")) is not int or raw["version"] != 1):
             raise ValueError("expected version: 1 and only agents, aliases, defaults mappings")
@@ -601,12 +698,19 @@ class EffectiveRegistry:
                 command = _patch_reasoning(command, provider, patch["reasoning"])
                 if review:
                     review = _patch_reasoning(review, provider, patch["reasoning"])
+            # A provider change rebuilds the command, so previous custom options are gone.
+            # The same provider keeps those options, including ones this layer does not mention.
+            valued = set() if provider != baseline_provider else set(self.option_values.get(name, ()))
             if "options" in patch:
-                command = _patch_options(command, patch["options"])
+                command = _patch_options(command, patch["options"], value_options=valued)
                 if review:
-                    review = _patch_options(review, patch["options"])
-            self.option_values[name] = {key for key, value in patch.get("options", {}).items()
-                                        if isinstance(value, str)}
+                    review = _patch_options(review, patch["options"], value_options=valued)
+                for key, value in patch["options"].items():
+                    if isinstance(value, str):
+                        valued.add(key)
+                    else:
+                        valued.discard(key)
+            self.option_values[name] = valued
             self.agents[name] = command
             if review:
                 self.reviews[name] = review
@@ -615,6 +719,10 @@ class EffectiveRegistry:
             self.labels[name] = patch.get("label", self.labels.get(name, AGENT_DISPLAY_LABELS.get(name)) if provider == baseline_provider else PROVIDER_DISPLAY_LABELS[provider].replace("{model}", patch["model"]))
             self.sources[name] = str(source)
             self.field_sources[name] = dict(self.field_sources.get(name, {}))
+            if provider != baseline_provider:
+                # The rebuilt command drops reasoning, options, and label from earlier layers.
+                for stale in ("reasoning", "options", "label"):
+                    self.field_sources[name].pop(stale, None)
             for field in patch:
                 self.field_sources[name][field] = str(source)
         self.aliases.update(raw.get("aliases", {}))
@@ -631,21 +739,44 @@ class EffectiveRegistry:
                 raise ValueError(f"aliases.{name}: collides with an agent")
             if not isinstance(target, str) or not target:
                 raise ValueError(f"aliases.{name}: expected agent or provider:model")
-        _validate_alias_graph(self.aliases, agent_keys=set(self.agents), provider_names=set(PROVIDER_CMD))
         for role, patch in raw.get("defaults", {}).items():
             if role not in ROLE_FALLBACKS:
                 raise ValueError(f"defaults.{role}: unknown role")
             self._validate_patch(patch, f"defaults.{role}")
+            merging = merge_defaults and role in self.defaults
+            merged = dict(self.defaults[role]) if merging else {}
+            fields = dict(self.default_field_sources.get(role, {})) if merging else {}
+            for key, value in patch.items():
+                merged[key] = value
+                fields[key] = str(source)
             if "agent" in patch and self.command(patch["agent"]) is None:
                 raise ValueError(f"defaults.{role}.agent: unknown agent {patch['agent']!r}")
-            spec = patch.get("agent", ROLE_FALLBACKS[role])
+            spec = merged.get("agent", ROLE_FALLBACKS[role])
             try:
-                self.command(spec, patch=patch)
-                self.command(spec, review=True, patch=patch)
+                self.command(spec, patch=merged)
+                self.command(spec, review=True, patch=merged)
             except ValueError as exc:
                 raise ValueError(f"defaults.{role}: {exc}") from exc
-            self.defaults[role] = patch
-            self.default_sources[role] = str(source)
+            self.defaults[role] = merged
+            self.default_field_sources[role] = fields
+            if not merging or "agent" in patch:
+                self.default_sources[role] = str(source)
+
+    def _validate_effective_aliases(self) -> None:
+        """Validate the combined alias graph after every preference layer is loaded."""
+        try:
+            _validate_alias_graph(self.aliases, agent_keys=set(self.agents), provider_names=set(PROVIDER_CMD))
+        except ValueError as exc:
+            message = str(exc)
+            parts = message.split()
+            if message.startswith("alias cycle:") and len(parts) >= 3:
+                name = parts[2]
+            elif message.startswith("alias ") and len(parts) >= 2:
+                name = parts[1]
+            else:
+                name = ""
+            source = self.alias_sources.get(name, str(self.path))
+            raise ValueError(f"{source}: {message}") from exc
 
     @staticmethod
     def _validate_patch(patch: Any, field: str, *, agent: bool = False) -> None:
@@ -713,7 +844,11 @@ class EffectiveRegistry:
             source = self.default_sources.get(name, "product") if patch else "product"
         if self.command(spec) is None:
             raise ValueError(f"{source}: {name} agent {spec!r} is invalid; choose an agent or provider:model")
-        return {"agent": spec, "patch": {key: value for key, value in patch.items() if key != "agent"}, "source": source}
+        result = {"agent": spec, "patch": {key: value for key, value in patch.items() if key != "agent"}, "source": source}
+        field_sources = self.default_field_sources.get(name, {})
+        if source not in {"task", "environment"} and len(set(field_sources.values())) > 1:
+            result["field_sources"] = dict(field_sources)
+        return result
 
     def model_choices(self, provider: str) -> dict[str, Any]:
         """Merge the tracked command IDs with an advisory discovery snapshot."""
@@ -736,18 +871,18 @@ class EffectiveRegistry:
             if _provider_for(command) != provider:
                 continue
             model = _command_option(command, "-m", "--model")
-            source = self.alias_sources[name] if name in self.aliases else self.sources[name]
+            source = self._model_choice_source(name)
             if model and source != "product":
                 choices[model] = {"id": model, "label": self.label(name), "capabilities": {},
-                                  "sources": ["shared" if source == str(self.shared_config_path) else "local"]}
+                                  "sources": [self._layer_label(source)]}
         for role in ROLE_FALLBACKS:
             selection = self.role(role)
             command = self.command(selection["agent"], patch=selection["patch"])
             model = _command_option(command, "-m", "--model")
             if model and _provider_for(command) == provider and selection["source"] != "product":
-                source = ("environment" if selection["source"] == "environment" else
-                          "shared" if selection["source"] == str(self.shared_config_path) else "local")
-                choices.setdefault(model, {"id": model, "label": model, "capabilities": {}, "sources": [source]})
+                model_source = selection.get("field_sources", {}).get("model", selection["source"])
+                choices.setdefault(model, {"id": model, "label": model, "capabilities": {},
+                                           "sources": [self._layer_label(model_source)]})
         for model in status["models"]:
             previous = choices.get(model["id"])
             choices[model["id"]] = {**model, "label": previous["label"] if previous and set(previous["sources"]) & {"local", "shared"} else model["label"],
@@ -787,7 +922,8 @@ def _configured_registry() -> EffectiveRegistry | None:
     # Configuration imports must not invoke Git (e.g. import-worktree has not
     # resolved its database yet). Explicit configure() establishes the repo later.
     root = Path(os.environ["KANBAN_DB"]).expanduser().resolve().parent if os.environ.get("KANBAN_DB") else Path.cwd()
-    return EffectiveRegistry(root)
+    # Import-time resolution must not call Git. configure() loads linked-worktree inheritance.
+    return EffectiveRegistry(root, inherit=False)
 
 
 def configure(repo_root: Path) -> EffectiveRegistry:

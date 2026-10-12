@@ -36,8 +36,10 @@ or checkout root. That installation provides the wrapper commands, including
 ## Agent Preferences
 
 Use `"$ORCHESTRA_DIR/bin/ko-task" agents` to inspect effective defaults and their
-sources. Selection follows explicit task agent -> environment -> repo-local
-role -> shared role -> product fallback. Shared aliases/defaults live in
+sources. Selection follows explicit task agent, then environment, then worktree-local
+role, then the primary checkout's role for a linked worktree, then shared
+role, then product fallback. A linked worktree reads the primary preferences
+in place. Shared aliases/defaults live in
 `$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`; repo overrides live in
 `.kanban-orchestra/agents.yaml`. Both are optional and ignored by Git.
 Restart workers and dashboards after edits; saved task commands remain fixed.

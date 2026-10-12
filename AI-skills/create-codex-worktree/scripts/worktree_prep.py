@@ -24,7 +24,11 @@ FORBIDDEN_TOP = {".git", ".kanban-orchestra"}
 FORBIDDEN_NAMES = {
     "kanban-orchestra.sql",
     "kanban-orchestra.lock",
+    "agents.local.yaml",
 }
+ROOT_AUTH = {"auth.json", "credentials.json", "credentials.yml", ".netrc"}
+RUNTIME_FILES = ("shared_scripts/agents.local.yaml",)
+LONG_LIVED_BRANCHES = ("develop", "main", "master")
 
 
 class PrepError(Exception):
@@ -122,8 +126,84 @@ def require_inputs(
         raise PrepError(
             "missing required value(s): "
             + ", ".join(missing)
-            + ". Ask the user; do not choose a default."
+            + ". Ask the user."
         )
+
+
+def _attached_branch(root: Path) -> str | None:
+    result = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _porcelain_path(line: str) -> Path:
+    raw = line[len("worktree "):]
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        raw = raw[1:-1]
+    return Path(raw)
+
+
+def _branch_holder(root: Path, branch: str) -> Path | None:
+    result = _git(root, "worktree", "list", "--porcelain")
+    current: Path | None = None
+    holder: Path | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = _porcelain_path(line)
+        elif line == f"branch refs/heads/{branch}":
+            holder = current
+    return holder.resolve() if holder is not None else None
+
+
+def _assert_branch_available(root: Path, branch: str, *allowed: Path) -> None:
+    holder = _branch_holder(root, branch)
+    if holder is None:
+        return
+    if holder in {path.resolve() for path in allowed}:
+        return
+    raise PrepError(f"target branch {branch} is checked out in {holder}")
+
+
+def resolve_creation(
+    root: Path | None,
+    mode: str | None,
+    branch: str | None,
+    parking: str | None = None,
+    base: str | None = None,
+) -> tuple[str, str, str | None, str | None]:
+    """Fill mode, base, and parking when the checkout identifies one value."""
+    current_root = _resolve_root(root)
+    if not branch or not branch.strip():
+        raise PrepError("missing required value(s): target branch. Ask the user; do not invent a branch.")
+    branch = branch.strip()
+    if mode not in {None, "existing", "new"}:
+        raise PrepError("missing required value(s): mode (`existing` or `new`). Ask the user.")
+    if mode is None:
+        mode = "existing" if _ref_exists(current_root, branch) else "new"
+    if mode == "existing":
+        if not parking:
+            current = _attached_branch(current_root)
+            if current and current != branch:
+                parking = current
+            else:
+                candidates = [
+                    name for name in LONG_LIVED_BRANCHES
+                    if name != branch and _ref_exists(current_root, name)
+                ]
+                if len(candidates) != 1:
+                    listed = ", ".join(candidates) if candidates else "none"
+                    raise PrepError(f"parking branch is ambiguous for {branch} ({listed}). Ask the user.")
+                parking = candidates[0]
+        return mode, branch, parking, None
+    if not base:
+        current = _attached_branch(current_root)
+        if not current:
+            raise PrepError("base branch is ambiguous because the checkout is detached. Ask the user.")
+        if current == branch:
+            raise PrepError(f"base branch is ambiguous for new branch {branch}. Ask the user.")
+        base = current
+    return mode, branch, None, base
 
 
 def prepare_existing(root: Path, branch: str, parking: str) -> Path:
@@ -135,6 +215,7 @@ def prepare_existing(root: Path, branch: str, parking: str) -> Path:
         raise PrepError(f"existing branch does not exist: {branch}")
     if not _ref_exists(current_root, parking):
         raise PrepError(f"parking branch does not exist: {parking}")
+    _assert_branch_available(current_root, branch, current_root)
     if _current_branch(current_root) == branch:
         _git(current_root, "switch", parking)
     return current_root
@@ -156,6 +237,7 @@ def prepare_new(root: Path, branch: str, base: str) -> Path:
 
 def attach_existing(root: Path, branch: str) -> str:
     worktree = _resolve_root(root)
+    _assert_branch_available(worktree, branch, worktree)
     _git(worktree, "switch", branch)
     attached = _git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if attached != branch:
@@ -184,10 +266,12 @@ def _manifest_patterns(manifest: Path) -> list[str]:
 
 def _is_forbidden(relative: Path) -> bool:
     parts = relative.parts
-    if not parts or parts[0] in FORBIDDEN_TOP:
+    if not parts or parts[0] in FORBIDDEN_TOP or ".git" in parts or ".kanban-orchestra" in parts:
         return True
     name = parts[-1]
-    return name.startswith("kanban-orchestra.db") or name in FORBIDDEN_NAMES
+    if name.startswith("kanban-orchestra.db") or name in FORBIDDEN_NAMES:
+        return True
+    return len(parts) == 1 and name in ROOT_AUTH
 
 
 def _ls_untracked_ignored(root: Path, *exclude_args: str) -> set[str]:
@@ -222,12 +306,19 @@ def _ignored_manifest_files(source: Path) -> list[Path]:
     selected = _ls_untracked_ignored(root, f"--exclude-from={manifest}")
     ignored = _ls_untracked_ignored(root, "--exclude-standard")
     files: list[Path] = []
+    rejected: list[str] = []
     for key in sorted(selected & ignored):
         relative = Path(key)
         if _is_forbidden(relative):
+            rejected.append(relative.as_posix())
             continue
         if _is_nonsymlink_regular_file(root / relative):
             files.append(relative)
+    if rejected:
+        raise PrepError(
+            "refusing Kanban, auth, or runtime state selected by .worktreeinclude: "
+            + ", ".join(rejected)
+        )
     return files
 
 
@@ -264,7 +355,7 @@ def verify_copy(source: Path, dest: Path) -> list[str]:
 def verify_kanban_absent(root: Path | None = None) -> Path:
     worktree = _resolve_root(root)
     present: list[str] = []
-    for name in KANBAN_FILES:
+    for name in (*KANBAN_FILES, *ROOT_AUTH, *RUNTIME_FILES):
         if (worktree / name).exists():
             present.append(name)
     for name in KANBAN_DIRS:
@@ -315,6 +406,48 @@ def bootstrap_kanban(root: Path | None = None) -> Path:
     return db_path
 
 
+def fleet_commands(worktree: Path, orchestra_dir: Path) -> list[list[str]]:
+    """Return the Fleet start and status commands for one worktree path."""
+    binary = str(Path(orchestra_dir) / "bin" / "ko-fleet")
+    root = str(worktree)
+    return [[binary, "start", root], [binary, "status", root]]
+
+
+def dashboard_url_from_status(text: str) -> str:
+    marker = "Dashboard: "
+    urls = [line.split(marker, 1)[1].strip() for line in text.splitlines() if marker in line]
+    if len(urls) != 1:
+        raise PrepError("fleet status did not report exactly one dashboard for the selected worktree")
+    url = urls[0]
+    if not url.startswith(("http://", "https://")):
+        raise PrepError(f"worktree dashboard is not running: {url}")
+    return url
+
+
+def start_instance(root: Path | None = None) -> str:
+    """Start and report only this worktree through Fleet's path selector."""
+    worktree = _resolve_root(root)
+    orchestra_dir = os.environ.get("ORCHESTRA_DIR", "").strip()
+    if not orchestra_dir:
+        raise PrepError("ORCHESTRA_DIR is not set")
+    ko_fleet = Path(orchestra_dir) / "bin" / "ko-fleet"
+    if not os.access(ko_fleet, os.X_OK):
+        raise PrepError(f"ko-fleet is not executable: {ko_fleet}")
+    status_out = ""
+    for command in fleet_commands(worktree, Path(orchestra_dir)):
+        result = subprocess.run(command, cwd=worktree, capture_output=True, text=True)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip() or "ko-fleet failed"
+            raise PrepError(detail)
+        if command[1] == "status":
+            status_out = result.stdout
+    url = dashboard_url_from_status(status_out)
+    print(f"dashboard: {url}")
+    if status_out:
+        sys.stdout.write(status_out if status_out.endswith("\n") else status_out + "\n")
+    return url
+
+
 def _add_root_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", type=Path, default=None)
 
@@ -327,7 +460,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     prepare = sub.add_parser("prepare", help="Park or switch the invoking checkout")
     _add_root_arg(prepare)
-    prepare.add_argument("--mode", choices=("existing", "new"), required=True)
+    prepare.add_argument("--mode", choices=("existing", "new"), default=None)
     prepare.add_argument("--branch", required=True)
     prepare.add_argument("--parking", default=None)
     prepare.add_argument("--base", default=None)
@@ -346,6 +479,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     bootstrap = sub.add_parser("bootstrap-kanban", help="Create a pristine Kanban database")
     _add_root_arg(bootstrap)
+
+    start = sub.add_parser("start-instance", help="Start and report only this worktree's Fleet instance")
+    _add_root_arg(start)
     return parser.parse_args(argv)
 
 
@@ -356,11 +492,19 @@ def main(argv: list[str] | None = None) -> int:
             root = preflight(args.root)
             print(root)
         elif args.command == "prepare":
-            require_inputs(args.mode, args.branch, parking=args.parking, base=args.base)
-            if args.mode == "existing":
-                print(prepare_existing(args.root, args.branch, args.parking))
+            root = _resolve_root(args.root)
+            mode, branch, parking, base = resolve_creation(
+                root, args.mode, args.branch, parking=args.parking, base=args.base,
+            )
+            if mode == "existing":
+                prepared = prepare_existing(root, branch, parking or "")
             else:
-                print(prepare_new(args.root, args.branch, args.base))
+                prepared = prepare_new(root, branch, base or "")
+            print(f"mode: {mode}")
+            print(f"branch: {branch}")
+            print(f"parking: {parking or ''}")
+            print(f"base: {base or ''}")
+            print(prepared)
         elif args.command == "attach":
             if args.mode == "existing":
                 print(attach_existing(args.root, args.branch))
@@ -375,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
             print(verify_kanban_absent(args.root))
         elif args.command == "bootstrap-kanban":
             bootstrap_kanban(args.root)
+        elif args.command == "start-instance":
+            start_instance(args.root)
         else:
             raise PrepError(f"unknown command: {args.command}")
     except PrepError as exc:

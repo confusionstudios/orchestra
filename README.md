@@ -256,8 +256,14 @@ instance per configured repo:
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 ```
 
-The private config at `~/.config/orchestra/fleet.repos` contains one repo root
-per line; blank lines and `#` comments are allowed. Fleet provides `status`,
+The private config at `~/.config/orchestra/fleet.repos` contains one primary
+repo root per line; blank lines and `#` comments are allowed. Fleet discovers
+an initialized linked worktree from Git and does not keep a second
+registration list. Create that worktree's queue with its own Kanban database,
+then start only that checkout with `ko-fleet start <worktree-path>` and read
+its dashboard URL from `ko-fleet status <worktree-path>`. Closeout stops that
+same path with `ko-fleet stop <worktree-path>` and removes the worktree with
+Git. Neither step registers or unregisters the worktree. Fleet provides `status`,
 `start`, `stop`, `stop-all`, `restart`, `attach`, and `logs`, plus:
 
 ```bash
@@ -308,7 +314,13 @@ defaults:
 
 This shared file accepts `version`, `aliases`, and `defaults`. It overrides the
 product baseline; work-repository aliases, agents, and role entries take
-precedence over it. A repo role entry replaces that shared role entry in full.
+precedence over it. A primary repo role entry replaces that shared role entry
+in full. A linked worktree reads the primary checkout's
+`.kanban-orchestra/agents.yaml` live and then applies its own file. A worktree
+role entry overrides one field at a time, so the other inherited fields keep
+their sources. Orchestra does not copy preferences, auth, databases, locks, or
+runtime state into the worktree.
+
 An environment setting such as `ORCHESTRA_DEFAULT_CODER=grok` keeps selecting
 `grok` and uses its effective target. Editing the shared file does not require
 a commit or shell-configuration change. Restart workers and dashboards after
@@ -361,8 +373,9 @@ are errors. Model IDs are passed as literal CLI arguments; the CLI decides
 whether they exist.
 
 Precedence is explicit task agent, then an explicit `ORCHESTRA_DEFAULT_*`
-environment agent, then the repo role entry, then the shared role entry, then
-the product fallback.
+environment agent, then the worktree-local role entry, then the inherited
+primary role entry, then the shared role entry, then the product fallback.
+A primary repository has no inherited layer.
 An explicit task or environment choice suppresses that role's configured model,
 reasoning, and options. Local agent and alias entries override same-named
 product entries. `ko-task agents` shows effective commands and their sources.
