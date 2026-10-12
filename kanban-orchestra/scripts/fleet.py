@@ -717,13 +717,24 @@ def session_runs_orchestrator(session: str) -> bool:
 
 
 def interrupt_tmux_session(session: str) -> None:
-    target = tmux_target(session)
-    subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], check=False)
+    """Ask the pane to exit, then kill the session if it is still present.
+
+    ``send-keys`` needs the pane-qualified exact target. A bare ``=name``
+    session target is not a pane on tmux 3.7. Session checks and ``kill-session``
+    keep the exact session target.
+    """
+    subprocess.run(
+        ["tmux", "send-keys", "-t", tmux_format_target(session), "C-c"],
+        check=False,
+    )
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and tmux_has_session(session):
         time.sleep(0.1)
     if tmux_has_session(session):
-        subprocess.run(["tmux", "kill-session", "-t", target], check=False)
+        subprocess.run(
+            ["tmux", "kill-session", "-t", tmux_target(session)],
+            check=False,
+        )
 
 
 def process_table() -> list[tuple[int, str]]:

@@ -667,6 +667,12 @@ class EffectiveRegistry:
         for section in ("agents", "aliases", "defaults"):
             if not isinstance(raw.get(section, {}), dict):
                 raise ValueError(f"{section}: expected a mapping")
+        # Capture providers before this layer retargets aliases or agent commands.
+        inherited_role_providers: dict[str, str | None] = {}
+        if merge_defaults:
+            for role, current in self.defaults.items():
+                spec = current.get("agent", ROLE_FALLBACKS[role])
+                inherited_role_providers[role] = self._spec_provider(spec)
         for name, patch in raw.get("agents", {}).items():
             if not isinstance(name, str) or not _PROVIDER_RE.fullmatch(name):
                 raise ValueError(f"agents.{name}: invalid name")
@@ -746,6 +752,13 @@ class EffectiveRegistry:
             merging = merge_defaults and role in self.defaults
             merged = dict(self.defaults[role]) if merging else {}
             fields = dict(self.default_field_sources.get(role, {})) if merging else {}
+            if merging and "agent" in patch:
+                previous_provider = inherited_role_providers.get(role)
+                next_provider = self._spec_provider(patch["agent"])
+                if previous_provider and next_provider and previous_provider != next_provider:
+                    for stale in ("model", "reasoning", "options"):
+                        merged.pop(stale, None)
+                        fields.pop(stale, None)
             for key, value in patch.items():
                 merged[key] = value
                 fields[key] = str(source)
@@ -804,6 +817,19 @@ class EffectiveRegistry:
             spec = self.aliases[spec]
         return spec
 
+    def _spec_provider(self, spec: str) -> str | None:
+        """Return the provider of a resolved agent command, or None when unresolved."""
+        try:
+            command = self.command(spec)
+        except ValueError:
+            return None
+        if not command:
+            return None
+        try:
+            return _provider_for(command)
+        except ValueError:
+            return None
+
     def command(self, spec: str, *, review: bool = False, patch: dict[str, Any] | None = None) -> list[str] | None:
         target = self._target(spec)
         command = (self.reviews.get(target) if review else None) or self.agents.get(target)
@@ -851,7 +877,11 @@ class EffectiveRegistry:
         return result
 
     def model_choices(self, provider: str) -> dict[str, Any]:
-        """Merge the tracked command IDs with an advisory discovery snapshot."""
+        """Merge tracked command IDs with an advisory discovery snapshot.
+
+        A local, shared, or inherited label outranks the discovered label for
+        the same model. Discovery is still recorded in the source list.
+        """
         status = model_registry.view(self.path.parent.parent, provider)
         choices = {}
         for name, command in AGENT_CMD.items():
@@ -885,7 +915,8 @@ class EffectiveRegistry:
                                            "sources": [self._layer_label(model_source)]})
         for model in status["models"]:
             previous = choices.get(model["id"])
-            choices[model["id"]] = {**model, "label": previous["label"] if previous and set(previous["sources"]) & {"local", "shared"} else model["label"],
+            configured_sources = {"local", "shared", "inherited"}
+            choices[model["id"]] = {**model, "label": previous["label"] if previous and set(previous["sources"]) & configured_sources else model["label"],
                                      "sources": ([*previous["sources"], "discovered"] if previous else ["discovered"])}
         return {**status, "models": list(choices.values())}
 

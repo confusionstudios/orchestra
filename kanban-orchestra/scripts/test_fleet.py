@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -676,7 +677,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
             fleet.stop([repo])
 
         run.assert_called_once_with(
-            ["tmux", "send-keys", "-t", fleet.tmux_target(repo.session), "C-c"],
+            ["tmux", "send-keys", "-t", fleet.tmux_format_target(repo.session), "C-c"],
             check=False,
         )
 
@@ -720,7 +721,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
             fleet.stop_all([repo])
 
         run.assert_called_once_with(
-            ["tmux", "send-keys", "-t", fleet.tmux_target(repo.session), "C-c"],
+            ["tmux", "send-keys", "-t", fleet.tmux_format_target(repo.session), "C-c"],
             check=False,
         )
         self.assertIn("repo [managed]: stopped fleet tmux session", out.getvalue())
@@ -1243,6 +1244,102 @@ class TestFleetOperatorFlows(unittest.TestCase):
                         capture_output=True,
                     )
 
+    def test_interrupt_sends_ctrl_c_to_the_pane_and_kills_the_session_on_fallback(self):
+        times = iter((0.0, 0.0, 3.0))
+        with patch.object(fleet, "tmux_has_session", side_effect=[True, True]), \
+             patch.object(fleet.time, "sleep"), \
+             patch.object(fleet.time, "monotonic", side_effect=lambda: next(times)), \
+             patch.object(fleet.subprocess, "run") as run:
+            fleet.interrupt_tmux_session("orch-example")
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["tmux", "send-keys", "-t", "=orch-example:", "C-c"],
+                ["tmux", "kill-session", "-t", "=orch-example"],
+            ],
+        )
+        for call in run.call_args_list:
+            self.assertFalse(call.kwargs["check"])
+
+    def test_live_interrupt_delivers_sigint_on_isolated_socket(self):
+        if shutil.which("tmux") is None:
+            self.skipTest("tmux is required")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            socket_dir = base / "tmux"
+            socket_dir.mkdir()
+            marker = base / "sigint.txt"
+            ready = base / "ready.txt"
+            script = base / "record_sigint.py"
+            script.write_text(
+                """import signal
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+
+def handle(_signum, _frame):
+    marker.write_text("sigint\\n", encoding="utf-8")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGINT, handle)
+ready.write_text("ready\\n", encoding="utf-8")
+while True:
+    time.sleep(0.05)
+""",
+                encoding="utf-8",
+            )
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"TMUX", "TMUX_PANE"}
+            }
+            env["TMUX_TMPDIR"] = str(socket_dir)
+            session = "ko-interrupt-probe"
+            bystander = "ko-interrupt-bystander"
+            started = False
+            try:
+                subprocess.run(
+                    [
+                        "tmux", "new-session", "-d", "-s", session, "--",
+                        sys.executable, str(script), str(marker), str(ready),
+                    ],
+                    check=True,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["tmux", "new-session", "-d", "-s", bystander, "--", "/bin/sleep", "60"],
+                    check=True,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                started = True
+                deadline = time.monotonic() + 5.0
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(ready.exists(), "probe did not become ready")
+                self.assertTrue(any(socket_dir.iterdir()), "tmux server was not isolated")
+                with patch.dict(os.environ, env, clear=True):
+                    fleet.interrupt_tmux_session(session)
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "sigint\n")
+                    self.assertFalse(fleet.tmux_has_session(session))
+                    self.assertTrue(fleet.tmux_has_session(bystander))
+            finally:
+                if started:
+                    for name in (session, bystander):
+                        subprocess.run(
+                            ["tmux", "kill-session", "-t", f"={name}"],
+                            env=env,
+                            check=False,
+                            capture_output=True,
+                        )
+
     def test_stop_leaves_unproven_session_untouched(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
         out = io.StringIO()
@@ -1310,7 +1407,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
             fleet.stop([worktree])
 
         run.assert_called_once_with(
-            ["tmux", "send-keys", "-t", fleet.tmux_target(worktree.session), "C-c"],
+            ["tmux", "send-keys", "-t", fleet.tmux_format_target(worktree.session), "C-c"],
             check=False,
         )
         self.assertNotIn(primary.session, run.call_args.args[0])
