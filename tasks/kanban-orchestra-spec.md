@@ -871,8 +871,14 @@ do not keep using older in-memory code.
 
 For multiple repos, `ko-fleet` reads a private flat path list from
 `~/.config/orchestra/fleet.repos` by default. Each non-empty non-comment line
-is one git repo root. `~` and environment variables are expanded, and display
-names are derived from the basename of the resolved repo path.
+is one primary git repo root. `~` and environment variables are expanded.
+Display names come from the directory basename. Fleet discovers linked
+worktrees with `git worktree list --porcelain` and includes a linked worktree
+only when that checkout already has a usable Orchestra database
+(`kanban-orchestra.db` opening read-only with an `orchestrator_runtime` table).
+Fleet does not initialize worktrees and does not keep a second registration
+list. Invalid or missing primary paths remain errors. A linked worktree that
+disappears is omitted with no unregister step. Canonical roots are listed once.
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-fleet" init
@@ -888,20 +894,36 @@ names are derived from the basename of the resolved repo path.
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
+Each instance has a stable selector: the readable basename plus a short hash
+of its canonical root path. The hash does not change when the branch changes.
+The tmux session name is `orch-` plus that selector. Commands and dashboard
+play accept the selector or a full path. A basename that matches more than one
+instance is rejected. Start, stop, restart, status, attach, logs, and
+dashboard selection all use this discovered set.
+
 `ko-fleet start`:
-- starts the orchestrator/dashboard pair for every selected configured repo
-- refuses duplicates when the repo singleton lock is already live
+- starts the orchestrator/dashboard pair for every selected primary or initialized worktree
+- reuses an instance whose singleton lock is already live
 - starts dirty selected repos in the observable `waiting-dirty` state
 - refuses selected starts when any selected repo configuration is invalid
 - keeps process-supervision details behind the fleet command
 
 `ko-fleet stop`:
-- stops fleet-owned terminal sessions for selected repos
+- stops a fleet tmux session only when the session name matches exactly and the session path reported for its current pane is the selected canonical root
+- leaves a same-named session untouched when that path proof is missing
 - leaves externally managed instances alone and reports them
+
+A disappeared linked worktree is reaped only when Git still lists that missing
+path, the exact session name hashes to it, the session path reported for its current pane matches,
+and a pane process is the Fleet-launched orchestrator. Fleet leaves every other
+leftover session untouched. That includes sessions whose worktree metadata was
+already pruned and sessions whose orchestrator process has already exited.
+Missing primary paths stay visible as configuration errors and are not reaped
+by this pass.
 
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
-`ko-fleet attach` and `ko-fleet logs` select by repo label/path and then use
+`ko-fleet attach` and `ko-fleet logs` select by label, unique selector, or path and then use
 the selected repo's tmux session and repo-local
 `.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
 starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
@@ -911,9 +933,11 @@ selector. Both open commands accept `--local` to open the localhost URL
 instead of the preferred Tailscale mapping.
 
 The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
-The Fleet Dashboard shows one card per configured repo: name, path, branch,
-status, current task, and ready / recently done / icebox counts. Both the
-Fleet Dashboard and each repo dashboard publish an HTTPS Tailscale Serve proxy
+The Fleet Dashboard shows separate Primary Repos and Worktrees sections. Each
+card shows the display name, path, branch, status, current task, and ready /
+recently done / icebox counts. A worktree card also shows its parent repository
+and stable selector. Both the Fleet Dashboard and each repo dashboard publish
+an HTTPS Tailscale Serve proxy
 to the chosen localhost port in the background after startup when the
 `tailscale` CLI is available. Existing exact mappings are reused; a same-port
 HTTPS listener is preferred when that port is free; a free alternate HTTPS
@@ -926,7 +950,7 @@ otherwise the localhost URL. The fleet table remains localhost. Each Fleet
 card has one Dashboard action: local Fleet views use localhost and Tailscale
 Fleet views use the exact remote mapping, omitting the action when that mapping
 is unavailable. Play on a stopped card is equivalent to
-`ko-fleet start <configured-repo-label>`. Each repo dashboard primarily displays
+`ko-fleet start <selector>`. Each repo dashboard primarily displays
 status and offers ready and review-cap continuation actions. It is repo-scoped and attached to the matching
 orchestrator instance. The old process-manager UI and its heartbeat/request/response JSON files are removed,
 not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,

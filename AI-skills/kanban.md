@@ -240,14 +240,25 @@ Use status commands and repo-local metadata instead of PID hunting:
 ```
 
 Fleet config lives at `~/.config/orchestra/fleet.repos` by default. It is a
-private flat list: one git repo root per non-empty line, with `~`, environment
-variables, blank lines, and `#` comments supported. Every configured repo gets
-one orchestrator and one matching dashboard. Fleet manages those running
-processes only; skill wrappers come from the one-time
-`ko-install-global-skills` install, not from Fleet. `ko-fleet start` launches
-every valid selected stopped repo. A dirty repo starts in `waiting-dirty` with
-its dashboard and heartbeat live, while invalid repo config remains a hard
-failure.
+private flat list of primary git repo roots: one path per non-empty line, with
+`~`, environment variables, blank lines, and `#` comments supported. Fleet
+discovers linked worktrees from Git and includes one only when that worktree
+already has a usable Orchestra database. It does not initialize worktrees or
+keep a second registration list. Missing linked worktrees disappear from Fleet
+without an unregister step. Invalid primary paths remain errors.
+
+Every selected primary and initialized worktree gets its own orchestrator and
+dashboard. The stable selector is the readable basename plus a short hash of
+the canonical root, and the tmux session is `orch-` plus that selector. The
+hash stays the same when the branch changes. Use the selector or a full path
+when basenames repeat; an ambiguous basename is rejected. Fleet signals a tmux
+session only when the exact name and the session path reported for its current
+pane both match that root. A disappeared worktree session is removed only when Git still lists
+the missing path and a pane process is the Fleet orchestrator for that path.
+If that proof is missing, the session is left untouched. `ko-fleet start`
+launches every valid selected stopped instance and reuses one that is already
+live. A dirty worktree starts in `waiting-dirty` with its dashboard and
+heartbeat live, while invalid primary config remains a hard failure.
 
 Graceful stop after the current task finishes:
 
@@ -260,10 +271,11 @@ at the top of the next polling loop after the current task finishes, logs the
 detection, deletes the file, and exits.
 
 Notes:
-- Use `ko-fleet dashboard` to start or open the Fleet Dashboard. Each card
-  shows the repo name, path, branch, status, current task, and ready /
-  recently done / icebox counts. Dashboard startup publishes an HTTPS
-  Tailscale Serve proxy to the chosen localhost port in the background when
+- Use `ko-fleet dashboard` to start or open the Fleet Dashboard. The page has
+  separate Primary Repos and Worktrees sections. Each card shows the display
+  name, path, branch, status, current task, and ready / recently done / icebox
+  counts. Worktree cards also show the parent repository and stable selector.
+  Dashboard startup publishes an HTTPS Tailscale Serve proxy to the chosen localhost port in the background when
   the `tailscale` CLI is available: existing exact mappings are reused, a
   same-port HTTPS listener is preferred when that port is free, a free
   alternate HTTPS listener is used when it is not, and unrelated Serve routes
@@ -275,7 +287,7 @@ Notes:
   Each card has one Dashboard action: local Fleet views use localhost and
   Tailscale Fleet views use the exact remote mapping, omitting the action when
   that mapping is unavailable. Play on a stopped card is equivalent to
-  `ko-fleet start <configured-repo-label>`.
+  `ko-fleet start <selector>`.
 - Use `ko-fleet dashboard <repo-label>` to open a running instance dashboard.
   It opens the preferred Tailscale URL when an exact mapping exists.
 - Use `ko-fleet dashboard-open <repo-label>` when a script wants an explicit

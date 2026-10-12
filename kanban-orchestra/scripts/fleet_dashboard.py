@@ -50,10 +50,13 @@ class FleetCard:
     dashboard_url: str | None
     tailscale_url: str | None
     last_start_failure: str | None
+    kind: str = "primary"
+    parent: str | None = None
+    selector: str = ""
 
 
 def collect_cards() -> list[FleetCard]:
-    """Return one card-data record per configured fleet repo."""
+    """Return one card per configured primary and initialized linked worktree."""
     return [collect_card(repo) for repo in fleet.load_repos()]
 
 
@@ -90,6 +93,9 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
         dashboard_url=dashboard_url,
         tailscale_url=tailscale_url,
         last_start_failure=None,
+        kind=repo.kind,
+        parent=fleet.display_path(repo.parent) if repo.parent is not None else None,
+        selector=repo.selector,
     )
 
 
@@ -490,13 +496,36 @@ a.repo-name:hover {
     grid-template-columns: 1fr;
   }
 }
+
+.fleet-section + .fleet-section {
+  margin-top: 28px;
+}
+
+.fleet-section h2 {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.fleet-empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.repo-parent,
+.repo-selector {
+  margin-top: 4px;
+}
 """
 
 
 FLEET_JS = r"""
 (() => {
-  const list = document.querySelector(".repo-list");
-  if (!list) return;
+  const root = document.querySelector("main");
+  if (!root) return;
 
   function showFailure(card, message) {
     let result = card.querySelector(".start-result");
@@ -515,7 +544,7 @@ FLEET_JS = r"""
     if (reason) reason.textContent = message;
   }
 
-  list.addEventListener("click", async (event) => {
+  root.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-start-repo]");
     if (!button || button.disabled) return;
     const label = button.dataset.startRepo;
@@ -628,16 +657,22 @@ def _current_task_html(card: FleetCard, *, local_access: bool) -> str:
     return f"<span>{label}</span>"
 
 
+def _start_selector(card: FleetCard) -> str:
+    """Play posts the stable selector, falling back to the display name."""
+    return card.selector or card.name
+
+
 def _status_html(card: FleetCard) -> str:
     badge_cls = dashboard.STATUS_BADGE_CLASS.get(card.status, "badge-none")
     badge = f'<span class="badge {badge_cls}">{_esc(card.status)}</span>'
     if card.invalid or card.status != "stopped":
         return badge
+    selector = _start_selector(card)
     return (
         '<div class="status-controls">'
         f"{badge}"
         f'<button class="start-button" type="button" '
-        f'data-start-repo="{_esc(card.name)}" '
+        f'data-start-repo="{_esc(selector)}" '
         f'aria-label="Start {_esc(card.name)}"></button>'
         "</div>"
     )
@@ -691,14 +726,25 @@ def _queue_box_html(count: int, label: str, extra_class: str = "") -> str:
     )
 
 
+def _identity_html(card: FleetCard) -> str:
+    lines = [f'<div class="repo-path muted">{_esc(card.path)}</div>']
+    if card.kind == "worktree":
+        parent = card.parent or "-"
+        lines.append(f'<div class="repo-parent muted">Parent {_esc(parent)}</div>')
+    if card.selector:
+        lines.append(f'<div class="repo-selector muted"><code>{_esc(card.selector)}</code></div>')
+    lines.append(_branch_html(card))
+    return "".join(lines)
+
+
 def render_card(card: FleetCard, *, local_access: bool = True) -> str:
     """Return HTML for one fleet repository card."""
     return (
-        f'<article class="card repo-record" data-repo-label="{_esc(card.name)}">'
+        f'<article class="card repo-record" data-repo-label="{_esc(card.name)}" '
+        f'data-repo-kind="{_esc(card.kind)}">'
         '<div class="repo-top">'
         f"<div>{_name_html(card, local_access=local_access)}"
-        f'<div class="repo-path muted">{_esc(card.path)}</div>'
-        f"{_branch_html(card)}</div>"
+        f"{_identity_html(card)}</div>"
         f"{_status_html(card)}"
         "</div>"
         '<div class="repo-details">'
@@ -717,6 +763,29 @@ def render_card(card: FleetCard, *, local_access: bool = True) -> str:
     )
 
 
+def _section_html(
+    title: str,
+    cards: list[FleetCard],
+    *,
+    local_access: bool,
+    empty: str,
+) -> str:
+    if cards:
+        body = (
+            '<div class="repo-list">\n'
+            + "\n".join(render_card(card, local_access=local_access) for card in cards)
+            + "\n</div>"
+        )
+    else:
+        body = f'<p class="fleet-empty">{_esc(empty)}</p>'
+    return (
+        f'<section class="fleet-section" aria-label="{_esc(title)}">\n'
+        f"  <h2>{_esc(title)}</h2>\n"
+        f"  {body}\n"
+        "</section>"
+    )
+
+
 def render_page(
     cards: list[FleetCard],
     *,
@@ -726,8 +795,23 @@ def render_page(
     """Return the Fleet Dashboard HTML document for *cards*."""
     if config_display is None:
         config_display = _config_display()
+    primaries = [card for card in cards if card.kind != "worktree"]
+    worktrees = [card for card in cards if card.kind == "worktree"]
     cards_html = "\n".join(
-        render_card(card, local_access=local_access) for card in cards
+        (
+            _section_html(
+                "Primary Repos",
+                primaries,
+                local_access=local_access,
+                empty="No primary repos",
+            ),
+            _section_html(
+                "Worktrees",
+                worktrees,
+                local_access=local_access,
+                empty="No worktrees",
+            ),
+        )
     )
     identity = dashboard.fleet_accent_identity()
     return f"""<!doctype html>
@@ -750,9 +834,7 @@ def render_page(
   </nav>
   <main>
     <h1>Fleet Dashboard</h1>
-    <section class="repo-list" aria-label="Fleet repositories">
-      {cards_html}
-    </section>
+    {cards_html}
   </main>
   <script>{dashboard.accent_picker_script(identity)}</script>
   <script>{FLEET_JS}</script>
@@ -774,10 +856,19 @@ def index(request: Request):
 
 
 def _configured_repo(label: str) -> fleet.FleetRepo | None:
-    for repo in fleet.load_repos():
-        if repo.label == label:
-            return repo
-    return None
+    """Resolve one play/start selector.
+
+    The dashboard accepts the stable selector or a display label that matches
+    exactly one configured instance. Full paths and ambiguous labels do not match.
+    """
+    matches = [
+        repo
+        for repo in fleet.load_repos()
+        if label == repo.selector or label == repo.label
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def _card_payload(card: FleetCard) -> dict:

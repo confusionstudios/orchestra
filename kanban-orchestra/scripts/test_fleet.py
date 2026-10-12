@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -352,10 +353,12 @@ class TestFleetOperatorFlows(unittest.TestCase):
             self.assertIn("dash_url", lines[0])
             self.assertIn("running/idle", lines[2])
             self.assertIn(f"{os.getpid()}/-", lines[2])
+            header = lines[0].split()
             columns = lines[2].split()
-            self.assertEqual(columns[-3], "-")
-            self.assertEqual(columns[-2], "managed")
-            self.assertEqual(columns[-1], str(root))
+            self.assertEqual(columns[header.index("dash_url")], "-")
+            self.assertEqual(columns[header.index("owner")], "managed")
+            self.assertEqual(columns[header.index("kind")], "primary")
+            self.assertEqual(columns[header.index("root")], str(root))
 
     def test_status_prints_waiting_dirty_as_running_service(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -530,7 +533,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
                 "new-session",
                 "-d",
                 "-s",
-                "orch-repo",
+                repo.session,
                 "-c",
                 "/tmp/repo",
                 "/opt/orchestra/bin/ko-orchestrator",
@@ -668,10 +671,14 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         with patch.object(fleet, "require_tool"), \
              patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
              patch.object(fleet.subprocess, "run") as run:
             fleet.stop([repo])
 
-        run.assert_called_once_with(["tmux", "send-keys", "-t", "orch-repo", "C-c"], check=False)
+        run.assert_called_once_with(
+            ["tmux", "send-keys", "-t", fleet.tmux_target(repo.session), "C-c"],
+            check=False,
+        )
 
     def test_stop_reports_external_repo_instance_without_killing_it(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
@@ -707,11 +714,15 @@ class TestFleetOperatorFlows(unittest.TestCase):
         out = io.StringIO()
 
         with patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
              patch.object(fleet.subprocess, "run") as run, \
              redirect_stdout(out):
             fleet.stop_all([repo])
 
-        run.assert_called_once_with(["tmux", "send-keys", "-t", "orch-repo", "C-c"], check=False)
+        run.assert_called_once_with(
+            ["tmux", "send-keys", "-t", fleet.tmux_target(repo.session), "C-c"],
+            check=False,
+        )
         self.assertIn("repo [managed]: stopped fleet tmux session", out.getvalue())
 
     def test_stop_all_stops_unmanaged_running_instance(self):
@@ -738,6 +749,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
         out = io.StringIO()
 
         with patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
              patch.object(fleet, "repo_process_state", return_value=("running/busy", "234", "-", "-")), \
              patch.object(fleet, "validated_orchestrator_pid", return_value=234), \
              patch.object(fleet, "stop_pid", return_value=True), \
@@ -765,7 +777,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_stop_all_dispatches_to_status_repos(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"), managed=False)
 
-        with patch.object(fleet, "status_repos", return_value=[repo]) as status_repos, \
+        with patch.object(fleet, "reap_disappeared_worktree_sessions"), \
+             patch.object(fleet, "status_repos", return_value=[repo]) as status_repos, \
              patch.object(fleet, "stop_all") as stop_all:
             exit_code = fleet.main(["stop-all"])
 
@@ -778,11 +791,15 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
         with patch.object(fleet, "require_tool"), \
              patch.object(fleet, "tmux_has_session", return_value=True), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
              patch.object(fleet.os, "execvp", side_effect=RuntimeError("stop")) as execvp, \
              self.assertRaisesRegex(RuntimeError, "stop"):
             fleet.attach(repo)
 
-        execvp.assert_called_once_with("tmux", ["tmux", "attach", "-t", "orch-repo"])
+        execvp.assert_called_once_with(
+            "tmux",
+            ["tmux", "attach", "-t", fleet.tmux_target(repo.session)],
+        )
 
     def test_logs_tails_repo_local_orchestrator_log(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1099,6 +1116,250 @@ class TestFleetOperatorFlows(unittest.TestCase):
 
             with self.assertRaises(SystemExit):
                 fleet.open_dashboard(repo)
+
+    def test_session_token_is_stable_when_the_branch_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve() / "repo"
+            _init_repo(root)
+            before = fleet.instance_token(root)
+            _git(root, "checkout", "-q", "-b", "other-branch")
+
+            self.assertEqual(fleet.instance_token(root), before)
+            self.assertEqual(fleet.FleetRepo("repo", root, root).session, f"orch-{before}")
+            elsewhere = root.parent / "nested" / root.name
+            self.assertNotEqual(fleet.instance_token(elsewhere), before)
+
+    def test_discovery_includes_only_initialized_linked_worktrees(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+            primary = base / "primary"
+            _init_repo(primary)
+            write_runtime(primary)
+            initialized = base / "one" / "leaf"
+            plain = base / "plain-tree"
+            vanished = base / "vanished"
+            initialized.parent.mkdir()
+            _git(primary, "worktree", "add", "-q", "-b", "initialized", str(initialized))
+            _git(primary, "worktree", "add", "-q", "-b", "plain", str(plain))
+            _git(primary, "worktree", "add", "-q", "-b", "gone", str(vanished))
+            write_runtime(initialized)
+            write_runtime(vanished)
+            shutil.rmtree(vanished)
+            missing_primary = base / "missing-primary"
+            config = base / "fleet.repos"
+            config.write_text(
+                f"{primary}\n{primary}\n{missing_primary}\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"ORCHESTRA_FLEET_REPOS": str(config)}):
+                repos = fleet.load_repos()
+
+            roots = [repo.root for repo in repos if repo.root is not None]
+            self.assertEqual(roots.count(primary), 1)
+            self.assertIn(initialized, roots)
+            self.assertNotIn(plain, roots)
+            self.assertTrue(all(repo.root != vanished for repo in repos))
+            invalid = [repo for repo in repos if repo.error]
+            self.assertEqual(len(invalid), 1)
+            self.assertIn("path does not exist", invalid[0].error)
+            worktree = next(repo for repo in repos if repo.root == initialized)
+            self.assertEqual(worktree.kind, "worktree")
+            self.assertEqual(worktree.parent, primary)
+            self.assertEqual(worktree.selector, fleet.instance_token(initialized))
+            self.assertNotEqual(worktree.session, fleet.FleetRepo("primary", primary, primary).session)
+
+    def test_same_basename_short_selector_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir).resolve()
+            primary = base / "main-repo"
+            first = base / "one" / "proj"
+            second = base / "two" / "proj"
+            _init_repo(primary)
+            first.parent.mkdir()
+            second.parent.mkdir()
+            _git(primary, "worktree", "add", "-q", "-b", "first", str(first))
+            _git(primary, "worktree", "add", "-q", "-b", "second", str(second))
+            write_runtime(first)
+            write_runtime(second)
+            config = base / "fleet.repos"
+            config.write_text(f"{primary}\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"ORCHESTRA_FLEET_REPOS": str(config)}):
+                with self.assertRaises(SystemExit):
+                    fleet.select_repos(["proj"])
+                by_path = fleet.select_repos([str(first)])
+                by_selector = fleet.select_repos([fleet.instance_token(second)])
+
+            self.assertEqual([repo.root for repo in by_path], [first])
+            self.assertEqual([repo.root for repo in by_selector], [second])
+            self.assertNotEqual(by_path[0].session, by_selector[0].session)
+
+    def test_live_tmux_format_target_proves_session_ownership(self):
+        if shutil.which("tmux") is None:
+            self.skipTest("tmux is required")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            root = base / "repo"
+            root.mkdir()
+            socket_dir = base / "tmux"
+            socket_dir.mkdir()
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"TMUX", "TMUX_PANE"}
+            }
+            env["TMUX_TMPDIR"] = str(socket_dir)
+            repo = fleet.FleetRepo("repo", root, root)
+            started = False
+            try:
+                subprocess.run(
+                    [
+                        "tmux", "new-session", "-d", "-s", repo.session,
+                        "-c", str(root), "--", "/bin/sleep", "60",
+                    ],
+                    check=True,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                started = True
+                self.assertTrue(any(socket_dir.iterdir()), "tmux server was not isolated")
+                with patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(
+                        fleet.tmux_recorded_path(repo.session),
+                        fleet.canonical_path(root),
+                    )
+                    self.assertTrue(fleet.session_is_owned(repo))
+                    self.assertFalse(
+                        fleet.tmux_session_matches_root(repo.session, base / "other")
+                    )
+            finally:
+                if started:
+                    subprocess.run(
+                        ["tmux", "kill-session", "-t", f"={repo.session}"],
+                        env=env,
+                        check=False,
+                        capture_output=True,
+                    )
+
+    def test_stop_leaves_unproven_session_untouched(self):
+        repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
+        out = io.StringIO()
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "tmux_has_session", return_value=True), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=False), \
+             patch.object(fleet.subprocess, "run") as run, \
+             redirect_stdout(out):
+            fleet.stop([repo])
+
+        run.assert_not_called()
+        self.assertIn("left untouched", out.getvalue())
+        self.assertNotIn(repo.session, run.call_args.args[0] if run.call_args else [])
+
+    def test_stop_signals_only_the_selected_owned_session(self):
+        primary = fleet.FleetRepo("proj", Path("/tmp/proj-a"), Path("/tmp/proj-a"))
+        worktree = fleet.FleetRepo(
+            "proj",
+            Path("/tmp/proj-b"),
+            Path("/tmp/proj-b"),
+            kind="worktree",
+            parent=Path("/tmp/proj-a"),
+        )
+        self.assertNotEqual(primary.session, worktree.session)
+
+        with patch.object(fleet, "require_tool"), \
+             patch.object(fleet, "tmux_has_session", side_effect=[True, False, False]), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
+             patch.object(fleet.subprocess, "run") as run:
+            fleet.stop([worktree])
+
+        run.assert_called_once_with(
+            ["tmux", "send-keys", "-t", fleet.tmux_target(worktree.session), "C-c"],
+            check=False,
+        )
+        self.assertNotIn(primary.session, run.call_args.args[0])
+
+    def test_porcelain_marks_prunable_worktrees_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            live = Path(tmpdir).resolve() / "live"
+            live.mkdir()
+            missing = live.parent / "missing"
+            text = (
+                f"worktree {live}\nHEAD abc\nbranch refs/heads/main\n\n"
+                f"worktree {missing}\nHEAD def\nprunable gitdir file points to non-existent location\n"
+            )
+
+            entries = fleet._parse_worktree_porcelain(text)
+
+            self.assertEqual(entries[0].path, live)
+            self.assertFalse(entries[0].missing)
+            self.assertEqual(entries[1].path, missing)
+            self.assertTrue(entries[1].missing)
+
+    def test_reap_requires_proven_orchestrator_ownership(self):
+        missing = Path("/tmp/gone-worktree")
+        primary = fleet.FleetRepo("primary", Path("/tmp/primary"), Path("/tmp/primary"))
+        entry = fleet._WorktreeEntry(missing, True)
+        session = f"orch-{fleet.instance_token(missing)}"
+
+        with patch.object(fleet, "list_worktree_entries", return_value=[entry]), \
+             patch.object(fleet.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fleet, "tmux_has_session", return_value=True), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
+             patch.object(fleet, "session_runs_orchestrator", return_value=False), \
+             patch.object(fleet, "interrupt_tmux_session") as interrupt:
+            fleet.reap_disappeared_worktree_sessions([primary])
+
+        interrupt.assert_not_called()
+
+        with patch.object(fleet, "list_worktree_entries", return_value=[entry]), \
+             patch.object(fleet.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fleet, "tmux_has_session", return_value=True), \
+             patch.object(fleet, "tmux_session_matches_root", return_value=True), \
+             patch.object(fleet, "session_runs_orchestrator", return_value=True), \
+             patch.object(fleet, "interrupt_tmux_session") as interrupt:
+            fleet.reap_disappeared_worktree_sessions([primary])
+
+        interrupt.assert_called_once_with(session)
+
+    def test_reap_leaves_live_worktree_sessions_alone(self):
+        live = Path("/tmp/live-worktree")
+        primary = fleet.FleetRepo("primary", Path("/tmp/primary"), Path("/tmp/primary"))
+        entry = fleet._WorktreeEntry(live, False)
+
+        with patch.object(fleet, "list_worktree_entries", return_value=[entry]), \
+             patch.object(fleet.shutil, "which", return_value="/usr/bin/tmux"), \
+             patch.object(fleet, "interrupt_tmux_session") as interrupt:
+            fleet.reap_disappeared_worktree_sessions([primary])
+
+        interrupt.assert_not_called()
+
+
+def _git(root: Path, *args: str) -> None:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _init_repo(root: Path) -> None:
+    root.mkdir(parents=True)
+    _git(root, "init", "-q")
+    (root / "README").write_text("initialized\n", encoding="utf-8")
+    _git(root, "add", "README")
+    _git(root, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
 
 
 if __name__ == "__main__":

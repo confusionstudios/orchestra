@@ -149,6 +149,27 @@ class TestCollectCardStatuses(FleetDashboardRepoTest):
         self.assertFalse(card.invalid)
         self.assertIsNone(card.last_start_failure)
 
+    def test_worktree_card_records_parent_and_selector(self):
+        parent = self.home / "dans-data" / "midi-parent"
+        parent.mkdir()
+        repo = fleet.FleetRepo(
+            "midi",
+            self.root,
+            self.root,
+            kind="worktree",
+            parent=parent,
+        )
+
+        card = _collect(repo)
+
+        self.assertEqual(card.kind, "worktree")
+        self.assertEqual(card.parent, fleet.display_path(parent))
+        self.assertEqual(card.selector, repo.selector)
+        self.assertNotEqual(card.selector, card.name)
+        html = fleet_dashboard.render_card(card)
+        self.assertIn(f'data-start-repo="{card.selector}"', html)
+        self.assertIn("Parent ", html)
+
     def test_stopped_dirty_worktree_remains_startable(self):
         (self.root / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
 
@@ -527,6 +548,30 @@ class TestFleetDashboardPage(unittest.TestCase):
         self.assertIn("@media (max-width: 960px)", html)
         self.assertIn("@media (max-width: 560px)", html)
 
+    def test_page_splits_primary_repos_and_worktrees(self):
+        worktree = _page_card(
+            name="midi",
+            path="~/work/one/midi",
+            branch="feature/sync",
+            status="stopped",
+            dashboard_url=None,
+            kind="worktree",
+            parent="~/dans-data/midi",
+            selector="midi-abcdef12",
+        )
+        html = _get_fleet_page(_page_card(name="library"), worktree).text
+
+        self.assertLess(html.index("Primary Repos"), html.index("Worktrees"))
+        self.assertIn('aria-label="Primary Repos"', html)
+        self.assertIn('aria-label="Worktrees"', html)
+        self.assertIn("library", html)
+        self.assertIn("Parent ~/dans-data/midi", html)
+        self.assertIn("feature/sync", html)
+        self.assertIn("<code>midi-abcdef12</code>", html)
+        self.assertIn('data-start-repo="midi-abcdef12"', html)
+        self.assertIn('data-repo-kind="worktree"', html)
+        self.assertIn('aria-label="Start midi"', html)
+
     def test_absent_current_task_renders_none(self):
         html = _get_fleet_page(_page_card(current_task=None)).text
 
@@ -804,6 +849,22 @@ class TestFleetDashboardStart(FleetDashboardRepoTest):
         self.assertFalse(unknown.json()["ok"])
         self.assertEqual(path_selector.status_code, 404)
         self.assertNotIn("card", unknown.json())
+
+    def test_start_accepts_unique_selector_and_rejects_ambiguous_label(self):
+        twin_root = self.home / "other" / "midi"
+        twin_root.mkdir(parents=True)
+        twin = fleet.FleetRepo("midi", twin_root, twin_root, kind="worktree", parent=self.root)
+
+        with patch.object(fleet, "load_repos", return_value=[self.repo, twin]), \
+             patch.object(fleet, "try_start_repo", return_value=None) as start_mock, \
+             patch.object(fleet, "tmux_has_session", return_value=False):
+            ambiguous = _post_start("midi")
+            selected = _post_start(twin.selector)
+
+        self.assertEqual(ambiguous.status_code, 404)
+        self.assertEqual(ambiguous.json()["error"], "Unknown repo")
+        self.assertEqual(selected.status_code, 200)
+        start_mock.assert_called_once_with(twin)
 
     def test_start_rejects_unknown_unmanaged_and_invalid_labels(self):
         unmanaged = fleet.FleetRepo("shadow", self.root, self.root, managed=False)
