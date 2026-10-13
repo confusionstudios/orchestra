@@ -88,9 +88,11 @@ The reviewer is the agent assigned to `commit-review` for a task.
 ### Default Role Overrides
 
 Default agent roles can be overridden at runtime with Unix environment variables.
-If the variable is unset, the work-repository local role entry applies, then
-the installation-wide shared role entry, then the product fallback. An explicitly
-set but invalid value is an error.
+If the variable is unset, the worktree-local role entry applies, then the
+inherited primary role entry when the checkout is a linked worktree, then the
+installation-wide shared role entry, then the product fallback. A primary
+repository has no inherited layer. An explicitly set but invalid value is an
+error.
 
 | Role | Environment Override | Product Fallback |
 |------|----------------------|------------------|
@@ -106,15 +108,27 @@ The tracked `shared_scripts/agent_registry.yaml` remains the product baseline.
 A Git-ignored `shared_scripts/agents.local.yaml` beside that registry
 provides installation-wide overrides with `version: 1`, `aliases`, and `defaults`.
 Its aliases and role defaults apply to all work repos using the same installation.
-A repo role entry replaces the shared role entry in full; omitted roles inherit
-the shared selection. Role inspection reports the winning file or environment
-source. Persistent shell exports can be removed once shared defaults are set.
-Repo-local agents and aliases take precedence over shared aliases. Both files
+A primary repo role entry replaces the shared role entry in full; omitted roles
+inherit the shared selection. A linked worktree resolves its primary checkout from the gitdir path in its
+`.git` file and that directory's `commondir` file, then reads that primary's
+`.kanban-orchestra/agents.yaml` in place. It does not copy
+preferences, auth, databases, locks, or runtime state. Load order is the shared
+file, the inherited primary file, then the worktree-local file. A worktree role
+entry overrides inherited fields one at a time and keeps the other fields and
+their sources. Aliases are validated against the combined agent and provider
+set after every layer is loaded. Role inspection reports the source of the
+selected agent, plus per-field sources when those fields come from more than
+one layer. Removing or ignoring a worktree preference file requires an explicit
+request. Persistent shell exports can be removed once shared defaults are set.
+Repo-local agents and aliases take precedence over shared aliases, and
+worktree-local entries take precedence over inherited primary entries. The
+shared file, the inherited primary file, and the worktree-local file
 participate in the worker configuration fingerprint and require worker/dashboard
 restart after changes. Missing shared overrides preserve the baseline; malformed
 files and alias cycles are actionable errors. Explicit environment or task
 selection of an alias uses its effective target; direct `provider:model`
-selections remain explicit. Snapshotting preserves previously admitted commands.
+selections remain explicit. Configured model IDs stay literal when discovery
+does not list them. Snapshotting preserves previously admitted commands.
 Shared overrides are local configuration and are never part of the model cache.
 `ko-migrate-agent-defaults` previews literal `ORCHESTRA_DEFAULT_*` exports
 from `~/.zshrc`; `--write` copies them into the shared ignored configuration.
@@ -136,6 +150,8 @@ to a string value, `true` to add a flag, or `false`/`null` to remove it.
 `model`, `reasoning`, and `options` fields. Local aliases override the baseline;
 collisions and alias cycles are errors. Explicit task agent selection and an
 explicit environment role agent each suppress the entire configured role patch.
+Linked-worktree preference order is explicit task, environment, worktree-local,
+inherited primary, shared, then product.
 
 New task admission records a version 1 snapshot of selected role specs, run
 and review command arrays, attribution facts, and their sources. This makes
@@ -143,10 +159,13 @@ queued and in-flight commands stable across local configuration edits and
 worker restarts. An explicit task agent edit replaces that role's snapshot for
 later steps. Older task rows get a snapshot before their next dispatch. Worker
 and dashboard processes load configuration at startup; restart them after
-editing either preference file. The CLI rejects admission or explicit task
-agent edits if the shared or repo-local configuration differs from the active
-worker. `ko-task agents` reports effective commands and sources. Missing local configuration is normal. Each work repository resolves
-its own file from its database workspace, not from the tooling checkout.
+editing a shared, inherited, or worktree-local preference file. The CLI rejects
+admission or explicit task agent edits if that configuration differs from the
+active worker. `ko-task agents` reports effective commands and sources,
+including the inherited primary path when the checkout is a linked worktree.
+Missing local configuration is normal. Each work repository resolves its own
+file from its database workspace, not from the tooling checkout. A linked
+worktree also reads the primary checkout's preference file live.
 
 `ko-task models refresh [provider]` explicitly discovers models through the
 installed CLI's metadata interface. `ko-task models status` reports each
@@ -871,8 +890,14 @@ do not keep using older in-memory code.
 
 For multiple repos, `ko-fleet` reads a private flat path list from
 `~/.config/orchestra/fleet.repos` by default. Each non-empty non-comment line
-is one git repo root. `~` and environment variables are expanded, and display
-names are derived from the basename of the resolved repo path.
+is one primary git repo root. `~` and environment variables are expanded.
+Display names come from the directory basename. Fleet discovers linked
+worktrees with `git worktree list --porcelain` and includes a linked worktree
+only when that checkout already has a usable Orchestra database
+(`kanban-orchestra.db` opening read-only with an `orchestrator_runtime` table).
+Fleet does not initialize worktrees and does not keep a second registration
+list. Invalid or missing primary paths remain errors. A linked worktree that
+disappears is omitted with no unregister step. Canonical roots are listed once.
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-fleet" init
@@ -888,20 +913,39 @@ names are derived from the basename of the resolved repo path.
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard <repo-label>
 ```
 
+Each instance has a stable selector: the readable basename plus a short hash
+of its canonical root path. The hash does not change when the branch changes.
+The tmux session name is `orch-` plus that selector. Commands and dashboard
+play accept the selector or a full path. A basename that matches more than one
+instance is rejected. Start, stop, restart, status, attach, logs, and
+dashboard selection all use this discovered set.
+
 `ko-fleet start`:
-- starts the orchestrator/dashboard pair for every selected configured repo
-- refuses duplicates when the repo singleton lock is already live
+- starts the orchestrator/dashboard pair for every selected primary or initialized worktree
+- accepts a worktree path or unique selector so one command starts only that instance
+- reuses an instance whose singleton lock is already live
 - starts dirty selected repos in the observable `waiting-dirty` state
 - refuses selected starts when any selected repo configuration is invalid
 - keeps process-supervision details behind the fleet command
 
 `ko-fleet stop`:
-- stops fleet-owned terminal sessions for selected repos
+- stops a fleet tmux session only when the session name matches exactly and the session path reported for its current pane is the selected canonical root
+- accepts a worktree path so closeout stops only that verified source
+- leaves a same-named session untouched when that path proof is missing
 - leaves externally managed instances alone and reports them
+- does not unregister a linked worktree; Git removal drops it from discovery
+
+A disappeared linked worktree is reaped only when Git still lists that missing
+path, the exact session name hashes to it, the session path reported for its current pane matches,
+and a pane process is the Fleet-launched orchestrator. Fleet leaves every other
+leftover session untouched. That includes sessions whose worktree metadata was
+already pruned and sessions whose orchestrator process has already exited.
+Missing primary paths stay visible as configuration errors and are not reaped
+by this pass.
 
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
-`ko-fleet attach` and `ko-fleet logs` select by repo label/path and then use
+`ko-fleet attach` and `ko-fleet logs` select by label, unique selector, or path and then use
 the selected repo's tmux session and repo-local
 `.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
 starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
@@ -911,9 +955,11 @@ selector. Both open commands accept `--local` to open the localhost URL
 instead of the preferred Tailscale mapping.
 
 The Fleet Dashboard and the per-repo dashboards are the supported UI surfaces.
-The Fleet Dashboard shows one card per configured repo: name, path, branch,
-status, current task, and ready / recently done / icebox counts. Both the
-Fleet Dashboard and each repo dashboard publish an HTTPS Tailscale Serve proxy
+The Fleet Dashboard shows separate Primary Repos and Worktrees sections. Each
+card shows the display name, path, branch, status, current task, and ready /
+recently done / icebox counts. A worktree card also shows its parent repository
+and stable selector. Both the Fleet Dashboard and each repo dashboard publish
+an HTTPS Tailscale Serve proxy
 to the chosen localhost port in the background after startup when the
 `tailscale` CLI is available. Existing exact mappings are reused; a same-port
 HTTPS listener is preferred when that port is free; a free alternate HTTPS
@@ -926,7 +972,7 @@ otherwise the localhost URL. The fleet table remains localhost. Each Fleet
 card has one Dashboard action: local Fleet views use localhost and Tailscale
 Fleet views use the exact remote mapping, omitting the action when that mapping
 is unavailable. Play on a stopped card is equivalent to
-`ko-fleet start <configured-repo-label>`. Each repo dashboard primarily displays
+`ko-fleet start <selector>`. Each repo dashboard primarily displays
 status and offers ready and review-cap continuation actions. It is repo-scoped and attached to the matching
 orchestrator instance. The old process-manager UI and its heartbeat/request/response JSON files are removed,
 not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,

@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared_scripts"))
 import agent_registry
+import model_registry
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 import db
@@ -496,3 +497,410 @@ def test_invalid_legacy_agent_blocks_once_and_preserves_following_task(tmp_path,
         assert db.get_task(connection, later_id)['status'] == 'ready'
     finally:
         connection.close()
+
+
+def _git(root, *args):
+    subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True, capture_output=True, text=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+             "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com"},
+    )
+
+
+def test_linked_worktree_inherits_primary_fields_and_keeps_snapshot(tmp_path, monkeypatch):
+    for role in agent_registry.ROLE_FALLBACKS:
+        monkeypatch.delenv("ORCHESTRA_DEFAULT_" + role.upper(), raising=False)
+    shared = tmp_path / "agents.local.yaml"
+    shared.write_text("""version: 1
+defaults:
+  planner: {agent: codex, reasoning: low}
+""")
+    monkeypatch.setattr(agent_registry, "SHARED_CONFIG_PATH", shared)
+    monkeypatch.setattr(agent_registry, "_ACTIVE", None)
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git(primary, "init", "-q", "-b", "main")
+    _git(primary, "config", "user.name", "Test")
+    _git(primary, "config", "user.email", "test@example.com")
+    (primary / "README").write_text("primary\n", encoding="utf-8")
+    _git(primary, "add", "README")
+    _git(primary, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    worktree = tmp_path / "linked"
+    _git(primary, "worktree", "add", "-q", "-b", "feature", str(worktree))
+    primary_config = write_config(primary, """version: 1
+agents:
+  codex: {reasoning: high}
+  quick: {provider: cursor, model: composer-next}
+defaults:
+  coder: {agent: codex, model: primary-role-model, reasoning: high}
+""")
+    primary_text = primary_config.read_text(encoding="utf-8")
+    worktree_config = write_config(worktree, """version: 1
+agents:
+  codex: {model: worktree-model}
+aliases:
+  audit: quick
+defaults:
+  coder: {model: worktree-role-model}
+  planner: {model: planner-worktree}
+""")
+    connection = None
+    try:
+        registry = agent_registry.configure(worktree)
+        assert registry.inherited_config_path == primary_config
+        assert primary_config.read_text(encoding="utf-8") == primary_text
+        assert not (worktree / "kanban-orchestra.db").exists()
+        command = registry.command("codex")
+        assert command[command.index("--model") + 1] == "worktree-model"
+        assert 'model_reasoning_effort="high"' in command
+        assert registry.field_sources["codex"]["model"] == str(worktree_config)
+        assert registry.field_sources["codex"]["reasoning"] == str(primary_config)
+        coder = registry.role("coder")
+        assert coder["agent"] == "codex"
+        assert coder["source"] == str(primary_config)
+        assert coder["patch"] == {"model": "worktree-role-model", "reasoning": "high"}
+        assert coder["field_sources"]["agent"] == str(primary_config)
+        assert coder["field_sources"]["model"] == str(worktree_config)
+        assert coder["field_sources"]["reasoning"] == str(primary_config)
+        planner = registry.role("planner")
+        assert planner["source"] == str(shared)
+        assert planner["patch"]["model"] == "planner-worktree"
+        assert planner["patch"]["reasoning"] == "low"
+        assert planner["field_sources"]["reasoning"] == str(shared)
+        assert planner["field_sources"]["model"] == str(worktree_config)
+        assert registry.alias_sources["audit"] == str(worktree_config)
+        assert registry.command("audit")[registry.command("audit").index("--model") + 1] == "composer-next"
+        assert registry.sources["quick"] == str(primary_config)
+        assert registry._layer_label(str(primary_config)) == "inherited"
+        assert registry.role("coder", "sonnet") == {"agent": "sonnet", "patch": {}, "source": "task"}
+        monkeypatch.setenv("ORCHESTRA_DEFAULT_CODER", "sonnet")
+        assert registry.role("coder") == {"agent": "sonnet", "patch": {}, "source": "environment"}
+        monkeypatch.delenv("ORCHESTRA_DEFAULT_CODER")
+        other = tmp_path / "other"
+        other.mkdir()
+        isolated = agent_registry.EffectiveRegistry(other)
+        assert isolated.inherited_config_path is None
+        assert isolated.command("quick") is None
+        before = registry.fingerprint
+        snapshot = config.agent_snapshot()
+        assert "worktree-role-model" in snapshot["roles"]["coder"]["run"]
+        assert 'model_reasoning_effort="high"' in snapshot["roles"]["coder"]["run"]
+        connection = db.connect(str(worktree / "kanban-orchestra.db"))
+        task_id = db.add_task(connection, "Inherited", coder_agent="codex", agent_snapshot=snapshot)
+        primary_config.write_text("""version: 1
+agents:
+  codex: {reasoning: low}
+  quick: {provider: cursor, model: composer-next}
+defaults:
+  coder: {agent: codex, model: primary-role-model, reasoning: low}
+""", encoding="utf-8")
+        after = config.configure_agents(worktree)
+        assert after.fingerprint != before
+        assert after.role("coder")["patch"]["reasoning"] == "low"
+        assert "low" not in snapshot["roles"]["coder"]["run"]
+        assert agent_runner._resolve_command_template(
+            "codex", conn=connection, task_id=task_id, verb="commit-make",
+        ) == snapshot["roles"]["coder"]["run"]
+        worktree_config.write_text("version: 1\naliases: {audit: 'missing:nope'}\n", encoding="utf-8")
+        with pytest.raises(ValueError) as raised:
+            agent_registry.EffectiveRegistry(worktree)
+        assert str(worktree_config) in str(raised.value)
+        assert "missing:nope" in str(raised.value)
+    finally:
+        if connection is not None:
+            connection.close()
+        agent_registry._ACTIVE = None
+
+
+def test_worktree_agent_change_drops_cross_provider_role_fields(tmp_path, monkeypatch):
+    for role in agent_registry.ROLE_FALLBACKS:
+        monkeypatch.delenv("ORCHESTRA_DEFAULT_" + role.upper(), raising=False)
+    shared = tmp_path / "agents.local.yaml"
+    shared.write_text("""version: 1
+defaults:
+  planner: {agent: codex, model: shared-planner-model, reasoning: low, options: {--foo: shared}}
+  plan_reviewer: {agent: codex, model: shared-review-model, reasoning: medium, options: {--foo: shared}}
+""")
+    monkeypatch.setattr(agent_registry, "SHARED_CONFIG_PATH", shared)
+    monkeypatch.setattr(agent_registry, "_ACTIVE", None)
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git(primary, "init", "-q", "-b", "main")
+    _git(primary, "config", "user.name", "Test")
+    _git(primary, "config", "user.email", "test@example.com")
+    (primary / "README").write_text("primary\n", encoding="utf-8")
+    _git(primary, "add", "README")
+    _git(primary, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    worktree = tmp_path / "linked"
+    _git(primary, "worktree", "add", "-q", "-b", "feature", str(worktree))
+    primary_config = write_config(primary, """version: 1
+defaults:
+  coder: {agent: codex, model: gpt-5.5, reasoning: xhigh, options: {--foo: bar}}
+  reviewer: {agent: codex, model: gpt-5.5, reasoning: xhigh, options: {--foo: bar}}
+""")
+    worktree_config = write_config(worktree, """version: 1
+aliases:
+  away: sonnet
+  fast: codex
+defaults:
+  coder: {agent: away}
+  reviewer: {agent: fast}
+  planner: {agent: "claude:sonnet-from-spec", model: claude-local-model}
+  plan_reviewer: {agent: "codex:explicit-spec", model: explicit-plan-model}
+""")
+    try:
+        registry = agent_registry.configure(worktree)
+        coder = registry.role("coder")
+        assert coder["agent"] == "away"
+        assert coder["patch"] == {}
+        assert coder["source"] == str(worktree_config)
+        assert registry.default_field_sources["coder"] == {"agent": str(worktree_config)}
+        coder_run = registry.command(coder["agent"], patch=coder["patch"])
+        coder_review = registry.command(coder["agent"], review=True, patch=coder["patch"])
+        assert coder_run[0] == "claude"
+        assert coder_run[coder_run.index("--model") + 1] == "sonnet"
+        assert not any("model_reasoning_effort" in part for part in coder_run)
+        assert "--foo" not in coder_run
+        assert "gpt-5.5" not in coder_run
+        assert coder_review[coder_review.index("--model") + 1] == "sonnet"
+        assert "review" not in coder_review
+
+        reviewer = registry.role("reviewer")
+        assert reviewer["agent"] == "fast"
+        assert reviewer["patch"] == {
+            "model": "gpt-5.5", "reasoning": "xhigh", "options": {"--foo": "bar"},
+        }
+        assert reviewer["field_sources"]["agent"] == str(worktree_config)
+        assert reviewer["field_sources"]["model"] == str(primary_config)
+        assert reviewer["field_sources"]["reasoning"] == str(primary_config)
+        assert reviewer["field_sources"]["options"] == str(primary_config)
+        reviewer_run = registry.command(reviewer["agent"], patch=reviewer["patch"])
+        reviewer_review = registry.command(reviewer["agent"], review=True, patch=reviewer["patch"])
+        assert reviewer_run[reviewer_run.index("--model") + 1] == "gpt-5.5"
+        assert 'model_reasoning_effort="xhigh"' in reviewer_run
+        assert reviewer_run[reviewer_run.index("--foo") + 1] == "bar"
+        assert "review" not in reviewer_run
+        assert reviewer_review[reviewer_review.index("--model") + 1] == "gpt-5.5"
+        assert 'model_reasoning_effort="xhigh"' in reviewer_review
+        assert reviewer_review[reviewer_review.index("--foo") + 1] == "bar"
+        assert "review" in reviewer_review
+
+        planner = registry.role("planner")
+        assert planner["agent"] == "claude:sonnet-from-spec"
+        assert planner["patch"] == {"model": "claude-local-model"}
+        assert registry.default_field_sources["planner"] == {
+            "agent": str(worktree_config), "model": str(worktree_config),
+        }
+        planner_run = registry.command(planner["agent"], patch=planner["patch"])
+        assert planner_run[0] == "claude"
+        assert planner_run[planner_run.index("--model") + 1] == "claude-local-model"
+        assert not any("model_reasoning_effort" in part for part in planner_run)
+        assert "--foo" not in planner_run
+        assert "shared-planner-model" not in planner_run
+
+        plan_reviewer = registry.role("plan_reviewer")
+        assert plan_reviewer["patch"]["model"] == "explicit-plan-model"
+        assert plan_reviewer["patch"]["reasoning"] == "medium"
+        assert plan_reviewer["patch"]["options"] == {"--foo": "shared"}
+        assert plan_reviewer["field_sources"]["agent"] == str(worktree_config)
+        assert plan_reviewer["field_sources"]["model"] == str(worktree_config)
+        assert plan_reviewer["field_sources"]["reasoning"] == str(shared)
+        assert plan_reviewer["field_sources"]["options"] == str(shared)
+        plan_run = registry.command(plan_reviewer["agent"], patch=plan_reviewer["patch"])
+        plan_review = registry.command(plan_reviewer["agent"], review=True, patch=plan_reviewer["patch"])
+        assert plan_run[plan_run.index("--model") + 1] == "explicit-plan-model"
+        assert 'model_reasoning_effort="medium"' in plan_run
+        assert plan_run[plan_run.index("--foo") + 1] == "shared"
+        assert "shared-review-model" not in plan_run
+        assert plan_review[plan_review.index("--model") + 1] == "explicit-plan-model"
+        assert "review" in plan_review
+
+        assert registry.role("coder", "codex") == {"agent": "codex", "patch": {}, "source": "task"}
+        monkeypatch.setenv("ORCHESTRA_DEFAULT_CODER", "opus")
+        assert registry.role("coder") == {"agent": "opus", "patch": {}, "source": "environment"}
+        monkeypatch.delenv("ORCHESTRA_DEFAULT_CODER")
+
+        snapshot = config.agent_snapshot()
+        assert snapshot["roles"]["coder"]["spec"] == "away"
+        assert snapshot["roles"]["coder"]["run"] == coder_run
+        assert snapshot["roles"]["coder"]["review"] == coder_review
+        assert snapshot["roles"]["reviewer"]["run"] == reviewer_run
+        assert snapshot["roles"]["reviewer"]["review"] == reviewer_review
+        connection = db.connect(str(worktree / "kanban-orchestra.db"))
+        try:
+            task_id = db.add_task(connection, "Cross provider", coder_agent="away", agent_snapshot=snapshot)
+            primary_config.write_text("""version: 1
+defaults:
+  coder: {agent: codex, model: gpt-5.5, reasoning: low}
+  reviewer: {agent: codex, model: gpt-5.5, reasoning: xhigh, options: {--foo: bar}}
+""", encoding="utf-8")
+            refreshed = agent_registry.configure(worktree)
+            assert refreshed.fingerprint != registry.fingerprint
+            assert refreshed.role("coder")["patch"] == {}
+            assert agent_runner._resolve_command_template(
+                "away", conn=connection, task_id=task_id, verb="commit-make",
+            ) == coder_run
+        finally:
+            connection.close()
+    finally:
+        agent_registry._ACTIVE = None
+
+
+def test_worktree_override_preserves_option_arity_until_explicit_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_registry, "SHARED_CONFIG_PATH", tmp_path / "agents.local.yaml")
+    monkeypatch.setattr(agent_registry, "_ACTIVE", None)
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git(primary, "init", "-q", "-b", "main")
+    _git(primary, "config", "user.name", "Test")
+    _git(primary, "config", "user.email", "test@example.com")
+    (primary / "README").write_text("primary\n", encoding="utf-8")
+    _git(primary, "add", "README")
+    _git(primary, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    worktree = tmp_path / "linked"
+    _git(primary, "worktree", "add", "-q", "-b", "feature", str(worktree))
+    write_config(primary, """version: 1
+agents:
+  codex:
+    options:
+      --foo: bar
+""")
+    write_config(worktree, """version: 1
+agents:
+  codex:
+    model: worktree-model
+    options:
+      --baz: qux
+""")
+    try:
+        registry = agent_registry.EffectiveRegistry(worktree)
+        assert registry.option_values["codex"] == {"--foo", "--baz"}
+        for review in (False, True):
+            command = registry.command("codex", review=review)
+            assert command[command.index("--model") + 1] == "worktree-model"
+            assert command[command.index("--foo") + 1] == "bar"
+            assert command[command.index("--baz") + 1] == "qux"
+            removed = registry.command("codex", review=review, patch={"options": {"--foo": False}})
+            assert "--foo" not in removed
+            assert "bar" not in removed
+            assert removed[removed.index("--baz") + 1] == "qux"
+            assert removed.count("{prompt}") == 1
+            assert ("review" in removed) is review
+
+        write_config(worktree, """version: 1
+agents:
+  codex:
+    options:
+      --foo: later
+""")
+        replaced = agent_registry.EffectiveRegistry(worktree)
+        command = replaced.command("codex")
+        assert command[command.index("--foo") + 1] == "later"
+        assert "bar" not in command
+        assert "--baz" not in command
+        assert replaced.option_values["codex"] == {"--foo"}
+
+        write_config(worktree, """version: 1
+agents:
+  codex:
+    options:
+      --foo: true
+""")
+        flagged = agent_registry.EffectiveRegistry(worktree)
+        assert "bar" not in flagged.command("codex")
+        assert "--foo" not in flagged.option_values["codex"]
+        removed = flagged.command("codex", review=True, patch={"options": {"--foo": False}})
+        assert "--foo" not in removed
+        assert "bar" not in removed
+        assert "review" in removed
+        assert removed.count("{prompt}") == 1
+    finally:
+        agent_registry._ACTIVE = None
+
+
+def test_inherited_model_source_stays_when_worktree_patches_another_field(tmp_path, monkeypatch):
+    for role in agent_registry.ROLE_FALLBACKS:
+        monkeypatch.delenv("ORCHESTRA_DEFAULT_" + role.upper(), raising=False)
+    monkeypatch.setattr(agent_registry, "SHARED_CONFIG_PATH", tmp_path / "agents.local.yaml")
+    monkeypatch.setattr(agent_registry, "_ACTIVE", None)
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git(primary, "init", "-q", "-b", "main")
+    _git(primary, "config", "user.name", "Test")
+    _git(primary, "config", "user.email", "test@example.com")
+    (primary / "README").write_text("primary\n", encoding="utf-8")
+    _git(primary, "add", "README")
+    _git(primary, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init")
+    worktree = tmp_path / "linked"
+    _git(primary, "worktree", "add", "-q", "-b", "feature", str(worktree))
+    primary_config = write_config(primary, """version: 1
+agents:
+  codex:
+    model: primary-model
+    reasoning: high
+    label: Primary Codex
+    options:
+      --foo: bar
+""")
+    write_config(worktree, """version: 1
+agents:
+  codex:
+    reasoning: low
+aliases:
+  audit: codex
+""")
+    try:
+        registry = agent_registry.EffectiveRegistry(worktree)
+        assert registry.sources["codex"] == str(worktree / ".kanban-orchestra" / "agents.yaml")
+        assert registry.field_sources["codex"]["model"] == str(primary_config)
+        assert registry.field_sources["codex"]["label"] == str(primary_config)
+        assert registry.field_sources["codex"]["options"] == str(primary_config)
+        assert registry.field_sources["codex"]["reasoning"] == str(worktree / ".kanban-orchestra" / "agents.yaml")
+        command = registry.command("audit")
+        assert command[command.index("--model") + 1] == "primary-model"
+        assert 'model_reasoning_effort="low"' in command
+        assert command[command.index("--foo") + 1] == "bar"
+        choice = next(item for item in registry.model_choices("codex")["models"] if item["id"] == "primary-model")
+        assert choice["sources"] == ["inherited"]
+        assert choice["label"] == "Primary Codex"
+        cache = worktree / model_registry.CACHE
+        cache.write_text(json.dumps({
+            "version": 1,
+            "providers": {
+                "codex": {
+                    "scope": model_registry.scope("codex"),
+                    "state": "fresh",
+                    "reason": None,
+                    "last_success": "2026-10-12T00:00:00+00:00",
+                    "last_attempt": "2026-10-12T00:00:00+00:00",
+                    "models": [{"id": "primary-model", "label": "Discovered Codex", "capabilities": {"source": "discovery"}}],
+                }
+            },
+        }), encoding="utf-8")
+        discovered = next(item for item in registry.model_choices("codex")["models"] if item["id"] == "primary-model")
+        assert discovered["label"] == "Primary Codex"
+        assert discovered["sources"] == ["inherited", "discovered"]
+        assert discovered["capabilities"] == {"source": "discovery"}
+        cache.unlink()
+
+        write_config(worktree, """version: 1
+agents:
+  codex:
+    provider: cursor
+    model: composer-next
+""")
+        rebuilt = agent_registry.EffectiveRegistry(worktree)
+        assert set(rebuilt.field_sources["codex"]) == {"provider", "model"}
+        assert rebuilt.field_sources["codex"]["model"] == str(worktree / ".kanban-orchestra" / "agents.yaml")
+        assert rebuilt.label("codex") == "Cursor composer-next"
+        rebuilt_command = rebuilt.command("codex")
+        assert rebuilt_command[rebuilt_command.index("--model") + 1] == "composer-next"
+        assert "--foo" not in rebuilt_command
+        assert "bar" not in rebuilt_command
+        assert not any("model_reasoning_effort" in part for part in rebuilt_command)
+        cursor_choice = next(item for item in rebuilt.model_choices("cursor")["models"] if item["id"] == "composer-next")
+        assert cursor_choice["sources"] == ["local"]
+        assert "primary-model" not in {item["id"] for item in rebuilt.model_choices("codex")["models"]}
+    finally:
+        agent_registry._ACTIVE = None

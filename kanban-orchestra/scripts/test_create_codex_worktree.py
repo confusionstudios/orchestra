@@ -193,18 +193,114 @@ class CreateCodexWorktreeTests(unittest.TestCase):
         self.assertIn("regular file", str(raised.exception))
         self.assertFalse(_git(self.root, "status", "--short").stdout.strip())
 
-    def test_missing_inputs_do_not_choose_defaults(self):
+    def test_missing_branch_is_not_invented(self):
         with self.assertRaises(worktree_prep.PrepError) as raised:
-            worktree_prep.require_inputs(None, None)
+            worktree_prep.resolve_creation(self.root, None, None)
         message = str(raised.exception)
-        self.assertIn("existing", message)
         self.assertIn("target branch", message)
-        self.assertIn("do not choose a default", message)
+        self.assertIn("do not invent a branch", message)
+        self.assertEqual(_git(self.root, "branch", "--show-current").stdout.strip(), "main")
 
+    def test_unambiguous_defaults_leave_branch_creation_to_the_worktree(self):
+        result = _run_prep("prepare", "--root", str(self.root), "--branch", "feature-new", cwd=self.root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode: new", result.stdout)
+        self.assertIn("base: main", result.stdout)
+        self.assertEqual(_git(self.root, "branch", "--show-current").stdout.strip(), "main")
+        missing = _git(self.root, "show-ref", "--verify", "--quiet", "refs/heads/feature-new", check=False)
+        self.assertNotEqual(missing.returncode, 0)
+
+    def test_ambiguous_parking_does_not_switch(self):
+        _git(self.root, "switch", "-c", "feature-hold")
+        result = _run_prep("prepare", "--root", str(self.root), "--branch", "feature-hold", cwd=self.root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ambiguous", result.stderr)
+        self.assertEqual(_git(self.root, "branch", "--show-current").stdout.strip(), "feature-hold")
+        self.assertEqual(_git(self.root, "worktree", "list", "--porcelain").stdout.count("worktree "), 1)
+
+    def test_branch_checked_out_elsewhere_is_left_alone(self):
+        other = Path(self.tmpdir.name) / "owned"
+        _git(self.root, "worktree", "add", "-q", "-b", "feature-owned", str(other))
+
+        result = _run_prep("prepare", "--root", str(self.root), "--branch", "feature-owned", cwd=self.root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checked out", result.stderr)
+        self.assertEqual(_git(self.root, "branch", "--show-current").stdout.strip(), "main")
+        self.assertEqual(_git(other, "branch", "--show-current").stdout.strip(), "feature-owned")
+
+    def test_empty_manifest_is_valid_and_runtime_auth_is_rejected(self):
+        _write(self.root / ".worktreeinclude", "# approved empty manifest\n")
+        _git(self.root, "add", ".worktreeinclude")
+        _commit(self.root, "empty manifest")
+        preflight = _run_prep("preflight", "--root", str(self.root), cwd=self.root)
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+
+        worktree = Path(self.tmpdir.name) / "empty-wt"
+        _add_detached_worktree(self.root, worktree, "main")
+        copied = _run_prep("verify-copy", "--source", str(self.root), "--dest", str(worktree))
+        self.assertEqual(copied.returncode, 0, copied.stderr)
+        self.assertIn("copied: none", copied.stdout)
+        self.assertNotIn(".env", copied.stdout.splitlines())
+
+        gitignore = (self.root / ".gitignore").read_text(encoding="utf-8")
+        _write(self.root / ".gitignore", gitignore + "auth.json\n")
+        _write(self.root / ".worktreeinclude", "auth.json\n")
+        _write(self.root / "auth.json", "token\n")
+        rejected = _run_prep("verify-copy", "--source", str(self.root), "--dest", str(worktree))
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("auth.json", rejected.stderr)
+        self.assertFalse((worktree / "auth.json").exists())
+
+        _write(worktree / "auth.json", "copied\n")
+        absent = _run_prep("verify-kanban-absent", "--root", str(worktree))
+        self.assertNotEqual(absent.returncode, 0)
+        self.assertIn("auth.json", absent.stderr)
+
+    def test_start_instance_uses_only_the_worktree_path(self):
+        orchestra = Path(self.tmpdir.name) / "orchestra"
+        binary = orchestra / "bin" / "ko-fleet"
+        binary.parent.mkdir(parents=True)
+        record = Path(self.tmpdir.name) / "fleet-args"
+        binary.write_text(
+            "\n".join([
+                "#!/usr/bin/env python3",
+                "import pathlib, sys",
+                f"path = pathlib.Path({str(record)!r})",
+                "path.write_text(path.read_text(encoding='utf-8') if path.exists() else '', encoding='utf-8')",
+                "with path.open('a', encoding='utf-8') as handle:",
+                "    handle.write('\\n'.join(sys.argv[1:]) + '\\n')",
+                "if len(sys.argv) > 1 and sys.argv[1] == 'status':",
+                "    print('This repo (leaf) is running/idle. Dashboard: http://127.0.0.1:8427')",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        worktree = Path(self.tmpdir.name) / "fleet-wt"
+        _add_detached_worktree(self.root, worktree, "main")
+        env = {**os.environ, "ORCHESTRA_DIR": str(orchestra), **{key: GIT_ENV[key] for key in GIT_ENV if key.startswith("GIT_")}}
+        result = subprocess.run(
+            [sys.executable, str(HELPER), "start-instance", "--root", str(worktree)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dashboard: http://127.0.0.1:8427", result.stdout)
+        recorded = record.read_text(encoding="utf-8").splitlines()
+        resolved = str(worktree.resolve())
+        self.assertEqual(recorded, ["start", resolved, "status", resolved])
+        self.assertNotIn(str(self.root.resolve()), recorded)
         with self.assertRaises(worktree_prep.PrepError):
-            worktree_prep.require_inputs("existing", "feature-x")
+            worktree_prep.dashboard_url_from_status("Dashboard: not running\n")
         with self.assertRaises(worktree_prep.PrepError):
-            worktree_prep.require_inputs("new", "feature-x")
+            worktree_prep.dashboard_url_from_status(
+                "Dashboard: http://127.0.0.1:1\nDashboard: http://127.0.0.1:2\n"
+            )
 
     def test_existing_branch_parks_main_checkout_then_worktree_owns_branch(self):
         _git(self.root, "switch", "-c", "feature-existing")

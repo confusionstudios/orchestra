@@ -75,9 +75,19 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
    ```
    Do not continue on a dirty checkout, and do not treat a dirty worktree as
    equivalent to any landed commit.
-6. Confirm the source Kanban database exists and its orchestrator is stopped:
+6. Stop only the verified source worktree's Fleet instance, then prove it is
+   stopped. Pass the resolved source root as the selector:
    ```bash
    test -f "$source_root/kanban-orchestra.db" || exit 1
+   "$ORCHESTRA_DIR/bin/ko-fleet" stop "$source_root"
+   ```
+   Do not pass a basename, the primary path, or any other selector. Do not
+   remove the primary from Fleet config, and do not unregister the worktree.
+   If the selector is unknown because the primary is not a Fleet primary, do
+   not search for a similarly named tmux session and do not stop anything
+   else. A stop message is not proof. Re-check the source until the three
+   conditions below pass, or stop and report if they do not:
+   ```bash
    "$ORCHESTRA_DIR/bin/ko-get-update" --db "$source_root/kanban-orchestra.db" || exit 1
    ```
    Confirm the `INSTANCE:` path is `$source_root`. Treat the source
@@ -216,7 +226,8 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
   detached, running an orchestrator, or missing its Kanban database.
 - Do not treat a stale orchestrator as stopped unless the source worktree has
   no orchestrator process, no active task, and no running dashboard. Do not
-  infer those from omitted `ko-get-update` fields.
+  infer those from omitted `ko-get-update` fields or from the Fleet stop
+  message. Stop only the verified source path, and do not unregister it.
 - Do not import before a landed commit is recorded, either a proven
   already-landed equivalent commit or a newly created squash commit.
 - Do not delete the source worktree manually with filesystem commands.

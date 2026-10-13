@@ -1354,6 +1354,7 @@ def main():
         if args.command == "agents":
             _json_out({
                 "config": str(registry.path), "shared_config": str(registry.shared_config_path),
+                "inherited_config": (str(registry.inherited_config_path) if registry.inherited_config_path else None),
                 "fingerprint": registry.fingerprint,
                 "agents": {name: {"source": registry.sources[name], "field_sources": registry.field_sources[name],
                                     "label": registry.labels[name],

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import config
@@ -27,19 +28,37 @@ ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().p
 DEFAULT_CONFIG_PATH = Path("~/.config/orchestra/fleet.repos").expanduser()
 FLEET_DASHBOARD_PORT = config.DASHBOARD_PORT_BASE - 1
 FLEET_DASHBOARD_METADATA_NAME = "fleet-dashboard.json"
+UNOWNED_SESSION = "unowned"
 
 
 @dataclass(frozen=True)
 class FleetRepo:
+    """One Fleet instance.
+
+    ``label`` is the readable display name. ``selector`` is the stable identity
+    used for commands and dashboard play. ``session`` is the tmux name derived
+    from that selector.
+    """
+
     label: str
     path: Path
     root: Path | None
     error: str | None = None
     managed: bool = True
+    kind: str = "primary"
+    parent: Path | None = None
+
+    @property
+    def selector(self) -> str:
+        if self.root is None:
+            return self.label
+        return instance_token(self.root)
 
     @property
     def session(self) -> str:
-        return f"orch-{self.label}"
+        if self.root is None:
+            return f"orch-{sanitize_token(self.label)}"
+        return f"orch-{self.selector}"
 
     @property
     def lock_path(self) -> Path | None:
@@ -129,6 +148,27 @@ def label_for(path: Path) -> str:
     return label or "repo"
 
 
+def sanitize_token(name: str) -> str:
+    """Return a tmux-safe token. Session targets treat '.' and ':' specially."""
+    token = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-")
+    return token or "repo"
+
+
+def canonical_path(path: Path) -> Path:
+    return path.expanduser().resolve()
+
+
+def instance_token(root: Path) -> str:
+    """Readable basename plus a short hash of the canonical root.
+
+    The hash follows the directory path, so a branch change does not rename
+    the instance or its tmux session.
+    """
+    canonical = canonical_path(root)
+    digest = hashlib.sha256(str(canonical).encode("utf-8")).hexdigest()[:8]
+    return f"{sanitize_token(canonical.name)}-{digest}"
+
+
 def parse_config_lines(text: str) -> list[str]:
     paths: list[str] = []
     for raw in text.splitlines():
@@ -175,29 +215,205 @@ def discover_repo(raw_path: str) -> FleetRepo:
     label = label_for(root)
     if physical_path != root:
         return FleetRepo(label, physical_path, root, f"configured path is not the git root: {root}")
-    return FleetRepo(label, physical_path, root)
+    return FleetRepo(label, physical_path, root, kind="primary")
 
 
-def load_repos() -> list[FleetRepo]:
+@dataclass(frozen=True)
+class _WorktreeEntry:
+    path: Path
+    missing: bool
+
+
+def _unquote_git_path(text: str) -> str:
+    if len(text) < 2 or not text.startswith('"') or not text.endswith('"'):
+        return text
+    body = text[1:-1]
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        if body[index] != "\\":
+            out.append(body[index])
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            break
+        escaped = body[index]
+        mapping = {"n": "\n", "t": "\t", "\\": "\\", '"': '"'}
+        if escaped in mapping:
+            out.append(mapping[escaped])
+            index += 1
+        elif escaped in "01234567":
+            octal = body[index:index + 3]
+            if len(octal) == 3 and octal.isdigit():
+                out.append(chr(int(octal, 8)))
+                index += 3
+            else:
+                out.append(escaped)
+                index += 1
+        else:
+            out.append(escaped)
+            index += 1
+    return "".join(out)
+
+
+def _parse_worktree_porcelain(text: str) -> list[_WorktreeEntry]:
+    entries: list[_WorktreeEntry] = []
+    path: Path | None = None
+    prunable = False
+
+    def finish() -> None:
+        nonlocal path, prunable
+        if path is not None:
+            missing = prunable or not path.exists()
+            entries.append(_WorktreeEntry(path, missing))
+        path = None
+        prunable = False
+
+    for line in text.splitlines():
+        if not line:
+            finish()
+            continue
+        if line.startswith("worktree "):
+            if path is not None:
+                finish()
+            path = Path(_unquote_git_path(line[len("worktree "):]))
+            prunable = False
+        elif line.startswith("prunable"):
+            prunable = True
+    finish()
+    return entries
+
+
+def list_worktree_entries(root: Path) -> list[_WorktreeEntry]:
+    result = run(["git", "-C", str(root), "worktree", "list", "--porcelain"])
+    if result.returncode != 0:
+        return []
+    return _parse_worktree_porcelain(result.stdout)
+
+
+def is_linked_worktree(path: Path) -> bool:
+    """Linked worktrees store a .git file; the main worktree stores a directory."""
+    try:
+        return (path / ".git").is_file()
+    except OSError:
+        return False
+
+
+def orchestra_database_usable(root: Path) -> bool:
+    """Return whether this checkout already has an Orchestra database.
+
+    Fleet does not create or migrate the database. A linked worktree opts in
+    only when the file opens read-only and already has orchestrator runtime.
+    """
+    db_path = root / "kanban-orchestra.db"
+    try:
+        if not db_path.is_file():
+            return False
+    except OSError:
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestrator_runtime'"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+    return row is not None
+
+
+def configured_primary_repos(*, missing_ok: bool = False) -> list[FleetRepo]:
     path = config_path()
     if not path.exists():
+        if missing_ok:
+            return []
         die(f"fleet config not found: {path}\nRun `ko-fleet init` or `ko-fleet add .`.")
     return [discover_repo(raw) for raw in parse_config_lines(path.read_text(encoding="utf-8"))]
 
 
+def expand_configured_repos(primaries: list[FleetRepo]) -> list[FleetRepo]:
+    """Return configured primaries plus initialized linked worktrees.
+
+    Invalid primary config is preserved. Missing linked worktrees are omitted.
+    Canonical roots are listed once; a configured primary wins over a worktree
+    entry for the same path. This list is derived from Git metadata and is not
+    a second registration database.
+    """
+    instances: list[FleetRepo] = []
+    seen: set[Path] = set()
+    valid: list[FleetRepo] = []
+    for primary in primaries:
+        if primary.error or primary.root is None:
+            instances.append(primary)
+            continue
+        try:
+            root = canonical_path(primary.root)
+        except OSError:
+            instances.append(replace(primary, error=primary.error or "path could not be resolved"))
+            continue
+        if root in seen:
+            continue
+        seen.add(root)
+        instances.append(replace(primary, path=root, root=root, kind="primary", parent=None))
+        valid.append(primary)
+
+    for primary in valid:
+        if primary.root is None:
+            continue
+        try:
+            parent = canonical_path(primary.root)
+        except OSError:
+            continue
+        for entry in list_worktree_entries(parent):
+            if entry.missing:
+                continue
+            try:
+                root = canonical_path(entry.path)
+            except OSError:
+                continue
+            if root in seen or root == parent:
+                continue
+            if not is_linked_worktree(root):
+                continue
+            if not orchestra_database_usable(root):
+                continue
+            seen.add(root)
+            instances.append(
+                FleetRepo(
+                    label_for(root),
+                    root,
+                    root,
+                    kind="worktree",
+                    parent=parent,
+                )
+            )
+    return instances
+
+
+def load_repos() -> list[FleetRepo]:
+    return expand_configured_repos(configured_primary_repos())
+
+
 def load_status_repos() -> list[FleetRepo]:
-    path = config_path()
-    if not path.exists():
-        return []
-    return [discover_repo(raw) for raw in parse_config_lines(path.read_text(encoding="utf-8"))]
+    return expand_configured_repos(configured_primary_repos(missing_ok=True))
 
 
 def repo_matches(repo: FleetRepo, query: str) -> bool:
-    return query in {repo.label, repo.path.name, str(repo.path), str(repo.root or "")}
+    candidates = {repo.label, repo.selector, repo.path.name, str(repo.path)}
+    if repo.root is not None:
+        candidates.add(str(repo.root))
+        try:
+            candidates.add(str(canonical_path(repo.root)))
+        except OSError:
+            pass
+    return query in candidates
 
 
-def select_repos(queries: list[str]) -> list[FleetRepo]:
-    repos = load_repos()
+def select_instances(repos: list[FleetRepo], queries: list[str]) -> list[FleetRepo]:
     if not queries:
         return repos
 
@@ -208,12 +424,18 @@ def select_repos(queries: list[str]) -> list[FleetRepo]:
         if not matches:
             unmatched.append(query)
             continue
-        for repo in matches:
-            if repo not in selected:
-                selected.append(repo)
+        if len(matches) > 1:
+            rendered = ", ".join(repo.selector for repo in matches)
+            die(f"ambiguous repo selector: {query} ({rendered})")
+        if matches[0] not in selected:
+            selected.append(matches[0])
     if unmatched:
         die(f"unknown repo selector(s): {', '.join(unmatched)}")
     return selected
+
+
+def select_repos(queries: list[str]) -> list[FleetRepo]:
+    return select_instances(load_repos(), queries)
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -397,14 +619,122 @@ def wait_dashboard_ready(repo: FleetRepo, *, timeout: float = 12.0) -> bool:
     return dashboard_status_url(repo) != "-"
 
 
+def tmux_target(session: str) -> str:
+    """Force an exact tmux session match. Plain names can match a unique prefix."""
+    return f"={session}"
+
+
+def tmux_format_target(session: str) -> str:
+    """Exact session target that resolves to the session's current pane.
+
+    tmux 3.7 ``display-message -t =name`` matches the session and exits 0, but
+    ``#{session_path}`` and ``#{pane_current_path}`` expand to empty. The
+    trailing colon selects that session's current window and pane, which
+    returns the paths used to prove ownership.
+    """
+    return f"{tmux_target(session)}:"
+
+
 def tmux_has_session(session: str) -> bool:
+    if shutil.which("tmux") is None or not session:
+        return False
+    return run(["tmux", "has-session", "-t", tmux_target(session)]).returncode == 0
+
+
+def _tmux_format(session: str, fmt: str) -> str | None:
+    if shutil.which("tmux") is None:
+        return None
+    result = run(["tmux", "display-message", "-p", "-t", tmux_format_target(session), fmt])
+    if result.returncode != 0:
+        return None
+    text = result.stdout.strip()
+    return text or None
+
+
+def tmux_recorded_path(session: str) -> Path | None:
+    recorded = _tmux_format(session, "#{session_path}")
+    if recorded is None:
+        recorded = _tmux_format(session, "#{pane_current_path}")
+    if recorded is None:
+        return None
+    try:
+        return canonical_path(Path(recorded))
+    except OSError:
+        return None
+
+
+def tmux_session_matches_root(session: str, root: Path) -> bool:
+    """Return whether this exact session was started in the selected root."""
+    recorded = tmux_recorded_path(session)
+    if recorded is None:
+        return False
+    try:
+        return recorded == canonical_path(root)
+    except OSError:
+        return False
+
+
+def reported_tmux_session(repo: FleetRepo) -> str:
+    """Return the owned session name, ``unowned``, or ``-``.
+
+    Status display maps ``unowned`` back to ``-``. Start and stop use the
+    sentinel so a name collision is not treated as a free session.
+    """
+    if repo.root is None or not tmux_has_session(repo.session):
+        return "-"
+    if not tmux_session_matches_root(repo.session, repo.root):
+        return UNOWNED_SESSION
+    return repo.session
+
+
+def session_is_owned(repo: FleetRepo) -> bool:
+    """Exact session name plus a recorded path for this canonical root."""
+    if repo.root is None or not tmux_has_session(repo.session):
+        return False
+    return tmux_session_matches_root(repo.session, repo.root)
+
+
+def session_runs_orchestrator(session: str) -> bool:
+    """Return whether a pane process is the Fleet-launched orchestrator."""
     if shutil.which("tmux") is None:
         return False
-    return subprocess.run(
-        ["tmux", "has-session", "-t", session],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    result = run(["tmux", "list-panes", "-t", tmux_target(session), "-F", "#{pane_pid}"])
+    if result.returncode != 0:
+        return False
+    commands = dict(process_table())
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            pid = int(text)
+        except ValueError:
+            continue
+        command = commands.get(pid, "")
+        if "ko-orchestrator" in command or is_orchestrator_command(command):
+            return True
+    return False
+
+
+def interrupt_tmux_session(session: str) -> None:
+    """Ask the pane to exit, then kill the session if it is still present.
+
+    ``send-keys`` needs the pane-qualified exact target. A bare ``=name``
+    session target is not a pane on tmux 3.7. Session checks and ``kill-session``
+    keep the exact session target.
+    """
+    subprocess.run(
+        ["tmux", "send-keys", "-t", tmux_format_target(session), "C-c"],
+        check=False,
+    )
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and tmux_has_session(session):
+        time.sleep(0.1)
+    if tmux_has_session(session):
+        subprocess.run(
+            ["tmux", "kill-session", "-t", tmux_target(session)],
+            check=False,
+        )
 
 
 def process_table() -> list[tuple[int, str]]:
@@ -483,7 +813,8 @@ def discover_running_repos() -> list[FleetRepo]:
     for pid, root in running_orchestrator_process_roots():
         if root in seen_roots:
             continue
-        repo = FleetRepo(label_for(root), root, root, managed=False)
+        kind = "worktree" if is_linked_worktree(root) else "primary"
+        repo = FleetRepo(label_for(root), root, root, managed=False, kind=kind)
         if metadata_pid(repo.lock_path, "orchestrator", repo) != pid:
             continue
         if not pid_alive(pid):
@@ -518,29 +849,14 @@ def status_repos(queries: list[str]) -> list[FleetRepo]:
         *configured,
         *unmanaged,
     ]
-    if not queries:
-        return repos
-
-    selected: list[FleetRepo] = []
-    unmatched: list[str] = []
-    for query in queries:
-        matches = [repo for repo in repos if repo_matches(repo, query)]
-        if not matches:
-            unmatched.append(query)
-            continue
-        for repo in matches:
-            if repo not in selected:
-                selected.append(repo)
-    if unmatched:
-        die(f"unknown repo selector(s): {', '.join(unmatched)}")
-    return selected
+    return select_instances(repos, queries)
 
 
 def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
     if repo.error:
         return "invalid", "-", "-", "-"
 
-    session_alive = tmux_has_session(repo.session)
+    session_name = reported_tmux_session(repo)
     orch_pid = metadata_pid(repo.lock_path, "orchestrator", repo)
     dashboard_pid = metadata_pid(repo.dashboard_metadata_path, "dashboard", repo)
     orch_alive = pid_alive(orch_pid)
@@ -555,7 +871,7 @@ def repo_process_state(repo: FleetRepo) -> tuple[str, str, str, str]:
         status,
         str(orch_pid) if orch_pid is not None else "-",
         str(dashboard_pid) if dashboard_pid is not None else "-",
-        repo.session if session_alive else "-",
+        session_name,
     )
 
 
@@ -610,9 +926,13 @@ def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
         status, orch_pid, dashboard_pid, tmux = repo_process_state(repo)
+        if tmux == UNOWNED_SESSION:
+            tmux = "-"
         dashboard_url = "-" if repo.error else dashboard_status_url(repo)
         owner = "managed" if repo.managed else "unmanaged"
         root_display = display_path(repo.root or repo.path)
+        if repo.parent is not None:
+            root_display = f"{root_display} parent {display_path(repo.parent)}"
         if repo.error:
             root_display = f"{root_display} ({repo.error})"
         rows.append(
@@ -623,6 +943,8 @@ def print_status(repos: list[FleetRepo]) -> None:
                 tmux,
                 dashboard_url,
                 owner,
+                repo.kind,
+                repo.selector,
                 root_display,
             )
         )
@@ -634,22 +956,27 @@ def print_status(repos: list[FleetRepo]) -> None:
         max(len("tmux"), *(len(row[3]) for row in rows)),
         max(len("dash_url"), *(len(row[4]) for row in rows)),
         max(len("owner"), *(len(row[5]) for row in rows)),
+        max(len("kind"), *(len(row[6]) for row in rows)),
+        max(len("selector"), *(len(row[7]) for row in rows)),
     ]
     print(
         f"{'repo':<{widths[0]}}  {'status':<{widths[1]}}  "
         f"{'orch/dash':>{widths[2]}}  {'tmux':<{widths[3]}}  "
-        f"{'dash_url':<{widths[4]}}  {'owner':<{widths[5]}}  root"
+        f"{'dash_url':<{widths[4]}}  {'owner':<{widths[5]}}  "
+        f"{'kind':<{widths[6]}}  {'selector':<{widths[7]}}  root"
     )
     print(
         f"{'-' * widths[0]}  {'-' * widths[1]}  "
         f"{'-' * widths[2]}  {'-' * widths[3]}  "
-        f"{'-' * widths[4]}  {'-' * widths[5]}  ----"
+        f"{'-' * widths[4]}  {'-' * widths[5]}  "
+        f"{'-' * widths[6]}  {'-' * widths[7]}  ----"
     )
-    for label, status, process_pids, tmux, dashboard_url, owner, root in rows:
+    for label, status, process_pids, tmux, dashboard_url, owner, kind, selector, root in rows:
         print(
             f"{label:<{widths[0]}}  {status:<{widths[1]}}  "
             f"{process_pids:>{widths[2]}}  {tmux:<{widths[3]}}  "
-            f"{dashboard_url:<{widths[4]}}  {owner:<{widths[5]}}  {root}"
+            f"{dashboard_url:<{widths[4]}}  {owner:<{widths[5]}}  "
+            f"{kind:<{widths[6]}}  {selector:<{widths[7]}}  {root}"
         )
 
     current_repo = current_fleet_repo(repos)
@@ -734,6 +1061,11 @@ def try_start_repo(repo: FleetRepo, *, preferred_port: int | None = None) -> str
             request_dashboard_start(repo, preferred_port=preferred_port)
             wait_dashboard_ready(repo)
         return None
+    if session == UNOWNED_SESSION:
+        return (
+            f"tmux session {repo.session} is in use without proof it belongs to this repo; "
+            "left untouched"
+        )
     if session != "-":
         return f"tmux session already exists without a live orchestrator ({session})"
     if shutil.which("tmux") is None:
@@ -784,6 +1116,12 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
             else:
                 print(f"{repo.label}: already running (orchestrator {orch_pid})")
             continue
+        if session == UNOWNED_SESSION:
+            print(
+                f"{repo.label}: tmux session {repo.session} is in use without proof it belongs "
+                "to this repo; left untouched"
+            )
+            continue
         if session != "-":
             print(f"{repo.label}: tmux session already exists without a live orchestrator ({session})")
             continue
@@ -806,20 +1144,19 @@ def stop(repos: list[FleetRepo]) -> None:
             print(f"{repo.label}: invalid config ({repo.error})")
         raise SystemExit(1)
     for repo in repos:
-        if tmux_has_session(repo.session):
-            subprocess.run(["tmux", "send-keys", "-t", repo.session, "C-c"], check=False)
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline and tmux_has_session(repo.session):
-                time.sleep(0.1)
-            if tmux_has_session(repo.session):
-                subprocess.run(["tmux", "kill-session", "-t", repo.session], check=False)
+        if session_is_owned(repo):
+            interrupt_tmux_session(repo.session)
             print(f"{repo.label}: stopped tmux session")
+            continue
+        blocked = unowned_session_reason(repo)
+        if blocked:
+            print(f"{repo.label}: {blocked}")
+            continue
+        status, orch_pid, _, _ = repo_process_state(repo)
+        if status_is_running(status):
+            print(f"{repo.label}: running outside fleet tmux session (orchestrator {orch_pid}); left alone")
         else:
-            status, orch_pid, _, _ = repo_process_state(repo)
-            if status_is_running(status):
-                print(f"{repo.label}: running outside fleet tmux session (orchestrator {orch_pid}); left alone")
-            else:
-                print(f"{repo.label}: not running")
+            print(f"{repo.label}: not running")
 
 
 def stop_pid(pid: int, *, timeout: float = 2.0) -> bool:
@@ -859,15 +1196,15 @@ def stop_all(repos: list[FleetRepo]) -> None:
             print(f"{prefix}: invalid config ({repo.error})")
             continue
 
-        if repo.managed and tmux_has_session(repo.session):
-            subprocess.run(["tmux", "send-keys", "-t", repo.session, "C-c"], check=False)
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline and tmux_has_session(repo.session):
-                time.sleep(0.1)
-            if tmux_has_session(repo.session):
-                subprocess.run(["tmux", "kill-session", "-t", repo.session], check=False)
+        if repo.managed and session_is_owned(repo):
+            interrupt_tmux_session(repo.session)
             print(f"{prefix}: stopped fleet tmux session")
             continue
+        if repo.managed:
+            blocked = unowned_session_reason(repo)
+            if blocked:
+                print(f"{prefix}: {blocked}")
+                continue
 
         status, orch_pid, _, _ = repo_process_state(repo)
         if not status_is_running(status):
@@ -903,9 +1240,50 @@ def wait_stopped(repos: list[FleetRepo], *, timeout: float = 12.0) -> None:
         time.sleep(0.2)
 
 
+def reap_disappeared_worktree_sessions(primaries: list[FleetRepo]) -> None:
+    """Stop leftover sessions for linked worktrees Git still lists as missing.
+
+    A session is reaped only when all of these are true: the worktree path is
+    absent, the exact session name is the fleet token for that canonical path,
+    tmux's recorded path is that path, and a pane process is the orchestrator.
+    Anything less is left untouched. In particular, Fleet does not scan every
+    tmux session, and it cannot prove ownership after ``git worktree prune``
+    has dropped the path or after the orchestrator process has already exited.
+    Missing primary-config entries are not reaped here; they stay visible as
+    configuration errors.
+    """
+    if shutil.which("tmux") is None:
+        return
+    for primary in primaries:
+        if primary.error or primary.root is None:
+            continue
+        try:
+            parent = canonical_path(primary.root)
+        except OSError:
+            continue
+        for entry in list_worktree_entries(parent):
+            if not entry.missing:
+                continue
+            try:
+                missing = canonical_path(entry.path)
+            except OSError:
+                continue
+            if missing == parent:
+                continue
+            session = f"orch-{instance_token(missing)}"
+            if not tmux_has_session(session):
+                continue
+            if not tmux_session_matches_root(session, missing):
+                continue
+            if not session_runs_orchestrator(session):
+                continue
+            interrupt_tmux_session(session)
+            print(f"reaped disappeared worktree session {session}")
+
+
 def one_repo(queries: list[str]) -> FleetRepo:
     if len(queries) != 1:
-        die("this command requires exactly one repo label or path")
+        die("this command requires exactly one repo label, unique selector, or path")
     repos = select_repos(queries)
     if len(repos) != 1:
         die("selector matched more than one repo")
@@ -914,11 +1292,26 @@ def one_repo(queries: list[str]) -> FleetRepo:
     return repos[0]
 
 
+def unowned_session_reason(repo: FleetRepo) -> str | None:
+    """Return a refusal when the exact session name exists without root proof."""
+    if repo.root is None or not tmux_has_session(repo.session):
+        return None
+    if tmux_session_matches_root(repo.session, repo.root):
+        return None
+    return (
+        f"tmux session {repo.session} is in use without proof it belongs to this repo; "
+        "left untouched"
+    )
+
+
 def attach(repo: FleetRepo) -> None:
     require_tool("tmux")
-    if not tmux_has_session(repo.session):
+    if not session_is_owned(repo):
+        blocked = unowned_session_reason(repo)
+        if blocked:
+            die(blocked)
         die(f"no fleet tmux session for {repo.label}")
-    os.execvp("tmux", ["tmux", "attach", "-t", repo.session])
+    os.execvp("tmux", ["tmux", "attach", "-t", tmux_target(repo.session)])
 
 
 def logs(repo: FleetRepo) -> None:
@@ -1016,7 +1409,8 @@ def init_config() -> None:
     if path.exists():
         die(f"config already exists: {path}")
     path.write_text(
-        "# One git repo root per line. Blank lines and # comments are ignored.\n"
+        "# One primary git repo root per line. Blank lines and # comments are ignored.\n"
+        "# Initialized linked worktrees of these primaries are discovered automatically.\n"
         "# ~/Documents/work/my-repo\n",
         encoding="utf-8",
     )
@@ -1076,11 +1470,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name in ("status", "precheck", "start", "stop", "stop-all", "restart"):
         p = sub.add_parser(name)
-        p.add_argument("repos", nargs="*", help="optional repo labels or paths")
+        p.add_argument("repos", nargs="*", help="optional repo labels, unique selectors, or paths")
 
     for name in ("attach", "logs"):
         p = sub.add_parser(name)
-        p.add_argument("repo", nargs=1, help="repo label or path")
+        p.add_argument("repo", nargs=1, help="repo label, unique selector, or path")
 
     local_help = (
         "open the localhost dashboard URL instead of the preferred Tailscale URL"
@@ -1104,7 +1498,7 @@ def build_parser() -> argparse.ArgumentParser:
         "dashboard-open",
         help="open a repo dashboard (requires a repo selector)",
     )
-    p_open.add_argument("repo", nargs=1, help="repo label or path")
+    p_open.add_argument("repo", nargs=1, help="repo label, unique selector, or path")
     p_open.add_argument("--local", action="store_true", help=local_help)
 
     sub.add_parser("init")
@@ -1123,6 +1517,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command in {"status", "precheck", "start", "stop", "stop-all", "restart"}:
+        reap_disappeared_worktree_sessions(configured_primary_repos(missing_ok=True))
 
     if args.command == "status":
         print_status(status_repos(args.repos))

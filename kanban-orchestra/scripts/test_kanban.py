@@ -7295,13 +7295,14 @@ class TestFleetConfig(unittest.TestCase):
             )
             repo = fleet.FleetRepo("repo", root, root)
 
-            with patch.object(fleet, "tmux_has_session", return_value=True):
+            with patch.object(fleet, "tmux_has_session", return_value=True), \
+                 patch.object(fleet, "tmux_session_matches_root", return_value=True):
                 state, orch_pid, dashboard_pid, session = fleet.repo_process_state(repo)
 
             self.assertEqual(state, "running")
             self.assertEqual(orch_pid, str(os.getpid()))
             self.assertEqual(dashboard_pid, str(os.getpid()))
-            self.assertEqual(session, "orch-repo")
+            self.assertEqual(session, repo.session)
 
     def test_process_state_reports_running_without_dashboard_for_external_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7526,7 +7527,8 @@ class TestFleetConfig(unittest.TestCase):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
         calls = []
 
-        with patch.object(fleet, "select_repos", return_value=[repo]), \
+        with patch.object(fleet, "reap_disappeared_worktree_sessions"), \
+             patch.object(fleet, "select_repos", return_value=[repo]), \
              patch.object(fleet, "require_startable", side_effect=lambda repos: calls.append("require")), \
              patch.object(fleet, "stop", side_effect=lambda repos: calls.append("stop")), \
              patch.object(fleet, "wait_stopped", side_effect=lambda repos: calls.append("wait")), \
