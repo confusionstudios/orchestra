@@ -1138,14 +1138,16 @@ def cmd_retire_queue(args, conn):
         )
         sys.exit(1)
     worktree = Path(row["path"]) if row["path"] else None
-    if worktree is not None and worktree.is_dir():
-        evidence = migrate_cutover.runtime_evidence(worktree)
-        if evidence["worker_live"] or evidence["dashboard_live"]:
-            print(
-                "Error: refusing to retire a queue while its worker or dashboard is live",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    evidence = migrate_cutover._central_runtime_live(
+        Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent, queue_id, worktree,
+        migrate_cutover.fleet.process_table(),
+    )
+    if evidence["worker_live"] or evidence["dashboard_live"]:
+        print(
+            "Error: refusing to retire a queue while its worker or dashboard is live",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     before = [item["id"] for item in conn.execute(
         "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
         (queue_id,),

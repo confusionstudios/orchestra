@@ -1134,8 +1134,9 @@ def unfinished_activation_reason(db_path: str | Path) -> str | None:
     path = Path(db_path)
     if not path.is_file() or _peek_database_kind(path) != "current":
         return None
-    conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
+    conn = None
     try:
+        conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )}
@@ -1144,10 +1145,11 @@ def unfinished_activation_reason(db_path: str | Path) -> str | None:
         pending = conn.execute(
             "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
         ).fetchone()[0]
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        return f"Cannot verify migration activation for {path}: {exc}"
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     if int(pending) == 0:
         return None
     return (
@@ -1162,13 +1164,13 @@ def assert_activation_finished(conn: sqlite3.Connection) -> None:
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )}
-    except sqlite3.Error:
-        return
-    if "migration_sources" not in names:
-        return
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
-    ).fetchone()[0]
+        if "migration_sources" not in names:
+            return
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
+        ).fetchone()[0]
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Cannot verify migration activation: {exc}") from exc
     if int(pending):
         raise RuntimeError(
             "Unfinished migration activation: this database is not a live store. "
@@ -2800,4 +2802,3 @@ def get_runtime(conn):
         (connection_queue_id(conn),),
     ).fetchone()
     return dict(row) if row else None
-

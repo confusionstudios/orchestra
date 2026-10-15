@@ -40,6 +40,16 @@ class TestCentralQueues(unittest.TestCase):
         self.conn_b.close()
         self.tmp.cleanup()
 
+    def test_activation_verification_refuses_sqlite_errors(self):
+        with patch.object(db, "_peek_database_kind", return_value="current"), patch.object(
+            db.sqlite3, "connect", side_effect=sqlite3.OperationalError("unavailable")
+        ):
+            self.assertIn("Cannot verify migration activation", db.unfinished_activation_reason(self.db_path))
+        broken = MagicMock()
+        broken.execute.side_effect = sqlite3.OperationalError("unavailable")
+        with self.assertRaisesRegex(RuntimeError, "Cannot verify migration activation"):
+            db.assert_activation_finished(broken)
+
     def test_two_queues_keep_independent_ids_claims_and_runtime(self):
         self.assertNotEqual(self.conn_a.orchestra_queue_id, self.conn_b.orchestra_queue_id)
         self.assertNotEqual(self.conn_a.orchestra_repository_id, self.conn_b.orchestra_repository_id)

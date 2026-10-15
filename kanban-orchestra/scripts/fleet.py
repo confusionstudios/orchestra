@@ -788,7 +788,7 @@ def interrupt_tmux_session(session: str) -> None:
 
 
 def process_table() -> list[tuple[int, str]]:
-    result = run(["ps", "-Ao", "pid=,command="])
+    result = run(["ps", "-ww", "-Ao", "pid=,command="])
     if result.returncode != 0:
         return []
 

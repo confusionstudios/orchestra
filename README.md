@@ -443,7 +443,10 @@ central database. A tracked legacy file stops the cutover before anything
 is changed.
 `ko-migrate rollback --destination <database>` refuses while a source or
 destination worker or dashboard is live, then restores the previous central
-file and any missing source backup before new workers start. Stable tooling keeps using an existing legacy
+file and any missing source backup before new workers start. It also refuses
+a used rollback record or any central database changes since activation. Stop
+ad-hoc CLI writes as well as workers during cutover; cutover replaces the
+central file, so concurrent writes could be lost. Stable tooling keeps using an existing legacy
 development database until that cutover is approved, and the development
 database has to be included. See
 [the canonical spec](tasks/kanban-orchestra-spec.md#database-compatibility-policy).

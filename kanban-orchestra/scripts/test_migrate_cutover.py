@@ -567,6 +567,8 @@ def test_retry_after_failure_is_idempotent_and_rollback_restores(tmp_path):
     assert not destination.exists()
     with _connect(database) as restored_source:
         assert restored_source.execute("SELECT title FROM tasks").fetchone()[0] == "Keep"
+    with pytest.raises(migrate_cutover.CutoverError, match="already been rolled back"):
+        migrate_cutover.rollback(destination)
 
     restored = migrate_cutover.cutover(destination, [source], fleet_config)
     assert restored["activated"] is True
@@ -706,7 +708,9 @@ def test_retry_after_failure_is_idempotent_and_rollback_restores(tmp_path):
     assert all(not path.exists() for path in later_identity_files)
 
 
-def test_cutover_refuses_live_worker_or_dashboard(tmp_path):
+def test_cutover_refuses_live_worker_or_dashboard(tmp_path, monkeypatch):
+    # GNU ps may truncate long command paths to this width unless -ww is used.
+    monkeypatch.setenv("COLUMNS", "80")
     source = tmp_path / "source"
     _init_repo(source)
     _legacy_db(source)
@@ -749,6 +753,36 @@ def test_cutover_refuses_live_worker_or_dashboard(tmp_path):
         sock.close()
 
 
+@pytest.mark.parametrize("existing_destination", [False, True])
+def test_rollback_refuses_work_added_after_activation(tmp_path, existing_destination):
+    source = tmp_path / "source"
+    _init_repo(source)
+    legacy = _legacy_db(source)
+    destination = tmp_path / "central" / "orchestra.db"
+    if existing_destination:
+        db.connect(str(destination)).close()
+    fleet_config = tmp_path / "empty-fleet.repos"
+    fleet_config.write_text("", encoding="utf-8")
+    result = migrate_cutover.cutover(destination, [source], fleet_config)
+    queue_id = result["imported"][0]["queue_id"]
+    conn = db.connect(str(destination), queue_id=queue_id)
+    try:
+        task_id = db.add_task(conn, "After cutover")
+    finally:
+        conn.close()
+    artifact = destination.parent / "queues" / queue_id / "new-work.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("keep", encoding="utf-8")
+    before = migrate_cutover._durable_snapshot(destination)
+    with pytest.raises(migrate_cutover.CutoverError, match="changed after cutover"):
+        migrate_cutover.rollback(destination)
+    assert migrate_cutover._durable_snapshot(destination) == before
+    assert artifact.read_text(encoding="utf-8") == "keep"
+    assert not legacy.exists()
+    with _connect(destination) as conn:
+        assert conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "After cutover"
+
+
 def test_retire_queue_keeps_ids_and_does_not_import(tmp_path):
     database = tmp_path / "orchestra.db"
     conn = db.connect(str(database))
@@ -773,6 +807,27 @@ def test_retire_queue_keeps_ids_and_does_not_import(tmp_path):
     assert refused.returncode != 0
     assert "abandon-unfinished" in refused.stderr
     assert "not imported" in refused.stderr
+
+    # Even a missing checkout must not hide a live central dashboard.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    dashboard = database.parent / "queues" / queue_id / "dashboard.json"
+    dashboard.parent.mkdir(parents=True, exist_ok=True)
+    dashboard.write_text(json.dumps({
+        "role": "dashboard", "pid": 999999,
+        "host": "127.0.0.1", "port": sock.getsockname()[1],
+    }), encoding="utf-8")
+    try:
+        live = subprocess.run(
+            [sys.executable, str(script), "retire-queue", "--abandon-unfinished"],
+            cwd=tmp_path, env=env, capture_output=True, text=True,
+        )
+        assert live.returncode != 0
+        assert "worker or dashboard is live" in live.stderr
+    finally:
+        sock.close()
+        dashboard.unlink()
 
     retired = subprocess.run(
         [sys.executable, str(script), "retire-queue", "--abandon-unfinished"],

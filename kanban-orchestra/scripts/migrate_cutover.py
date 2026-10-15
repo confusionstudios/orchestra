@@ -10,6 +10,7 @@ untracked legacy database files are removed so normal runtime has one layout.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -519,6 +520,7 @@ def _durable_snapshot(path: Path):
     """
     conn = _open_ro(path)
     try:
+        conn.execute("BEGIN")
         payload = []
         for name in sorted(_tables(conn)):
             columns = [
@@ -1319,6 +1321,10 @@ def rollback(destination: Path, manifest_path: Path | None = None,
     if not pointer.is_file():
         raise CutoverError(f"Rollback manifest not found: {pointer}")
     manifest = json.loads(pointer.read_text(encoding="utf-8"))
+    if manifest.get("rolled_back"):
+        raise CutoverError("This cutover has already been rolled back; its record cannot be reused")
+    if Path(manifest["destination"]).resolve() != destination.expanduser().resolve():
+        raise CutoverError("Rollback manifest belongs to a different destination")
     processes = fleet.process_table()
     details = _rollback_live_details(manifest, processes)
     if details:
@@ -1326,7 +1332,37 @@ def rollback(destination: Path, manifest_path: Path | None = None,
             "Refusing rollback while a source or destination worker or dashboard is live: "
             + "; ".join(details)
         )
+    activation_reason = db.unfinished_activation_reason(destination)
+    if activation_reason and not activation_reason.startswith("Unfinished migration activation:"):
+        raise CutoverError(activation_reason)
+    if destination.is_file() and not activation_reason:
+        expected = manifest.get("activated_fingerprint")
+        conn = _open_ro(destination)
+        try:
+            conn.execute("BEGIN")
+            current = _connection_fingerprint(conn)
+        finally:
+            conn.close()
+        if not expected or current != expected:
+            raise CutoverError(
+                "Refusing rollback: the central database changed after cutover "
+                "or its activation snapshot is unavailable. Preserve current state "
+                "and recover manually from the migration backups."
+            )
     return _apply_rollback(manifest)
+
+
+def _connection_fingerprint(conn: sqlite3.Connection) -> str:
+    """Hash schema and all rows, including runtime and allocation sequences.
+
+    The caller holds a read or write transaction so the dump is one snapshot.
+    Comparing logical content avoids false differences from WAL checkpointing.
+    """
+    digest = hashlib.sha256()
+    for statement in conn.iterdump():
+        digest.update(statement.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _complete_sources(destination: Path, sources: list[dict]) -> set[str]:
@@ -1643,6 +1679,10 @@ def cutover(
                VALUES (?, ?, 'activated', ?, CURRENT_TIMESTAMP)""",
             (attempt_id, str(destination), str(pointer)),
         )
+        # Persist the expected final state before opening the execution gate.
+        # A crash after commit but before activated=True is still safe to check.
+        manifest["activated_fingerprint"] = _connection_fingerprint(activated)
+        _write_json(pointer, manifest)
         activated.commit()
     finally:
         activated.close()

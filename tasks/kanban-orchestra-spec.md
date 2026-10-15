@@ -279,8 +279,10 @@ These rules define the system.
   refuses while a source or destination worker or dashboard is live. It
   restores the previous central database and copies each verified source
   backup back when that legacy file is missing, including when a crash
-  removed the file before the removal journal was saved. Run it before
-  starting workers.
+  removed the file before the removal journal was saved. It refuses an already
+  used rollback record or a central database changed since activation. Run it
+  before starting workers. Stop ad-hoc CLI writes during cutover as well: the
+  staged replacement cannot preserve writes made to the old destination.
 - The import keeps `done`, draft (`none`), `ready`, and `blocked` as they
   were. A `running` task becomes `blocked` with `block_reason`
   `migration_recovery`, and keeps its branch, stash, worktree, and resume
