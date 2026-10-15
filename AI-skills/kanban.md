@@ -213,7 +213,22 @@ cat <<'EOF' | task comment <task-id> --message-stdin [--plan-approval|--plan-rej
 EOF
 
 task log <task-id> "<message>"
+task retire-queue [--abandon-unfinished]
 ```
+
+Retiring a queue keeps its task ids, comments, and artifacts in the central
+store. It does not import another database or renumber tasks. Unfinished tasks
+require `--abandon-unfinished`. `ko-migrate preview` inventories legacy
+per-worktree databases without changing them. `ko-migrate cutover` is the
+approved one-time import. A later run leaves an absent source alone. If that
+legacy file is present and its durable rows differ from the recorded backup,
+cutover stops and leaves the file in place. A matching present copy is
+removed in that same run, including when the run also imports a new source,
+after the rollback manifest records its verified backup. `ko-migrate rollback --destination
+<database>` refuses while a source or destination worker or dashboard is
+live, then undoes activation before new workers start. Until that cutover,
+stable tooling keeps using an existing legacy development database, and that
+database has to be one of the sources.
 
 ## Process control
 
@@ -221,11 +236,9 @@ task log <task-id> "<message>"
 "$ORCHESTRA_DIR/bin/ko-orchestrator"
 ```
 
-`ko-orchestrator` is the repo instance: it runs the durable worker and starts
-the matching dashboard for the same git repo root. Resolve the current git repo
-root and treat that launch directory as the Orchestra instance identity. The
-orchestrator records that identity in the repo-scoped `kanban-orchestra.lock`,
-and the dashboard writes `.kanban-orchestra/dashboard.json`.
+`ko-orchestrator` is the queue worker for the current worktree. It uses the
+central database and writes the lock, log, and dashboard metadata under
+`<state-root>/queues/<queue-id>/`. `ko-get-update` prints the lock path.
 
 Use status commands and repo-local metadata instead of PID hunting:
 

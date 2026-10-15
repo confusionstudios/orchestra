@@ -17,9 +17,10 @@ Usage:
     task comment <id> --message-stdin [--comment|--approval|--rejection|--commit-message|--validation] [--author <name>] [--review-round N]
     task purge [--before <date>|--days <n>]
     task delete <id>
-    task dump                       # dump DB to kanban-orchestra.sql
-    task restore
-    task import-worktree <path>     # import another worktree's Kanban DB
+    task dump                       # dump the central DB to orchestra.sql
+    task restore                    # restore orchestra.sql into an empty central DB
+    task retire-queue [--abandon-unfinished]
+                                    # retire this queue without importing or renumbering
 
 Policy:
     Branches master/main are disabled for tasks by default. Use a feature
@@ -1029,9 +1030,9 @@ def cmd_delete(args, conn):
 
 
 def cmd_dump(args, conn):
-    """Dump the database to kanban-orchestra.sql in the same directory as the DB."""
-    db_path = db.get_db_path()
-    sql_path = os.path.join(os.path.dirname(db_path) or ".", "kanban-orchestra.sql")
+    """Dump the central database to orchestra.sql beside that database."""
+    db_path = db.get_connection_db_path(conn) or db.get_db_path()
+    sql_path = str(Path(db_path).resolve().with_name("orchestra.sql"))
     with open(sql_path, "w") as f:
         for line in conn.iterdump():
             f.write(line + "\n")
@@ -1112,14 +1113,58 @@ def cmd_restore(args):
     print(f"Restored to {result['db_path']} from {result['sql_path']}")
 
 
-def cmd_import_worktree(args, conn):
-    """Import tasks and task-owned history from another worktree's Kanban DB."""
-    try:
-        result = db.import_worktree_database(conn, args.path)
-    except (FileNotFoundError, ValueError, OSError, RuntimeError) as e:
-        print(f"Error: {e}", file=sys.stderr)
+def cmd_retire_queue(args, conn):
+    """Retire the selected queue without moving, importing, or renumbering tasks."""
+    import migrate_cutover
+
+    queue_id = db.connection_queue_id(conn)
+    row = conn.execute("SELECT * FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    if row is None:
+        print(f"Error: unknown queue {queue_id}", file=sys.stderr)
         sys.exit(1)
-    _json_out(result)
+    unfinished = conn.execute(
+        """SELECT id, status, title FROM tasks
+           WHERE queue_id = ? AND status != 'done'
+           ORDER BY id""",
+        (queue_id,),
+    ).fetchall()
+    if unfinished and not args.abandon_unfinished:
+        listed = ", ".join(f"#{item['id']} ({item['status']})" for item in unfinished)
+        print(
+            "Error: this queue has unfinished tasks and was not retired. "
+            "Pass --abandon-unfinished to retire it explicitly. "
+            "Tasks stay on this queue; they are not imported or renumbered: "
+            + listed,
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    worktree = Path(row["path"]) if row["path"] else None
+    if worktree is not None and worktree.is_dir():
+        evidence = migrate_cutover.runtime_evidence(worktree)
+        if evidence["worker_live"] or evidence["dashboard_live"]:
+            print(
+                "Error: refusing to retire a queue while its worker or dashboard is live",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    before = [item["id"] for item in conn.execute(
+        "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
+        (queue_id,),
+    ).fetchall()]
+    db.retire_queue(conn, queue_id)
+    after = [item["id"] for item in conn.execute(
+        "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
+        (queue_id,),
+    ).fetchall()]
+    if before != after:
+        print("Error: retire changed task ids", file=sys.stderr)
+        sys.exit(1)
+    _json_out({
+        "queue_id": queue_id,
+        "state": "retired",
+        "task_ids": after,
+        "abandoned_unfinished": [item["id"] for item in unfinished],
+    })
 
 
 def _resolve_message_arg(args, command_name):
@@ -1320,18 +1365,19 @@ def build_parser():
     # restore
     sub.add_parser("restore")
 
-    # import-worktree
-    p_import = sub.add_parser(
-        "import-worktree",
+    # retire-queue
+    p_retire = sub.add_parser(
+        "retire-queue",
+        parents=[queue_selector],
         help=(
-            "Import another worktree's Kanban database into the current database. "
-            "PATH may be a worktree root or a kanban-orchestra.db file. "
-            "Does not run any Git commands."
+            "Retire this queue and keep its tasks, history, and ids. "
+            "Does not import or renumber. Unfinished tasks require --abandon-unfinished."
         ),
     )
-    p_import.add_argument(
-        "path",
-        help="Worktree root directory or path to kanban-orchestra.db",
+    p_retire.add_argument(
+        "--abandon-unfinished",
+        action="store_true",
+        help="Retire even when tasks are not done. Those tasks stay on this queue.",
     )
 
     # get-commit-footer
@@ -1355,22 +1401,6 @@ def main():
     args = parser.parse_args()
     if args.command == "restore":
         cmd_restore(args)
-        return
-    # import-worktree must not invoke Git (acceptance criterion). Resolve the
-    # target DB via KANBAN_DB or a cwd walk for kanban-orchestra.db.
-    if args.command == "import-worktree":
-        try:
-            target_db = db.get_db_path_without_git()
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-        # import-worktree must not invoke Git. Bind the database's sole queue
-        # directly; a shared store with several queues needs an explicit selector.
-        conn = db.connect(target_db)
-        try:
-            cmd_import_worktree(args, conn)
-        finally:
-            conn.close()
         return
 
     try:
@@ -1452,6 +1482,7 @@ def main():
             "dump": cmd_dump,
             "requeue": cmd_requeue,
             "follow-up": cmd_follow_up,
+            "retire-queue": cmd_retire_queue,
             "get-commit-footer": cmd_get_commit_footer,
         }
         try:

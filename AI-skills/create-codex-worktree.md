@@ -1,6 +1,6 @@
 Create a native Codex worktree chat from a clean checkout with a user-owned `.worktreeinclude` manifest. Use when the user asks to start Codex in a fresh worktree, open a Codex worktree thread, or isolate work on an existing or new branch.
 
-The Codex app owns the chat and worktree. Do not run `git worktree add`, start a CLI-only session as a substitute, stash, commit, discard changes, or create `.worktreeinclude`. The new worktree must own a named branch and a newly created Kanban database so `close-worktree` can import it later. Fleet discovers that database from the primary checkout; do not register the worktree separately.
+The Codex app owns the chat and worktree. Do not run `git worktree add`, start a CLI-only session as a substitute, stash, commit, discard changes, or create `.worktreeinclude`. The new worktree must own a named branch and a newly registered queue in the central store. Closeout retires that queue without importing or renumbering tasks. Fleet discovers the queue from the central store; do not register the worktree separately.
 
 Helper:
 
@@ -82,7 +82,7 @@ Target branch: <target_branch>
 3. Run: prep verify-copy --source <current_root> --dest "<worktree_path>"
 4. Run: prep verify-kanban-absent --root "<worktree_path>"
 5. Run: prep bootstrap-kanban --root "<worktree_path>"
-   Require that helper stdout to include "Status: created kanban database".
+   Require that helper stdout to include "Status: created kanban queue" and a Database path outside the worktree.
 6. Run: prep start-instance --root "<worktree_path>"
    Require stdout to include a dashboard URL for this worktree only.
 7. Report the Codex thread, worktree path, branch, Kanban database path, and dashboard URL.

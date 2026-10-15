@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 import config
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 LOCK_FILE_NAME = "kanban-orchestra.lock"
 LEGACY_DB_FILENAME = "kanban-orchestra.db"
 CENTRAL_DB_FILENAME = "orchestra.db"
@@ -259,6 +259,45 @@ WHEN NEW.current_task_id IS NOT NULL AND NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'runtime task belongs to a different queue');
 END;
+
+CREATE TABLE IF NOT EXISTS migration_sources (
+    id              TEXT PRIMARY KEY,
+    source_path     TEXT NOT NULL UNIQUE,
+    queue_id        TEXT NOT NULL REFERENCES queues(id),
+    repository_id   TEXT NOT NULL REFERENCES repositories(id),
+    status          TEXT NOT NULL
+                    CHECK(status IN ('imported', 'activated')),
+    task_count      INTEGER NOT NULL,
+    attempt_id      TEXT NOT NULL,
+    backup_path     TEXT,
+    imported_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS migration_task_map (
+    source_id       TEXT NOT NULL REFERENCES migration_sources(id),
+    old_task_id     INTEGER NOT NULL,
+    new_task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    PRIMARY KEY (source_id, old_task_id),
+    UNIQUE (new_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS migration_comment_map (
+    source_id       TEXT NOT NULL REFERENCES migration_sources(id),
+    old_comment_id  INTEGER NOT NULL,
+    new_comment_id  INTEGER NOT NULL REFERENCES comments(id),
+    queue_id        TEXT NOT NULL REFERENCES queues(id),
+    PRIMARY KEY (source_id, old_comment_id),
+    UNIQUE (new_comment_id)
+);
+
+CREATE TABLE IF NOT EXISTS migration_attempts (
+    id              TEXT PRIMARY KEY,
+    destination     TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    manifest_path   TEXT NOT NULL,
+    started_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    finished_at     DATETIME
+);
 """
 
 
@@ -283,7 +322,8 @@ def migration_required_message(path: str | Path) -> str:
     return (
         f"Migration required: {path} is a legacy per-worktree Kanban Orchestra database. "
         "The central store will not read, modify, or delete it. "
-        "Leave the file in place until the migration reader imports it. "
+        "Inventory it with ko-migrate preview and import it only with an approved "
+        "ko-migrate cutover after its worker and dashboard are stopped. "
         "An empty queue was not created."
     )
 
@@ -860,6 +900,32 @@ def lookup_queue_by_path(repo_root: str | Path, *, db_path: str | None = None) -
     return dict(row) if row else None
 
 
+def queue_registration_error(repo_root: str | Path) -> str | None:
+    """Return why a worktree's on-disk queue identity is unsafe to run.
+
+    A missing identity file is not an error: the central row addressed by
+    path is the registration. A present identity file must name that row.
+    """
+    root = Path(repo_root).expanduser().resolve()
+    try:
+        row = lookup_queue_by_path(root)
+    except (RuntimeError, OSError):
+        return None
+    if row is None:
+        return None
+    try:
+        _repo_dir, queue_dir = _identity_dirs(root)
+        recorded = _read_identity(queue_dir / QUEUE_ID_FILENAME)
+    except RuntimeError as exc:
+        return str(exc)
+    if recorded and recorded != row["id"]:
+        return (
+            f"Queue identity file at {queue_dir / QUEUE_ID_FILENAME} "
+            f"does not match the central queue {row['id']} for {root}."
+        )
+    return None
+
+
 def queue_dispatch_block_reason(conn: sqlite3.Connection) -> str | None:
     """Return why this queue must not claim tasks, or None when dispatch is allowed."""
     try:
@@ -896,6 +962,58 @@ def retire_queue(conn: sqlite3.Connection, queue_id: str | None = None) -> None:
     conn.commit()
 
 
+def unfinished_activation_reason(db_path: str | Path) -> str | None:
+    """Return why a central database must not be opened, or None when it is live.
+
+    A cutover marks imported sources activated only after the replacement,
+    artifact move, and identity write finish. A crash in that window leaves
+    ``imported`` rows. That file is a partial store.
+    """
+    path = Path(db_path)
+    if not path.is_file() or _peek_database_kind(path) != "current":
+        return None
+    conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
+    try:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        if "migration_sources" not in names:
+            return None
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
+        ).fetchone()[0]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if int(pending) == 0:
+        return None
+    return (
+        f"Unfinished migration activation: {path} is not a live store. "
+        "Run ko-migrate rollback before opening it or claiming tasks."
+    )
+
+
+def assert_activation_finished(conn: sqlite3.Connection) -> None:
+    """Refuse claims on a database whose cutover stopped before activation."""
+    try:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+    except sqlite3.Error:
+        return
+    if "migration_sources" not in names:
+        return
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
+    ).fetchone()[0]
+    if int(pending):
+        raise RuntimeError(
+            "Unfinished migration activation: this database is not a live store. "
+            "Run ko-migrate rollback before opening it or claiming tasks."
+        )
+
+
 def connect(
     db_path: str | None = None,
     *,
@@ -918,6 +1036,9 @@ def connect(
             f"Migration required: {path} is not the central Orchestra schema. "
             "It was left unchanged."
         )
+    unfinished = unfinished_activation_reason(path)
+    if unfinished:
+        raise RuntimeError(unfinished)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30.0, factory=OrchestraConnection)
     conn.row_factory = sqlite3.Row
@@ -2123,8 +2244,9 @@ def claim_ready_task(conn, task_id):
     Returns the claimed task, or None when it is no longer ready on this queue,
     the queue already has a running task, or the queue can no longer dispatch
     because it is retired or its worktree is gone. The unique running-task
-    index is the backstop.
+    index is the backstop. An unfinished cutover activation is refused.
     """
+    assert_activation_finished(conn)
     queue_id = connection_queue_id(conn)
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
@@ -2440,287 +2562,3 @@ def get_runtime(conn):
     ).fetchone()
     return dict(row) if row else None
 
-
-# ── Worktree database import ───────────────────────────────────────────
-
-IMPORT_TASK_TABLES = ("tasks", "task_skips", "comments", "run_log")
-
-# Columns copied from a source tasks row into the target insert.
-_IMPORT_TASK_COLUMNS = (
-    "title",
-    "description",
-    "status",
-    "next_step",
-    "branch",
-    "commit_hash",
-    "stash_ref",
-    "coder_agent",
-    "reviewer_agent",
-    "review_round",
-    "max_review_rounds",
-    "last_review_decision",
-    "created_at",
-    "ready_at",
-    "last_ready_at",
-    "first_started_at",
-    "done_at",
-    "updated_at",
-    "kind",
-    "sequence_index",
-    "commit_plan",
-    "allow_when_blocked",
-    "block_reason",
-    "resume_next_step",
-)
-
-
-def resolve_worktree_db_path(path: str | Path) -> Path:
-    """Resolve a worktree root or database file path to kanban-orchestra.db."""
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"Import path not found: {resolved}")
-    if resolved.is_file():
-        return resolved
-    db_path = resolved / "kanban-orchestra.db"
-    if not db_path.is_file():
-        raise FileNotFoundError(
-            f"No kanban-orchestra.db found under worktree path: {resolved}"
-        )
-    return db_path
-
-
-def _open_source_db_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open a source database read-only without running migrations."""
-    uri = f"file:{db_path.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _validate_import_source(conn: sqlite3.Connection) -> None:
-    """Raise ValueError if the source DB is missing required import tables/columns."""
-    tables = set(_list_user_tables(conn))
-    missing_tables = [name for name in IMPORT_TASK_TABLES if name not in tables]
-    if missing_tables:
-        raise ValueError(
-            "Source database is missing required tables: "
-            + ", ".join(missing_tables)
-        )
-
-    task_cols = {
-        row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-    }
-    required = (
-        {"id", *_IMPORT_TASK_COLUMNS, "parent_task_id", "follow_up_task_id"}
-        - {"first_started_at"}
-    )
-    missing_cols = sorted(required - task_cols)
-    if missing_cols:
-        raise ValueError(
-            "Source database tasks table is missing required columns: "
-            + ", ".join(missing_cols)
-        )
-
-
-def _normalize_imported_task_fields(row: sqlite3.Row) -> tuple[dict, str | None]:
-    """Copy task fields and normalize unfinished tasks to status none."""
-    source_keys = set(row.keys())
-    data = {col: row[col] for col in _IMPORT_TASK_COLUMNS if col in source_keys}
-    source_branch = data.get("branch")
-    if data.get("status") != "done":
-        data["status"] = "none"
-        data["ready_at"] = None
-        # Stash refs are worktree-local Git state and must not transfer.
-        data["stash_ref"] = None
-    return data, source_branch
-
-
-def import_worktree_database(
-    target_conn: sqlite3.Connection,
-    source_path: str | Path,
-) -> dict:
-    """Import tasks and task-owned history from another worktree database.
-
-    The target database remains authoritative: imported tasks receive fresh IDs.
-    Source is opened read-only and never modified. The target import runs in a
-    single transaction and is rolled back on failure.
-
-    Returns a result dict with ``id_map`` (old_id -> new_id), ``source_db``,
-    and ``imported_count``.
-    """
-    source_db = resolve_worktree_db_path(source_path)
-    target_db = get_connection_db_path(target_conn)
-    if target_db and Path(target_db).resolve() == source_db:
-        raise ValueError("Cannot import a worktree database into itself")
-
-    source_conn = _open_source_db_readonly(source_db)
-    try:
-        source_tables = set(_list_user_tables(source_conn))
-        if _schema_is_legacy(source_conn, source_tables):
-            raise MigrationRequired(migration_required_message(source_db))
-        _validate_import_source(source_conn)
-
-        source_tasks = source_conn.execute(
-            "SELECT * FROM tasks ORDER BY id ASC"
-        ).fetchall()
-        source_by_id = {row["id"]: row for row in source_tasks}
-        source_skips = source_conn.execute(
-            "SELECT task_id, step FROM task_skips ORDER BY task_id ASC, step ASC"
-        ).fetchall()
-        source_comments = source_conn.execute(
-            "SELECT * FROM comments WHERE task_id IS NOT NULL ORDER BY id ASC"
-        ).fetchall()
-        source_run_logs = source_conn.execute(
-            "SELECT * FROM run_log WHERE task_id IS NOT NULL ORDER BY id ASC"
-        ).fetchall()
-
-        source_snapshots = (source_conn.execute("SELECT * FROM task_agent_snapshots").fetchall()
-                            if "task_agent_snapshots" in _list_user_tables(source_conn) else [])
-
-        # Snapshot after reads so callers can verify we never wrote the source.
-        source_mtime_ns = source_db.stat().st_mtime_ns
-
-        id_map: dict[int, int] = {}
-        source_branches: dict[int, str | None] = {}
-
-        # End any open transaction so the import is one atomic unit.
-        target_conn.commit()
-        try:
-            for row in source_tasks:
-                fields, source_branch = _normalize_imported_task_fields(row)
-                fields["repository_id"] = connection_repository_id(target_conn)
-                fields["queue_id"] = connection_queue_id(target_conn)
-                source_branches[row["id"]] = source_branch
-                cols = list(fields.keys())
-                placeholders = ", ".join("?" for _ in cols)
-                cur = target_conn.execute(
-                    f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({placeholders})",
-                    [fields[c] for c in cols],
-                )
-                id_map[row["id"]] = cur.lastrowid
-
-            for old_id, new_id in id_map.items():
-                source_row = source_by_id[old_id]
-                parent_old = source_row["parent_task_id"]
-                follow_old = source_row["follow_up_task_id"]
-                parent_new = id_map.get(parent_old) if parent_old is not None else None
-                follow_new = id_map.get(follow_old) if follow_old is not None else None
-                if parent_old is not None and parent_new is None:
-                    raise ValueError(
-                        f"Source task {old_id} references missing parent_task_id {parent_old}"
-                    )
-                if follow_old is not None and follow_new is None:
-                    raise ValueError(
-                        f"Source task {old_id} references missing follow_up_task_id {follow_old}"
-                    )
-                target_conn.execute(
-                    "UPDATE tasks SET parent_task_id = ?, follow_up_task_id = ? WHERE id = ?",
-                    (parent_new, follow_new, new_id),
-                )
-
-            for snapshot in source_snapshots:
-                new_task_id = id_map.get(snapshot["task_id"])
-                if new_task_id is None:
-                    raise ValueError("Source agent snapshot references a missing task")
-                save_agent_snapshot(target_conn, new_task_id, json.loads(snapshot["snapshot"]), commit=False)
-
-            for skip in source_skips:
-                new_task_id = id_map.get(skip["task_id"])
-                if new_task_id is None:
-                    raise ValueError(
-                        f"Source task_skips references missing task_id {skip['task_id']}"
-                    )
-                target_conn.execute(
-                    "INSERT INTO task_skips (task_id, step) VALUES (?, ?)",
-                    (new_task_id, skip["step"]),
-                )
-
-            for comment in source_comments:
-                new_task_id = id_map.get(comment["task_id"])
-                if new_task_id is None:
-                    raise ValueError(
-                        f"Source comments references missing task_id {comment['task_id']}"
-                    )
-                target_conn.execute(
-                    """INSERT INTO comments (
-                           task_id, review_round, verb, author, message, kind, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_task_id,
-                        comment["review_round"],
-                        comment["verb"],
-                        comment["author"],
-                        comment["message"],
-                        comment["kind"],
-                        comment["created_at"],
-                    ),
-                )
-
-            for entry in source_run_logs:
-                new_task_id = id_map.get(entry["task_id"])
-                if new_task_id is None:
-                    raise ValueError(
-                        f"Source run_log references missing task_id {entry['task_id']}"
-                    )
-                target_conn.execute(
-                    """INSERT INTO run_log (
-                           task_id, queue_id, verb, author, message, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_task_id,
-                        connection_queue_id(target_conn),
-                        entry["verb"],
-                        entry["author"],
-                        entry["message"],
-                        entry["created_at"],
-                    ),
-                )
-
-            # Preserve source branch metadata as durable per-task history.
-            for old_id, new_id in id_map.items():
-                branch = source_branches.get(old_id)
-                branch_text = branch if branch else "(none)"
-                target_conn.execute(
-                    """INSERT INTO comments (
-                           task_id, review_round, verb, author, message, kind
-                       ) VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_id,
-                        0,
-                        "import-worktree",
-                        "kanban",
-                        (
-                            f"Imported from worktree database {source_db} "
-                            f"(source task id {old_id}). "
-                            f"Source branch: {branch_text}."
-                        ),
-                        "comment",
-                    ),
-                )
-
-            # Validate before commit so a mid-import source change rolls back
-            # the target instead of reporting failure after a successful write.
-            if source_db.stat().st_mtime_ns != source_mtime_ns:
-                raise RuntimeError("Source database was modified during import")
-
-            source_has_first_started_at = "first_started_at" in {
-                row["name"]
-                for row in source_conn.execute("PRAGMA table_info(tasks)").fetchall()
-            }
-            _backfill_first_started_at(
-                target_conn,
-                use_legacy_fallback=not source_has_first_started_at,
-                task_ids=list(id_map.values()),
-            )
-            target_conn.commit()
-        except Exception:
-            target_conn.rollback()
-            raise
-
-        return {
-            "source_db": str(source_db),
-            "imported_count": len(id_map),
-            "id_map": {str(old): new for old, new in id_map.items()},
-        }
-    finally:
-        source_conn.close()

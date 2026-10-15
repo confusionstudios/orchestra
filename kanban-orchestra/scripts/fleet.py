@@ -367,6 +367,10 @@ def expand_configured_repos(primaries: list[FleetRepo]) -> list[FleetRepo]:
             continue
         seen.add(root)
         annotated = _annotate_legacy(replace(primary, path=root, root=root, kind="primary", parent=None))
+        if annotated.error is None:
+            identity_error = db.queue_registration_error(root)
+            if identity_error:
+                annotated = replace(annotated, error=identity_error)
         instances.append(annotated)
         valid.append(primary)
 
@@ -397,6 +401,20 @@ def expand_configured_repos(primaries: list[FleetRepo]) -> list[FleetRepo]:
                         root,
                         root,
                         error=db.migration_required_message(legacy),
+                        kind="worktree",
+                        parent=parent,
+                    )
+                )
+                continue
+            identity_error = db.queue_registration_error(root)
+            if identity_error:
+                seen.add(root)
+                instances.append(
+                    FleetRepo(
+                        label_for(root),
+                        root,
+                        root,
+                        error=identity_error,
                         kind="worktree",
                         parent=parent,
                     )

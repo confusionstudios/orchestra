@@ -399,7 +399,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Print a concise plain-text Kanban Orchestra status update."
     )
-    parser.add_argument("--db", metavar="PATH", help="Path to kanban-orchestra.db")
+    parser.add_argument("--db", metavar="PATH", help="Path to the central orchestra.db")
     args = parser.parse_args()
 
     try:

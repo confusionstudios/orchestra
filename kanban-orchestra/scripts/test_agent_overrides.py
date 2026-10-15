@@ -307,19 +307,6 @@ def test_legacy_task_dispatch_keeps_resolved_local_defaults(tmp_path, monkeypatc
         connection.close()
 
 
-def test_worktree_import_preserves_saved_agent_commands(tmp_path):
-    source = db.connect(str(tmp_path / 'source.db'))
-    target = db.connect(str(tmp_path / 'target.db'))
-    try:
-        snapshot = {'version': 1, 'roles': {'coder': {'spec': 'custom', 'run': ['cli', 'saved-model', '{prompt}']}}}
-        task_id = db.add_task(source, 'Saved', agent_snapshot=snapshot)
-        result = db.import_worktree_database(target, tmp_path / 'source.db')
-        assert db.get_agent_snapshot(target, result['id_map'][str(task_id)]) == snapshot
-    finally:
-        source.close()
-        target.close()
-
-
 def test_shared_alias_override_applies_to_multiple_work_repos(tmp_path, monkeypatch):
     shared = tmp_path / 'agents.local.yaml'
     shared.write_text('version: 1\naliases: {grok: "cursor:grok-4.7-high", audit: "codex:new-review-model"}\n')

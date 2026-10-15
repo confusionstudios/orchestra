@@ -253,14 +253,79 @@ These rules define the system.
 ## Database Compatibility Policy
 
 - The central database is never committed to git.
-- A worktree that still contains a legacy `kanban-orchestra.db` is not a live
-  queue. Opening or initializing that worktree raises a migration-required
-  error and leaves the legacy file unread, unmodified, and undeleted.
-- Do not delete a legacy database to silence that error. Do not point an
-  existing worker at the central file until its data has been migrated.
-- An explicit current-schema dump can be restored with `task restore` into
-  the selected central database. A dump from a legacy schema is not a
-  migration.
+- Normal runtime uses that one database. A worktree does not keep a live
+  `kanban-orchestra.db`.
+- A legacy per-worktree database is not a queue. Opening or initializing that
+  worktree raises a migration-required error and leaves the legacy file unread,
+  unmodified, and undeleted.
+- `ko-migrate preview` is the read-only inventory. It discovers each Fleet
+  primary and that primary's linked worktrees, plus any explicit `--source`
+  path, including a development queue that still has a legacy database. It
+  reports source path, source identity, task counts, worker and dashboard
+  evidence, the destination, and the planned old-task-id to global-id map.
+  Preview does not create the destination and does not change source files or Git.
+- `ko-migrate cutover` is the only import. It refuses while any relevant
+  worker or dashboard is still alive, checking processes, locks, and ports
+  rather than a stored status row. It backs up every source with the SQLite
+  backup API, imports into a staging database, and activates that database
+  only after counts, foreign keys, ownership, id maps, artifacts, and backup
+  integrity check pass. The rollback manifest is written before activation.
+  A crash after the staged file is installed leaves that database unopened
+  and unclaimed until `ko-migrate rollback` or a later `ko-migrate cutover`
+  restores the previous file. `ko-migrate rollback --destination <path>`
+  refuses while a source or destination worker or dashboard is live. It
+  restores the previous central database and copies each verified source
+  backup back when that legacy file is missing, including when a crash
+  removed the file before the removal journal was saved. Run it before
+  starting workers.
+- The import keeps `done`, draft (`none`), `ready`, and `blocked` as they
+  were. A `running` task becomes `blocked` with `block_reason`
+  `migration_recovery`, and keeps its branch, stash, worktree, and resume
+  step. Cutover does not requeue it, reassign it, or clean its edits.
+- Tasks are not matched by title or commit. A source that was already
+  imported keeps that history. Distinct tasks stay distinct, including when
+  their old numeric ids collide. Artifact directories are copied under the
+  new global task id. A comment with no task keeps its source queue in
+  `migration_comment_map`.
+- After activation, untracked `kanban-orchestra.db` files and their `-wal`,
+  `-shm`, and `-journal` sidecars are removed from the worktree. Consistent
+  backups stay under the destination's `migration-attempts` directory and are
+  not a second runtime. A later cutover of an absent source copies nothing
+  again. If that legacy file is present and its durable rows differ from the
+  recorded backup, cutover stops before deleting the file or importing any
+  other source in that run. A present copy whose rows match is removed in
+  that same run, including when the run also imports a new source. The
+  rollback manifest records the verified backup before the file is removed,
+  and rollback restores that file with the previous central database. A
+  tracked legacy file is refused before the destination changes.
+  Activation writes `orchestra-repository-id` and `orchestra-queue-id` so
+  the next launch from that checkout selects the migrated queue. History
+  and artifacts remain in the central store.
+- Do not point an existing worker at the central file until cutover has
+  finished and the old worker is stopped.
+- `task dump` writes `orchestra.sql` beside the central database. `task restore`
+  loads a current-schema dump into an empty central database. A legacy dump
+  is not a migration.
+- Until an operator runs an approved cutover, stable tooling from the primary
+  Orchestra checkout keeps using each worktree's existing legacy database,
+  including the development queue for this repository. That development
+  database has to be one of the cutover sources. Previewing the procedure
+  does not migrate the machine.
+
+## Worktree Registration and Closeout
+
+- Creating a worktree registers a new queue in the central store. Bootstrap
+  does not create or copy `kanban-orchestra.db`. An empty approved
+  `.worktreeinclude` is valid. Auth files and runtime state are not copied.
+- Fleet starts a linked worktree only when the central store has an enabled
+  queue for that path. If the worktree has a queue identity file, it must
+  name that same queue. A legacy database is reported as migration-required
+  and is not started.
+- Closing a worktree stops that worktree's worker, proves the branch landed,
+  and retires the queue with `task retire-queue`. It does not import a
+  database or renumber tasks. Unfinished tasks require
+  `task retire-queue --abandon-unfinished`; they stay on the retired queue.
+  History and artifacts remain after the worktree directory is removed.
 
 ## Storage Model
 
@@ -591,6 +656,7 @@ task delete <task-id>
 task purge [--before <date> | --days <n>]
 task dump
 task restore
+task retire-queue [--abandon-unfinished]
 task models refresh [provider]
 ```
 
@@ -935,7 +1001,8 @@ For multiple repos, `ko-fleet` reads a private flat path list from
 is one primary git repo root. `~` and environment variables are expanded.
 Display names come from the directory basename. Fleet discovers linked
 worktrees with `git worktree list --porcelain` and includes a linked worktree
-when that checkout has an enabled queue in the central database. A legacy
+when that checkout has an enabled queue in the central database and, when a
+queue identity file is present, that file names the same queue. A legacy
 per-worktree database is reported as migration-required and is not started,
 read, or deleted. Fleet does not initialize worktrees and does not keep a
 second registration list. Invalid or missing primary paths remain errors. A
@@ -989,10 +1056,10 @@ by this pass.
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
 `ko-fleet attach` and `ko-fleet logs` select by label, unique selector, or path and then use
-the selected repo's tmux session and repo-local
-`.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
+the selected repo's tmux session and the queue log at
+`<state-root>/queues/<queue-id>/orchestrator.log`. `ko-fleet dashboard` with no argument
 starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
-that repo's preferred dashboard from repo-local dashboard metadata.
+that repo's preferred dashboard from the queue's `dashboard.json`.
 `ko-fleet dashboard-open` is an explicit open verb that requires a repo
 selector. Both open commands accept `--local` to open the localhost URL
 instead of the preferred Tailscale mapping.
@@ -1020,7 +1087,7 @@ status and offers ready and review-cap continuation actions. It is repo-scoped a
 orchestrator instance. The old process-manager UI and its heartbeat/request/response JSON files are removed,
 not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
 `ko-task`, and `ko-get-update`; active child process metadata is maintained
-independently in `.kanban-orchestra/active-agent-processes.json`. The old
+independently in `<state-root>/queues/<queue-id>/active-agent-processes.json`. The old
 `BREAK` control is intentionally removed as a remote operator command: it killed
 in-flight agent process groups and rewrote runtime state outside the
 orchestrator's normal task loop. The supported migration is to stop or interrupt

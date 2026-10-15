@@ -15,7 +15,8 @@ Leave every recovery decision to that native loop. Monitor the repo with
 1. Resolve the repo root with `git rev-parse --show-toplevel`. Stop if the
    command fails.
 2. Require `$ORCHESTRA_DIR`, `bin/ko-get-update`, and `bin/ko-task`.
-3. Require `<repo-root>/kanban-orchestra.db`.
+3. The current worktree must have a queue in the central store. A legacy
+   `kanban-orchestra.db` is not that queue.
 4. Monitor only this repo. A running orchestrator is preferred, but report
    stopped or stale state honestly. Native unblocking runs only while the
    orchestrator itself is running.
@@ -33,7 +34,7 @@ Immediately sample state and give one short plain-language summary:
 - Dashboard URL for this repo instance
 
 Take the dashboard URL from the current `ko-get-update` `Dashboard:` line, or
-from this repo's runtime metadata (`.kanban-orchestra/dashboard.json` `url`)
+from this repo's queue runtime metadata (`dashboard.json` beside the lock file, `url`)
 when that metadata matches the monitored instance. Prefer the exact Tailscale
 Serve HTTPS mapping when one exists; otherwise use the localhost URL. Do not
 hard-code a host, Tailnet name, suffix, or dashboard URL. If the dashboard is

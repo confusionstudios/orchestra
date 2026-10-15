@@ -24,7 +24,8 @@ Runs the canonical status wrapper from `$ORCHESTRA_DIR` against the current work
 - `$ORCHESTRA_DIR` must point at the Orchestra checkout root and contain `bin/ko-get-update`
 - The command infers the queue from the current worktree. A legacy
   `kanban-orchestra.db` in that worktree is a migration-required diagnostic;
-  it is not opened or deleted.
+  it is not opened or deleted. Inventory it with `ko-migrate preview` and
+  import it only with an approved `ko-migrate cutover`.
 - Queue lock, log, and dashboard files live under the central state directory
   for that queue. Agent preference files stay in the checkout.
 
@@ -36,10 +37,10 @@ Run from anywhere inside the repo:
 "$ORCHESTRA_DIR/bin/ko-get-update"
 ```
 
-Optional flag:
+Optional central-database override:
 
 ```bash
-"$ORCHESTRA_DIR/bin/ko-get-update" --db <path-to-kanban-orchestra.db>
+"$ORCHESTRA_DIR/bin/ko-get-update" --db <path-to-orchestra.db>
 ```
 
 ## Exit codes
@@ -67,6 +68,6 @@ The **ATTENTION** line is the quick answer. Common values:
    Orchestra instance identity.
 2. If this fails, stop and tell the user they must run from inside a git repo.
 3. Check that `$ORCHESTRA_DIR` is set and that `"$ORCHESTRA_DIR/bin/ko-get-update"` exists. If not, stop and tell the user the Orchestra tooling environment is not configured.
-4. Check that `$(git rev-parse --show-toplevel)/kanban-orchestra.db` exists. If not, stop and tell the user this repo does not have Kanban Orchestra initialized.
+4. Run `"$ORCHESTRA_DIR/bin/ko-kanban"` when this worktree has no central queue yet. A legacy `kanban-orchestra.db` in the worktree is not that queue; leave it for `ko-migrate`.
 5. Run: `"$ORCHESTRA_DIR/bin/ko-get-update"`
 6. Report the output to the user verbatim, then offer a brief interpretation if they want one.

@@ -424,12 +424,34 @@ Kanban state is one local database shared by the worktrees on this machine.
 On macOS it defaults to `$HOME/Library/Application Support/Orchestra/orchestra.db`.
 Each worktree has its own queue, lock, log, and transcripts under that state
 directory. Checkout-local `.kanban-orchestra/agents.yaml` remains an agent
-preference file, not the task database.
+preference file, not the task database. `ko-kanban` registers the current
+worktree's queue there. It does not create `kanban-orchestra.db` in the
+worktree.
+
+A legacy `kanban-orchestra.db` left in a worktree is not a second runtime.
+`ko-migrate preview` inventories Fleet primaries, linked worktrees, and any
+extra `--source` path without changing those files. `ko-migrate cutover`
+imports them only after every relevant worker and dashboard is stopped. It
+keeps source backups beside the central database, writes each checkout's queue
+identity, and removes untracked legacy files. A later cutover of an absent
+source copies nothing again. If that legacy file is present and its durable
+rows differ from the recorded backup, cutover stops and leaves the file in
+place, including when the same command also names a new source. A matching
+present copy is removed in that same run, after the rollback manifest
+records its verified backup. Rollback restores that file with the previous
+central database. A tracked legacy file stops the cutover before anything
+is changed.
+`ko-migrate rollback --destination <database>` refuses while a source or
+destination worker or dashboard is live, then restores the previous central
+file and any missing source backup before new workers start. Stable tooling keeps using an existing legacy
+development database until that cutover is approved, and the development
+database has to be included. See
+[the canonical spec](tasks/kanban-orchestra-spec.md#database-compatibility-policy).
 
 These files are local runtime state and belong in the work repo's
 `.gitignore`; coders stage with `git add .`, so unignored runtime files can end
 up in a commit. `"$ORCHESTRA_DIR/bin/ko-kanban"` appends most of them when it
-first creates the database; you can also add them yourself as in the
+first creates the queue; you can also add them yourself as in the
 [first-task guide](docs/first-task.md#2-create-a-throwaway-repo).
 
 `ORCHESTRA_DIR` supplies the shared tools; it may point at the same checkout
