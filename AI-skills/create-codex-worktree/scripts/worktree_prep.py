@@ -379,7 +379,6 @@ def bootstrap_kanban(root: Path | None = None) -> Path:
     if not os.access(ko_kanban, os.X_OK):
         raise PrepError(f"ko-kanban is not executable: {ko_kanban}")
     env = os.environ.copy()
-    env.pop("KANBAN_DB", None)
     result = subprocess.run(
         [str(ko_kanban)],
         cwd=worktree,
@@ -389,17 +388,19 @@ def bootstrap_kanban(root: Path | None = None) -> Path:
     )
     if result.returncode != 0:
         raise PrepError((result.stderr or result.stdout).strip() or "ko-kanban failed")
-    if "Status: created kanban database" not in result.stdout:
+    if "Status: using existing kanban queue" in result.stdout:
+        raise PrepError("Kanban queue already exists for this worktree")
+    if "Status: created kanban queue" not in result.stdout:
         raise PrepError(
-            "ko-kanban did not create a pristine database:\n" + result.stdout.strip()
+            "ko-kanban did not create a pristine queue:\n" + result.stdout.strip()
         )
     db_line = next(
         (line for line in result.stdout.splitlines() if line.startswith("Database: ")),
         "",
     )
     db_path = Path(db_line.split(" ", 1)[1]).resolve() if db_line else worktree / "kanban-orchestra.db"
-    if db_path != (worktree / "kanban-orchestra.db").resolve():
-        raise PrepError(f"Kanban database is not in the new worktree: {db_path}")
+    if db_path == (worktree / "kanban-orchestra.db").resolve():
+        raise PrepError(f"Kanban database must not be created inside the worktree: {db_path}")
     sys.stdout.write(result.stdout)
     if result.stdout and not result.stdout.endswith("\n"):
         sys.stdout.write("\n")

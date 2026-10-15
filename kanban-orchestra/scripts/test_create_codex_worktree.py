@@ -60,7 +60,7 @@ def _run_prep(*args: str, cwd: Path | None = None) -> subprocess.CompletedProces
         cwd=cwd,
         capture_output=True,
         text=True,
-        env={**GIT_ENV, "ORCHESTRA_DIR": str(REPO_ROOT)},
+        env={**os.environ, **GIT_ENV, "ORCHESTRA_DIR": str(REPO_ROOT)},
     )
 
 
@@ -390,17 +390,15 @@ class CreateCodexWorktreeTests(unittest.TestCase):
         self.assertEqual((worktree / "fastlane" / "api.json").read_text(encoding="utf-8"), '{"ok": true}\n')
 
         bootstrap = _run_prep("bootstrap-kanban", "--root", str(worktree))
-        self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
-        self.assertIn("Status: created kanban database", bootstrap.stdout)
-        worktree_db = (worktree / "kanban-orchestra.db").resolve()
-        source_db = self.root / "kanban-orchestra.db"
-        self.assertTrue(worktree_db.is_file())
-        self.assertFalse(source_db.exists())
-        self.assertIn(str(worktree_db), bootstrap.stdout)
+        self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr + bootstrap.stdout)
+        self.assertIn("Status: created kanban queue", bootstrap.stdout)
+        self.assertFalse((worktree / "kanban-orchestra.db").exists())
+        self.assertFalse((self.root / "kanban-orchestra.db").exists())
+        self.assertIn("Queue:", bootstrap.stdout)
 
         reused = _run_prep("bootstrap-kanban", "--root", str(worktree))
         self.assertNotEqual(reused.returncode, 0)
-        self.assertIn("Kanban database/runtime state is present", reused.stderr)
+        self.assertIn("already exists", reused.stderr)
 
     def test_verify_copy_skips_tracked_glob_overlap_across_branches(self):
         _git(self.root, "switch", "-q", "develop")

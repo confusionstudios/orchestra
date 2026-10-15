@@ -20,19 +20,23 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    db_path = workspace["db_path"]
-    created = not db_path.exists()
-    conn = db.connect(str(db_path))
+    try:
+        conn = db.connect(repo_root=workspace["repo_root"])
+    except db.MigrationRequired as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    created = bool(getattr(conn, "orchestra_queue_created", False))
+    queue_id = db.connection_queue_id(conn)
     conn.close()
 
-    if created:
-        _ensure_gitignore(Path(workspace["repo_root"]))
+    _ensure_gitignore(Path(workspace["repo_root"]))
 
     print(f"Repo root: {workspace['repo_root']}")
     print(f"Orchestra: {orchestra_dir}")
-    print(f"Database: {db_path}")
+    print(f"Database: {workspace['db_path']}")
+    print(f"Queue: {queue_id}")
     print(f"SQL dump: {workspace['sql_path']}")
-    print("Status: created kanban database" if created else "Status: using existing kanban database")
+    print("Status: created kanban queue" if created else "Status: using existing kanban queue")
     print("Ready for kanban task work.")
 
 

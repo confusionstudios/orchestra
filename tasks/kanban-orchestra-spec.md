@@ -4,11 +4,12 @@ This document is the canonical behavior spec for Kanban Orchestra.
 
 ## Scope
 
-- One work repo at a time.
-- One orchestrator instance per repo.
-- One active task at a time.
+- One central database per local user and machine.
+- One serial queue per worktree, including the primary checkout.
+- One orchestrator instance per queue.
+- One active task per queue.
 - One task maps to one eventual landed commit.
-- The task database is the durable source of truth.
+- The central database is the durable source of truth. Worktrees share it and do not share a running task.
 
 ## Repo Model
 
@@ -19,13 +20,46 @@ Two roles participate:
 
 The two roles may be the same checkout when Orchestra is working on itself.
 
-The work repo contains the live database:
+Durable Orchestra state lives outside the checkout. On macOS the default
+database is `$HOME/Library/Application Support/Orchestra/orchestra.db`. On
+other systems it is `$XDG_DATA_HOME/orchestra/orchestra.db`, or
+`~/.local/share/orchestra/orchestra.db` when `XDG_DATA_HOME` is unset.
+`ORCHESTRA_STATE_DIR` selects another state directory. `KANBAN_DB` selects an
+explicit database file for an isolated store, including tests and CI.
 
 ```text
-<work-repo>/
-  kanban-orchestra.db
-  kanban-orchestra.sql
+<state-root>/
+  orchestra.db
+  orchestra.sql
+  queues/<queue-id>/
+    kanban-orchestra.lock
+    orchestrator.log
+    dashboard.json
+    active-agent-processes.json
+    artifacts/
 ```
+
+A repository id is stored in the Git common directory. A queue id is stored
+in that checkout's Git directory. Separate local clones therefore stay
+distinct even when they share a remote URL, and linked worktrees share a
+repository while keeping separate queues. The queue row records the current
+path and whether the queue is enabled or retired. Identity does not follow
+the mutable branch name.
+
+Each task belongs to one repository and one queue. Child and follow-up links
+stay inside that repository and queue. Moving a task requires an enabled
+queue in the same repository and moves its parent, children, and follow-ups
+together. A family that contains a running task cannot be moved. Run rows
+keep the queue where that run happened, and their transcript files stay
+there. A later run on the destination queue records that queue. A missing
+or retired worktree does not make its unfinished tasks runnable on another
+queue, and claim checks that again after the worker has started. Dispatch
+also requires the checkout at the queue path to carry that queue's identity.
+
+Checkout-local files stay with the worktree: `.kanban-orchestra/agents.yaml`,
+the model cache, and the Git-directory identity files. The stop file
+`KANBAN_ORCHESTRATOR_STOP_AFTER_TASK` also stays in the worktree. Git
+operations, stashes, and commits use that worktree, not the state directory.
 
 The Orchestra repo is resolved via `ORCHESTRA_DIR` and contains:
 
@@ -221,29 +255,105 @@ These rules define the system.
 
 ## Database Compatibility Policy
 
-- It is never committed to git.
-- It does not need to be preserved across schema changes.
-- There is no automatic migration of old DB files to new schemas.
+- The central database is never committed to git.
+- Normal runtime uses that one database. A worktree does not keep a live
+  `kanban-orchestra.db`.
+- A legacy per-worktree database is not a queue. Opening or initializing that
+  worktree raises a migration-required error and leaves the legacy file unread,
+  unmodified, and undeleted.
+- `ko-migrate preview` is the read-only inventory. It discovers each Fleet
+  primary and that primary's linked worktrees, plus any explicit `--source`
+  path, including a development queue that still has a legacy database. It
+  reports source path, source identity, task counts, worker and dashboard
+  evidence, the destination, and the planned old-task-id to global-id map.
+  Preview does not create the destination and does not change source files or Git.
+- `ko-migrate cutover` is the only import. It refuses while any relevant
+  worker or dashboard is still alive, checking processes, locks, and ports
+  rather than a stored status row. It backs up every source with the SQLite
+  backup API, imports into a staging database, and activates that database
+  only after counts, foreign keys, ownership, id maps, artifacts, and backup
+  integrity check pass. The rollback manifest is written before activation.
+  A crash after the staged file is installed leaves that database unopened
+  and unclaimed until `ko-migrate rollback` or a later `ko-migrate cutover`
+  restores the previous file. `ko-migrate rollback --destination <path>`
+  refuses while a source or destination worker or dashboard is live. It
+  restores the previous central database and copies each verified source
+  backup back when that legacy file is missing, including when a crash
+  removed the file before the removal journal was saved. It refuses an already
+  used rollback record or a central database changed since activation. Run it
+  before starting workers. Stop ad-hoc CLI writes during cutover as well: the
+  staged replacement cannot preserve writes made to the old destination.
+- The import keeps `done`, draft (`none`), `ready`, and `blocked` as they
+  were. A `running` task becomes `blocked` with `block_reason`
+  `migration_recovery`, and keeps its branch, stash, worktree, and resume
+  step. Cutover does not requeue it, reassign it, or clean its edits.
+- Tasks are not matched by title or commit. A source that was already
+  imported keeps that history. Distinct tasks stay distinct, including when
+  their old numeric ids collide. Artifact directories are copied under the
+  new global task id. A comment with no task keeps its source queue in
+  `migration_comment_map`.
+- After activation, untracked `kanban-orchestra.db` files and their `-wal`,
+  `-shm`, and `-journal` sidecars are removed from the worktree. Consistent
+  backups stay under the destination's `migration-attempts` directory and are
+  not a second runtime. A later cutover of an absent source copies nothing
+  again. If that legacy file is present and its durable rows differ from the
+  recorded backup, cutover stops before deleting the file or importing any
+  other source in that run. A present copy whose rows match is removed in
+  that same run, including when the run also imports a new source. The
+  rollback manifest records the verified backup before the file is removed,
+  and rollback restores that file with the previous central database. A
+  tracked legacy file is refused before the destination changes.
+  Activation writes `orchestra-repository-id` and `orchestra-queue-id` so
+  the next launch from that checkout selects the migrated queue. History
+  and artifacts remain in the central store.
+- Do not point an existing worker at the central file until cutover has
+  finished and the old worker is stopped.
+- `task dump` writes `orchestra.sql` beside the central database from one
+  consistent snapshot. `task restore` loads that dump into an empty central
+  database and checks the schema, integrity, and foreign keys without
+  choosing a single queue. A legacy dump is not a migration.
+- Until an operator runs an approved cutover, stable tooling from the primary
+  Orchestra checkout keeps using each worktree's existing legacy database,
+  including the development queue for this repository. That development
+  database has to be one of the cutover sources. Previewing the procedure
+  does not migrate the machine.
 
-When a schema change requires a table recreation:
+## Worktree Registration and Closeout
 
-1. Delete `kanban-orchestra.db` (and its `-shm`/`-wal` sidecar files if present).
-2. Reopen: `db.connect()` will bootstrap a fresh database automatically.
-3. Alternatively, restore from a current `kanban-orchestra.sql` dump using `task restore`.
-
-`db.connect()` checks for incompatible schemas on open and raises a `RuntimeError`
-with recovery instructions if the DB is stale.
-
-The `kanban-orchestra.sql` dump file is the restore source. If a dump was produced
-by an older schema, regenerate it from a current database.
+- Creating a worktree registers a new queue in the central store. A checkout
+  with no queue identity file does not adopt an older queue that used the
+  same path. That older queue is retired only when it belongs to this same
+  repository and Git can list every live checkout, none of which still
+  carries its queue identity. Unfinished tasks stay on the retired queue.
+  If a listed checkout still carries the identity, registration stops with
+  a diagnostic. A different repository at that path, including a new clone
+  created after the old primary checkout moved, cannot prove the old owner
+  is gone. Registration stops with a diagnostic and leaves the old queue
+  enabled. Open the checkout that carries its identity file, or retire the
+  queue with `task retire-queue --queue-id <id> --abandon-unfinished` when
+  that checkout is actually gone. A checkout that keeps its identity file
+  keeps that queue, including when the directory itself moves, and is
+  refused while another live checkout still carries the same identity.
+  Bootstrap does not create or copy `kanban-orchestra.db`. An empty approved
+  `.worktreeinclude` is valid. Auth files and runtime state are not copied.
+- Fleet starts a linked worktree only when the central store has an enabled
+  queue for that path and the checkout's queue identity file names that
+  queue. A reused path without that identity is not the old queue. A legacy
+  database is reported as migration-required and is not started.
+- Closing a worktree stops that worktree's worker, proves the branch landed,
+  and retires the queue with `task retire-queue`. It does not import a
+  database or renumber tasks. Unfinished tasks require
+  `task retire-queue --abandon-unfinished`; they stay on the retired queue.
+  History and artifacts remain after the worktree directory is removed.
 
 ## Storage Model
 
 ### Database Files
 
-- `kanban-orchestra.db`: live source of truth
-- `kanban-orchestra.sql`: optional tracked SQL dump of the live DB
-- `.kanban-orchestra/orchestrator.log`: persisted orchestrator stdout for operator and dashboard use
+- `<state-root>/orchestra.db`: live source of truth for every local queue
+- `<state-root>/orchestra.sql`: optional SQL dump beside that database
+- `<state-root>/queues/<queue-id>/orchestrator.log`: persisted orchestrator
+  stdout for that queue
 
 ### Tables
 
@@ -253,7 +363,9 @@ Primary durable workflow state.
 
 Important columns:
 
-- `id`
+- `id`: globally unique and stable
+- `repository_id`: owning local clone
+- `queue_id`: current worktree queue
 - `title`
 - `description`
 - `status`
@@ -282,7 +394,7 @@ Task timestamps:
 - `created_at`: row creation time.
 - `ready_at`: time the task entered the current ready-queue wait. Cleared when the task leaves `ready`.
 - `last_ready_at`: most recent time the task entered `ready`, including internal requeues between build, review, rework, and finalization.
-- `first_started_at`: first status transition to `running` (first actual pickup). This is the durable wall-clock runtime start. It is not set while the task is waiting in the initial ready queue, and later requeues or blocked/resumed lifecycle steps do not reset it. Missing values are recovered from the earliest retained `run_log` row when one exists. The `last_ready_at`/`ready_at` fallback applies only during the one-time missing-column migration and when importing a legacy source that lacks `first_started_at`.
+- `first_started_at`: first status transition to `running` (first actual pickup). This is the durable wall-clock runtime start. It is not set while the task is waiting in the initial ready queue, and later requeues or blocked/resumed lifecycle steps do not reset it. Missing values are recovered from the earliest retained `run_log` row when one exists. Queue timestamps are not used as a start time.
 - `done_at`: terminal completion time.
 - `updated_at`: last task-row mutation.
 
@@ -340,7 +452,10 @@ Ephemeral operational log.
 
 #### `orchestrator_runtime`
 
-Single-row live runtime state for operational visibility.
+One live runtime row per queue. Heartbeat, current task, and worker identity
+are queue-scoped. A queue claims at most one running task. Selection and
+claim are atomic for that queue. Claim also refuses a retired queue or a
+missing worktree.
 
 Important fields:
 
@@ -368,24 +483,30 @@ Runtime status values:
 
 ### Runtime Files
 
-- `kanban-orchestra.lock`: repo-scoped singleton lock for the real orchestrator
-  process. Its metadata records the process PID, launch repo root, repo label,
+Queue runtime files live under `<state-root>/queues/<queue-id>/`. Retired
+queues keep their history and files.
+
+- `kanban-orchestra.lock`: queue-scoped lock for the real orchestrator
+  process. Its metadata records the process PID, launch worktree, repo label,
   database path, runtime directory, and lock path so local agents can identify
-  the orchestrator for the current repo without process hunting.
-- `.kanban-orchestra/orchestrator.log`: append-only stdout log for each orchestrator process
-- `.kanban-orchestra/dashboard.json`: repo-scoped metadata for the dashboard
-  owned by the orchestrator instance, including PID, host, port, localhost URL,
-  and optional Tailscale remote URL when Serve publication succeeds.
-- `.kanban-orchestra/artifacts/`: filesystem-backed run artifacts such as transcripts.
+  the orchestrator for the current queue without process hunting.
+- `orchestrator.log`: append-only stdout log for that queue's orchestrator
+- `dashboard.json`: metadata for the dashboard owned by that orchestrator,
+  including PID, host, port, localhost URL, and optional Tailscale remote URL
+  when Serve publication succeeds. The dashboard process working directory is
+  the worktree.
+- `artifacts/`: filesystem-backed run artifacts such as transcripts.
   Idle-time maintenance deletes `*.log` transcript files older than seven days
-  only for completed (`done`) tasks, then removes empty `task-<id>` directories.
-  File cleanup starts from the trusted database-parent directory, opens
-  `.kanban-orchestra` and `artifacts` descriptor-relatively without following
-  links, then traverses and deletes through no-follow directory descriptors.
-  It does not take paths from database content.
-- `.kanban-orchestra/active-agent-processes.json`: transient process-group
-  metadata for active agent children, maintained by the active-agent runtime
-  helpers
+  only for completed (`done`) tasks on that queue, then removes empty
+  `task-<id>` directories. File cleanup starts from the trusted database
+  parent, opens `queues/<queue-id>/artifacts` descriptor-relatively without
+  following links, then traverses and deletes through no-follow directory
+  descriptors. It does not take paths from database content.
+- `active-agent-processes.json`: transient process-group metadata for active
+  agent children of that queue
+
+Checkout-local `.kanban-orchestra/agents.yaml` and the model cache are agent
+preferences, not queue runtime state.
 
 ## Task States
 
@@ -554,11 +675,17 @@ task delete <task-id>
 task purge [--before <date> | --days <n>]
 task dump
 task restore
+task retire-queue [--abandon-unfinished]
 task models refresh [provider]
 ```
 
 ### CLI Rules
 
+- `task show` and the other read commands accept a task id from any queue.
+  `set`, `continue`, `comment`, `log`, `delete`, `follow-up`, and `requeue`
+  change a task only when it is on the current queue. `--queue-id` or
+  `ORCHESTRA_QUEUE_ID` selects another queue first; branch policy and agent
+  preferences then come from that queue's worktree.
 - `task add` defaults to `type=commit` and resolves coder/reviewer through
   effective role preferences, saving their commands. Product fallbacks are
   `sonnet` and `codex`. `--kind task` remains a legacy alias for `--type commit`.
@@ -877,8 +1004,8 @@ no separate unblock process or command.
 
 ### Instance and Fleet Control
 
-The primary runtime unit is a repo instance: one orchestrator process and one
-dashboard process for the same git repo root. Start it from the work repo root:
+The primary runtime unit is a queue: one orchestrator process and one
+dashboard process for one worktree. Start it from that worktree:
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-orchestrator"
@@ -893,11 +1020,14 @@ For multiple repos, `ko-fleet` reads a private flat path list from
 is one primary git repo root. `~` and environment variables are expanded.
 Display names come from the directory basename. Fleet discovers linked
 worktrees with `git worktree list --porcelain` and includes a linked worktree
-only when that checkout already has a usable Orchestra database
-(`kanban-orchestra.db` opening read-only with an `orchestrator_runtime` table).
-Fleet does not initialize worktrees and does not keep a second registration
-list. Invalid or missing primary paths remain errors. A linked worktree that
-disappears is omitted with no unregister step. Canonical roots are listed once.
+when that checkout has an enabled queue in the central database and its
+queue identity file names that same queue. A path match without that
+identity file is not registration. A legacy
+per-worktree database is reported as migration-required and is not started,
+read, or deleted. Fleet does not initialize worktrees and does not keep a
+second registration list. Invalid or missing primary paths remain errors. A
+linked worktree that disappears is omitted with no unregister step. Canonical
+roots are listed once.
 
 ```bash
 "$ORCHESTRA_DIR/bin/ko-fleet" init
@@ -946,10 +1076,10 @@ by this pass.
 `ko-fleet restart` stops the selected fleet-owned instances, waits for the
 repo-scoped orchestrator lock metadata to clear, and starts them again.
 `ko-fleet attach` and `ko-fleet logs` select by label, unique selector, or path and then use
-the selected repo's tmux session and repo-local
-`.kanban-orchestra/orchestrator.log`. `ko-fleet dashboard` with no argument
+the selected repo's tmux session and the queue log at
+`<state-root>/queues/<queue-id>/orchestrator.log`. `ko-fleet dashboard` with no argument
 starts or opens the Fleet Dashboard. `ko-fleet dashboard <repo>` still opens
-that repo's preferred dashboard from repo-local dashboard metadata.
+that repo's preferred dashboard from the queue's `dashboard.json`.
 `ko-fleet dashboard-open` is an explicit open verb that requires a repo
 selector. Both open commands accept `--local` to open the localhost URL
 instead of the preferred Tailscale mapping.
@@ -977,7 +1107,7 @@ status and offers ready and review-cap continuation actions. It is repo-scoped a
 orchestrator instance. The old process-manager UI and its heartbeat/request/response JSON files are removed,
 not compatibility surfaces. Operator workflows should use `ko-orchestrator`, `ko-fleet`,
 `ko-task`, and `ko-get-update`; active child process metadata is maintained
-independently in `.kanban-orchestra/active-agent-processes.json`. The old
+independently in `<state-root>/queues/<queue-id>/active-agent-processes.json`. The old
 `BREAK` control is intentionally removed as a remote operator command: it killed
 in-flight agent process groups and rewrote runtime state outside the
 orchestrator's normal task loop. The supported migration is to stop or interrupt
@@ -1080,8 +1210,8 @@ Primary questions:
 
 ### Runtime Semantics
 
-- The orchestrator writes a singleton runtime row on startup.
-- Startup acquires the singleton lock and initializes logging, database access,
+- The orchestrator writes that queue's runtime row on startup.
+- Startup acquires the queue lock and initializes logging, database access,
   dashboard, and heartbeat even when the worktree is dirty.
 - `waiting-dirty` has a fresh heartbeat and no active task. While in that state,
   the orchestrator does not recover interrupted tasks, inspect blocked gates,
@@ -1207,7 +1337,7 @@ Useful commands:
 "$ORCHESTRA_DIR/bin/ko-task" show <task-id>
 "$ORCHESTRA_DIR/bin/ko-task" show-comments <task-id>
 "$ORCHESTRA_DIR/bin/ko-task" show-run-log <task-id>
-sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
+sqlite3 "$HOME/Library/Application Support/Orchestra/orchestra.db" "select queue_id, status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
 ```
 
 ### Unblock A Task

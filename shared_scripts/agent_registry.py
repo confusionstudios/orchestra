@@ -950,8 +950,8 @@ def _configured_registry() -> EffectiveRegistry | None:
     # callers to initialize a work-repository view first.
     if not SHARED_CONFIG_PATH.exists():
         return None
-    # Configuration imports must not invoke Git (e.g. import-worktree has not
-    # resolved its database yet). Explicit configure() establishes the repo later.
+    # Configuration reads must not invoke Git before the caller has selected a
+    # checkout. Explicit configure() establishes the repo later.
     root = Path(os.environ["KANBAN_DB"]).expanduser().resolve().parent if os.environ.get("KANBAN_DB") else Path.cwd()
     # Import-time resolution must not call Git. configure() loads linked-worktree inheritance.
     return EffectiveRegistry(root, inherit=False)

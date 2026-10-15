@@ -111,7 +111,7 @@ def accent_storage_identity(scope: str) -> str:
 def repo_accent_identity(repo_root: str | Path | None = None) -> str:
     """Return the accent-storage identity for a repo dashboard."""
     if repo_root is None:
-        repo_root = db.get_instance_identity()["repo_root"]
+        repo_root = db.get_instance_identity().get("repo_root") or db.get_repo_root()
     return accent_storage_identity(f"repo:{Path(repo_root).expanduser().resolve()}")
 
 
@@ -376,7 +376,14 @@ def _abbreviate_home(path: Path) -> str:
 
 def _running_directory_display() -> str:
     """Return the resolved work repo directory shown on the dashboard."""
-    return _abbreviate_home(db.get_repo_root())
+    try:
+        root = db.get_repo_root()
+    except RuntimeError:
+        raw = db.get_instance_identity().get("repo_root")
+        if not raw:
+            return ""
+        root = Path(raw)
+    return _abbreviate_home(root)
 
 
 def _short_computer_name(hostname: str | None = None) -> str:
@@ -675,14 +682,17 @@ def _open_conn() -> sqlite3.Connection | None:
     path = Path(db.get_db_path())
     if not path.exists():
         return None
-    return db.connect(str(path))
+    return db.launch_worktree_connection(str(path))
 
 
 def _get_prev_next_task_ids(conn, task_id: int) -> tuple[int | None, int | None]:
     """Return (prev_id, next_id) for the tasks adjacent to task_id ordered by id."""
     if conn is None:
         return None, None
-    rows = conn.execute("SELECT id FROM tasks ORDER BY id").fetchall()
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
+        (db.connection_queue_id(conn),),
+    ).fetchall()
     ids = [r["id"] for r in rows]
     try:
         idx = ids.index(task_id)
@@ -1393,7 +1403,8 @@ def render_recently_done(conn) -> str:
     rows_raw = [dict(r) for r in conn.execute(
         "SELECT id, title, branch, commit_hash, kind, parent_task_id, coder_agent, reviewer_agent, "
         "review_round, ready_at, last_ready_at, first_started_at, done_at FROM tasks "
-        "WHERE status = 'done' ORDER BY updated_at DESC, id DESC"
+        "WHERE status = 'done' AND queue_id = ? ORDER BY updated_at DESC, id DESC",
+        (db.connection_queue_id(conn),),
     ).fetchall()]
     for row in rows_raw:
         row["approvers"] = _get_task_approvers(conn, row["id"])
@@ -1677,6 +1688,16 @@ def _connection_db_path(conn) -> str | None:
     return row["file"] if hasattr(row, "keys") else row[2]
 
 
+def _connection_queue_id(conn) -> str | None:
+    """Return the queue bound to this connection, when it has one."""
+    if conn is None:
+        return None
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    if isinstance(queue_id, str) and queue_id:
+        return queue_id
+    return None
+
+
 def _tail_text_file(path: Path, limit: int = 200) -> list[str]:
     """Return the last limit lines from a text file."""
     if not path.exists():
@@ -1690,11 +1711,12 @@ def _latest_agent_transcript_for_step(
     step: str | None,
     *,
     db_path: str | None = None,
+    queue_id: str | None = None,
 ) -> Path | None:
     """Return the newest transcript matching one task's active step."""
     if not step or step == "none":
         return None
-    task_dir = db.get_artifacts_root(db_path) / f"task-{task_id}"
+    task_dir = db.get_artifacts_root(db_path, queue_id=queue_id) / f"task-{task_id}"
     if not task_dir.exists():
         return None
     candidates = [path for path in task_dir.glob(f"*-{step}-*.log") if path.is_file()]
@@ -1726,7 +1748,12 @@ def current_agent_output_state(runtime: dict | None, conn) -> dict:
 
     step = runtime.get("current_step") or task.get("next_step") or ""
     db_path = _connection_db_path(conn)
-    transcript_path = _latest_agent_transcript_for_step(task_id, step, db_path=db_path)
+    transcript_path = _latest_agent_transcript_for_step(
+        task_id,
+        step,
+        db_path=db_path,
+        queue_id=_connection_queue_id(conn),
+    )
     if transcript_path is None:
         return {
             "state": "pending",
@@ -1794,7 +1821,10 @@ def _slice_from_last_orchestrator_start(lines: list[str]) -> list[str]:
 
 def render_global_run_log_panel(conn) -> str:
     """Render the persisted orchestrator stdout tail."""
-    log_path = db.get_orchestrator_log_path(_connection_db_path(conn))
+    log_path = db.get_orchestrator_log_path(
+        _connection_db_path(conn),
+        queue_id=_connection_queue_id(conn),
+    )
     lines = _tail_text_file(log_path, limit=200)
     lines = _slice_from_last_orchestrator_start(lines)
     if not lines:
@@ -3195,7 +3225,11 @@ def _run_dashboard(host: str, preferred_port: int, *, _uvicorn=None) -> None:
     *_uvicorn* is the uvicorn module to use; if None the real uvicorn is
     imported at call time.  The parameter exists solely for test injection.
     """
-    config.configure_agents(Path(db.get_db_path()).resolve().parent)
+    opened = db.launch_worktree_connection()
+    try:
+        db.configure_for_connection(opened)
+    finally:
+        opened.close()
     config.agent_snapshot()
     config.agent_snapshot("supertask")
     if _uvicorn is None:

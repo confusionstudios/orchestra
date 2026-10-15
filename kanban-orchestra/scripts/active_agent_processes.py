@@ -19,8 +19,8 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _path(db_path: str | None = None) -> Path:
-    return db.get_runtime_root(db_path) / ACTIVE_AGENTS_FILE
+def _path(db_path: str | None = None, *, queue_id: str | None = None) -> Path:
+    return db.get_runtime_root(db_path, queue_id=queue_id) / ACTIVE_AGENTS_FILE
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -65,16 +65,21 @@ def is_pid_alive(pid: int | None) -> bool:
         return True
 
 
-def _read_active_agents(db_path: str | None = None) -> list[dict[str, Any]]:
-    payload = _read_json(_path(db_path))
+def _read_active_agents(db_path: str | None = None, *, queue_id: str | None = None) -> list[dict[str, Any]]:
+    payload = _read_json(_path(db_path, queue_id=queue_id))
     if not payload:
         return []
     records = payload.get("agents", [])
     return records if isinstance(records, list) else []
 
 
-def _write_active_agents(records: list[dict[str, Any]], db_path: str | None = None) -> None:
-    path = _path(db_path)
+def _write_active_agents(
+    records: list[dict[str, Any]],
+    db_path: str | None = None,
+    *,
+    queue_id: str | None = None,
+) -> None:
+    path = _path(db_path, queue_id=queue_id)
     live_records = [record for record in records if is_pid_alive(_coerce_int(record.get("pid")))]
     if not live_records:
         _safe_unlink(path)
@@ -95,6 +100,7 @@ def register_active_agent(
     agent_name: str,
     pid: int,
     db_path: str | None = None,
+    queue_id: str | None = None,
 ) -> str:
     """Record an active agent process so stop/break flows can terminate it."""
     pid_value = _coerce_int(pid)
@@ -107,7 +113,7 @@ def register_active_agent(
     except OSError:
         pgid = pid
     records = [
-        record for record in _read_active_agents(db_path)
+        record for record in _read_active_agents(db_path, queue_id=queue_id)
         if record.get("id") != record_id and is_pid_alive(_coerce_int(record.get("pid")))
     ]
     records.append(
@@ -121,14 +127,20 @@ def register_active_agent(
             "started_at": _now_iso(),
         }
     )
-    _write_active_agents(records, db_path)
+    _write_active_agents(records, db_path, queue_id=queue_id)
     return record_id
 
 
-def clear_active_agent(record_id: str | None = None, *, pid: int | None = None, db_path: str | None = None) -> None:
-    records = _read_active_agents(db_path)
+def clear_active_agent(
+    record_id: str | None = None,
+    *,
+    pid: int | None = None,
+    db_path: str | None = None,
+    queue_id: str | None = None,
+) -> None:
+    records = _read_active_agents(db_path, queue_id=queue_id)
     if record_id is None and pid is None:
-        _write_active_agents([], db_path)
+        _write_active_agents([], db_path, queue_id=queue_id)
         return
     kept = []
     for record in records:
@@ -137,12 +149,17 @@ def clear_active_agent(record_id: str | None = None, *, pid: int | None = None, 
         if pid is not None and _coerce_int(record.get("pid")) == pid:
             continue
         kept.append(record)
-    _write_active_agents(kept, db_path)
+    _write_active_agents(kept, db_path, queue_id=queue_id)
 
 
-def kill_active_agents(db_path: str | None = None, *, timeout: float = 2.0) -> list[dict[str, Any]]:
+def kill_active_agents(
+    db_path: str | None = None,
+    *,
+    timeout: float = 2.0,
+    queue_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Terminate recorded active agent process groups and clear the metadata file."""
-    records = _read_active_agents(db_path)
+    records = _read_active_agents(db_path, queue_id=queue_id)
     killed = []
     current_pgid = os.getpgrp()
     for record in records:
@@ -178,5 +195,5 @@ def kill_active_agents(db_path: str | None = None, *, timeout: float = 2.0) -> l
         except (ProcessLookupError, PermissionError):
             pass
 
-    clear_active_agent(db_path=db_path)
+    clear_active_agent(db_path=db_path, queue_id=queue_id)
     return killed

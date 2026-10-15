@@ -83,10 +83,11 @@ least one target path you plan to modify under that root.
    - `$ORCHESTRA_DIR`: the Orchestra checkout that provides wrappers and
      implementation files; it may be the same path as the current repo root.
 5. Canonical paths:
-   - DB: `<repo-root>/kanban-orchestra.db`
-   - SQL dump: `<repo-root>/kanban-orchestra.sql`
-   - Runtime dir: `<repo-root>/.kanban-orchestra/`
-   - Orchestrator output: `<repo-root>/.kanban-orchestra/orchestrator.log`
+   - DB: the central store, by default `$HOME/Library/Application Support/Orchestra/orchestra.db` on macOS. `KANBAN_DB` overrides it.
+   - SQL dump: `orchestra.sql` beside that database
+   - Queue runtime: `<state-root>/queues/<queue-id>/`
+   - Orchestrator output: `<state-root>/queues/<queue-id>/orchestrator.log`
+   - Checkout-local preferences: `<repo-root>/.kanban-orchestra/agents.yaml`
    - Orchestra repo root: `$ORCHESTRA_DIR`
    - Kanban Orchestra root: `$ORCHESTRA_DIR/kanban-orchestra/`
    - Scripts: `$ORCHESTRA_DIR/kanban-orchestra/scripts/`
@@ -212,7 +213,22 @@ cat <<'EOF' | task comment <task-id> --message-stdin [--plan-approval|--plan-rej
 EOF
 
 task log <task-id> "<message>"
+task retire-queue [--abandon-unfinished]
 ```
+
+Retiring a queue keeps its task ids, comments, and artifacts in the central
+store. It does not import another database or renumber tasks. Unfinished tasks
+require `--abandon-unfinished`. `ko-migrate preview` inventories legacy
+per-worktree databases without changing them. `ko-migrate cutover` is the
+approved one-time import. A later run leaves an absent source alone. If that
+legacy file is present and its durable rows differ from the recorded backup,
+cutover stops and leaves the file in place. A matching present copy is
+removed in that same run, including when the run also imports a new source,
+after the rollback manifest records its verified backup. `ko-migrate rollback --destination
+<database>` refuses while a source or destination worker or dashboard is
+live, then undoes activation before new workers start. Until that cutover,
+stable tooling keeps using an existing legacy development database, and that
+database has to be one of the sources.
 
 ## Process control
 
@@ -220,11 +236,9 @@ task log <task-id> "<message>"
 "$ORCHESTRA_DIR/bin/ko-orchestrator"
 ```
 
-`ko-orchestrator` is the repo instance: it runs the durable worker and starts
-the matching dashboard for the same git repo root. Resolve the current git repo
-root and treat that launch directory as the Orchestra instance identity. The
-orchestrator records that identity in the repo-scoped `kanban-orchestra.lock`,
-and the dashboard writes `.kanban-orchestra/dashboard.json`.
+`ko-orchestrator` is the queue worker for the current worktree. It uses the
+central database and writes the lock, log, and dashboard metadata under
+`<state-root>/queues/<queue-id>/`. `ko-get-update` prints the lock path.
 
 Use status commands and repo-local metadata instead of PID hunting:
 
@@ -411,7 +425,7 @@ reviewer state, and current orchestrator output.
 CLI-level state check via `orchestrator_runtime`:
 
 ```bash
-sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
+sqlite3 "$HOME/Library/Application Support/Orchestra/orchestra.db" "select queue_id, status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
 ```
 
 Read the result like this:

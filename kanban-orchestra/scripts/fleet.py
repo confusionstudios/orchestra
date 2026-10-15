@@ -22,6 +22,7 @@ from pathlib import Path
 
 import config
 import dashboard_tailscale
+import db
 
 
 ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -62,15 +63,17 @@ class FleetRepo:
 
     @property
     def lock_path(self) -> Path | None:
-        if self.root is None:
+        row = _registered_queue(self.root)
+        if row is None:
             return None
-        return self.root / "kanban-orchestra.lock"
+        return db.get_lock_path(queue_id=row["id"])
 
     @property
     def runtime_root(self) -> Path | None:
-        if self.root is None:
+        row = _registered_queue(self.root)
+        if row is None:
             return None
-        return self.root / ".kanban-orchestra"
+        return db.get_runtime_root(queue_id=row["id"])
 
     @property
     def log_path(self) -> Path | None:
@@ -300,30 +303,38 @@ def is_linked_worktree(path: Path) -> bool:
         return False
 
 
-def orchestra_database_usable(root: Path) -> bool:
-    """Return whether this checkout already has an Orchestra database.
+def _annotate_legacy(repo: FleetRepo) -> FleetRepo:
+    """Attach a migration diagnostic when a checkout still has a legacy database."""
+    if repo.root is None or repo.error:
+        return repo
+    legacy = db.legacy_database_file(repo.root)
+    if legacy is None or _registered_queue(repo.root) is not None:
+        return repo
+    return replace(repo, error=db.migration_required_message(legacy))
 
-    Fleet does not create or migrate the database. A linked worktree opts in
-    only when the file opens read-only and already has orchestrator runtime.
+
+def _registered_queue(root: Path | None) -> dict | None:
+    """Return the enabled central-store queue for a worktree, if one exists."""
+    if root is None:
+        return None
+    try:
+        return db.lookup_queue_by_path(root)
+    except (RuntimeError, OSError):
+        return None
+
+
+def orchestra_database_usable(root: Path) -> bool:
+    """Return whether this checkout has an enabled queue in the central store.
+
+    A legacy per-worktree database does not count: Fleet must not treat it as
+    a live queue. A path match without this checkout's queue identity is not
+    usable either. Callers surface migration-required separately.
     """
-    db_path = root / "kanban-orchestra.db"
-    try:
-        if not db_path.is_file():
-            return False
-    except OSError:
+    if db.legacy_database_file(root) is not None:
         return False
-    conn = None
-    try:
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestrator_runtime'"
-        ).fetchone()
-    except sqlite3.Error:
+    if _registered_queue(root) is None:
         return False
-    finally:
-        if conn is not None:
-            conn.close()
-    return row is not None
+    return db.queue_registration_error(root) is None
 
 
 def configured_primary_repos(*, missing_ok: bool = False) -> list[FleetRepo]:
@@ -358,7 +369,12 @@ def expand_configured_repos(primaries: list[FleetRepo]) -> list[FleetRepo]:
         if root in seen:
             continue
         seen.add(root)
-        instances.append(replace(primary, path=root, root=root, kind="primary", parent=None))
+        annotated = _annotate_legacy(replace(primary, path=root, root=root, kind="primary", parent=None))
+        if annotated.error is None:
+            identity_error = db.queue_registration_error(root)
+            if identity_error:
+                annotated = replace(annotated, error=identity_error)
+        instances.append(annotated)
         valid.append(primary)
 
     for primary in valid:
@@ -378,6 +394,34 @@ def expand_configured_repos(primaries: list[FleetRepo]) -> list[FleetRepo]:
             if root in seen or root == parent:
                 continue
             if not is_linked_worktree(root):
+                continue
+            legacy = db.legacy_database_file(root)
+            if legacy is not None:
+                seen.add(root)
+                instances.append(
+                    FleetRepo(
+                        label_for(root),
+                        root,
+                        root,
+                        error=db.migration_required_message(legacy),
+                        kind="worktree",
+                        parent=parent,
+                    )
+                )
+                continue
+            identity_error = db.queue_registration_error(root)
+            if identity_error:
+                seen.add(root)
+                instances.append(
+                    FleetRepo(
+                        label_for(root),
+                        root,
+                        root,
+                        error=identity_error,
+                        kind="worktree",
+                        parent=parent,
+                    )
+                )
                 continue
             if not orchestra_database_usable(root):
                 continue
@@ -494,17 +538,23 @@ def metadata_pid(path: Path | None, role: str, repo: FleetRepo | None = None) ->
 
 
 def repo_runtime_status(repo: FleetRepo) -> dict | None:
-    """Read the repo runtime row without creating or migrating its database."""
+    """Read this queue's runtime row without creating or migrating a database."""
     if repo.root is None:
         return None
-    db_path = repo.root / "kanban-orchestra.db"
-    if not db_path.exists():
+    queue = _registered_queue(repo.root)
+    if queue is None:
+        return None
+    db_path = Path(db.get_db_path())
+    if not db_path.is_file():
         return None
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(db._readonly_uri(db_path), uri=True)
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM orchestrator_runtime WHERE singleton = 1").fetchone()
+        row = conn.execute(
+            "SELECT * FROM orchestrator_runtime WHERE queue_id = ?",
+            (queue["id"],),
+        ).fetchone()
     except sqlite3.Error:
         return None
     finally:
@@ -738,7 +788,7 @@ def interrupt_tmux_session(session: str) -> None:
 
 
 def process_table() -> list[tuple[int, str]]:
-    result = run(["ps", "-Ao", "pid=,command="])
+    result = run(["ps", "-ww", "-Ao", "pid=,command="])
     if result.returncode != 0:
         return []
 

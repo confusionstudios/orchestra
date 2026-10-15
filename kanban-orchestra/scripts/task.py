@@ -17,9 +17,10 @@ Usage:
     task comment <id> --message-stdin [--comment|--approval|--rejection|--commit-message|--validation] [--author <name>] [--review-round N]
     task purge [--before <date>|--days <n>]
     task delete <id>
-    task dump                       # dump DB to kanban-orchestra.sql
-    task restore
-    task import-worktree <path>     # import another worktree's Kanban DB
+    task dump                       # dump the central DB to orchestra.sql
+    task restore                    # restore orchestra.sql into an empty central DB
+    task retire-queue [--abandon-unfinished]
+                                    # retire this queue without importing or renumbering
 
 Policy:
     Branches master/main are disabled for tasks by default. Use a feature
@@ -32,6 +33,7 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -103,27 +105,46 @@ def _is_interactive():
     return sys.stdin.isatty() and os.environ.get("KANBAN_NONINTERACTIVE") != "1"
 
 
-def _current_branch():
+def _current_branch(repo_root=None):
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, check=True,
+            cwd=str(repo_root) if repo_root else None,
         )
         return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return None
 
 
-def _repo_root_for_policy():
-    return Path(db.get_db_path()).resolve().parent
+def _repo_root_for_policy(conn=None):
+    """Return the checkout whose AGENTS.md policy applies.
+
+    A bound worktree wins, so an explicit queue selection uses that queue's
+    checkout. An explicit ``KANBAN_DB`` uses that file's parent so isolated
+    tests can carry their own policy file. The central state directory is
+    not a checkout.
+    """
+    if conn is not None:
+        bound = db.connection_worktree(conn)
+        if bound is not None and bound.is_dir():
+            return bound
+    inherited = db.matching_inherited_repo_root(conn)
+    if inherited is not None:
+        return inherited
+    if os.environ.get("KANBAN_DB"):
+        parent = Path(os.environ["KANBAN_DB"]).expanduser().resolve().parent
+        if parent != db.get_state_root():
+            return parent
+    return db.get_repo_root()
 
 
 def _is_master_branch(branch):
     return branch in MASTER_BRANCHES
 
 
-def _allow_tasks_on_master():
-    return repo_policy.read_allow_tasks_on_master(_repo_root_for_policy())
+def _allow_tasks_on_master(conn=None):
+    return repo_policy.read_allow_tasks_on_master(_repo_root_for_policy(conn))
 
 
 def _validate_branch_name(branch):
@@ -134,9 +155,9 @@ def _validate_branch_name(branch):
         sys.exit(1)
 
 
-def _reject_master_branch_without_marker(branch):
+def _reject_master_branch_without_marker(branch, conn=None):
     try:
-        validate_master_branch_policy(branch)
+        validate_master_branch_policy(branch, conn)
     except TaskValidationError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
@@ -149,7 +170,7 @@ def _resolve_branch_for_ready(conn, task, branch_arg):
     if task.get("branch"):
         return task["branch"]
     if _is_interactive():
-        current = _current_branch()
+        current = _current_branch(db.connection_worktree(conn))
         if current and current not in ("master", "main"):
             answer = input(f"Use current branch '{current}'? [Y/n] ").strip().lower()
             if answer in ("", "y", "yes"):
@@ -258,8 +279,8 @@ def validate_branch_name(branch):
         raise TaskValidationError(f"invalid branch name '{branch}'.")
 
 
-def validate_master_branch_policy(branch):
-    if _is_master_branch(branch) and not _allow_tasks_on_master():
+def validate_master_branch_policy(branch, conn=None):
+    if _is_master_branch(branch) and not _allow_tasks_on_master(conn):
         raise TaskValidationError(MASTER_TASKS_DISABLED_ERROR)
 
 
@@ -306,10 +327,7 @@ def cmd_add(args, conn):
                 file=sys.stderr,
             )
             sys.exit(1)
-        parent = db.get_task(conn, parent_task_id)
-        if not parent:
-            print(f"Error: parent task {parent_task_id} not found", file=sys.stderr)
-            sys.exit(1)
+        parent = _require_mutable_task(conn, parent_task_id)
         if parent.get("kind") != "supertask":
             print(
                 f"Error: parent task {parent_task_id} is not a supertask",
@@ -332,7 +350,7 @@ def cmd_add(args, conn):
 
     if branch is not None:
         _validate_branch_name(branch)
-        _reject_master_branch_without_marker(branch)
+        _reject_master_branch_without_marker(branch, conn)
 
     task_id = db.add_task(
         conn, args.title, description=args.description,
@@ -367,7 +385,7 @@ SMART_UNBLOCK_CONSULTATION_ENV_VAR = "ORCHESTRA_SMART_UNBLOCK_CONSULTATION"
 _SMART_UNBLOCK_LOCK_NAME = "smart-unblock.lock"
 
 
-def _consultation_task_id_from_lock() -> int | None:
+def _consultation_task_id_from_lock(conn=None) -> int | None:
     """Return the task id under a live smart-unblock consultation, if any.
 
     The watcher publishes `consultation_task_id` in its flock'd lock metadata
@@ -376,12 +394,15 @@ def _consultation_task_id_from_lock() -> int | None:
     (including SIGKILL) can leave stale key=value bytes behind, and those must
     not permanently refuse continue/set. Probe with a non-blocking exclusive
     lock — acquire means no live watcher (ignore metadata); BlockingIOError
-    means the watcher holds the flock (trust metadata).
+    means the watcher holds the flock (trust metadata). The lock is the
+    connection's queue lock when a connection is available.
     """
     try:
-        lock_path = db.get_runtime_root() / _SMART_UNBLOCK_LOCK_NAME
+        db_path = db.get_connection_db_path(conn) if conn is not None else None
+        queue_id = db.connection_queue_id(conn) if conn is not None else None
+        lock_path = db.get_runtime_root(db_path, queue_id=queue_id) / _SMART_UNBLOCK_LOCK_NAME
         handle = lock_path.open("a+", encoding="utf-8")
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError, RuntimeError):
         return None
     try:
         try:
@@ -405,10 +426,10 @@ def _consultation_task_id_from_lock() -> int | None:
         handle.close()
 
 
-def _reject_if_smart_unblock_consultation(command: str, task_id: int | None = None) -> None:
+def _reject_if_smart_unblock_consultation(command: str, task_id: int | None = None, conn=None) -> None:
     blocked_by_env = bool(os.environ.get(SMART_UNBLOCK_CONSULTATION_ENV_VAR))
     blocked_by_lock = (
-        task_id is not None and _consultation_task_id_from_lock() == task_id
+        task_id is not None and _consultation_task_id_from_lock(conn) == task_id
     )
     if not blocked_by_env and not blocked_by_lock:
         return
@@ -421,14 +442,29 @@ def _reject_if_smart_unblock_consultation(command: str, task_id: int | None = No
     sys.exit(1)
 
 
+def _require_mutable_task(conn, task_id):
+    """Return a task on the connection's queue, or exit.
+
+    Global inspection stays available. Mutations need the current queue, which
+    is the invoking worktree unless ``--queue-id`` selected another one.
+    """
+    task = db.get_task(conn, task_id)
+    if not task:
+        print(f"Error: task {task_id} not found", file=sys.stderr)
+        sys.exit(1)
+    try:
+        db.require_task_queue(conn, task_id)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    return task
+
+
 def cmd_set(args, conn):
-    _reject_if_smart_unblock_consultation("set", args.task_id)
+    _reject_if_smart_unblock_consultation("set", args.task_id, conn)
+    task = _require_mutable_task(conn, args.task_id)
     if args.coder_agent is not None or args.reviewer_agent is not None:
         config.check_worker_config(conn)
-    task = db.get_task(conn, args.task_id)
-    if not task:
-        print(f"Error: task {args.task_id} not found", file=sys.stderr)
-        sys.exit(1)
 
     fields = {}
     task_type = _normalize_task_type(task.get("kind", "commit"))
@@ -447,7 +483,7 @@ def cmd_set(args, conn):
             )
             sys.exit(1)
         _validate_branch_name(args.branch)
-        _reject_master_branch_without_marker(args.branch)
+        _reject_master_branch_without_marker(args.branch, conn)
         fields["branch"] = args.branch
     if args.commit is not None:
         fields["commit_hash"] = args.commit
@@ -528,7 +564,7 @@ def cmd_set(args, conn):
             if task_type != "other":
                 branch = _resolve_branch_for_ready(conn, task, fields.get("branch"))
                 _validate_branch_name(branch)
-                _reject_master_branch_without_marker(branch)
+                _reject_master_branch_without_marker(branch, conn)
                 fields["branch"] = branch
         fields["status"] = args.status
 
@@ -613,7 +649,7 @@ def _resolve_branch_for_continue(conn, task):
     if task.get("branch"):
         return task["branch"]
     if _is_interactive():
-        current = _current_branch()
+        current = _current_branch(db.connection_worktree(conn))
         if current and current not in ("master", "main"):
             answer = input(f"Use current branch '{current}'? [Y/n] ").strip().lower()
             if answer in ("", "y", "yes"):
@@ -643,7 +679,7 @@ def _prepare_task_for_ready(conn, task, next_step):
         branch = _resolve_branch_for_continue(conn, task)
         try:
             validate_branch_name(branch)
-            validate_master_branch_policy(branch)
+            validate_master_branch_policy(branch, conn)
         except TaskValidationError as exc:
             raise _continue_error(str(exc)) from exc
         fields["branch"] = branch
@@ -663,6 +699,10 @@ def continue_blocked_task(conn, task_id, *, add_review_rounds=None, next_step=No
     task = db.get_task(conn, task_id)
     if not task:
         raise _continue_error(f"task {task_id} not found")
+    try:
+        db.require_task_queue(conn, task_id)
+    except ValueError as exc:
+        raise _continue_error(str(exc)) from exc
 
     if task["status"] != "blocked":
         raise _continue_error(
@@ -797,7 +837,7 @@ def continue_blocked_task(conn, task_id, *, add_review_rounds=None, next_step=No
 
 def cmd_continue(args, conn):
     """Resume a blocked task via review-cap extension or an explicit next step."""
-    _reject_if_smart_unblock_consultation("continue", args.task_id)
+    _reject_if_smart_unblock_consultation("continue", args.task_id, conn)
     try:
         updated = continue_blocked_task(
             conn,
@@ -815,6 +855,7 @@ def cmd_list(args, conn):
     tasks = db.list_tasks(
         conn, status=args.status, next_step=args.next_step,
         branch=args.branch, parent=args.parent, page=args.page,
+        all_queues=args.all_queues, queue_id=args.queue_id,
     )
     _json_out(tasks)
 
@@ -836,11 +877,13 @@ def cmd_show_run_log(args, conn):
 
 
 def cmd_log(args, conn):
+    _require_mutable_task(conn, args.task_id)
     db.add_run_log(conn, args.task_id, args.message)
     print("OK")
 
 
 def cmd_comment(args, conn):
+    _require_mutable_task(conn, args.task_id)
     message = _resolve_message_arg(args, "comment")
     kind = "comment"
     if args.approval:
@@ -893,10 +936,7 @@ def cmd_comment(args, conn):
 
 
 def cmd_follow_up(args, conn):
-    task = db.get_task(conn, args.task_id)
-    if not task:
-        print(f"Error: task {args.task_id} not found", file=sys.stderr)
-        sys.exit(1)
+    task = _require_mutable_task(conn, args.task_id)
     if task["status"] != "running" or task["next_step"] != "commit-make":
         print(
             f"Error: task {args.task_id} is not currently in commit-make "
@@ -956,6 +996,7 @@ def cmd_follow_up(args, conn):
 
 
 def cmd_requeue(args, conn):
+    _require_mutable_task(conn, args.task_id)
     try:
         task = db.reposition_task(
             conn,
@@ -980,6 +1021,7 @@ def cmd_purge(args, conn):
 
 
 def cmd_delete(args, conn):
+    _require_mutable_task(conn, args.task_id)
     try:
         db.delete_task(conn, args.task_id)
         print("OK")
@@ -989,12 +1031,10 @@ def cmd_delete(args, conn):
 
 
 def cmd_dump(args, conn):
-    """Dump the database to kanban-orchestra.sql in the same directory as the DB."""
-    db_path = db.get_db_path()
-    sql_path = os.path.join(os.path.dirname(db_path) or ".", "kanban-orchestra.sql")
-    with open(sql_path, "w") as f:
-        for line in conn.iterdump():
-            f.write(line + "\n")
+    """Dump the central database to orchestra.sql beside that database."""
+    db_path = db.get_connection_db_path(conn) or db.get_db_path()
+    sql_path = str(Path(db_path).resolve().with_name("orchestra.sql"))
+    db.write_consistent_dump(conn, sql_path)
     print(f"Dumped to {sql_path}")
 
 
@@ -1065,21 +1105,67 @@ def cmd_get_commit_footer(args, conn):
 def cmd_restore(args):
     try:
         result = db.restore_dump()
-    except (FileNotFoundError, ValueError, OSError) as e:
+    except (FileNotFoundError, ValueError, OSError, RuntimeError, sqlite3.Error) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Restored to {result['db_path']} from {result['sql_path']}")
 
 
-def cmd_import_worktree(args, conn):
-    """Import tasks and task-owned history from another worktree's Kanban DB."""
-    try:
-        result = db.import_worktree_database(conn, args.path)
-    except (FileNotFoundError, ValueError, OSError, RuntimeError) as e:
-        print(f"Error: {e}", file=sys.stderr)
+def cmd_retire_queue(args, conn):
+    """Retire the selected queue without moving, importing, or renumbering tasks."""
+    import migrate_cutover
+
+    queue_id = db.connection_queue_id(conn)
+    row = conn.execute("SELECT * FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    if row is None:
+        print(f"Error: unknown queue {queue_id}", file=sys.stderr)
         sys.exit(1)
-    _json_out(result)
+    unfinished = conn.execute(
+        """SELECT id, status, title FROM tasks
+           WHERE queue_id = ? AND status != 'done'
+           ORDER BY id""",
+        (queue_id,),
+    ).fetchall()
+    if unfinished and not args.abandon_unfinished:
+        listed = ", ".join(f"#{item['id']} ({item['status']})" for item in unfinished)
+        print(
+            "Error: this queue has unfinished tasks and was not retired. "
+            "Pass --abandon-unfinished to retire it explicitly. "
+            "Tasks stay on this queue; they are not imported or renumbered: "
+            + listed,
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    worktree = Path(row["path"]) if row["path"] else None
+    evidence = migrate_cutover._central_runtime_live(
+        Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent, queue_id, worktree,
+        migrate_cutover.fleet.process_table(),
+    )
+    if evidence["worker_live"] or evidence["dashboard_live"]:
+        print(
+            "Error: refusing to retire a queue while its worker or dashboard is live",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    before = [item["id"] for item in conn.execute(
+        "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
+        (queue_id,),
+    ).fetchall()]
+    db.retire_queue(conn, queue_id)
+    after = [item["id"] for item in conn.execute(
+        "SELECT id FROM tasks WHERE queue_id = ? ORDER BY id",
+        (queue_id,),
+    ).fetchall()]
+    if before != after:
+        print("Error: retire changed task ids", file=sys.stderr)
+        sys.exit(1)
+    _json_out({
+        "queue_id": queue_id,
+        "state": "retired",
+        "task_ids": after,
+        "abandoned_unfinished": [item["id"] for item in unfinished],
+    })
 
 
 def _resolve_message_arg(args, command_name):
@@ -1118,10 +1204,19 @@ def build_parser():
             "branch, or add ALLOW_TASKS_ON_MASTER as a standalone line in AGENTS.md."
         ),
     )
+    queue_selector = argparse.ArgumentParser(add_help=False)
+    queue_selector.add_argument(
+        "--queue-id",
+        default=None,
+        help=(
+            "Select a queue explicitly. Mutations then use that queue's "
+            "worktree for branch policy and agent preferences."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # add
-    p_add = sub.add_parser("add")
+    p_add = sub.add_parser("add", parents=[queue_selector])
     p_add.add_argument("title")
     p_add.add_argument(
         "--description",
@@ -1144,7 +1239,7 @@ def build_parser():
     p_add.add_argument("--allow-when-blocked", action="store_true")
 
     # set
-    p_set = sub.add_parser("set")
+    p_set = sub.add_parser("set", parents=[queue_selector])
     p_set.add_argument("task_id", type=int)
     p_set.add_argument("--title", default=None)
     p_set.add_argument("--status", default=None)
@@ -1170,6 +1265,7 @@ def build_parser():
     # continue
     p_continue = sub.add_parser(
         "continue",
+        parents=[queue_selector],
         help=(
             "Resume a blocked task after a review-cap block or with an explicit next step; "
             "legacy: --add-review-rounds N --next-step <step>"
@@ -1202,6 +1298,8 @@ def build_parser():
     p_list.add_argument("--branch", default=None)
     p_list.add_argument("--parent", type=int, default=None)
     p_list.add_argument("--page", type=int, default=1)
+    p_list.add_argument("--queue-id", default=None, help="Inspect one queue instead of the current queue")
+    p_list.add_argument("--all-queues", action="store_true", help="Inspect tasks in every queue")
 
     # show
     p_show = sub.add_parser("show")
@@ -1216,12 +1314,12 @@ def build_parser():
     p_sr.add_argument("task_id", type=int)
 
     # log
-    p_log = sub.add_parser("log")
+    p_log = sub.add_parser("log", parents=[queue_selector])
     p_log.add_argument("task_id", type=int)
     p_log.add_argument("message")
 
     # comment
-    p_comment = sub.add_parser("comment")
+    p_comment = sub.add_parser("comment", parents=[queue_selector])
     p_comment.add_argument("task_id", type=int)
     p_comment.add_argument("message", nargs="?", default=None)
     p_comment.add_argument("--message-stdin", action="store_true", default=False)
@@ -1238,16 +1336,16 @@ def build_parser():
     p_comment.add_argument("--review-round", type=int, default=None)
 
     # purge
-    p_purge = sub.add_parser("purge")
+    p_purge = sub.add_parser("purge", parents=[queue_selector])
     p_purge.add_argument("--before", default=None)
     p_purge.add_argument("--days", type=int, default=None)
 
     # delete
-    p_del = sub.add_parser("delete")
+    p_del = sub.add_parser("delete", parents=[queue_selector])
     p_del.add_argument("task_id", type=int)
 
     # follow-up
-    p_follow_up = sub.add_parser("follow-up")
+    p_follow_up = sub.add_parser("follow-up", parents=[queue_selector])
     p_follow_up.add_argument("task_id", type=int)
     p_follow_up.add_argument(
         "--description",
@@ -1256,7 +1354,7 @@ def build_parser():
     )
 
     # requeue
-    p_requeue = sub.add_parser("requeue")
+    p_requeue = sub.add_parser("requeue", parents=[queue_selector])
     p_requeue.add_argument("task_id", type=int)
     requeue_pos = p_requeue.add_mutually_exclusive_group(required=True)
     requeue_pos.add_argument("--before", type=int, default=None, metavar="OTHER_ID")
@@ -1268,18 +1366,19 @@ def build_parser():
     # restore
     sub.add_parser("restore")
 
-    # import-worktree
-    p_import = sub.add_parser(
-        "import-worktree",
+    # retire-queue
+    p_retire = sub.add_parser(
+        "retire-queue",
+        parents=[queue_selector],
         help=(
-            "Import another worktree's Kanban database into the current database. "
-            "PATH may be a worktree root or a kanban-orchestra.db file. "
-            "Does not run any Git commands."
+            "Retire this queue and keep its tasks, history, and ids. "
+            "Does not import or renumber. Unfinished tasks require --abandon-unfinished."
         ),
     )
-    p_import.add_argument(
-        "path",
-        help="Worktree root directory or path to kanban-orchestra.db",
+    p_retire.add_argument(
+        "--abandon-unfinished",
+        action="store_true",
+        help="Retire even when tasks are not done. Those tasks stay on this queue.",
     )
 
     # get-commit-footer
@@ -1304,25 +1403,15 @@ def main():
     if args.command == "restore":
         cmd_restore(args)
         return
-    # import-worktree must not invoke Git (acceptance criterion). Resolve the
-    # target DB via KANBAN_DB or a cwd walk for kanban-orchestra.db.
-    if args.command == "import-worktree":
-        try:
-            target_db = db.get_db_path_without_git()
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-        conn = db.connect(target_db)
-        try:
-            cmd_import_worktree(args, conn)
-        finally:
-            conn.close()
-        return
 
-    conn = db.connect()
+    try:
+        conn = db.launch_connection(queue_id=getattr(args, "queue_id", None))
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     try:
         try:
-            registry = config.configure_agents(Path(db.get_connection_db_path(conn)).parent)
+            registry = db.configure_for_connection(conn)
             config.agent_snapshot()
             config.agent_snapshot("supertask")
         except ValueError as exc:
@@ -1394,6 +1483,7 @@ def main():
             "dump": cmd_dump,
             "requeue": cmd_requeue,
             "follow-up": cmd_follow_up,
+            "retire-queue": cmd_retire_queue,
             "get-commit-footer": cmd_get_commit_footer,
         }
         try:

@@ -1,4 +1,4 @@
-Merge a linked worktree branch, import its Kanban history, and remove the worktree.
+Merge a linked worktree branch, retire its central queue, and remove the worktree.
 
 Use this when the user asks to finish a linked Git worktree after its branch is
 ready to land, including when that branch was already squash-merged through a
@@ -78,7 +78,6 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
 6. Stop only the verified source worktree's Fleet instance, then prove it is
    stopped. Pass the resolved source root as the selector:
    ```bash
-   test -f "$source_root/kanban-orchestra.db" || exit 1
    "$ORCHESTRA_DIR/bin/ko-fleet" stop "$source_root"
    ```
    Do not pass a basename, the primary path, or any other selector. Do not
@@ -88,11 +87,14 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
    else. A stop message is not proof. Re-check the source until the three
    conditions below pass, or stop and report if they do not:
    ```bash
-   "$ORCHESTRA_DIR/bin/ko-get-update" --db "$source_root/kanban-orchestra.db" || exit 1
+   cd "$source_root"
+   "$ORCHESTRA_DIR/bin/ko-get-update"
    ```
-   Confirm the `INSTANCE:` path is `$source_root`. Treat the source
-   orchestrator as safely stopped only when that source update shows no live
-   process, no active task, and no running dashboard for the source worktree.
+   Confirm the `INSTANCE:` path is `$source_root`.
+   The `lock:` line is the central queue lock, not a file inside the worktree.
+   Dashboard metadata is `dashboard.json` in that lock file's directory.
+   Treat the source orchestrator as safely stopped only when that source
+   update shows no live process, no active task, and no running dashboard.
    Check all three independently. A `stale` or `stopped` status line is not
    enough.
 
@@ -104,9 +106,8 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
      `  processes: none found`. If a fleet summary is present (`This repo (`),
      it must say `is stopped.`, not `is running.`. Any `processes:` value that
      lists a PID is a live process. `ORCHESTRATOR: no runtime row` omits
-     `  processes:`; that omission is not proof. Read the `INSTANCE` `lock:`
-     file and stop if it names a `role=orchestrator` PID for which `kill -0`
-     succeeds.
+     `  processes:`; that omission is not proof. Read the `lock:` file and
+     stop if it names a `role=orchestrator` PID for which `kill -0` succeeds.
    - No active task: `ORCHESTRATOR: no runtime row` (no `ACTIVE TASK:`
      section), or `ACTIVE TASK: none (orchestrator idle)`. Any
      `ACTIVE TASK: #` line is an active task.
@@ -115,11 +116,10 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
      summary, if present, also has a `Dashboard:` value. Any `Dashboard:`
      value with a URL means the dashboard is running.
      `ORCHESTRATOR: no runtime row` omits the runtime `  Dashboard:` line;
-     that omission is not proof. Read
-     `$source_root/.kanban-orchestra/dashboard.json` and stop if it names a
-     `role=dashboard` PID for which `kill -0` succeeds.
+     that omission is not proof. Read `dashboard.json` beside the lock file
+     and stop if it names a `role=dashboard` PID for which `kill -0` succeeds.
 
-   Do not import a database that an orchestrator may still write, and do not
+   Do not retire a queue that an orchestrator may still write, and do not
    remove a running worktree.
 
 ## Prove Already Landed Or Squash Merge
@@ -163,25 +163,28 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
      explains the motivation, not the implementation. Record the new commit as
      the landed commit and set `landed_via=squash`.
 
-## Import Kanban History
+## Retire The Queue
 
-1. Count source tasks before importing, then import from the target checkout:
+1. From the source worktree, list unfinished tasks. `done` is finished.
+   Draft, ready, running, blocked, and pending-subtask rows are unfinished:
    ```bash
-   source_task_count="$(
-     "$ORCHESTRA_DIR/bin/ko-python" -c \
-       'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM tasks").fetchone()[0])' \
-       "$source_root/kanban-orchestra.db"
-   )"
-   cd "$target_root"
-   "$ORCHESTRA_DIR/bin/ko-task" import-worktree "$source_root"
+   cd "$source_root"
+   "$ORCHESTRA_DIR/bin/ko-task" list --status ready
+   "$ORCHESTRA_DIR/bin/ko-task" list --status none
+   "$ORCHESTRA_DIR/bin/ko-task" list --status blocked
+   "$ORCHESTRA_DIR/bin/ko-task" list --status running
+   "$ORCHESTRA_DIR/bin/ko-task" list --status pending_subtasks
    ```
-2. Require the JSON result to report `imported_count` equal to
-   `source_task_count`, and retain its `id_map`. Stop if the import fails or the
-   counts differ. Do not remove the worktree after a failed import.
-3. Remember the import semantics when reporting: target task IDs remain
-   authoritative; imported tasks receive fresh IDs; done tasks stay done;
-   unfinished tasks become `none`; and source branch metadata is retained in
-   import comments.
+2. If any unfinished task exists, stop and ask the operator to confirm
+   retirement. Do not move those tasks to another queue. After an explicit
+   yes, retire with the abandon flag. If every task is done, omit the flag:
+   ```bash
+   "$ORCHESTRA_DIR/bin/ko-task" retire-queue --abandon-unfinished
+   ```
+3. Require the JSON result's `task_ids` to be the source queue's existing ids.
+   Stop if retirement fails. Do not import a database, renumber tasks, or
+   delete history. The central queue row becomes `retired` and its tasks stay
+   on that queue.
 
 ## Verify And Remove
 
@@ -201,10 +204,8 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
      test "$(git -C "$target_root" rev-parse HEAD)" != "$target_head" || exit 1
      test "$(git -C "$target_root" rev-parse HEAD)" = "$landed_commit" || exit 1
      ```
-2. Confirm `"$ORCHESTRA_DIR/bin/ko-task" list --status done` and
-   `"$ORCHESTRA_DIR/bin/ko-task" list --status none` can read the target
-   database after import. Inspect the import result and at least one imported
-   task/comment when tasks were imported.
+2. Confirm `"$ORCHESTRA_DIR/bin/ko-task" list --status done` can read the
+   retired queue's history. Task ids are unchanged. Do not expect an id map.
 3. Remove the source with normal Git worktree removal only:
    ```bash
    git -C "$target_root" worktree remove "$source_root"
@@ -213,22 +214,24 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
    Never pass `--force`. Stop and report if removal fails.
 4. Verify `git -C "$target_root" worktree list --porcelain` no longer lists
    `source_root`, then report the source branch, target branch, landed commit,
-   `landed_via`, imported task count and ID map, and successful worktree
-   removal. For `landed_via=squash`, report the newly created squash commit.
-   For `landed_via=already-landed`, report the previously landed equivalent
-   commit and that no new commit was created.
+   `landed_via`, retired queue id, and successful worktree removal. History
+   and artifacts remain in the central store. For `landed_via=squash`, report
+   the newly created squash commit. For `landed_via=already-landed`, report
+   the previously landed equivalent commit and that no new commit was created.
 
 ## Guardrails
 
 - Do not use this for an ordinary branch that is not checked out in a linked
   worktree.
-- Do not merge, import, or remove anything when the source worktree is dirty,
-  detached, running an orchestrator, or missing its Kanban database.
+- Do not merge, retire, or remove anything when the source worktree is dirty,
+  detached, or running an orchestrator.
 - Do not treat a stale orchestrator as stopped unless the source worktree has
   no orchestrator process, no active task, and no running dashboard. Do not
   infer those from omitted `ko-get-update` fields or from the Fleet stop
   message. Stop only the verified source path, and do not unregister it.
-- Do not import before a landed commit is recorded, either a proven
+- Do not retire the queue before a landed commit is recorded, either a proven
   already-landed equivalent commit or a newly created squash commit.
+- Do not import a database or renumber tasks. Unfinished tasks stay on the
+  retired queue, and only after the operator explicitly abandons them.
 - Do not delete the source worktree manually with filesystem commands.
 - Do not push unless the user separately asks.

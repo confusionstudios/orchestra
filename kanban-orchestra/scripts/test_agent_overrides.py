@@ -206,8 +206,10 @@ def test_stale_worker_config_rejects_admission_without_task_changes():
         connection = db.connect(str(Path(root) / "kanban-orchestra.db"))
         try:
             db.upsert_runtime(connection, status="idle", pid=os.getpid())
-            connection.execute("INSERT INTO agent_worker_config VALUES (1, ?)",
-                               (agent_registry.effective().fingerprint,))
+            connection.execute(
+                "INSERT INTO agent_worker_config(queue_id, fingerprint) VALUES (?, ?)",
+                (connection.orchestra_queue_id, agent_registry.effective().fingerprint),
+            )
             connection.commit()
             path.write_text("version: 1\naliases: {my-agent: codex}\n")
             config.configure_agents(root)
@@ -227,7 +229,7 @@ def test_cli_add_and_set_keep_explicit_agent_separate_from_local_role_patch():
         environment.pop("ORCHESTRA_DEFAULT_CODER", None)
         script = Path(__file__).with_name("task.py")
         added = subprocess.run([sys.executable, str(script), "add", "Local choice", "--branch", "feature"],
-                               env=environment, capture_output=True, text=True)
+                               env=environment, cwd=root, capture_output=True, text=True)
         assert added.returncode == 0, added.stderr
         task_id = json.loads(added.stdout)["id"]
         connection = db.connect(str(database))
@@ -237,7 +239,7 @@ def test_cli_add_and_set_keep_explicit_agent_separate_from_local_role_patch():
             connection.close()
         edited = subprocess.run([sys.executable, str(script), "set", str(task_id),
                                  "--coder-agent", "claude:sonnet-next"],
-                                env=environment, capture_output=True, text=True)
+                                env=environment, cwd=root, capture_output=True, text=True)
         assert edited.returncode == 0, edited.stderr
         connection = db.connect(str(database))
         try:
@@ -305,19 +307,6 @@ def test_legacy_task_dispatch_keeps_resolved_local_defaults(tmp_path, monkeypatc
         connection.close()
 
 
-def test_worktree_import_preserves_saved_agent_commands(tmp_path):
-    source = db.connect(str(tmp_path / 'source.db'))
-    target = db.connect(str(tmp_path / 'target.db'))
-    try:
-        snapshot = {'version': 1, 'roles': {'coder': {'spec': 'custom', 'run': ['cli', 'saved-model', '{prompt}']}}}
-        task_id = db.add_task(source, 'Saved', agent_snapshot=snapshot)
-        result = db.import_worktree_database(target, tmp_path / 'source.db')
-        assert db.get_agent_snapshot(target, result['id_map'][str(task_id)]) == snapshot
-    finally:
-        source.close()
-        target.close()
-
-
 def test_shared_alias_override_applies_to_multiple_work_repos(tmp_path, monkeypatch):
     shared = tmp_path / 'agents.local.yaml'
     shared.write_text('version: 1\naliases: {grok: "cursor:grok-4.7-high", audit: "codex:new-review-model"}\n')
@@ -362,7 +351,10 @@ def test_shared_alias_change_preserves_saved_task_and_changes_fingerprint(tmp_pa
     try:
         task_id = db.add_task(connection, 'Saved', coder_agent='grok', agent_snapshot=snapshot)
         db.upsert_runtime(connection, status='running', pid=os.getpid())
-        connection.execute('INSERT INTO agent_worker_config(singleton,fingerprint) VALUES(1,?)', (before.fingerprint,))
+        connection.execute(
+            'INSERT INTO agent_worker_config(queue_id,fingerprint) VALUES(?,?)',
+            (connection.orchestra_queue_id, before.fingerprint),
+        )
         connection.commit()
         shared.write_text('version: 1\naliases: {grok: "cursor:after"}\n')
         after = config.configure_agents(tmp_path)

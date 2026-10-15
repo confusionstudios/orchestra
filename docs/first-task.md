@@ -70,10 +70,11 @@ The last command should print nothing. Three details matter:
   the task runs on `first-task`.
 - **Initial commit.** Orchestra works on a branch with existing history, not
   an empty repo.
-- **Ignored runtime state.** Orchestra keeps its task database, logs, and
-  agent preferences in the work repo, and the coder stages its work with
-  `git add .`. Ignoring these files keeps them out of your commits and keeps
-  `git status` clean.
+- **Ignored local state.** The task database lives in the central store, not
+  in this repo. On macOS that is `$HOME/Library/Application Support/Orchestra/orchestra.db`.
+  The `.gitignore` entries above keep a leftover legacy database, SQL dump,
+  lock, and checkout-local `.kanban-orchestra/` preferences out of commits.
+  The coder stages its work with `git add .`.
 
 ## 3. Use One CLI For Every Role
 
@@ -100,7 +101,7 @@ For Claude Code only, replace each `codex` with `sonnet`.
 
 `ORCHESTRA_DEFAULT_*` environment variables take priority over this file. If
 you have set any, unset them in this terminal. If `KANBAN_DB` is set, unset it
-too, so the wrappers use this repo's database. Then confirm the effective
+too, so the wrappers use the central database. Then confirm the effective
 choices:
 
 ```bash

@@ -217,7 +217,11 @@ def _format_skips(skips: list[str] | None) -> str:
 
 def build_update(conn) -> str:
     lines = []
-    identity = db.get_instance_identity(db.get_connection_db_path(conn))
+    identity = db.get_instance_identity(
+        db.get_connection_db_path(conn),
+        queue_id=db.connection_queue_id(conn),
+        repo_root=db.connection_worktree(conn),
+    )
 
     lines.append(f"INSTANCE: {identity['repo_label']}  ({identity['repo_root']})")
     lines.append(f"  lock: {identity['lock_path']}")
@@ -317,7 +321,8 @@ def build_update(conn) -> str:
     # ── Recently done ────────────────────────────────────────────────────
     done_rows = conn.execute(
         "SELECT id, title, branch, commit_hash, coder_agent, reviewer_agent FROM tasks "
-        "WHERE status = 'done' ORDER BY updated_at DESC, id DESC LIMIT 3"
+        "WHERE status = 'done' AND queue_id = ? ORDER BY updated_at DESC, id DESC LIMIT 3",
+        (db.connection_queue_id(conn),),
     ).fetchall()
     if done_rows:
         lines.append(f"RECENTLY DONE ({len(done_rows)} shown):")
@@ -394,7 +399,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Print a concise plain-text Kanban Orchestra status update."
     )
-    parser.add_argument("--db", metavar="PATH", help="Path to kanban-orchestra.db")
+    parser.add_argument("--db", metavar="PATH", help="Path to the central orchestra.db")
     args = parser.parse_args()
 
     try:
@@ -407,7 +412,7 @@ def main():
         print(f"Error: database not found at {db_path}", file=sys.stderr)
         sys.exit(1)
 
-    conn = db.connect(db_path)
+    conn = db.launch_worktree_connection(db_path)
     try:
         print(build_update(conn))
     finally:

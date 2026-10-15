@@ -35,6 +35,13 @@ def tearDownModule():
     _fleet_live_payload_patcher.stop()
 
 
+def _use_implicit_queue(testcase, db_path):
+    """Run the test outside a Git worktree so an explicit DB keeps its sole queue."""
+    previous = os.getcwd()
+    os.chdir(Path(db_path).parent)
+    testcase.addCleanup(lambda: os.chdir(previous))
+
+
 def _fresh_conn():
     """Return a connection to a fresh in-memory-ish temp DB."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -2265,6 +2272,7 @@ class TestTaskDetailLiveHeader(unittest.TestCase):
     def setUp(self):
         self.conn, self.db_path = _fresh_conn()
         os.environ["KANBAN_DB"] = self.db_path
+        _use_implicit_queue(self, self.db_path)
         self.tid = db.add_task(self.conn, "Live header task", branch="feat-live", coder_agent="claude")
         db.update_task(self.conn, self.tid, status="running", next_step="commit-review", review_round=1)
 
@@ -2306,6 +2314,7 @@ class TestTaskEditingRoutes(unittest.TestCase):
     def setUp(self):
         self.conn, self.db_path = _fresh_conn()
         os.environ["KANBAN_DB"] = self.db_path
+        _use_implicit_queue(self, self.db_path)
         self.tid = db.add_task(
             self.conn,
             "Editable task",
@@ -2460,6 +2469,7 @@ class TestTaskSetReadyRoutes(unittest.TestCase):
     def setUp(self):
         self.conn, self.db_path = _fresh_conn()
         os.environ["KANBAN_DB"] = self.db_path
+        _use_implicit_queue(self, self.db_path)
 
     def tearDown(self):
         self.conn.close()
@@ -2591,6 +2601,7 @@ class TestTaskContinueReviewCapRoutes(unittest.TestCase):
     def setUp(self):
         self.conn, self.db_path = _fresh_conn()
         os.environ["KANBAN_DB"] = self.db_path
+        _use_implicit_queue(self, self.db_path)
 
     def tearDown(self):
         self.conn.close()
@@ -2720,6 +2731,7 @@ class TestOverviewPage(unittest.TestCase):
     def setUp(self):
         self.conn, self.db_path = _fresh_conn()
         os.environ["KANBAN_DB"] = self.db_path
+        _use_implicit_queue(self, self.db_path)
 
     def tearDown(self):
         self.conn.close()
@@ -2730,7 +2742,7 @@ class TestOverviewPage(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         client = TestClient(dashboard.app)
-        with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
+        with patch("dashboard._running_directory_display", return_value="~/work-repo"):
             resp = client.get("/")
         self.assertEqual(resp.status_code, 200)
         self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
@@ -2742,7 +2754,7 @@ class TestOverviewPage(unittest.TestCase):
 
         tid = db.add_task(self.conn, "Task detail path", branch="feat-path")
         client = TestClient(dashboard.app)
-        with patch("dashboard.db.get_repo_root", return_value=Path.home().resolve() / "work-repo"):
+        with patch("dashboard._running_directory_display", return_value="~/work-repo"):
             resp = client.get(f"/task/{tid}")
         self.assertEqual(resp.status_code, 200)
         self.assertIn('<span class="nav-repo-path" title="~/work-repo">~/work-repo</span>', resp.text)
@@ -2838,6 +2850,9 @@ class TestRunDashboard(unittest.TestCase):
     """Tests for _run_dashboard: startup-flow wiring and final-port reporting."""
 
     def setUp(self):
+        self._previous_cwd = os.getcwd()
+        os.chdir(Path(os.environ["KANBAN_DB"]).parent)
+        self.addCleanup(lambda: os.chdir(self._previous_cwd))
         self.publish_patch = patch.object(
             dashboard.dashboard_tailscale,
             "schedule_publish_dashboard",

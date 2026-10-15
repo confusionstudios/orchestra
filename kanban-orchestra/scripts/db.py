@@ -5,18 +5,27 @@ Handles SQLite schema creation, connection management (WAL mode),
 and all queries used by task.py and orchestrator.py.
 """
 
-import sqlite3
 import json
 import os
+import re
+import sqlite3
 import subprocess
+import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import config
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 21
 LOCK_FILE_NAME = "kanban-orchestra.lock"
+LEGACY_DB_FILENAME = "kanban-orchestra.db"
+CENTRAL_DB_FILENAME = "orchestra.db"
+REPOSITORY_ID_FILENAME = "orchestra-repository-id"
+QUEUE_ID_FILENAME = "orchestra-queue-id"
+QUEUES_DIR_NAME = "queues"
 COMMIT_TASK_KINDS = {"commit", "task"}
 BLOCK_REASON_REVIEW_CAP = "review_cap"
 BLOCK_REASON_REVIEWER_UNAVAILABLE = "reviewer_unavailable"
@@ -24,10 +33,34 @@ DEFAULT_MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
 RUN_LOG_RETENTION_DAYS = 7
 COMPLETED_TASK_STATUS = "done"
 TASK_ARTIFACT_DIR_PREFIX = "task-"
+_QUEUE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 SCHEMA_SQL = f"""\
+CREATE TABLE IF NOT EXISTS repositories (
+    id          TEXT PRIMARY KEY,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS queues (
+    id              TEXT PRIMARY KEY,
+    repository_id   TEXT NOT NULL REFERENCES repositories(id),
+    path            TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'enabled'
+                    CHECK(state IN ('enabled', 'retired')),
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    retired_at      DATETIME
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS queues_enabled_path
+    ON queues(path) WHERE state = 'enabled' AND path != '';
+
 CREATE TABLE IF NOT EXISTS tasks (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_id           TEXT NOT NULL REFERENCES repositories(id),
+    queue_id                TEXT NOT NULL REFERENCES queues(id),
     title                   TEXT NOT NULL,
     description             TEXT,
     status                  TEXT NOT NULL DEFAULT 'none'
@@ -65,13 +98,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     resume_next_step        TEXT
 );
 
+CREATE INDEX IF NOT EXISTS tasks_queue_status ON tasks(queue_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_one_running_per_queue
+    ON tasks(queue_id) WHERE status = 'running';
+
 CREATE TABLE IF NOT EXISTS task_agent_snapshots (
     task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     snapshot TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_worker_config (
-    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    queue_id TEXT PRIMARY KEY REFERENCES queues(id),
     fingerprint TEXT NOT NULL
 );
 
@@ -87,6 +124,7 @@ CREATE TABLE IF NOT EXISTS task_skips (
 CREATE TABLE IF NOT EXISTS run_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id     INTEGER REFERENCES tasks(id),
+    queue_id    TEXT NOT NULL REFERENCES queues(id),
     verb        TEXT,
     author      TEXT,
     message     TEXT,
@@ -108,7 +146,7 @@ CREATE TABLE IF NOT EXISTS comments (
 );
 
 CREATE TABLE IF NOT EXISTS orchestrator_runtime (
-    singleton            INTEGER PRIMARY KEY CHECK(singleton = 1),
+    queue_id             TEXT PRIMARY KEY REFERENCES queues(id),
     status               TEXT NOT NULL
         CHECK(status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')),
     pid                  INTEGER,
@@ -130,16 +168,200 @@ CREATE TABLE IF NOT EXISTS orchestrator_runtime (
     status_message       TEXT,
     updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TRIGGER IF NOT EXISTS tasks_queue_repository_insert
+BEFORE INSERT ON tasks
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM queues
+    WHERE id = NEW.queue_id AND repository_id = NEW.repository_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task queue does not belong to its repository');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_parent_same_queue_insert
+BEFORE INSERT ON tasks
+FOR EACH ROW
+WHEN NEW.parent_task_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM tasks parent
+    WHERE parent.id = NEW.parent_task_id
+      AND parent.repository_id = NEW.repository_id
+      AND parent.queue_id = NEW.queue_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'parent task must belong to the same repository and queue');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_repository_immutable
+BEFORE UPDATE OF repository_id ON tasks
+FOR EACH ROW
+WHEN NEW.repository_id != OLD.repository_id
+BEGIN
+    SELECT RAISE(ABORT, 'task repository cannot change');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_queue_same_repository_update
+BEFORE UPDATE OF queue_id ON tasks
+FOR EACH ROW
+WHEN NEW.queue_id != OLD.queue_id AND NOT EXISTS (
+    SELECT 1 FROM queues
+    WHERE id = NEW.queue_id AND repository_id = NEW.repository_id AND state = 'enabled'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task queue does not belong to its repository');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_parent_same_queue_update
+BEFORE UPDATE OF parent_task_id ON tasks
+FOR EACH ROW
+WHEN NEW.parent_task_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM tasks parent
+    WHERE parent.id = NEW.parent_task_id
+      AND parent.repository_id = NEW.repository_id
+      AND parent.queue_id = NEW.queue_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'parent task must belong to the same repository and queue');
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_follow_up_same_queue_update
+BEFORE UPDATE OF follow_up_task_id ON tasks
+FOR EACH ROW
+WHEN NEW.follow_up_task_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM tasks follow_up
+    WHERE follow_up.id = NEW.follow_up_task_id
+      AND follow_up.repository_id = NEW.repository_id
+      AND follow_up.queue_id = NEW.queue_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up task must belong to the same repository and queue');
+END;
+
+CREATE TRIGGER IF NOT EXISTS runtime_task_same_queue_insert
+BEFORE INSERT ON orchestrator_runtime
+FOR EACH ROW
+WHEN NEW.current_task_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM tasks
+    WHERE id = NEW.current_task_id AND queue_id = NEW.queue_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runtime task belongs to a different queue');
+END;
+
+CREATE TRIGGER IF NOT EXISTS runtime_task_same_queue_update
+BEFORE UPDATE OF current_task_id ON orchestrator_runtime
+FOR EACH ROW
+WHEN NEW.current_task_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM tasks
+    WHERE id = NEW.current_task_id AND queue_id = NEW.queue_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runtime task belongs to a different queue');
+END;
+
+CREATE TABLE IF NOT EXISTS migration_sources (
+    id              TEXT PRIMARY KEY,
+    source_path     TEXT NOT NULL UNIQUE,
+    queue_id        TEXT NOT NULL REFERENCES queues(id),
+    repository_id   TEXT NOT NULL REFERENCES repositories(id),
+    status          TEXT NOT NULL
+                    CHECK(status IN ('imported', 'activated')),
+    task_count      INTEGER NOT NULL,
+    attempt_id      TEXT NOT NULL,
+    backup_path     TEXT,
+    imported_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS migration_task_map (
+    source_id       TEXT NOT NULL REFERENCES migration_sources(id),
+    old_task_id     INTEGER NOT NULL,
+    new_task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    PRIMARY KEY (source_id, old_task_id),
+    UNIQUE (new_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS migration_comment_map (
+    source_id       TEXT NOT NULL REFERENCES migration_sources(id),
+    old_comment_id  INTEGER NOT NULL,
+    new_comment_id  INTEGER NOT NULL REFERENCES comments(id),
+    queue_id        TEXT NOT NULL REFERENCES queues(id),
+    PRIMARY KEY (source_id, old_comment_id),
+    UNIQUE (new_comment_id)
+);
+
+CREATE TABLE IF NOT EXISTS migration_attempts (
+    id              TEXT PRIMARY KEY,
+    destination     TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    manifest_path   TEXT NOT NULL,
+    started_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    finished_at     DATETIME
+);
 """
 
 
+class MigrationRequired(RuntimeError):
+    """Raised when a legacy per-worktree database must be migrated by hand.
+
+    The legacy file is left untouched. This class carries no reader.
+    """
+
+
+class OrchestraConnection(sqlite3.Connection):
+    """SQLite connection tagged with the queue it is operating on."""
+
+    orchestra_queue_id: str | None = None
+    orchestra_repository_id: str | None = None
+    orchestra_repo_root: str | None = None
+    orchestra_queue_created: bool = False
+
+
+def migration_required_message(path: str | Path) -> str:
+    """Return the operator diagnostic for an unmigrated legacy database."""
+    return (
+        f"Migration required: {path} is a legacy per-worktree Kanban Orchestra database. "
+        "The central store will not read, modify, or delete it. "
+        "Inventory it with ko-migrate preview and import it only with an approved "
+        "ko-migrate cutover after its worker and dashboard are stopped. "
+        "An empty queue was not created."
+    )
+
+
+def _is_id(value: str | None) -> bool:
+    return bool(value) and _QUEUE_ID_RE.fullmatch(value) is not None
+
+
+def get_state_root() -> Path:
+    """Return the durable Orchestra state directory for this user and machine.
+
+    ``ORCHESTRA_STATE_DIR`` isolates tests and Linux CI. macOS otherwise uses
+    Application Support. Other platforms use ``$XDG_DATA_HOME/orchestra`` or
+    ``~/.local/share/orchestra``.
+    """
+    override = os.environ.get("ORCHESTRA_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return (Path.home() / "Library" / "Application Support" / "Orchestra").resolve()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return (base / "orchestra").resolve()
+
+
+def default_db_path() -> Path:
+    """Return the central database path for this user and machine."""
+    return get_state_root() / CENTRAL_DB_FILENAME
+
+
 def get_db_path(db_path: str | None = None) -> str:
-    """Return the database path. Checks explicit arg, KANBAN_DB, then repo root."""
+    """Return the database path. Explicit arg, then KANBAN_DB, then the central default."""
     if db_path:
-        return db_path
-    if os.environ.get("KANBAN_DB"):
-        return os.environ["KANBAN_DB"]
-    return str(get_workspace()["db_path"])
+        return str(Path(db_path).expanduser().resolve())
+    env = os.environ.get("KANBAN_DB")
+    if env:
+        return str(Path(env).expanduser().resolve())
+    return str(default_db_path())
 
 
 def get_db_path_without_git(
@@ -147,25 +369,14 @@ def get_db_path_without_git(
     *,
     cwd: str | None = None,
 ) -> str:
-    """Resolve the Kanban DB path without invoking Git.
+    """Resolve the central database path without invoking Git.
 
-    Order: explicit arg, ``KANBAN_DB``, then walk upward from ``cwd`` (default:
-    process cwd) looking for an existing ``kanban-orchestra.db`` file.
+    Order: explicit arg, ``KANBAN_DB``, then the platform central default.
+    ``cwd`` is accepted for callers and is not used to walk a checkout for a
+    legacy database file.
     """
-    if db_path:
-        return db_path
-    if os.environ.get("KANBAN_DB"):
-        return os.environ["KANBAN_DB"]
-    start = Path(cwd or os.getcwd()).resolve()
-    for directory in [start, *start.parents]:
-        candidate = directory / "kanban-orchestra.db"
-        if candidate.is_file():
-            return str(candidate)
-    raise RuntimeError(
-        "Could not locate kanban-orchestra.db from the current directory "
-        "without Git. Set KANBAN_DB or run from a worktree that contains "
-        "kanban-orchestra.db."
-    )
+    del cwd
+    return get_db_path(db_path)
 
 
 def get_repo_root(cwd: str | None = None) -> Path:
@@ -178,8 +389,8 @@ def get_repo_root(cwd: str | None = None) -> Path:
             check=True,
             cwd=cwd,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        raise RuntimeError("Not inside a git repository and KANBAN_DB is not set.") from e
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError("Not inside a git repository and KANBAN_DB is not set.") from exc
     return Path(result.stdout.strip()).resolve()
 
 
@@ -207,18 +418,397 @@ def get_orchestra_dir() -> Path:
 
 
 def get_workspace(cwd: str | None = None) -> dict[str, Path]:
-    """Resolve the kanban workspace paths for the current repo."""
+    """Resolve the worktree and the central database paths."""
     repo_root = get_repo_root(cwd)
+    db_path = Path(get_db_path())
     return {
         "repo_root": repo_root,
-        "db_path": repo_root / "kanban-orchestra.db",
-        "sql_path": repo_root / "kanban-orchestra.sql",
+        "db_path": db_path,
+        "sql_path": db_path.with_name("orchestra.sql"),
     }
 
 
-def get_lock_path(db_path: str | None = None) -> Path:
-    """Return the repo-scoped singleton lock path for the current workspace."""
-    return Path(get_db_path(db_path)).resolve().with_name(LOCK_FILE_NAME)
+def _readonly_uri(path: Path) -> str:
+    return "file:" + quote(path.resolve().as_posix()) + "?mode=ro"
+
+
+def _peek_database_kind(path: str | Path) -> str:
+    """Classify a database file without writing it.
+
+    Returns ``absent``, ``empty``, ``current``, ``legacy``, or ``incompatible``.
+    """
+    db_file = Path(path)
+    if not db_file.exists() or db_file.stat().st_size == 0:
+        return "absent" if not db_file.exists() else "empty"
+    conn = sqlite3.connect(_readonly_uri(db_file), uri=True, timeout=30.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        if not tables:
+            return "empty"
+        if _schema_is_current(conn, tables):
+            return "current"
+        if _schema_is_legacy(conn, tables):
+            return "legacy"
+        return "incompatible"
+    except sqlite3.Error:
+        return "incompatible"
+    finally:
+        conn.close()
+
+
+def _schema_is_current(conn: sqlite3.Connection, tables: set[str]) -> bool:
+    if not {"repositories", "queues", "tasks", "orchestrator_runtime"}.issubset(tables):
+        return False
+    task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    runtime_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(orchestrator_runtime)").fetchall()
+    }
+    return "queue_id" in task_cols and "repository_id" in task_cols and "queue_id" in runtime_cols
+
+
+def _schema_is_legacy(conn: sqlite3.Connection, tables: set[str]) -> bool:
+    if "queues" in tables and "repositories" in tables:
+        return False
+    if "tasks" in tables:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "queue_id" not in cols:
+            return True
+    if "orchestrator_runtime" in tables and "queues" not in tables:
+        return True
+    return False
+
+
+def legacy_database_file(repo_root: str | Path) -> Path | None:
+    """Return a legacy worktree database path when one is present and unmigrated."""
+    path = Path(repo_root) / LEGACY_DB_FILENAME
+    if not path.is_file():
+        return None
+    if _peek_database_kind(path) == "legacy":
+        return path
+    return None
+
+
+def assert_worktree_not_legacy(repo_root: str | Path) -> None:
+    """Refuse to register a queue while a legacy database still sits in the worktree."""
+    legacy = legacy_database_file(repo_root)
+    if legacy is not None:
+        raise MigrationRequired(migration_required_message(legacy))
+
+
+def _git_dir(repo_root: Path, flag: str) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", flag],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = repo_root / path
+    return path.resolve()
+
+
+def _identity_dirs(repo_root: Path) -> tuple[Path, Path]:
+    """Return directories that anchor repository identity and queue identity.
+
+    Git checkouts keep the repository id in the common git dir and the queue
+    id in the worktree git dir, so linked worktrees share a repository and
+    keep distinct queues. Non-git directories keep both ids under
+    ``.kanban-orchestra`` beside agent preference files.
+    """
+    common = _git_dir(repo_root, "--git-common-dir")
+    git_dir = _git_dir(repo_root, "--git-dir")
+    if common is not None and git_dir is not None:
+        return common, git_dir
+    local = repo_root / ".kanban-orchestra"
+    return local, local
+
+
+def _read_identity(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not _is_id(text):
+        raise RuntimeError(f"Orchestra identity file is invalid: {path}")
+    return text
+
+
+def _write_identity(path: Path, value: str) -> None:
+    if not _is_id(value):
+        raise RuntimeError(f"Refusing to store an unsafe Orchestra id: {value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(value + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_or_create_identity(path: Path) -> str:
+    existing = _read_identity(path)
+    if existing:
+        return existing
+    value = str(uuid.uuid4())
+    _write_identity(path, value)
+    return value
+
+
+def _checkout_identity(repo_root: Path) -> tuple[str | None, str | None]:
+    """Return the repository and queue ids recorded in a checkout."""
+    repo_dir, queue_dir = _identity_dirs(repo_root)
+    return (
+        _read_identity(repo_dir / REPOSITORY_ID_FILENAME),
+        _read_identity(queue_dir / QUEUE_ID_FILENAME),
+    )
+
+
+def _checkout_owns_queue(repo_root: Path, queue_id: str, repository_id: str) -> bool:
+    recorded_repo, recorded_queue = _checkout_identity(repo_root)
+    return recorded_queue == queue_id and recorded_repo == repository_id
+
+
+def _repository_checkouts(root: Path) -> list[Path] | None:
+    """Return every checkout of this repository.
+
+    None means the listing failed, so a missing identity file is not proof
+    that a queue is gone. A directory that is not a Git checkout is only
+    itself.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        found.append(resolved)
+
+    if _git_dir(root, "--git-common-dir") is None:
+        add(root)
+        return found
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            add(Path(line.split(" ", 1)[1]))
+    if not found:
+        return None
+    return found
+
+
+def _path_owner_disposition(queue_id: str, repository_id: str, root: Path) -> str:
+    """Return whether the enabled queue at ``root`` is live, gone, or unknown.
+
+    ``gone`` means this checkout belongs to that queue's repository and every
+    listed live checkout lacks its queue identity. ``live`` means one of those
+    checkouts still carries it. ``unknown`` means this checkout cannot list
+    that repository, so the owner is not provably gone.
+    """
+    try:
+        recorded_repo, _recorded_queue = _checkout_identity(root)
+    except RuntimeError:
+        return "unknown"
+    if recorded_repo != repository_id:
+        return "unknown"
+    checkouts = _repository_checkouts(root)
+    if checkouts is None:
+        return "unknown"
+    for checkout in checkouts:
+        if not checkout.is_dir():
+            continue
+        try:
+            _repo, recorded_queue = _checkout_identity(checkout)
+        except RuntimeError:
+            return "unknown"
+        if recorded_queue == queue_id:
+            return "live"
+    return "gone"
+
+
+def _queue_still_lives_at(queue_id: str, path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    try:
+        _recorded_repo, recorded_queue = _checkout_identity(path)
+    except RuntimeError:
+        return True
+    return recorded_queue == queue_id
+
+
+def _retire_enabled_queue(conn: sqlite3.Connection, queue_id: str) -> None:
+    conn.execute(
+        """UPDATE queues
+           SET state = 'retired', retired_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND state = 'enabled'""",
+        (queue_id,),
+    )
+
+
+def _release_stale_path_owner(
+    conn: sqlite3.Connection,
+    path_text: str,
+    root: Path,
+    *,
+    except_id: str | None = None,
+) -> None:
+    """Retire an enabled queue at this path only when its identity is provably gone.
+
+    A live checkout that still carries the queue id keeps the path. A primary
+    that moved out of this repository's view is not retired. Registration
+    stops with a diagnostic until that checkout reconnects or an operator
+    retires the queue.
+    """
+    sql = "SELECT id, repository_id FROM queues WHERE path = ? AND state = 'enabled'"
+    params: list[str] = [path_text]
+    if except_id is not None:
+        sql += " AND id != ?"
+        params.append(except_id)
+    holder = conn.execute(sql, params).fetchone()
+    if holder is None:
+        return
+    disposition = _path_owner_disposition(holder["id"], holder["repository_id"], root)
+    retire_cmd = f"task retire-queue --queue-id {holder['id']} --abandon-unfinished"
+    if disposition == "gone":
+        _retire_enabled_queue(conn, holder["id"])
+        return
+    if disposition == "live":
+        raise RuntimeError(
+            f"Enabled queue {holder['id']} still owns {root}. "
+            "This checkout will not take its tasks. Open the checkout that "
+            "carries its identity file, or retire it with "
+            f"{retire_cmd}."
+        )
+    raise RuntimeError(
+        f"Enabled queue {holder['id']} owns {root}, and this checkout cannot "
+        "prove that queue's checkout is gone. This checkout will not take its "
+        "tasks. Open the checkout that carries its identity file, or retire it "
+        f"with {retire_cmd} if that checkout no longer exists."
+    )
+
+
+def connection_queue_id(conn: sqlite3.Connection) -> str:
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    if not _is_id(queue_id):
+        raise RuntimeError("Orchestra connection is missing queue context")
+    return queue_id
+
+
+def connection_repository_id(conn: sqlite3.Connection) -> str:
+    repository_id = getattr(conn, "orchestra_repository_id", None)
+    if not _is_id(repository_id):
+        raise RuntimeError("Orchestra connection is missing repository context")
+    return repository_id
+
+
+def connection_worktree(conn: sqlite3.Connection) -> Path | None:
+    """Return the bound worktree path, when this queue has one."""
+    raw = getattr(conn, "orchestra_repo_root", None)
+    if not isinstance(raw, (str, Path)) or not str(raw):
+        return None
+    return Path(raw)
+
+
+def execution_root(conn: sqlite3.Connection, *, repo_root: str | Path | None = None) -> Path:
+    """Return the worktree used for Git, agents, and stop files.
+
+    A bound queue path wins. An isolated database uses its parent directory
+    when that parent is not the central state directory. The central state
+    directory is never treated as a checkout.
+    """
+    if repo_root:
+        return Path(repo_root).expanduser().resolve()
+    bound = connection_worktree(conn)
+    if bound is not None and bound.is_dir():
+        return bound
+    db_file = get_connection_db_path(conn)
+    if not db_file:
+        raise RuntimeError("connection has no database path")
+    parent = Path(db_file).resolve().parent
+    if parent == get_state_root():
+        raise RuntimeError(
+            "This queue has no worktree. Refusing to use the central state directory as a checkout."
+        )
+    return parent
+
+
+def get_runtime_root(db_path: str | None = None, *, queue_id: str | None = None) -> Path:
+    """Return the durable runtime directory for one queue."""
+    path = get_db_path(db_path)
+    qid = queue_id or _sole_queue_id(path)
+    if not _is_id(qid):
+        raise RuntimeError("queue id is required for runtime paths")
+    return Path(path).resolve().parent / QUEUES_DIR_NAME / qid
+
+
+def get_lock_path(db_path: str | None = None, *, queue_id: str | None = None) -> Path:
+    """Return the queue-scoped orchestrator lock path."""
+    return get_runtime_root(db_path, queue_id=queue_id) / LOCK_FILE_NAME
+
+
+def get_artifacts_root(db_path: str | None = None, *, queue_id: str | None = None) -> Path:
+    """Return the directory used for one queue's run artifacts."""
+    return get_runtime_root(db_path, queue_id=queue_id) / "artifacts"
+
+
+def get_orchestrator_log_path(db_path: str | None = None, *, queue_id: str | None = None) -> Path:
+    """Return the persisted orchestrator stdout log for one queue."""
+    return get_runtime_root(db_path, queue_id=queue_id) / "orchestrator.log"
+
+
+def _queue_count(db_path: str) -> int:
+    """Return how many queues a current database has, or zero when it has none."""
+    path = Path(db_path)
+    if not path.is_file() or _peek_database_kind(path) != "current":
+        return 0
+    conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM queues").fetchone()
+    except sqlite3.Error:
+        return 0
+    finally:
+        conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _sole_queue_id(db_path: str) -> str:
+    kind = _peek_database_kind(db_path)
+    if kind != "current":
+        raise RuntimeError(f"Orchestra database has no queue yet: {db_path}")
+    conn = sqlite3.connect(_readonly_uri(Path(db_path)), uri=True, timeout=30.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT id FROM queues").fetchall()
+    finally:
+        conn.close()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "This Orchestra database has more than one queue. "
+            "Pass queue_id or open it from a worktree."
+        )
+    return rows[0]["id"]
 
 
 def get_instance_identity(
@@ -226,63 +816,62 @@ def get_instance_identity(
     *,
     cwd: str | None = None,
     lock_path: str | Path | None = None,
+    queue_id: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> dict[str, str]:
-    """Return stable identifiers for the current Orchestra work-repo instance.
-
-    The git repo root is the human-facing instance identity. The database,
-    runtime directory, and lock path remain explicit because advanced setups may
-    override KANBAN_DB while still launching from a work repository.
-    """
-    resolved_db_path: Path | None = None
-    if not (lock_path is not None and db_path is None and not os.environ.get("KANBAN_DB")):
+    """Return identifiers for one queue without treating the database directory as a checkout."""
+    resolved_db = get_db_path(db_path)
+    qid = queue_id
+    if qid is None:
         try:
-            resolved_db_path = Path(get_db_path(db_path)).resolve()
+            qid = _sole_queue_id(resolved_db)
         except RuntimeError:
-            if lock_path is None:
-                raise
-
-    has_explicit_state_path = db_path is not None or lock_path is not None or os.environ.get("KANBAN_DB")
-    repo_root = None
-    if cwd is not None or not has_explicit_state_path:
+            qid = None
+    runtime_root = get_runtime_root(resolved_db, queue_id=qid) if qid else None
+    resolved_lock = (
+        Path(lock_path).resolve()
+        if lock_path is not None
+        else (runtime_root / LOCK_FILE_NAME if runtime_root is not None else None)
+    )
+    resolved_repo = Path(repo_root).resolve() if repo_root else None
+    if resolved_repo is None and qid:
+        row_path = _queue_path(resolved_db, qid)
+        if row_path:
+            resolved_repo = Path(row_path)
+    if resolved_repo is None and (cwd is not None or not os.environ.get("KANBAN_DB")):
         try:
-            repo_root = get_repo_root(cwd)
+            resolved_repo = get_repo_root(cwd)
         except RuntimeError:
-            repo_root = None
-
-    if repo_root is None:
-        if resolved_db_path is not None:
-            repo_root = resolved_db_path.parent
-        elif lock_path is not None:
-            repo_root = Path(lock_path).resolve().parent
-        else:
-            repo_root = get_repo_root(cwd)
-
-    resolved_lock_path = Path(lock_path).resolve() if lock_path is not None else get_lock_path(db_path)
-    runtime_root = get_runtime_root(db_path) if resolved_db_path is not None else repo_root / ".kanban-orchestra"
-    resolved_db_path = resolved_db_path or repo_root / "kanban-orchestra.db"
-
-    return {
-        "repo_root": str(repo_root),
-        "repo_label": repo_root.name or str(repo_root),
-        "db_path": str(resolved_db_path),
-        "runtime_root": str(runtime_root),
-        "lock_path": str(resolved_lock_path),
+            resolved_repo = None
+    if resolved_repo is None:
+        parent = Path(resolved_db).resolve().parent
+        if parent != get_state_root().resolve():
+            resolved_repo = parent
+    identity = {
+        "db_path": resolved_db,
     }
+    if qid:
+        identity["queue_id"] = qid
+    if resolved_repo is not None:
+        identity["repo_root"] = str(resolved_repo)
+        identity["repo_label"] = resolved_repo.name or str(resolved_repo)
+    if runtime_root is not None:
+        identity["runtime_root"] = str(runtime_root)
+    if resolved_lock is not None:
+        identity["lock_path"] = str(resolved_lock)
+    return identity
 
 
-def get_runtime_root(db_path: str | None = None) -> Path:
-    """Return the directory used for repo-scoped runtime artifacts."""
-    return Path(get_db_path(db_path)).resolve().parent / ".kanban-orchestra"
-
-
-def get_artifacts_root(db_path: str | None = None) -> Path:
-    """Return the directory used for filesystem-backed run artifacts."""
-    return get_runtime_root(db_path) / "artifacts"
-
-
-def get_orchestrator_log_path(db_path: str | None = None) -> Path:
-    """Return the path of the persisted orchestrator stdout log."""
-    return get_runtime_root(db_path) / "orchestrator.log"
+def _queue_path(db_path: str, queue_id: str) -> str:
+    conn = sqlite3.connect(_readonly_uri(Path(db_path)), uri=True, timeout=30.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT path FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return ""
+    return row["path"] or ""
 
 
 def new_agent_transcript_path(
@@ -290,40 +879,555 @@ def new_agent_transcript_path(
     verb: str | None,
     agent_name: str | None,
     db_path: str | None = None,
+    *,
+    queue_id: str | None = None,
 ) -> Path:
     """Create and return a unique path for one agent transcript."""
-    artifacts_root = get_artifacts_root(db_path)
+    artifacts_root = get_artifacts_root(db_path, queue_id=queue_id)
     task_dir = artifacts_root / f"task-{task_id}"
     task_dir.mkdir(parents=True, exist_ok=True)
-
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     safe_verb = (verb or "run").replace("/", "-")
     safe_agent = (agent_name or "agent").replace("/", "-")
     return task_dir / f"{stamp}-{safe_verb}-{safe_agent}.log"
 
 
-def connect(db_path: str | None = None) -> sqlite3.Connection:
-    """Open (and possibly create) the database with WAL mode."""
+def _attach_queue(conn: OrchestraConnection, row: sqlite3.Row, *, created: bool = False) -> None:
+    conn.orchestra_queue_id = row["id"]
+    conn.orchestra_repository_id = row["repository_id"]
+    conn.orchestra_repo_root = row["path"] or None
+    conn.orchestra_queue_created = created
+    runtime = get_runtime_root(get_connection_db_path(conn), queue_id=row["id"])
+    runtime.mkdir(parents=True, exist_ok=True)
+    (runtime / "artifacts").mkdir(exist_ok=True)
+
+
+def _insert_repository(conn: sqlite3.Connection, repository_id: str | None = None) -> str:
+    repo_id = repository_id or str(uuid.uuid4())
+    if not _is_id(repo_id):
+        raise RuntimeError(f"Refusing unsafe repository id: {repo_id}")
+    conn.execute("INSERT OR IGNORE INTO repositories (id) VALUES (?)", (repo_id,))
+    return repo_id
+
+
+def _insert_queue(
+    conn: sqlite3.Connection,
+    repository_id: str,
+    path: str,
+    *,
+    queue_id: str | None = None,
+    state: str = "enabled",
+) -> str:
+    qid = queue_id or str(uuid.uuid4())
+    if not _is_id(qid):
+        raise RuntimeError(f"Refusing unsafe queue id: {qid}")
+    conn.execute(
+        """INSERT INTO queues (id, repository_id, path, state)
+           VALUES (?, ?, ?, ?)""",
+        (qid, repository_id, path, state),
+    )
+    return qid
+
+
+def _require_queue(conn: sqlite3.Connection, queue_id: str) -> sqlite3.Row:
+    if not _is_id(queue_id):
+        raise RuntimeError(f"Refusing unsafe queue id: {queue_id}")
+    row = conn.execute("SELECT * FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    if row is None:
+        raise RuntimeError(f"Unknown queue: {queue_id}")
+    return row
+
+
+def _sole_or_default_queue(conn: sqlite3.Connection) -> tuple[sqlite3.Row, bool]:
+    rows = conn.execute("SELECT * FROM queues ORDER BY created_at, id").fetchall()
+    if len(rows) == 1:
+        return rows[0], False
+    if len(rows) == 0:
+        repo_id = _insert_repository(conn)
+        qid = _insert_queue(conn, repo_id, "")
+        conn.commit()
+        return conn.execute("SELECT * FROM queues WHERE id = ?", (qid,)).fetchone(), True
+    raise RuntimeError(
+        "This Orchestra database has more than one queue. "
+        "Open it from a worktree or pass queue_id."
+    )
+
+
+def ensure_queue(conn: sqlite3.Connection, repo_root: str | Path) -> tuple[sqlite3.Row, bool]:
+    """Register or refresh the enabled queue for a worktree.
+
+    A checkout with no queue identity file gets a new queue. It does not
+    adopt an older row that used the same path. That older row is retired
+    only when this checkout is the same repository and every listed live
+    checkout lacks the old queue identity. When the old owner cannot be
+    proven gone, including a primary that moved before a new repository
+    reused its path, registration stops with a diagnostic and the old queue
+    stays enabled. A checkout that carries an identity file keeps that queue,
+    including after its directory moves, and is refused while another live
+    checkout still carries the same identity. A legacy ``kanban-orchestra.db``
+    aborts before any queue row is inserted. Retired queues stay retired. A
+    missing directory is not given a replacement queue.
+    """
+    root = Path(repo_root).expanduser().resolve()
+    if not root.is_dir():
+        raise RuntimeError(
+            f"Worktree path is missing: {root}. "
+            "Unfinished tasks stay on their queue and will not run elsewhere."
+        )
+    assert_worktree_not_legacy(root)
+    repo_dir, queue_dir = _identity_dirs(root)
+    repository_id = _read_or_create_identity(repo_dir / REPOSITORY_ID_FILENAME)
+    _insert_repository(conn, repository_id)
+    path_text = str(root)
+    queue_file = queue_dir / QUEUE_ID_FILENAME
+    existing_queue_id = _read_identity(queue_file)
+    created = False
+    try:
+        if existing_queue_id:
+            row = conn.execute(
+                "SELECT * FROM queues WHERE id = ?",
+                (existing_queue_id,),
+            ).fetchone()
+            if row is None:
+                _release_stale_path_owner(conn, path_text, root)
+                _insert_queue(conn, repository_id, path_text, queue_id=existing_queue_id)
+                created = True
+            elif row["repository_id"] != repository_id:
+                raise RuntimeError(
+                    f"Queue {existing_queue_id} belongs to a different repository than {root}"
+                )
+            elif row["state"] != "enabled":
+                raise RuntimeError(
+                    f"Queue for {root} is retired. Its tasks stay on that queue "
+                    "and will not run on another worktree."
+                )
+            elif row["path"] != path_text:
+                recorded = Path(row["path"]) if row["path"] else None
+                if recorded is not None and _queue_still_lives_at(existing_queue_id, recorded):
+                    raise RuntimeError(
+                        f"Queue {existing_queue_id} is still live at {recorded}. "
+                        f"Refusing to point it at {root} while that checkout exists."
+                    )
+                _release_stale_path_owner(
+                    conn, path_text, root, except_id=existing_queue_id,
+                )
+                conn.execute(
+                    "UPDATE queues SET path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (path_text, existing_queue_id),
+                )
+            conn.commit()
+            return conn.execute(
+                "SELECT * FROM queues WHERE id = ?",
+                (existing_queue_id,),
+            ).fetchone(), created
+
+        _release_stale_path_owner(conn, path_text, root)
+        qid = str(uuid.uuid4())
+        _insert_queue(conn, repository_id, path_text, queue_id=qid)
+        _write_identity(queue_file, qid)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return conn.execute("SELECT * FROM queues WHERE id = ?", (qid,)).fetchone(), True
+
+
+def lookup_queue_by_path(repo_root: str | Path, *, db_path: str | None = None) -> dict | None:
+    """Return an enabled queue row for a worktree path without creating the database."""
+    db_file = Path(get_db_path(db_path))
+    if not db_file.is_file() or _peek_database_kind(db_file) != "current":
+        return None
+    path_text = str(Path(repo_root).expanduser().resolve())
+    conn = sqlite3.connect(_readonly_uri(db_file), uri=True, timeout=30.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM queues WHERE path = ? AND state = 'enabled'",
+            (path_text,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def queue_registration_error(repo_root: str | Path) -> str | None:
+    """Return why a worktree's on-disk queue identity is unsafe to run.
+
+    A path match is not registration. The checkout's Git identity files
+    must name the enabled queue stored for that path. A missing identity
+    file does not inherit an older queue that used the path.
+    """
+    root = Path(repo_root).expanduser().resolve()
+    try:
+        row = lookup_queue_by_path(root)
+    except (RuntimeError, OSError):
+        return None
+    if row is None:
+        return None
+    try:
+        owns = _checkout_owns_queue(root, row["id"], row["repository_id"])
+    except RuntimeError as exc:
+        return str(exc)
+    if owns:
+        return None
+    return (
+        f"Checkout at {root} does not carry queue {row['id']}. "
+        "A reused path does not inherit that queue's tasks."
+    )
+
+
+def queue_dispatch_block_reason(conn: sqlite3.Connection) -> str | None:
+    """Return why this queue must not claim tasks, or None when dispatch is allowed."""
+    try:
+        row = _require_queue(conn, connection_queue_id(conn))
+    except (RuntimeError, sqlite3.Error, TypeError) as exc:
+        return f"Queue dispatch is unavailable: {exc}"
+    if row["state"] != "enabled":
+        return (
+            f"Queue {row['id']} is retired. Its tasks stay on that queue "
+            "and will not run on another worktree."
+        )
+    path = row["path"] or ""
+    if not path:
+        return None
+    checkout = Path(path)
+    if not checkout.is_dir():
+        return (
+            f"Worktree {path} is missing. Tasks on queue {row['id']} "
+            "will not run on a different queue."
+        )
+    try:
+        owns = _checkout_owns_queue(checkout, row["id"], row["repository_id"])
+    except (RuntimeError, OSError) as exc:
+        return f"Queue dispatch is unavailable: {exc}"
+    if not owns:
+        return (
+            f"Checkout at {path} does not carry queue {row['id']}. "
+            "Refusing to dispatch its tasks into a different checkout."
+        )
+    return None
+
+
+def retire_queue(conn: sqlite3.Connection, queue_id: str | None = None) -> None:
+    """Mark a queue retired and keep its tasks, runtime history, and files."""
+    qid = queue_id or connection_queue_id(conn)
+    _require_queue(conn, qid)
+    conn.execute(
+        """UPDATE queues
+           SET state = 'retired', retired_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?""",
+        (qid,),
+    )
+    conn.commit()
+
+
+def unfinished_activation_reason(db_path: str | Path) -> str | None:
+    """Return why a central database must not be opened, or None when it is live.
+
+    A cutover marks imported sources activated only after the replacement,
+    artifact move, and identity write finish. A crash in that window leaves
+    ``imported`` rows. That file is a partial store.
+    """
+    path = Path(db_path)
+    if not path.is_file() or _peek_database_kind(path) != "current":
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        if "migration_sources" not in names:
+            return None
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
+        ).fetchone()[0]
+    except sqlite3.Error as exc:
+        return f"Cannot verify migration activation for {path}: {exc}"
+    finally:
+        if conn is not None:
+            conn.close()
+    if int(pending) == 0:
+        return None
+    return (
+        f"Unfinished migration activation: {path} is not a live store. "
+        "Run ko-migrate rollback before opening it or claiming tasks."
+    )
+
+
+def assert_activation_finished(conn: sqlite3.Connection) -> None:
+    """Refuse claims on a database whose cutover stopped before activation."""
+    try:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        if "migration_sources" not in names:
+            return
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM migration_sources WHERE status != 'activated'"
+        ).fetchone()[0]
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Cannot verify migration activation: {exc}") from exc
+    if int(pending):
+        raise RuntimeError(
+            "Unfinished migration activation: this database is not a live store. "
+            "Run ko-migrate rollback before opening it or claiming tasks."
+        )
+
+
+def connect(
+    db_path: str | None = None,
+    *,
+    repo_root: str | Path | None = None,
+    queue_id: str | None = None,
+    cwd: str | None = None,
+) -> OrchestraConnection:
+    """Open the central database and bind one queue.
+
+    An explicit ``queue_id`` or ``repo_root`` selects that queue. Otherwise the
+    database's only queue is used, or a path-less default queue is created for
+    an isolated database. A legacy database file is rejected without writes.
+    """
     path = get_db_path(db_path)
-    conn = sqlite3.connect(path, timeout=30.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
+    kind = _peek_database_kind(path)
+    if kind == "legacy":
+        raise MigrationRequired(migration_required_message(path))
+    if kind == "incompatible":
+        raise MigrationRequired(
+            f"Migration required: {path} is not the central Orchestra schema. "
+            "It was left unchanged."
+        )
+    unfinished = unfinished_activation_reason(path)
+    if unfinished:
+        raise RuntimeError(unfinished)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30.0, factory=OrchestraConnection)
     conn.row_factory = sqlite3.Row
-    _check_schema_compatible(conn)
-    conn.executescript(SCHEMA_SQL)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    if kind in ("absent", "empty"):
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+    if queue_id is not None:
+        _attach_queue(conn, _require_queue(conn, queue_id))
+    elif repo_root is not None:
+        row, created = ensure_queue(conn, repo_root)
+        _attach_queue(conn, row, created=created)
+    elif cwd is not None:
+        row, created = ensure_queue(conn, get_repo_root(cwd))
+        _attach_queue(conn, row, created=created)
+    else:
+        row, created = _sole_or_default_queue(conn)
+        _attach_queue(conn, row, created=created)
+    _recover_missing_start_times(conn)
     return conn
 
 
+def _recover_missing_start_times(conn: sqlite3.Connection) -> None:
+    """Fill this queue's missing start times from retained run history."""
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    if not isinstance(queue_id, str):
+        return
+    task_ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE queue_id = ? AND first_started_at IS NULL",
+            (queue_id,),
+        ).fetchall()
+    ]
+    if not task_ids:
+        return
+    _backfill_first_started_at(conn, task_ids=task_ids)
+    conn.commit()
+
+
+def _database_has_queue(db_path: str, queue_id: str) -> bool:
+    if not _is_id(queue_id):
+        return False
+    path = Path(db_path)
+    if not path.is_file() or _peek_database_kind(path) != "current":
+        return False
+    conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
+    try:
+        row = conn.execute("SELECT 1 FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return row is not None
+
+
+def _inherited_queue_id(db_path: str | None) -> str | None:
+    """Return an inherited queue id only when that queue is in the selected database."""
+    raw = os.environ.get("ORCHESTRA_QUEUE_ID")
+    if not raw or not _is_id(raw):
+        return None
+    if _database_has_queue(get_db_path(db_path), raw):
+        return raw
+    return None
+
+
+def _assert_inherited_queue_matches_invoking_checkout(conn: sqlite3.Connection) -> None:
+    """Refuse a stale queue hint when this checkout is the queue's recorded path."""
+    try:
+        cwd_root = get_repo_root()
+    except RuntimeError:
+        return
+    row = _require_queue(conn, connection_queue_id(conn))
+    path = row["path"] or ""
+    if not path or Path(path).resolve() != cwd_root:
+        return
+    try:
+        owns = _checkout_owns_queue(cwd_root, row["id"], row["repository_id"])
+    except (RuntimeError, OSError) as exc:
+        raise RuntimeError(f"Queue dispatch is unavailable: {exc}") from exc
+    if not owns:
+        raise RuntimeError(
+            f"Checkout at {cwd_root} does not carry queue {row['id']}. "
+            "A stale queue hint cannot run that queue's tasks in this checkout."
+        )
+
+
+def matching_inherited_repo_root(
+    conn: sqlite3.Connection | None = None,
+    *,
+    db_path: str | None = None,
+) -> Path | None:
+    """Return ``ORCHESTRA_REPO_ROOT`` when it belongs to the selected database.
+
+    An open connection or an explicit ``db_path`` selects that database.
+    ``KANBAN_DB`` is used only when neither was given. An inherited checkout
+    is ignored when the selected database does not contain that checkout's
+    queue. Callers then keep using the selected database's own worktree or
+    parent directory.
+    """
+    raw = os.environ.get("ORCHESTRA_REPO_ROOT")
+    if not raw:
+        return None
+    root = Path(raw).expanduser().resolve()
+    db_file = get_connection_db_path(conn) if conn is not None else None
+    if not db_file and db_path:
+        db_file = get_db_path(db_path)
+    if not db_file:
+        db_file = os.environ.get("KANBAN_DB")
+    if not db_file:
+        return root
+    db_file = str(Path(db_file).expanduser().resolve())
+    if conn is not None:
+        bound = connection_worktree(conn)
+        if bound is not None and bound.is_dir() and bound.resolve() == root:
+            return root
+    row = lookup_queue_by_path(root, db_path=db_file)
+    if row is not None:
+        try:
+            if _checkout_owns_queue(root, row["id"], row["repository_id"]):
+                return root
+        except RuntimeError:
+            return None
+        return None
+    parent = Path(db_file).parent
+    if parent == root or parent.is_relative_to(root):
+        return root
+    return None
+
+
+def launch_connection(
+    db_path: str | None = None,
+    *,
+    repo_root: str | Path | None = None,
+    queue_id: str | None = None,
+    cwd: str | None = None,
+) -> OrchestraConnection:
+    """Open the database the way a CLI or worker process should.
+
+    An explicit queue, repository, or working directory selects that queue.
+    ``ORCHESTRA_QUEUE_ID`` selects a queue only when that queue exists in the
+    selected database. A hint for some other database is ignored, and a hint
+    for a queue whose recorded checkout no longer carries that identity is
+    refused. An explicit database binds the invoking worktree when one can
+    be inferred, even if another queue is already the only row. A path-less
+    default queue is used only when no worktree can be inferred and the
+    database has at most one queue.
+    """
+    inherited = None if queue_id else _inherited_queue_id(db_path)
+    selected_queue = queue_id or inherited
+    if selected_queue or repo_root is not None or cwd is not None:
+        conn = connect(db_path, repo_root=repo_root, queue_id=selected_queue, cwd=cwd)
+    elif db_path or os.environ.get("KANBAN_DB"):
+        path = get_db_path(db_path)
+        try:
+            root = get_repo_root()
+        except RuntimeError:
+            root = None
+        if root is not None:
+            conn = connect(path, repo_root=root)
+        elif _queue_count(path) <= 1:
+            conn = connect(path)
+        else:
+            raise RuntimeError(
+                "This Orchestra database has more than one queue. "
+                "Open it from a worktree or pass queue_id."
+            )
+    else:
+        conn = connect(repo_root=get_repo_root(cwd))
+    if inherited:
+        try:
+            _assert_inherited_queue_matches_invoking_checkout(conn)
+        except Exception:
+            conn.close()
+            raise
+    return conn
+
+
+def launch_worktree_connection(db_path: str | None = None) -> OrchestraConnection:
+    """Open a status or dashboard connection for the invoking worktree."""
+    return launch_connection(db_path)
+
+
+def configure_for_connection(conn: sqlite3.Connection):
+    """Load checkout-local agent preferences for the connection's worktree.
+
+    Isolated databases use the database parent. That parent is a checkout
+    when tests point ``KANBAN_DB`` at a file inside a temporary workspace.
+    The platform state directory is used only as an empty preference root
+    so agent config is not loaded from the central database directory's
+    neighbors by accident; a bound worktree always wins.
+    """
+    bound = connection_worktree(conn)
+    if bound is not None and bound.is_dir():
+        return config.configure_agents(bound)
+    db_file = get_connection_db_path(conn)
+    if isinstance(db_file, (str, Path)):
+        parent = Path(db_file).resolve().parent
+        if parent != get_state_root():
+            return config.configure_agents(parent)
+    env_db = os.environ.get("KANBAN_DB")
+    if env_db:
+        return config.configure_agents(Path(env_db).expanduser().resolve().parent)
+    return config.configure_agents(get_repo_root())
+
 def get_connection_db_path(conn: sqlite3.Connection) -> str | None:
     """Return the on-disk main database path for an open SQLite connection."""
-    row = conn.execute("PRAGMA database_list").fetchone()
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except (sqlite3.Error, AttributeError, TypeError):
+        return None
     if not row:
         return None
     try:
-        return row["file"]
+        value = row["file"]
     except (KeyError, TypeError):
-        return row[2]
+        try:
+            value = row[2]
+        except (IndexError, TypeError, KeyError):
+            return None
+    if not isinstance(value, str) or not value:
+        return None
+    return value
 
 
 def _list_user_tables(conn: sqlite3.Connection) -> list[str]:
@@ -343,261 +1447,58 @@ def _cleanup_db_artifacts(db_path: str) -> None:
             pass
 
 
-def _migrate_orchestrator_runtime(conn: sqlite3.Connection) -> None:
-    """Recreate the transient runtime table with current CHECK constraints."""
-    cols = {
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(orchestrator_runtime)").fetchall()
-    }
-    required = {
-        "singleton", "status", "pid", "started_at", "last_heartbeat_at",
-        "current_task_id", "current_step", "current_branch", "review_round",
-        "active_agents", "status_message", "updated_at",
-    }
-    if not required.issubset(cols):
-        conn.executescript("DROP TABLE IF EXISTS orchestrator_runtime;")
-        return
+def write_consistent_dump(conn: sqlite3.Connection, sql_path: str | Path) -> None:
+    """Write one SQL dump from a single consistent snapshot of ``conn``."""
+    snapshot = sqlite3.connect(":memory:")
+    try:
+        conn.backup(snapshot)
+        path = Path(sql_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for line in snapshot.iterdump():
+                handle.write(line + "\n")
+    finally:
+        snapshot.close()
 
-    conn.executescript("""
-        BEGIN;
-        CREATE TABLE orchestrator_runtime_migrated (
-            singleton            INTEGER PRIMARY KEY CHECK(singleton = 1),
-            status               TEXT NOT NULL
-                CHECK(status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')),
-            pid                  INTEGER,
-            started_at           DATETIME,
-            last_heartbeat_at    DATETIME,
-            current_task_id      INTEGER REFERENCES tasks(id),
-            current_step         TEXT
-                CHECK(current_step IN (
-                    'commit-make', 'commit-review',
-                    'commit-make-supertask', 'commit-review-supertask',
-                    'commit-plan', 'commit-plan-review',
-                    'pull-request-make', 'pull-request-review',
-                    'other-make', 'other-review',
-                    'none'
-                )),
-            current_branch       TEXT,
-            review_round         INTEGER,
-            active_agents        INTEGER NOT NULL DEFAULT 0,
-            status_message       TEXT,
-            updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-        INSERT INTO orchestrator_runtime_migrated (
-            singleton, status, pid, started_at, last_heartbeat_at, current_task_id,
-            current_step, current_branch, review_round, active_agents, status_message,
-            updated_at
+
+def _validate_restored_database(db_path: str) -> None:
+    """Check schema, integrity, and foreign keys without binding a queue."""
+    kind = _peek_database_kind(db_path)
+    if kind != "current":
+        raise ValueError(
+            f"Restored database at {db_path} is {kind}, not the current Orchestra schema"
         )
-        SELECT
-            singleton,
-            CASE
-                WHEN status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error')
-                THEN status ELSE 'error'
-            END,
-            pid,
-            started_at,
-            last_heartbeat_at,
-            CASE
-                WHEN current_task_id IN (SELECT id FROM tasks) THEN current_task_id
-                ELSE NULL
-            END,
-            CASE
-                WHEN current_step IN (
-                    'commit-make', 'commit-review',
-                    'commit-make-supertask', 'commit-review-supertask',
-                    'commit-plan', 'commit-plan-review',
-                    'pull-request-make', 'pull-request-review',
-                    'other-make', 'other-review',
-                    'none'
-                )
-                THEN current_step ELSE 'none'
-            END,
-            current_branch,
-            review_round,
-            active_agents,
-            status_message,
-            updated_at
-        FROM orchestrator_runtime;
-        DROP TABLE orchestrator_runtime;
-        ALTER TABLE orchestrator_runtime_migrated RENAME TO orchestrator_runtime;
-        COMMIT;
-    """)
-
-
-def _tasks_value_expr(task_cols: set[str]) -> dict[str, str]:
-    """Column expressions used when recreating the tasks table during migration."""
-    return {
-        "id": "id",
-        "title": "title",
-        "description": "description" if "description" in task_cols else "NULL",
-        "status": "status" if "status" in task_cols else "'none'",
-        "next_step": "next_step" if "next_step" in task_cols else "'commit-make'",
-        "branch": "branch" if "branch" in task_cols else "NULL",
-        "commit_hash": "commit_hash" if "commit_hash" in task_cols else "NULL",
-        "stash_ref": "stash_ref" if "stash_ref" in task_cols else "NULL",
-        "coder_agent": "coder_agent" if "coder_agent" in task_cols else "NULL",
-        "reviewer_agent": "reviewer_agent" if "reviewer_agent" in task_cols else "NULL",
-        "review_round": "review_round" if "review_round" in task_cols else "0",
-        "max_review_rounds": (
-            "max_review_rounds" if "max_review_rounds" in task_cols
-            else str(DEFAULT_MAX_REVIEW_ROUNDS)
-        ),
-        "last_review_decision": "last_review_decision" if "last_review_decision" in task_cols else "'none'",
-        "created_at": "created_at" if "created_at" in task_cols else "CURRENT_TIMESTAMP",
-        "ready_at": "ready_at" if "ready_at" in task_cols else "NULL",
-        "last_ready_at": "last_ready_at" if "last_ready_at" in task_cols else "ready_at" if "ready_at" in task_cols else "NULL",
-        "first_started_at": "first_started_at" if "first_started_at" in task_cols else "NULL",
-        "done_at": "done_at" if "done_at" in task_cols else "CASE WHEN status = 'done' THEN updated_at ELSE NULL END" if "updated_at" in task_cols else "NULL",
-        "updated_at": "updated_at" if "updated_at" in task_cols else "CURRENT_TIMESTAMP",
-        "kind": "kind" if "kind" in task_cols else "'commit'",
-        "parent_task_id": "parent_task_id" if "parent_task_id" in task_cols else "NULL",
-        "sequence_index": "sequence_index" if "sequence_index" in task_cols else "NULL",
-        "commit_plan": "commit_plan" if "commit_plan" in task_cols else "NULL",
-        "follow_up_task_id": "follow_up_task_id" if "follow_up_task_id" in task_cols else "NULL",
-        "allow_when_blocked": "allow_when_blocked" if "allow_when_blocked" in task_cols else "0",
-        "block_reason": "block_reason" if "block_reason" in task_cols else "NULL",
-        "resume_next_step": "resume_next_step" if "resume_next_step" in task_cols else "NULL",
-    }
-
-
-def _tasks_create_table_sql(table_name: str = "tasks_migrated") -> str:
-    """Current tasks DDL used by table-recreation migrations."""
-    return f"""
-            CREATE TABLE {table_name} (
-                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                title                   TEXT NOT NULL,
-                description             TEXT,
-                status                  TEXT NOT NULL DEFAULT 'none'
-                    CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                next_step               TEXT NOT NULL DEFAULT 'commit-make'
-                    CHECK(next_step IN ('commit-make', 'commit-review',
-                                        'commit-make-supertask', 'commit-review-supertask',
-                                        'commit-plan', 'commit-plan-review',
-                                        'pull-request-make', 'pull-request-review',
-                                        'other-make', 'other-review',
-                                        'none')),
-                branch                  TEXT,
-                commit_hash             TEXT,
-                stash_ref               TEXT,
-                coder_agent             TEXT,
-                reviewer_agent          TEXT,
-                review_round            INTEGER DEFAULT 0,
-                max_review_rounds       INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS},
-                last_review_decision    TEXT DEFAULT 'none'
-                    CHECK(last_review_decision IN ('none', 'approve', 'reject')),
-                created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ready_at                DATETIME DEFAULT NULL,
-                last_ready_at           DATETIME DEFAULT NULL,
-                first_started_at        DATETIME DEFAULT NULL,
-                done_at                 DATETIME DEFAULT NULL,
-                updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                kind                    TEXT NOT NULL DEFAULT 'commit'
-                    CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
-                parent_task_id          INTEGER REFERENCES tasks(id),
-                sequence_index          INTEGER,
-                commit_plan             TEXT,
-                follow_up_task_id       INTEGER REFERENCES tasks(id),
-                allow_when_blocked      INTEGER NOT NULL DEFAULT 0,
-                block_reason            TEXT,
-                resume_next_step        TEXT
-            );
-    """
-
-
-def _migrate_skip_commit_plan_tasks(conn: sqlite3.Connection, task_cols: set[str]) -> None:
-    """Migrate the old tasks.skip_commit_plan flag into task_skips rows."""
-    value_expr = _tasks_value_expr(task_cols)
-    columns = list(value_expr)
-
-    conn.execute("PRAGMA foreign_keys=OFF")
+    conn = sqlite3.connect(_readonly_uri(Path(db_path)), uri=True, timeout=30.0)
     try:
-        conn.executescript(f"""
-            BEGIN;
-            CREATE TEMP TABLE skip_commit_plan_tasks AS
-                SELECT id FROM tasks WHERE skip_commit_plan = 1;
-            {_tasks_create_table_sql("tasks_migrated")}
-            INSERT INTO tasks_migrated ({", ".join(columns)})
-                SELECT {", ".join(value_expr[column] for column in columns)}
-                FROM tasks;
-            DROP TABLE tasks;
-            ALTER TABLE tasks_migrated RENAME TO tasks;
-            CREATE TABLE IF NOT EXISTS task_skips (
-                task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                step     TEXT    NOT NULL
-                                 CHECK(step IN ('commit-plan','commit-plan-review',
-                                                'commit-review','commit-review-supertask',
-                                                'pull-request-review','other-review')),
-                PRIMARY KEY (task_id, step)
-            );
-            INSERT OR IGNORE INTO task_skips (task_id, step)
-                SELECT id, 'commit-plan' FROM skip_commit_plan_tasks;
-            DROP TABLE skip_commit_plan_tasks;
-            COMMIT;
-        """)
-    except Exception:
-        conn.rollback()
-        raise
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            detail = integrity[0] if integrity else "no result"
+            raise ValueError(f"Restored database failed integrity check: {detail}")
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise ValueError(
+                "Restored database failed foreign key check "
+                f"({len(violations)} violation(s))"
+            )
     finally:
-        conn.execute("PRAGMA foreign_keys=ON")
-    conn.commit()
-
-
-def _migrate_task_constraints(conn: sqlite3.Connection, task_cols: set[str]) -> None:
-    """Recreate tasks with current next_step/kind CHECK constraints."""
-    value_expr = _tasks_value_expr(task_cols)
-    columns = list(value_expr)
-
-    conn.execute("PRAGMA foreign_keys=OFF")
-    try:
-        conn.executescript(f"""
-            BEGIN;
-            {_tasks_create_table_sql("tasks_migrated")}
-            INSERT INTO tasks_migrated ({", ".join(columns)})
-                SELECT {", ".join(value_expr[column] for column in columns)}
-                FROM tasks;
-            DROP TABLE tasks;
-            ALTER TABLE tasks_migrated RENAME TO tasks;
-            COMMIT;
-        """)
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.execute("PRAGMA foreign_keys=ON")
-    conn.commit()
-
-
-def _migrate_task_skips_constraints(conn: sqlite3.Connection) -> None:
-    """Recreate task_skips with the current step CHECK constraint."""
-    conn.executescript("""
-        BEGIN;
-        CREATE TABLE task_skips_migrated (
-            task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-            step     TEXT    NOT NULL
-                             CHECK(step IN ('commit-plan','commit-plan-review',
-                                            'commit-review','commit-review-supertask',
-                                            'pull-request-review','other-review')),
-            PRIMARY KEY (task_id, step)
-        );
-        INSERT OR IGNORE INTO task_skips_migrated (task_id, step)
-            SELECT task_id, step FROM task_skips
-            WHERE step IN ('commit-plan','commit-plan-review',
-                           'commit-review','commit-review-supertask',
-                           'pull-request-review','other-review');
-        DROP TABLE task_skips;
-        ALTER TABLE task_skips_migrated RENAME TO task_skips;
-        COMMIT;
-    """)
+        conn.close()
 
 
 def restore_dump(
     db_path: str | None = None,
     sql_path: str | None = None,
 ) -> dict[str, str]:
-    """Restore a SQL dump into a fresh database file."""
+    """Restore a SQL dump into a fresh central database file.
+
+    Validation covers the schema, integrity, and foreign keys for every
+    queue in the dump. It does not select a sole queue, and a failed
+    restore removes a database file that this call created.
+    """
     target_db_path = get_db_path(db_path)
-    target_sql_path = sql_path or str(Path(target_db_path).resolve().parent / "kanban-orchestra.sql")
+    target_sql_path = sql_path or str(Path(target_db_path).resolve().with_name("orchestra.sql"))
     db_preexisted = os.path.exists(target_db_path)
+    if db_preexisted and _peek_database_kind(target_db_path) in ("legacy", "incompatible"):
+        raise MigrationRequired(migration_required_message(target_db_path))
 
     if not os.path.exists(target_sql_path):
         raise FileNotFoundError(f"SQL dump not found at {target_sql_path}")
@@ -618,8 +1519,7 @@ def restore_dump(
         finally:
             raw_conn.close()
 
-        conn = connect(target_db_path)
-        conn.close()
+        _validate_restored_database(target_db_path)
     except Exception:
         if not db_preexisted:
             _cleanup_db_artifacts(target_db_path)
@@ -629,231 +1529,6 @@ def restore_dump(
         "db_path": target_db_path,
         "sql_path": target_sql_path,
     }
-
-
-def _check_schema_compatible(conn: sqlite3.Connection) -> None:
-    """Raise RuntimeError if the existing DB schema is incompatible.
-
-    kanban-orchestra.db is local and expendable state. When a schema change
-    requires a table recreation, the correct response is to delete
-    kanban-orchestra.db and let it be recreated on next connect, or to restore
-    from a current kanban-orchestra.sql dump.
-    """
-    task_cols = {
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-    }
-    if not task_cols:
-        return  # Fresh DB — no tables yet
-
-    # Capture before table-recreation migrations that introduce the column.
-    needs_first_started_at_legacy_fallback = "first_started_at" not in task_cols
-
-    if "skip_commit_plan" in task_cols:
-        _migrate_skip_commit_plan_tasks(conn, task_cols)
-        task_cols = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-        }
-
-    # Columns that were removed in past schema versions and cannot be migrated.
-    removed_cols = {
-        "koid", "commit_hashes", "skip_same_branch_koid_check", "failed_coders",
-    }
-    present_legacy = removed_cols & task_cols
-    if present_legacy:
-        raise RuntimeError(
-            f"kanban-orchestra.db has a legacy schema "
-            f"(removed columns still present: {', '.join(sorted(present_legacy))}). "
-            "Delete kanban-orchestra.db to recreate it, "
-            "or run 'task restore' from a current kanban-orchestra.sql dump."
-        )
-
-    # Columns required in the current schema
-    required_cols = {"commit_plan"}
-    missing_cols = required_cols - task_cols
-    if missing_cols:
-        raise RuntimeError(
-            f"kanban-orchestra.db is missing required columns: "
-            f"{', '.join(sorted(missing_cols))}. "
-            "Delete kanban-orchestra.db to recreate it, "
-            "or run 'task restore' from a current kanban-orchestra.sql dump."
-        )
-
-    # Columns that can be added via ALTER TABLE migration
-    if "follow_up_task_id" not in task_cols:
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN follow_up_task_id INTEGER REFERENCES tasks(id)"
-        )
-        conn.commit()
-    if "allow_when_blocked" not in task_cols:
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN allow_when_blocked INTEGER NOT NULL DEFAULT 0"
-        )
-        conn.commit()
-    if "max_review_rounds" not in task_cols:
-        # Existing tasks inherit the present global default; new tasks also use it.
-        conn.execute(
-            f"ALTER TABLE tasks ADD COLUMN max_review_rounds "
-            f"INTEGER NOT NULL DEFAULT {DEFAULT_MAX_REVIEW_ROUNDS}"
-        )
-        conn.commit()
-        task_cols.add("max_review_rounds")
-    if "block_reason" not in task_cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN block_reason TEXT")
-        conn.commit()
-        task_cols.add("block_reason")
-    if "resume_next_step" not in task_cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN resume_next_step TEXT")
-        conn.commit()
-        task_cols.add("resume_next_step")
-    if "reviewer_agent" not in task_cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN reviewer_agent TEXT")
-        conn.commit()
-    if "last_ready_at" not in task_cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_ready_at DATETIME DEFAULT NULL")
-        conn.execute("UPDATE tasks SET last_ready_at = ready_at WHERE ready_at IS NOT NULL")
-        conn.commit()
-    if "done_at" not in task_cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN done_at DATETIME DEFAULT NULL")
-        conn.execute("UPDATE tasks SET done_at = updated_at WHERE status = 'done'")
-        conn.commit()
-        task_cols.add("done_at")
-    if "first_started_at" not in task_cols:
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN first_started_at DATETIME DEFAULT NULL"
-        )
-        conn.commit()
-        task_cols.add("first_started_at")
-
-    # Refresh after ALTER TABLE so later table-recreation migrations copy
-    # newly added timestamp columns instead of inserting NULL placeholders.
-    task_cols = {
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-    }
-
-    # The task_skips table must exist and its step CHECK constraint must be current.
-    skips_schema = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_skips'"
-    ).fetchone()
-    if not skips_schema:
-        raise RuntimeError(
-            "kanban-orchestra.db is missing the 'task_skips' table. "
-            "Delete kanban-orchestra.db to recreate it, "
-            "or run 'task restore' from a current kanban-orchestra.sql dump."
-        )
-    valid_steps = (
-        "'commit-plan'",
-        "'commit-plan-review'",
-        "'commit-review'",
-        "'commit-review-supertask'",
-        "'pull-request-review'",
-        "'other-review'",
-    )
-    missing_steps = [s for s in valid_steps if s not in skips_schema[0]]
-    if missing_steps:
-        _migrate_task_skips_constraints(conn)
-
-    # The tasks CHECK constraints must include current next_step and kind values.
-    tasks_schema = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
-    ).fetchone()
-    if tasks_schema and (
-        "'commit-plan'" not in tasks_schema[0]
-        or "'pull-request-make'" not in tasks_schema[0]
-        or "'pull_request'" not in tasks_schema[0]
-        or "'other-make'" not in tasks_schema[0]
-        or "'other'" not in tasks_schema[0]
-    ):
-        _migrate_task_constraints(conn, task_cols)
-        task_cols = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-        }
-
-    # orchestrator_runtime must accept all current status and step names.
-    # This table holds transient state, but preserve the singleton row when
-    # possible so live deployments do not lose useful operator context.
-    runtime_schema = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='orchestrator_runtime'"
-    ).fetchone()
-    if runtime_schema:
-        required_runtime_tokens = (
-            "'commit-make-supertask'",
-            "'pull-request-make'",
-            "'pull-request-review'",
-            "'other-make'",
-            "'other-review'",
-            "'starting'",
-            "'waiting-dirty'",
-            "'hard-break'",
-        )
-        if any(token not in runtime_schema[0] for token in required_runtime_tokens):
-            _migrate_orchestrator_runtime(conn)
-
-    # run_log.task_id must be nullable so the orchestrator can write global entries
-    # with task_id=NULL.  Older schema versions may have created it with NOT NULL.
-    run_log_cols = {
-        row["name"]: row
-        for row in conn.execute("PRAGMA table_info(run_log)").fetchall()
-    }
-    if run_log_cols and run_log_cols.get("task_id", {})["notnull"]:
-        conn.executescript("""
-            BEGIN;
-            CREATE TABLE run_log_migrated (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id     INTEGER REFERENCES tasks(id),
-                verb        TEXT,
-                author      TEXT,
-                message     TEXT,
-                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            INSERT INTO run_log_migrated
-                SELECT id, task_id, verb, author, message, created_at
-                FROM run_log;
-            DROP TABLE run_log;
-            ALTER TABLE run_log_migrated RENAME TO run_log;
-            COMMIT;
-        """)
-
-    # The comments.kind CHECK must include the full current kind set.
-    # When it's outdated, recreate the table in-place preserving all rows.
-    comments_schema = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='comments'"
-    ).fetchone()
-    if comments_schema:
-        required_kinds = ("'validation'", "'plan-approval'", "'plan-rejection'",
-                          "'done-without-commit'", "'deferred-build-changed'")
-        missing_kinds = [k for k in required_kinds if k not in comments_schema[0]]
-        if missing_kinds:
-            conn.executescript("""
-                BEGIN;
-                CREATE TABLE comments_migrated (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id        INTEGER REFERENCES tasks(id),
-                    review_round   INTEGER,
-                    verb           TEXT,
-                    author         TEXT,
-                    message        TEXT,
-                    kind           TEXT DEFAULT 'comment'
-                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
-                                       'validation', 'plan-approval', 'plan-rejection',
-                                       'done-without-commit', 'deferred-build-changed')),
-                    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                INSERT INTO comments_migrated
-                    SELECT id, task_id, review_round, verb, author, message, kind, created_at
-                    FROM comments;
-                DROP TABLE comments;
-                ALTER TABLE comments_migrated RENAME TO comments;
-                COMMIT;
-            """)
-
-    _backfill_first_started_at(
-        conn, use_legacy_fallback=needs_first_started_at_legacy_fallback
-    )
-    conn.commit()
 
 
 def _backfill_first_started_at(conn, *, use_legacy_fallback=False, task_ids=None):
@@ -924,6 +1599,105 @@ def task_type(task_or_kind) -> str:
 
 # ── Task CRUD ──────────────────────────────────────────────────────────
 
+def _assert_same_queue_reference(conn, other_id, repository_id, queue_id, label):
+    row = conn.execute(
+        "SELECT repository_id, queue_id FROM tasks WHERE id = ?",
+        (other_id,),
+    ).fetchone()
+    if row is None or row["repository_id"] != repository_id or row["queue_id"] != queue_id:
+        raise ValueError(f"{label} task must belong to the same repository and queue")
+
+
+def _task_family_ids(conn, task_id):
+    """Return the task plus parent, children, and follow-up links."""
+    seen = set()
+    stack = [task_id]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        row = conn.execute(
+            "SELECT id, parent_task_id, follow_up_task_id FROM tasks WHERE id = ?",
+            (current,),
+        ).fetchone()
+        if row is None:
+            continue
+        seen.add(current)
+        if row["parent_task_id"] is not None:
+            stack.append(row["parent_task_id"])
+        if row["follow_up_task_id"] is not None:
+            stack.append(row["follow_up_task_id"])
+        related = conn.execute(
+            """SELECT id FROM tasks
+               WHERE parent_task_id = ? OR follow_up_task_id = ?""",
+            (current, current),
+        ).fetchall()
+        stack.extend(item["id"] for item in related)
+    return seen
+
+
+def reassign_task_queue(conn, task_id, queue_id):
+    """Move a task family onto another enabled queue in the same repository.
+
+    Parent, child, and follow-up links stay together. A family that contains
+    a running task cannot be moved. Existing run rows keep the queue where
+    that run happened, and their transcript files stay beside that queue.
+    A later run on the destination records the destination queue. The source
+    queue stops treating a moved task as its current task.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"Task {task_id} not found")
+    target = _require_queue(conn, queue_id)
+    if target["repository_id"] != task["repository_id"]:
+        raise ValueError("cannot move a task onto a queue in another repository")
+    if target["state"] != "enabled":
+        raise ValueError("cannot move a task onto a retired queue")
+    if task["queue_id"] == queue_id:
+        return task
+    family = _task_family_ids(conn, task_id)
+    family_ids = tuple(family)
+    placeholders = ", ".join("?" for _ in family_ids)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        owners = conn.execute(
+            f"SELECT id, repository_id, queue_id FROM tasks WHERE id IN ({placeholders})",
+            family_ids,
+        ).fetchall()
+        if any(row["repository_id"] != task["repository_id"] for row in owners):
+            raise ValueError("task family crosses repositories")
+        source_ids = {row["queue_id"] for row in owners}
+        if len(source_ids) != 1:
+            raise ValueError("task family is not on one queue")
+        source_queue_id = source_ids.pop()
+        running_here = conn.execute(
+            f"""SELECT 1 FROM tasks
+                WHERE status = 'running' AND id IN ({placeholders})""",
+            family_ids,
+        ).fetchone()
+        if running_here is not None:
+            raise ValueError(
+                "cannot move a task family while one of its tasks is running"
+            )
+        conn.execute(
+            f"""UPDATE tasks
+                SET queue_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id IN ({placeholders})""",
+            (queue_id, *family_ids),
+        )
+        conn.execute(
+            f"""UPDATE orchestrator_runtime
+                SET current_task_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE queue_id = ? AND current_task_id IN ({placeholders})""",
+            (source_queue_id, *family_ids),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return get_task(conn, task_id)
+
+
 def add_task(
     conn,
     title,
@@ -955,14 +1729,20 @@ def add_task(
 
     if status is None:
         status = "none"
+    repository_id = connection_repository_id(conn)
+    queue_id = connection_queue_id(conn)
+    if parent_task_id is not None:
+        _assert_same_queue_reference(conn, parent_task_id, repository_id, queue_id, "parent")
     cur = conn.execute(
         """INSERT INTO tasks (
-               title, description, branch, coder_agent, reviewer_agent,
-               kind, parent_task_id, sequence_index, next_step, status,
-               allow_when_blocked, max_review_rounds
+               repository_id, queue_id, title, description, branch, coder_agent,
+               reviewer_agent, kind, parent_task_id, sequence_index, next_step,
+               status, allow_when_blocked, max_review_rounds
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
+            repository_id,
+            queue_id,
             title,
             description,
             branch,
@@ -990,7 +1770,28 @@ def add_task(
     return task_id
 
 
+def require_task_queue(conn, task_id) -> None:
+    """Reject a mutation unless the task is on this connection's queue.
+
+    Missing tasks are left for the caller. Global reads stay available through
+    ``get_task``. Binding the connection to a queue, including with an explicit
+    queue id, is the queue selection.
+    """
+    row = conn.execute(
+        "SELECT queue_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    if row["queue_id"] != connection_queue_id(conn):
+        raise ValueError(
+            f"Task {task_id} belongs to another queue. "
+            "Inspect it globally, or select that queue explicitly before changing it."
+        )
+
+
 def save_agent_snapshot(conn, task_id, snapshot, *, commit=True):
+    require_task_queue(conn, task_id)
     conn.execute(
         "INSERT INTO task_agent_snapshots(task_id, snapshot) VALUES (?, ?) "
         "ON CONFLICT(task_id) DO UPDATE SET snapshot=excluded.snapshot",
@@ -1027,6 +1828,7 @@ def should_skip_step(conn, task_id, step):
 
 
 def add_task_skip(conn, task_id, step):
+    require_task_queue(conn, task_id)
     conn.execute(
         "INSERT OR IGNORE INTO task_skips (task_id, step) VALUES (?, ?)",
         (task_id, step)
@@ -1035,6 +1837,7 @@ def add_task_skip(conn, task_id, step):
 
 
 def remove_task_skip(conn, task_id, step):
+    require_task_queue(conn, task_id)
     conn.execute(
         "DELETE FROM task_skips WHERE task_id = ? AND step = ?",
         (task_id, step)
@@ -1073,14 +1876,20 @@ def list_tasks(
     page=1,
     page_size=20,
     parent=None,
+    *,
+    all_queues=False,
+    queue_id=None,
 ):
     query = (
         "SELECT id, title, status, next_step, branch, coder_agent, reviewer_agent, "
         "review_round, created_at, ready_at, last_ready_at, first_started_at, done_at, updated_at, "
-        "kind, parent_task_id, sequence_index, allow_when_blocked "
+        "kind, parent_task_id, sequence_index, allow_when_blocked, repository_id, queue_id "
         "FROM tasks WHERE 1=1"
     )
     params = []
+    if not all_queues:
+        query += " AND queue_id = ?"
+        params.append(queue_id or connection_queue_id(conn))
     if status:
         query += " AND status = ?"
         params.append(status)
@@ -1113,6 +1922,7 @@ def update_task(conn, task_id, *, commit=True, **fields):
     """Update task fields and maintain queue/completion timestamps."""
     if not fields:
         return
+    require_task_queue(conn, task_id)
     allowed = {
         "title", "description", "status", "next_step", "branch",
         "commit_hash", "stash_ref", "coder_agent", "reviewer_agent",
@@ -1124,6 +1934,20 @@ def update_task(conn, task_id, *, commit=True, **fields):
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"Cannot update fields: {bad}")
+    if "follow_up_task_id" in fields and fields["follow_up_task_id"] is not None:
+        current = conn.execute(
+            "SELECT repository_id, queue_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"Task {task_id} not found")
+        _assert_same_queue_reference(
+            conn,
+            fields["follow_up_task_id"],
+            current["repository_id"],
+            current["queue_id"],
+            "follow-up",
+        )
     if "status" in fields:
         current = conn.execute(
             "SELECT status, ready_at, done_at, first_started_at FROM tasks WHERE id = ?",
@@ -1165,6 +1989,7 @@ def update_task(conn, task_id, *, commit=True, **fields):
 
 
 def delete_task(conn, task_id):
+    require_task_queue(conn, task_id)
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"Task {task_id} not found")
@@ -1185,9 +2010,19 @@ def delete_task(conn, task_id):
 # ── Run Log ────────────────────────────────────────────────────────────
 
 def add_run_log(conn, task_id, message, verb=None, author=None):
+    queue_id = connection_queue_id(conn)
+    if task_id is not None:
+        owner = conn.execute(
+            "SELECT queue_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if owner is None:
+            raise ValueError(f"Task {task_id} not found")
+        require_task_queue(conn, task_id)
+        queue_id = owner["queue_id"]
     conn.execute(
-        "INSERT INTO run_log (task_id, verb, author, message) VALUES (?, ?, ?, ?)",
-        (task_id, verb, author, message),
+        "INSERT INTO run_log (task_id, queue_id, verb, author, message) VALUES (?, ?, ?, ?, ?)",
+        (task_id, queue_id, verb, author, message),
     )
     conn.commit()
 
@@ -1201,7 +2036,10 @@ def get_run_log(conn, task_id):
 
 def get_global_run_log(conn, limit=50):
     rows = conn.execute(
-        "SELECT * FROM run_log WHERE task_id IS NULL ORDER BY id DESC LIMIT ?", (limit,)
+        """SELECT * FROM run_log
+           WHERE task_id IS NULL AND queue_id = ?
+           ORDER BY id DESC LIMIT ?""",
+        (connection_queue_id(conn), limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1215,10 +2053,11 @@ def get_orchestrator_run_log(conn, limit=200):
         FROM run_log
         LEFT JOIN tasks ON tasks.id = run_log.task_id
         WHERE run_log.author = 'orchestrator'
+          AND run_log.queue_id = ?
         ORDER BY run_log.id DESC
         LIMIT ?
         """,
-        (limit,),
+        (connection_queue_id(conn), limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1292,7 +2131,6 @@ def _parse_task_artifact_id(name):
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_NOFOLLOW_FLAGS = _DIRECTORY_FLAGS | os.O_NOFOLLOW
-_RUNTIME_DIR_NAME = ".kanban-orchestra"
 _ARTIFACTS_DIR_NAME = "artifacts"
 
 
@@ -1323,11 +2161,14 @@ def _open_nested_directory_nofollow(parent_path, *components):
             os.close(fd)
 
 
-def _open_canonical_artifacts_fd(db_path):
-    """Open the canonical artifacts directory from the database parent."""
+def _open_canonical_artifacts_fd(db_path, queue_id):
+    """Open one queue's artifacts directory from the trusted state parent."""
+    if not _is_id(queue_id):
+        raise OSError("refusing unsafe queue id")
     return _open_nested_directory_nofollow(
         Path(db_path).resolve().parent,
-        _RUNTIME_DIR_NAME,
+        QUEUES_DIR_NAME,
+        queue_id,
         _ARTIFACTS_DIR_NAME,
     )
 
@@ -1342,17 +2183,17 @@ def _is_simple_filename(name):
 
 def _completed_task_ids(conn):
     rows = conn.execute(
-        "SELECT id FROM tasks WHERE status = ?",
-        (COMPLETED_TASK_STATUS,),
+        "SELECT id FROM tasks WHERE status = ? AND queue_id = ?",
+        (COMPLETED_TASK_STATUS, connection_queue_id(conn)),
     ).fetchall()
     return {row[0] for row in rows}
 
 
-def _purge_completed_task_transcripts(db_path, done_task_ids, cutoff_ts):
-    """Delete old transcript files under the canonical artifacts root.
+def _purge_completed_task_transcripts(db_path, queue_id, done_task_ids, cutoff_ts):
+    """Delete old transcript files under one queue's artifacts root.
 
     Starts from the trusted directory that contains the database, then opens
-    `.kanban-orchestra` and `artifacts` descriptor-relatively with
+    ``queues/<queue-id>/artifacts`` descriptor-relatively with
     O_DIRECTORY|O_NOFOLLOW. Task directories are opened the same way so a
     swapped symlink cannot redirect cleanup outside the canonical tree.
     """
@@ -1362,7 +2203,7 @@ def _purge_completed_task_transcripts(db_path, done_task_ids, cutoff_ts):
         return deleted, reclaimed
 
     try:
-        root_fd = _open_canonical_artifacts_fd(db_path)
+        root_fd = _open_canonical_artifacts_fd(db_path, queue_id)
     except OSError:
         return deleted, reclaimed
 
@@ -1429,18 +2270,20 @@ def _purge_task_transcript_dir(task_fd, cutoff_ts):
 def purge_run_log(conn, before_date=None, days=None, compact=False):
     """Purge ephemeral runtime history for completed work.
 
-    Default retention is seven days. Eligible rows are run_log entries for
-    done tasks and global orchestrator entries (`task_id IS NULL`). Unfinished
-    task history, task records, and comments are preserved. Old transcript
-    files for completed tasks are removed from the canonical artifacts root.
-    Cleanup opens `.kanban-orchestra` and `artifacts` from the database parent
-    through no-follow directory descriptors. When `compact` is true and rows
-    were deleted, SQLite pages are reclaimed with VACUUM.
+    Default retention is seven days. Eligible rows are this queue's run_log
+    entries for done tasks and this queue's global orchestrator entries
+    (`task_id IS NULL`). Unfinished task history, task records, and comments
+    are preserved. Old transcript files for this queue's completed tasks are
+    removed from that queue's artifacts root. Cleanup opens
+    ``queues/<queue-id>/artifacts`` from the database parent through
+    no-follow directory descriptors. When `compact` is true and rows were
+    deleted, SQLite pages are reclaimed with VACUUM.
     """
     if days is not None and days < 0:
         raise ValueError("days must be >= 0")
 
-    params = [COMPLETED_TASK_STATUS]
+    queue_id = connection_queue_id(conn)
+    params = [queue_id, COMPLETED_TASK_STATUS, queue_id]
     if before_date:
         cutoff_sql = "created_at < ?"
         params.append(before_date)
@@ -1458,9 +2301,9 @@ def purge_run_log(conn, before_date=None, days=None, compact=False):
     before_disk = _sqlite_disk_usage(db_path) if compact and db_path else 0
 
     deleted_rows = conn.execute(
-        "DELETE FROM run_log WHERE "
+        "DELETE FROM run_log WHERE queue_id = ? AND "
         "(task_id IS NULL OR task_id IN "
-        "(SELECT id FROM tasks WHERE status = ?)) "
+        "(SELECT id FROM tasks WHERE status = ? AND queue_id = ?)) "
         f"AND ({cutoff_sql})",
         params,
     ).rowcount
@@ -1474,6 +2317,7 @@ def purge_run_log(conn, before_date=None, days=None, compact=False):
         deleted_transcripts, reclaimed_artifact_bytes = (
             _purge_completed_task_transcripts(
                 db_path,
+                queue_id,
                 _completed_task_ids(conn),
                 file_cutoff,
             )
@@ -1511,6 +2355,7 @@ def add_comment(
     review_round=None,
     expected_review_round=None,
 ):
+    require_task_queue(conn, task_id)
     task = None
     if review_round is None or expected_review_round is not None:
         task = get_task(conn, task_id)
@@ -1556,10 +2401,14 @@ def find_ready_task(conn, exclude_ids=None):
 
     ``exclude_ids`` skips those task ids (used to keep a task under
     smart-unblock consultation undispatchable even if status was mutated).
+    A retired queue or a missing worktree has nothing dispatchable.
     """
+    if queue_dispatch_block_reason(conn):
+        return None
+    queue_id = connection_queue_id(conn)
     excluded = [int(i) for i in (exclude_ids or ()) if i is not None]
     exclude_sql = ""
-    params: list = []
+    params: list = [queue_id, queue_id, queue_id]
     if excluded:
         placeholders = ",".join("?" for _ in excluded)
         exclude_sql = f" AND id NOT IN ({placeholders})"
@@ -1567,16 +2416,21 @@ def find_ready_task(conn, exclude_ids=None):
     row = conn.execute(
         f"""WITH has_active_supertask(active) AS (
                SELECT EXISTS (
-                   SELECT 1 FROM tasks active_parent WHERE active_parent.status = 'pending_subtasks'
+                   SELECT 1 FROM tasks active_parent
+                   WHERE active_parent.status = 'pending_subtasks'
+                     AND active_parent.queue_id = ?
                )
            ),
            has_blocked_task(blocked) AS (
                SELECT EXISTS (
-                   SELECT 1 FROM tasks blocked_task WHERE blocked_task.status = 'blocked'
+                   SELECT 1 FROM tasks blocked_task
+                   WHERE blocked_task.status = 'blocked'
+                     AND blocked_task.queue_id = ?
                )
            )
            SELECT * FROM tasks
-           WHERE status = 'ready'
+           WHERE queue_id = ?
+             AND status = 'ready'
            {exclude_sql}
            AND (
                (SELECT blocked FROM has_blocked_task) = 0
@@ -1625,21 +2479,66 @@ def find_ready_task(conn, exclude_ids=None):
     return _row_to_task(row) if row else None
 
 
+def claim_ready_task(conn, task_id):
+    """Atomically claim one ready task for this queue.
+
+    Returns the claimed task, or None when it is no longer ready on this queue,
+    the queue already has a running task, or the queue can no longer dispatch
+    because it is retired or its worktree is gone. The unique running-task
+    index is the backstop. An unfinished cutover activation is refused.
+    """
+    assert_activation_finished(conn)
+    queue_id = connection_queue_id(conn)
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if queue_dispatch_block_reason(conn):
+            conn.rollback()
+            return None
+        row = conn.execute(
+            "SELECT status, queue_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["queue_id"] != queue_id or row["status"] != "ready":
+            conn.rollback()
+            return None
+        running = conn.execute(
+            """SELECT id FROM tasks
+               WHERE queue_id = ? AND status = 'running' AND id != ?""",
+            (queue_id, task_id),
+        ).fetchone()
+        if running is not None:
+            conn.rollback()
+            return None
+        update_task(conn, task_id, commit=False, status="running")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return get_task(conn, task_id)
+
+
 def list_ready_tasks_blocked_by_blocked_gate(conn):
     """Return ready tasks skipped specifically by the blocked-task gate."""
+    queue_id = connection_queue_id(conn)
     rows = conn.execute(
         """WITH has_active_supertask(active) AS (
                SELECT EXISTS (
-                   SELECT 1 FROM tasks active_parent WHERE active_parent.status = 'pending_subtasks'
+                   SELECT 1 FROM tasks active_parent
+                   WHERE active_parent.status = 'pending_subtasks'
+                     AND active_parent.queue_id = ?
                )
            ),
            has_blocked_task(blocked) AS (
                SELECT EXISTS (
-                   SELECT 1 FROM tasks blocked_task WHERE blocked_task.status = 'blocked'
+                   SELECT 1 FROM tasks blocked_task
+                   WHERE blocked_task.status = 'blocked'
+                     AND blocked_task.queue_id = ?
                )
            )
            SELECT * FROM tasks
-           WHERE status = 'ready'
+           WHERE queue_id = ?
+             AND status = 'ready'
            AND allow_when_blocked = 0
            AND (SELECT blocked FROM has_blocked_task) = 1
            AND (
@@ -1678,7 +2577,8 @@ def list_ready_tasks_blocked_by_blocked_gate(conn):
                )
            )
            ORDER BY CASE WHEN sequence_index IS NULL THEN 1 ELSE 0 END ASC,
-                    sequence_index ASC, id ASC"""
+                    sequence_index ASC, id ASC""",
+        (queue_id, queue_id, queue_id),
     ).fetchall()
     return [_row_to_task(row) for row in rows]
 
@@ -1696,6 +2596,7 @@ def get_child_tasks(conn, parent_task_id):
 
 def renumber_siblings(conn, parent_task_id):
     """Renumber all children of parent at 100-step intervals, preserving relative order."""
+    require_task_queue(conn, parent_task_id)
     children = conn.execute(
         "SELECT id FROM tasks WHERE parent_task_id = ? "
         "ORDER BY CASE WHEN sequence_index IS NULL THEN 1 ELSE 0 END ASC, "
@@ -1732,6 +2633,13 @@ def attach_follow_up_to_supertask(conn, source_task_id, follow_up_task_id):
     parent = get_task(conn, parent_id)
     if not parent or parent.get("kind") != "supertask":
         raise ValueError(f"Parent task {parent_id} is not a supertask")
+    if (
+        follow_up.get("repository_id") != source.get("repository_id")
+        or follow_up.get("queue_id") != source.get("queue_id")
+        or parent.get("repository_id") != source.get("repository_id")
+        or parent.get("queue_id") != source.get("queue_id")
+    ):
+        raise ValueError("follow-up task must belong to the same repository and queue")
 
     renumber_siblings(conn, parent_id)
     source = get_task(conn, source_task_id)
@@ -1782,10 +2690,17 @@ def reposition_task(conn, task_id, *, before_id=None, after_id=None):
     if target["status"] != "ready":
         raise ValueError(f"Task {task_id} is not ready (status={target['status']})")
 
+    queue_id = connection_queue_id(conn)
+    if target["queue_id"] != queue_id or anchor["queue_id"] != queue_id:
+        raise ValueError("requeue stays inside the current queue")
+    if target["repository_id"] != anchor["repository_id"]:
+        raise ValueError("requeue stays inside one repository")
     # Fetch all top-level ready tasks in current queue order
     rows = conn.execute(
         "SELECT id FROM tasks WHERE status = 'ready' AND parent_task_id IS NULL "
-        f"ORDER BY {READY_TASK_ORDER_BY}"
+        "AND queue_id = ? "
+        f"ORDER BY {READY_TASK_ORDER_BY}",
+        (queue_id,),
     ).fetchall()
     ordered = [r["id"] for r in rows]
 
@@ -1814,16 +2729,19 @@ def reposition_task(conn, task_id, *, before_id=None, after_id=None):
 
 
 def get_tasks_on_branch(conn, branch, landed_only=True):
-    """Get tasks on a given branch. If landed_only, only those with a landed commit hash."""
+    """Get tasks on a given branch within the connection's repository."""
+    repository_id = connection_repository_id(conn)
     if landed_only:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE branch = ? AND commit_hash IS NOT NULL ORDER BY id ASC",
-            (branch,),
+            """SELECT * FROM tasks
+               WHERE branch = ? AND repository_id = ? AND commit_hash IS NOT NULL
+               ORDER BY id ASC""",
+            (branch, repository_id),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE branch = ? ORDER BY id ASC",
-            (branch,),
+            "SELECT * FROM tasks WHERE branch = ? AND repository_id = ? ORDER BY id ASC",
+            (branch, repository_id),
         ).fetchall()
     return [_row_to_task(r) for r in rows]
 
@@ -1831,327 +2749,56 @@ def get_tasks_on_branch(conn, branch, landed_only=True):
 # ── Orchestrator Runtime ──────────────────────────────────────────────
 
 def upsert_runtime(conn, **fields):
-    """Insert or replace the singleton orchestrator_runtime row."""
-    fields["singleton"] = 1
+    """Insert or replace the runtime row for the connection's queue."""
+    fields.pop("singleton", None)
+    fields["queue_id"] = connection_queue_id(conn)
     cols = list(fields.keys())
     placeholders = []
     params = []
-    for c in cols:
-        if fields[c] == "CURRENT_TIMESTAMP":
+    for column in cols:
+        if fields[column] == "CURRENT_TIMESTAMP":
             placeholders.append("CURRENT_TIMESTAMP")
         else:
             placeholders.append("?")
-            params.append(fields[c])
+            params.append(fields[column])
+    updates = ", ".join(
+        f"{column} = excluded.{column}" for column in cols if column != "queue_id"
+    )
     sql = (
-        f"INSERT OR REPLACE INTO orchestrator_runtime ({', '.join(cols)}) "
-        f"VALUES ({', '.join(placeholders)})"
+        f"INSERT INTO orchestrator_runtime ({', '.join(cols)}) "
+        f"VALUES ({', '.join(placeholders)}) "
+        f"ON CONFLICT(queue_id) DO UPDATE SET {updates}"
     )
     conn.execute(sql, params)
     conn.commit()
 
 
 def update_runtime(conn, **fields):
-    """Update specific fields on the singleton runtime row."""
+    """Update specific fields on this queue's runtime row."""
     if not fields:
         return
+    fields.pop("singleton", None)
     fields["updated_at"] = "CURRENT_TIMESTAMP"
     sets = []
     params = []
-    for k, v in fields.items():
-        if v == "CURRENT_TIMESTAMP":
-            sets.append(f"{k} = CURRENT_TIMESTAMP")
+    for key, value in fields.items():
+        if value == "CURRENT_TIMESTAMP":
+            sets.append(f"{key} = CURRENT_TIMESTAMP")
         else:
-            sets.append(f"{k} = ?")
-            params.append(v)
+            sets.append(f"{key} = ?")
+            params.append(value)
+    params.append(connection_queue_id(conn))
     conn.execute(
-        f"UPDATE orchestrator_runtime SET {', '.join(sets)} WHERE singleton = 1",
+        f"UPDATE orchestrator_runtime SET {', '.join(sets)} WHERE queue_id = ?",
         params,
     )
     conn.commit()
 
 
 def get_runtime(conn):
-    """Read the singleton orchestrator_runtime row. Returns dict or None."""
+    """Read this queue's orchestrator_runtime row. Returns dict or None."""
     row = conn.execute(
-        "SELECT * FROM orchestrator_runtime WHERE singleton = 1"
+        "SELECT * FROM orchestrator_runtime WHERE queue_id = ?",
+        (connection_queue_id(conn),),
     ).fetchone()
     return dict(row) if row else None
-
-
-# ── Worktree database import ───────────────────────────────────────────
-
-IMPORT_TASK_TABLES = ("tasks", "task_skips", "comments", "run_log")
-
-# Columns copied from a source tasks row into the target insert.
-_IMPORT_TASK_COLUMNS = (
-    "title",
-    "description",
-    "status",
-    "next_step",
-    "branch",
-    "commit_hash",
-    "stash_ref",
-    "coder_agent",
-    "reviewer_agent",
-    "review_round",
-    "max_review_rounds",
-    "last_review_decision",
-    "created_at",
-    "ready_at",
-    "last_ready_at",
-    "first_started_at",
-    "done_at",
-    "updated_at",
-    "kind",
-    "sequence_index",
-    "commit_plan",
-    "allow_when_blocked",
-    "block_reason",
-    "resume_next_step",
-)
-
-
-def resolve_worktree_db_path(path: str | Path) -> Path:
-    """Resolve a worktree root or database file path to kanban-orchestra.db."""
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"Import path not found: {resolved}")
-    if resolved.is_file():
-        return resolved
-    db_path = resolved / "kanban-orchestra.db"
-    if not db_path.is_file():
-        raise FileNotFoundError(
-            f"No kanban-orchestra.db found under worktree path: {resolved}"
-        )
-    return db_path
-
-
-def _open_source_db_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open a source database read-only without running migrations."""
-    uri = f"file:{db_path.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _validate_import_source(conn: sqlite3.Connection) -> None:
-    """Raise ValueError if the source DB is missing required import tables/columns."""
-    tables = set(_list_user_tables(conn))
-    missing_tables = [name for name in IMPORT_TASK_TABLES if name not in tables]
-    if missing_tables:
-        raise ValueError(
-            "Source database is missing required tables: "
-            + ", ".join(missing_tables)
-        )
-
-    task_cols = {
-        row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-    }
-    required = (
-        {"id", *_IMPORT_TASK_COLUMNS, "parent_task_id", "follow_up_task_id"}
-        - {"first_started_at"}
-    )
-    missing_cols = sorted(required - task_cols)
-    if missing_cols:
-        raise ValueError(
-            "Source database tasks table is missing required columns: "
-            + ", ".join(missing_cols)
-        )
-
-
-def _normalize_imported_task_fields(row: sqlite3.Row) -> tuple[dict, str | None]:
-    """Copy task fields and normalize unfinished tasks to status none."""
-    source_keys = set(row.keys())
-    data = {col: row[col] for col in _IMPORT_TASK_COLUMNS if col in source_keys}
-    source_branch = data.get("branch")
-    if data.get("status") != "done":
-        data["status"] = "none"
-        data["ready_at"] = None
-        # Stash refs are worktree-local Git state and must not transfer.
-        data["stash_ref"] = None
-    return data, source_branch
-
-
-def import_worktree_database(
-    target_conn: sqlite3.Connection,
-    source_path: str | Path,
-) -> dict:
-    """Import tasks and task-owned history from another worktree database.
-
-    The target database remains authoritative: imported tasks receive fresh IDs.
-    Source is opened read-only and never modified. The target import runs in a
-    single transaction and is rolled back on failure.
-
-    Returns a result dict with ``id_map`` (old_id -> new_id), ``source_db``,
-    and ``imported_count``.
-    """
-    source_db = resolve_worktree_db_path(source_path)
-    target_db = get_connection_db_path(target_conn)
-    if target_db and Path(target_db).resolve() == source_db:
-        raise ValueError("Cannot import a worktree database into itself")
-
-    source_conn = _open_source_db_readonly(source_db)
-    try:
-        _validate_import_source(source_conn)
-
-        source_tasks = source_conn.execute(
-            "SELECT * FROM tasks ORDER BY id ASC"
-        ).fetchall()
-        source_by_id = {row["id"]: row for row in source_tasks}
-        source_skips = source_conn.execute(
-            "SELECT task_id, step FROM task_skips ORDER BY task_id ASC, step ASC"
-        ).fetchall()
-        source_comments = source_conn.execute(
-            "SELECT * FROM comments WHERE task_id IS NOT NULL ORDER BY id ASC"
-        ).fetchall()
-        source_run_logs = source_conn.execute(
-            "SELECT * FROM run_log WHERE task_id IS NOT NULL ORDER BY id ASC"
-        ).fetchall()
-
-        source_snapshots = (source_conn.execute("SELECT * FROM task_agent_snapshots").fetchall()
-                            if "task_agent_snapshots" in _list_user_tables(source_conn) else [])
-
-        # Snapshot after reads so callers can verify we never wrote the source.
-        source_mtime_ns = source_db.stat().st_mtime_ns
-
-        id_map: dict[int, int] = {}
-        source_branches: dict[int, str | None] = {}
-
-        # End any open transaction so the import is one atomic unit.
-        target_conn.commit()
-        try:
-            for row in source_tasks:
-                fields, source_branch = _normalize_imported_task_fields(row)
-                source_branches[row["id"]] = source_branch
-                cols = list(fields.keys())
-                placeholders = ", ".join("?" for _ in cols)
-                cur = target_conn.execute(
-                    f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({placeholders})",
-                    [fields[c] for c in cols],
-                )
-                id_map[row["id"]] = cur.lastrowid
-
-            for old_id, new_id in id_map.items():
-                source_row = source_by_id[old_id]
-                parent_old = source_row["parent_task_id"]
-                follow_old = source_row["follow_up_task_id"]
-                parent_new = id_map.get(parent_old) if parent_old is not None else None
-                follow_new = id_map.get(follow_old) if follow_old is not None else None
-                if parent_old is not None and parent_new is None:
-                    raise ValueError(
-                        f"Source task {old_id} references missing parent_task_id {parent_old}"
-                    )
-                if follow_old is not None and follow_new is None:
-                    raise ValueError(
-                        f"Source task {old_id} references missing follow_up_task_id {follow_old}"
-                    )
-                target_conn.execute(
-                    "UPDATE tasks SET parent_task_id = ?, follow_up_task_id = ? WHERE id = ?",
-                    (parent_new, follow_new, new_id),
-                )
-
-            for snapshot in source_snapshots:
-                new_task_id = id_map.get(snapshot["task_id"])
-                if new_task_id is None:
-                    raise ValueError("Source agent snapshot references a missing task")
-                save_agent_snapshot(target_conn, new_task_id, json.loads(snapshot["snapshot"]), commit=False)
-
-            for skip in source_skips:
-                new_task_id = id_map.get(skip["task_id"])
-                if new_task_id is None:
-                    raise ValueError(
-                        f"Source task_skips references missing task_id {skip['task_id']}"
-                    )
-                target_conn.execute(
-                    "INSERT INTO task_skips (task_id, step) VALUES (?, ?)",
-                    (new_task_id, skip["step"]),
-                )
-
-            for comment in source_comments:
-                new_task_id = id_map.get(comment["task_id"])
-                if new_task_id is None:
-                    raise ValueError(
-                        f"Source comments references missing task_id {comment['task_id']}"
-                    )
-                target_conn.execute(
-                    """INSERT INTO comments (
-                           task_id, review_round, verb, author, message, kind, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_task_id,
-                        comment["review_round"],
-                        comment["verb"],
-                        comment["author"],
-                        comment["message"],
-                        comment["kind"],
-                        comment["created_at"],
-                    ),
-                )
-
-            for entry in source_run_logs:
-                new_task_id = id_map.get(entry["task_id"])
-                if new_task_id is None:
-                    raise ValueError(
-                        f"Source run_log references missing task_id {entry['task_id']}"
-                    )
-                target_conn.execute(
-                    """INSERT INTO run_log (
-                           task_id, verb, author, message, created_at
-                       ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        new_task_id,
-                        entry["verb"],
-                        entry["author"],
-                        entry["message"],
-                        entry["created_at"],
-                    ),
-                )
-
-            # Preserve source branch metadata as durable per-task history.
-            for old_id, new_id in id_map.items():
-                branch = source_branches.get(old_id)
-                branch_text = branch if branch else "(none)"
-                target_conn.execute(
-                    """INSERT INTO comments (
-                           task_id, review_round, verb, author, message, kind
-                       ) VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_id,
-                        0,
-                        "import-worktree",
-                        "kanban",
-                        (
-                            f"Imported from worktree database {source_db} "
-                            f"(source task id {old_id}). "
-                            f"Source branch: {branch_text}."
-                        ),
-                        "comment",
-                    ),
-                )
-
-            # Validate before commit so a mid-import source change rolls back
-            # the target instead of reporting failure after a successful write.
-            if source_db.stat().st_mtime_ns != source_mtime_ns:
-                raise RuntimeError("Source database was modified during import")
-
-            source_has_first_started_at = "first_started_at" in {
-                row["name"]
-                for row in source_conn.execute("PRAGMA table_info(tasks)").fetchall()
-            }
-            _backfill_first_started_at(
-                target_conn,
-                use_legacy_fallback=not source_has_first_started_at,
-                task_ids=list(id_map.values()),
-            )
-            target_conn.commit()
-        except Exception:
-            target_conn.rollback()
-            raise
-
-        return {
-            "source_db": str(source_db),
-            "imported_count": len(id_map),
-            "id_map": {str(old): new for old, new in id_map.items()},
-        }
-    finally:
-        source_conn.close()
