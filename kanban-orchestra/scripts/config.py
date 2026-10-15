@@ -52,8 +52,16 @@ def role_snapshot(role, explicit=None):
 
 
 def check_worker_config(conn):
-    worker = conn.execute("SELECT fingerprint FROM agent_worker_config WHERE singleton=1").fetchone()
-    runtime = conn.execute("SELECT pid, status FROM orchestrator_runtime WHERE singleton=1").fetchone()
+    import db
+    queue_id = db.connection_queue_id(conn)
+    worker = conn.execute(
+        "SELECT fingerprint FROM agent_worker_config WHERE queue_id=?",
+        (queue_id,),
+    ).fetchone()
+    runtime = conn.execute(
+        "SELECT pid, status FROM orchestrator_runtime WHERE queue_id=?",
+        (queue_id,),
+    ).fetchone()
     if not worker or not runtime or runtime["status"] in ("stopped", "error", "hard-break"):
         return
     try:

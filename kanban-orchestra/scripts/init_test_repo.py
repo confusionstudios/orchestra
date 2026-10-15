@@ -192,7 +192,7 @@ try:
 finally:
     sys.path.pop(0)
 
-conn = db.connect(str(db_path))
+conn = db.connect(str(db_path), repo_root=target)
 
 if args.most_simple:
     db.add_task(
@@ -254,11 +254,7 @@ else:
         status="ready",
     )
 
-conn.execute(
-    "INSERT OR REPLACE INTO orchestrator_runtime (singleton, status) VALUES (1, 'idle')"
-)
-
-conn.commit()
+db.upsert_runtime(conn, status="idle")
 conn.close()
 print(
     f"Seeded kanban DB at {db_path}  "

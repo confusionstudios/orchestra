@@ -201,7 +201,7 @@ def test_task_cli_reads_cache_without_discovery(tmp_path, monkeypatch):
     environment = {**os.environ, 'KANBAN_DB': str(tmp_path / 'kanban-orchestra.db')}
     script = Path(__file__).with_name('task.py')
     listed = subprocess.run([sys.executable, str(script), 'models', 'list', 'codex'],
-                            env=environment, capture_output=True, text=True, timeout=5)
+                            env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=5)
     assert listed.returncode == 0, listed.stderr
     assert 'codex: fresh' in listed.stdout and 'first | First' in listed.stdout
     assert 'supportedReasoningEfforts' in listed.stdout

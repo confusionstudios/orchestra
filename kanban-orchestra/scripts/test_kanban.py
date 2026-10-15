@@ -248,9 +248,10 @@ class TestDB(unittest.TestCase):
         self.assertEqual(done["first_started_at"], first_started_at)
         self.assertIsNotNone(done["done_at"])
 
-    def test_orchestrator_log_path_lives_under_repo_runtime_dir(self):
+    def test_orchestrator_log_path_lives_under_queue_runtime_dir(self):
         log_path = db.get_orchestrator_log_path(self.tmp.name)
-        self.assertEqual(log_path, Path(self.tmp.name).resolve().parent / ".kanban-orchestra" / "orchestrator.log")
+        self.assertEqual(log_path, db.get_runtime_root(self.tmp.name) / "orchestrator.log")
+        self.assertNotEqual(log_path.parent, db.get_state_root())
 
     def test_allow_when_blocked_defaults_false(self):
         tid = db.add_task(self.conn, "Blocked gate default")
@@ -264,114 +265,6 @@ class TestDB(unittest.TestCase):
         self.assertIsNone(task["block_reason"])
         self.assertIsNone(task["resume_next_step"])
 
-    def test_missing_max_review_rounds_and_resume_columns_are_migrated(self):
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.execute(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none',
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review',
-                                            'pull-request-make', 'pull-request-review',
-                                            'other-make', 'other-review',
-                                            'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    reviewer_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    last_ready_at DATETIME DEFAULT NULL,
-                    done_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'commit',
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan TEXT,
-                    follow_up_task_id INTEGER REFERENCES tasks(id),
-                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL
-                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
-                                       'commit-review-supertask','pull-request-review','other-review')),
-                    PRIMARY KEY (task_id, step)
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE run_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE comments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    review_round INTEGER,
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    kind TEXT DEFAULT 'comment'
-                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
-                                       'validation', 'plan-approval', 'plan-rejection',
-                                       'done-without-commit', 'deferred-build-changed')),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE orchestrator_runtime (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    status TEXT NOT NULL,
-                    pid INTEGER,
-                    started_at DATETIME,
-                    last_heartbeat_at DATETIME,
-                    current_task_id INTEGER REFERENCES tasks(id),
-                    current_step TEXT,
-                    current_branch TEXT,
-                    review_round INTEGER,
-                    active_agents INTEGER NOT NULL DEFAULT 0,
-                    status_message TEXT,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
-            legacy.execute(
-                "INSERT INTO tasks (id, title, status, next_step, kind) VALUES (1, 'Legacy', 'none', 'commit-plan', 'commit')"
-            )
-            legacy.commit()
-            legacy.close()
-
-            migrated = db.connect(tmp.name)
-            try:
-                cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)").fetchall()}
-                self.assertIn("max_review_rounds", cols)
-                self.assertIn("block_reason", cols)
-                self.assertIn("resume_next_step", cols)
-                task = db.get_task(migrated, 1)
-                self.assertEqual(task["max_review_rounds"], orchestrator.MAX_REVIEW_ROUNDS)
-                self.assertIsNone(task["block_reason"])
-                self.assertIsNone(task["resume_next_step"])
-            finally:
-                migrated.close()
-        finally:
-            os.unlink(tmp.name)
 
     def test_task_add_defaults_normal_tasks_to_build_step(self):
         args = SimpleNamespace(
@@ -417,333 +310,27 @@ class TestDB(unittest.TestCase):
         self.assertEqual(task["next_step"], "commit-make")
         self.assertEqual(task["skips"], ["commit-plan", "commit-review"])
 
-    def test_missing_allow_when_blocked_column_is_migrated(self):
+
+
+
+    def test_missing_first_started_at_is_backfilled_from_run_log(self):
+        """A legacy file is left untouched instead of being rewritten in place."""
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.close()
         try:
             legacy = sqlite3.connect(tmp.name)
-            legacy.execute(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none',
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review',
-                                            'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'task',
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan TEXT,
-                    follow_up_task_id INTEGER REFERENCES tasks(id)
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL
-                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review','commit-review-supertask')),
-                    PRIMARY KEY (task_id, step)
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE run_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE comments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    review_round INTEGER,
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    kind TEXT DEFAULT 'comment'
-                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
-                                       'validation', 'plan-approval', 'plan-rejection',
-                                       'done-without-commit', 'deferred-build-changed')),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE orchestrator_runtime (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    status TEXT NOT NULL,
-                    pid INTEGER,
-                    started_at DATETIME,
-                    last_heartbeat_at DATETIME,
-                    current_task_id INTEGER REFERENCES tasks(id),
-                    current_step TEXT,
-                    current_branch TEXT,
-                    review_round INTEGER,
-                    active_agents INTEGER NOT NULL DEFAULT 0,
-                    status_message TEXT,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
+            legacy.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT)")
+            legacy.execute("INSERT INTO tasks (title) VALUES ('keep')")
             legacy.commit()
             legacy.close()
-
-            migrated = db.connect(tmp.name)
-            try:
-                cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)").fetchall()}
-                self.assertIn("allow_when_blocked", cols)
-            finally:
-                migrated.close()
+            before = Path(tmp.name).read_bytes()
+            with self.assertRaises(db.MigrationRequired) as ctx:
+                db.connect(tmp.name)
+            self.assertIn("Migration required", str(ctx.exception))
+            self.assertEqual(Path(tmp.name).read_bytes(), before)
         finally:
             os.unlink(tmp.name)
 
-    def test_missing_reviewer_agent_column_is_migrated(self):
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.execute(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none',
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review',
-                                            'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'task',
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan TEXT,
-                    follow_up_task_id INTEGER REFERENCES tasks(id),
-                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL
-                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review','commit-review-supertask')),
-                    PRIMARY KEY (task_id, step)
-                )"""
-            )
-            legacy.commit()
-            legacy.close()
-
-            conn = db.connect(tmp.name)
-            try:
-                cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-                self.assertIn("reviewer_agent", cols)
-                tid = db.add_task(conn, "Old schema ok", reviewer_agent=DEFAULT_REVIEWER)
-                self.assertEqual(db.get_task(conn, tid)["reviewer_agent"], DEFAULT_REVIEWER)
-            finally:
-                conn.close()
-        finally:
-            for suffix in ("", "-shm", "-wal"):
-                path = tmp.name + suffix
-                if os.path.exists(path):
-                    os.unlink(path)
-
-    def test_missing_done_runtime_columns_are_migrated(self):
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.execute(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none'
-                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review',
-                                            'pull-request-make', 'pull-request-review',
-                                            'other-make', 'other-review', 'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    reviewer_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'commit'
-                        CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan TEXT,
-                    follow_up_task_id INTEGER REFERENCES tasks(id),
-                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL
-                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
-                                       'commit-review-supertask','pull-request-review','other-review')),
-                    PRIMARY KEY (task_id, step)
-                )"""
-            )
-            legacy.execute(
-                "INSERT INTO tasks (title, status, next_step, ready_at, updated_at) "
-                "VALUES ('queued', 'ready', 'commit-make', '2026-05-31 10:00:00', '2026-05-31 10:01:00')"
-            )
-            legacy.execute(
-                "INSERT INTO tasks (title, status, next_step, updated_at) "
-                "VALUES ('complete', 'done', 'none', '2026-05-31 11:00:00')"
-            )
-            legacy.commit()
-            legacy.close()
-
-            migrated = db.connect(tmp.name)
-            try:
-                queued = db.get_task(migrated, 1)
-                complete = db.get_task(migrated, 2)
-                self.assertEqual(queued["last_ready_at"], "2026-05-31 10:00:00")
-                self.assertIsNone(queued["done_at"])
-                self.assertIsNone(queued["first_started_at"])
-                self.assertIsNone(complete["last_ready_at"])
-                self.assertEqual(complete["done_at"], "2026-05-31 11:00:00")
-                self.assertIsNone(complete["first_started_at"])
-            finally:
-                migrated.close()
-        finally:
-            for suffix in ("", "-shm", "-wal"):
-                path = tmp.name + suffix
-                if os.path.exists(path):
-                    os.unlink(path)
-
-    def test_missing_first_started_at_is_backfilled_from_run_log(self):
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.execute(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none'
-                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review',
-                                            'pull-request-make', 'pull-request-review',
-                                            'other-make', 'other-review', 'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    reviewer_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    last_ready_at DATETIME DEFAULT NULL,
-                    done_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'commit'
-                        CHECK(kind IN ('commit', 'task', 'supertask', 'pull_request', 'other')),
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan TEXT,
-                    follow_up_task_id INTEGER REFERENCES tasks(id),
-                    allow_when_blocked INTEGER NOT NULL DEFAULT 0
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL
-                        CHECK(step IN ('commit-plan','commit-plan-review','commit-review',
-                                       'commit-review-supertask','pull-request-review','other-review')),
-                    PRIMARY KEY (task_id, step)
-                )"""
-            )
-            legacy.execute(
-                """CREATE TABLE run_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )"""
-            )
-            legacy.execute(
-                "INSERT INTO tasks (title, status, next_step, last_ready_at, done_at) "
-                "VALUES ('multi-round', 'done', 'none', "
-                "'2026-08-25 03:43:10', '2026-08-25 03:44:18')"
-            )
-            legacy.execute(
-                "INSERT INTO tasks (title, status, next_step, last_ready_at, done_at) "
-                "VALUES ('legacy-no-log', 'done', 'none', "
-                "'2026-05-31 10:00:00', '2026-05-31 10:10:00')"
-            )
-            legacy.execute(
-                "INSERT INTO tasks (title, status, next_step, ready_at, last_ready_at) "
-                "VALUES ('still-queued', 'ready', 'commit-make', "
-                "'2026-05-31 08:00:00', '2026-05-31 08:00:00')"
-            )
-            legacy.execute(
-                "INSERT INTO run_log (task_id, verb, author, message, created_at) "
-                "VALUES (1, 'commit-make', 'orchestrator', 'Starting commit-make', "
-                "'2026-08-25 03:05:57')"
-            )
-            legacy.execute(
-                "INSERT INTO run_log (task_id, verb, author, message, created_at) "
-                "VALUES (1, 'commit-make', 'orchestrator', 'Starting commit-make', "
-                "'2026-08-25 03:43:10')"
-            )
-            legacy.commit()
-            legacy.close()
-
-            migrated = db.connect(tmp.name)
-            try:
-                multi = db.get_task(migrated, 1)
-                legacy_done = db.get_task(migrated, 2)
-                queued = db.get_task(migrated, 3)
-                self.assertEqual(multi["first_started_at"], "2026-08-25 03:05:57")
-                self.assertEqual(legacy_done["first_started_at"], "2026-05-31 10:00:00")
-                self.assertIsNone(queued["first_started_at"])
-            finally:
-                migrated.close()
-        finally:
-            for suffix in ("", "-shm", "-wal"):
-                path = tmp.name + suffix
-                if os.path.exists(path):
-                    os.unlink(path)
 
     def test_current_schema_blocked_before_running_does_not_inherit_queue_time_on_reconnect(self):
         """Ready → blocked (never running) must not treat last_ready_at as a start.
@@ -804,110 +391,6 @@ class TestDB(unittest.TestCase):
         recovered = db.get_task(self.conn, tid)
         self.assertEqual(recovered["first_started_at"], "2026-08-25 03:05:57")
 
-    def test_skip_commit_plan_column_migrates_to_task_skips(self):
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.executescript(
-                """CREATE TABLE tasks (
-                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title                   TEXT NOT NULL,
-                    description             TEXT,
-                    status                  TEXT NOT NULL DEFAULT 'none'
-                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked',
-                                         'pending_subtasks')),
-                    next_step               TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review',
-                                            'none')),
-                    branch                  TEXT,
-                    commit_hash             TEXT,
-                    stash_ref               TEXT,
-                    coder_agent             TEXT,
-                    review_round            INTEGER DEFAULT 0,
-                    last_review_decision    TEXT DEFAULT 'none'
-                        CHECK(last_review_decision IN ('none', 'approve', 'reject')),
-                    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at                DATETIME DEFAULT NULL,
-                    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind                    TEXT NOT NULL DEFAULT 'task'
-                        CHECK(kind IN ('task', 'supertask')),
-                    parent_task_id          INTEGER REFERENCES tasks(id),
-                    sequence_index          INTEGER,
-                    skip_commit_plan        INTEGER NOT NULL DEFAULT 0
-                        CHECK(skip_commit_plan IN (0, 1)),
-                    commit_plan             TEXT
-                );
-                CREATE TABLE run_log (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id     INTEGER REFERENCES tasks(id),
-                    verb        TEXT,
-                    author      TEXT,
-                    message     TEXT,
-                    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE comments (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id        INTEGER REFERENCES tasks(id),
-                    review_round   INTEGER,
-                    verb           TEXT,
-                    author         TEXT,
-                    message        TEXT,
-                    kind           TEXT DEFAULT 'comment'
-                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
-                                       'validation', 'plan-approval', 'plan-rejection')),
-                    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE orchestrator_runtime (
-                    singleton            INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    status               TEXT NOT NULL
-                        CHECK(status IN ('idle', 'running', 'starting', 'stopping', 'stopped',
-                                         'hard-break', 'error')),
-                    pid                  INTEGER,
-                    started_at           DATETIME,
-                    last_heartbeat_at    DATETIME,
-                    current_task_id      INTEGER REFERENCES tasks(id),
-                    current_step         TEXT
-                        CHECK(current_step IN ('commit-make', 'commit-review',
-                                               'commit-make-supertask', 'commit-review-supertask',
-                                               'commit-plan', 'commit-plan-review', 'none')),
-                    current_branch       TEXT,
-                    review_round         INTEGER,
-                    active_agents        INTEGER NOT NULL DEFAULT 0,
-                    status_message       TEXT,
-                    updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                INSERT INTO tasks (title, status, next_step, skip_commit_plan)
-                    VALUES ('Skip planning', 'done', 'commit-make', 1);
-                INSERT INTO tasks (title, status, next_step, skip_commit_plan)
-                    VALUES ('Keep planning', 'done', 'commit-plan', 0);
-                """
-            )
-            legacy.commit()
-            legacy.close()
-
-            conn = db.connect(tmp.name)
-            try:
-                task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-                self.assertNotIn("skip_commit_plan", task_cols)
-                self.assertIn("reviewer_agent", task_cols)
-                self.assertIn("follow_up_task_id", task_cols)
-                self.assertIn("allow_when_blocked", task_cols)
-
-                skipped = db.get_task(conn, 1)
-                planned = db.get_task(conn, 2)
-                self.assertEqual(skipped["skips"], ["commit-plan"])
-                self.assertEqual(planned["skips"], [])
-                self.assertEqual(skipped["title"], "Skip planning")
-            finally:
-                conn.close()
-        finally:
-            for suffix in ("", "-shm", "-wal"):
-                path = tmp.name + suffix
-                if os.path.exists(path):
-                    os.unlink(path)
 
 
     def test_legacy_db_with_koid_raises_error(self):
@@ -939,8 +422,7 @@ class TestDB(unittest.TestCase):
 
             with self.assertRaises(RuntimeError) as ctx:
                 db.connect(tmp.name)
-            self.assertIn("legacy schema", str(ctx.exception))
-            self.assertIn("koid", str(ctx.exception))
+            self.assertIn("Migration required", str(ctx.exception))
         finally:
             os.unlink(tmp.name)
 
@@ -970,233 +452,13 @@ class TestDB(unittest.TestCase):
 
             with self.assertRaises(RuntimeError) as ctx:
                 db.connect(tmp.name)
-            self.assertIn("legacy schema", str(ctx.exception))
-        finally:
-            os.unlink(tmp.name)
-
-    def test_outdated_next_step_constraint_auto_migrates(self):
-        """connect() auto-migrates next_step CHECK constraints."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.execute(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none',
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask',
-                                            'commit-review-supertask', 'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'task',
-                    parent_task_id INTEGER,
-                    sequence_index INTEGER,
-                    commit_plan TEXT
-                )"""
-            )
-            # Must also have task_skips table or it fails on that first
-            legacy.execute(
-                """CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL CHECK(step IN ('commit-plan','commit-plan-review',
-                                                      'commit-review','commit-review-supertask')),
-                    PRIMARY KEY (task_id, step)
-                )"""
-            )
-            legacy.execute(
-                "INSERT INTO tasks (title, kind, next_step, commit_plan) VALUES (?, ?, ?, ?)",
-                ("Legacy task row", "task", "commit-make", None),
-            )
-            legacy.commit()
-            legacy.close()
-
-            conn = db.connect(tmp.name)
-            try:
-                schema = conn.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
-                ).fetchone()[0]
-                self.assertIn("commit-plan", schema)
-                self.assertIn("pull-request-make", schema)
-                self.assertIn("pull_request", schema)
-                self.assertIn("other-make", schema)
-                self.assertIn("other", schema)
-                task = db.get_task(conn, 1)
-                self.assertEqual(task["kind"], "task")
-                self.assertEqual(db.task_type(task), "commit")
-            finally:
-                conn.close()
-        finally:
-            for suffix in ("", "-shm", "-wal"):
-                path = tmp.name + suffix
-                if os.path.exists(path):
-                    os.unlink(path)
-
-    def test_stale_comments_schema_missing_plan_kinds_auto_migrates(self):
-        """connect() auto-migrates the comments table when kind CHECK is outdated."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            # Intermediate schema: has 'validation' but not 'plan-approval'/'plan-rejection'
-            # Also must include task_skips table or it will fail on that first.
-            legacy.executescript(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none'
-                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review', 'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at       DATETIME DEFAULT NULL,
-                    updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'task',
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan    TEXT
-                );
-                CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL CHECK(step IN ('commit-plan','commit-plan-review',
-                                                      'commit-review','commit-review-supertask')),
-                    PRIMARY KEY (task_id, step)
-                );
-                CREATE TABLE comments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    review_round INTEGER,
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    kind TEXT DEFAULT 'comment'
-                        CHECK(kind IN ('comment', 'approval', 'rejection',
-                                       'commit-message', 'validation')),
-                    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
-                );"""
-            )
-            legacy.commit()
-            legacy.close()
-
-            # connect() should auto-migrate rather than raise
-            conn = db.connect(tmp.name)
-            schema = conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='comments'"
-            ).fetchone()[0]
-            conn.close()
-            self.assertIn("plan-approval", schema)
-            self.assertIn("plan-rejection", schema)
-            self.assertIn("done-without-commit", schema)
+            self.assertIn("Migration required", str(ctx.exception))
         finally:
             os.unlink(tmp.name)
 
 
-    def test_run_log_task_id_not_null_auto_migrates(self):
-        """connect() auto-migrates run_log when task_id has NOT NULL so NULL inserts work."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy = sqlite3.connect(tmp.name)
-            legacy.executescript(
-                """CREATE TABLE tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'none'
-                        CHECK(status IN ('none', 'ready', 'running', 'done', 'blocked', 'pending_subtasks')),
-                    next_step TEXT NOT NULL DEFAULT 'commit-make'
-                        CHECK(next_step IN ('commit-make', 'commit-review',
-                                            'commit-make-supertask', 'commit-review-supertask',
-                                            'commit-plan', 'commit-plan-review', 'none')),
-                    branch TEXT,
-                    commit_hash TEXT,
-                    stash_ref TEXT,
-                    coder_agent TEXT,
-                    review_round INTEGER DEFAULT 0,
-                    last_review_decision TEXT DEFAULT 'none',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ready_at DATETIME DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    kind TEXT NOT NULL DEFAULT 'task',
-                    parent_task_id INTEGER REFERENCES tasks(id),
-                    sequence_index INTEGER,
-                    commit_plan TEXT,
-                    follow_up_task_id INTEGER REFERENCES tasks(id)
-                );
-                CREATE TABLE task_skips (
-                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    step TEXT NOT NULL CHECK(step IN ('commit-plan','commit-plan-review',
-                                                      'commit-review','commit-review-supertask')),
-                    PRIMARY KEY (task_id, step)
-                );
-                CREATE TABLE run_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER NOT NULL REFERENCES tasks(id),
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE comments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES tasks(id),
-                    review_round INTEGER,
-                    verb TEXT,
-                    author TEXT,
-                    message TEXT,
-                    kind TEXT DEFAULT 'comment'
-                        CHECK(kind IN ('comment', 'approval', 'rejection', 'commit-message',
-                                       'validation', 'plan-approval', 'plan-rejection',
-                                       'done-without-commit', 'deferred-build-changed')),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );"""
-            )
-            legacy.execute(
-                "INSERT INTO tasks (id, title, next_step, status) "
-                "VALUES (1, 'existing task', 'commit-make', 'done')"
-            )
-            legacy.execute("INSERT INTO run_log (task_id, message) VALUES (1, 'old entry')")
-            legacy.commit()
-            legacy.close()
 
-            conn = db.connect(tmp.name)
-            # After migration, task_id should be nullable
-            col_info = {
-                row["name"]: row
-                for row in conn.execute("PRAGMA table_info(run_log)").fetchall()
-            }
-            self.assertEqual(col_info["task_id"]["notnull"], 0)
-            # Old row survived migration
-            rows = conn.execute("SELECT * FROM run_log").fetchall()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["message"], "old entry")
-            # Can now insert a NULL task_id row
-            db.add_run_log(conn, None, "global entry", author="orchestrator")
-            global_rows = db.get_global_run_log(conn)
-            self.assertEqual(len(global_rows), 1)
-            self.assertEqual(global_rows[0]["message"], "global entry")
-            conn.close()
-        finally:
-            os.unlink(tmp.name)
+
 
     def test_global_run_log_returns_only_null_task_id_entries(self):
         """get_global_run_log returns only rows where task_id IS NULL."""
@@ -1658,9 +920,14 @@ class TestRuntimeHistoryPurge(unittest.TestCase):
         planted.write_text("keep\n", encoding="utf-8")
         os.utime(planted, (time.time() - 8 * 86400, time.time() - 8 * 86400))
 
-        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
-        runtime.mkdir(parents=True, exist_ok=True)
-        (runtime / "artifacts").symlink_to(real_artifacts)
+        runtime = db.get_runtime_root(self.db_path)
+        artifacts_link = runtime / "artifacts"
+        if artifacts_link.is_symlink() or artifacts_link.exists():
+            if artifacts_link.is_dir() and not artifacts_link.is_symlink():
+                artifacts_link.rmdir()
+            else:
+                artifacts_link.unlink()
+        artifacts_link.symlink_to(real_artifacts)
 
         result = db.purge_run_log(self.conn)
 
@@ -1670,14 +937,20 @@ class TestRuntimeHistoryPurge(unittest.TestCase):
     def test_path_safety_skips_symlinked_runtime_parent(self):
         done_id = db.add_task(self.conn, "Symlink runtime")
         db.update_task(self.conn, done_id, status="done")
-        outside_runtime = Path(self.tmpdir.name) / "elsewhere" / ".kanban-orchestra"
+        outside_runtime = Path(self.tmpdir.name) / "elsewhere" / "queue-runtime"
         task_dir = outside_runtime / "artifacts" / f"task-{done_id}"
         task_dir.mkdir(parents=True)
         planted = task_dir / "planted.log"
         planted.write_text("keep\n", encoding="utf-8")
         os.utime(planted, (time.time() - 8 * 86400, time.time() - 8 * 86400))
 
-        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+        runtime = db.get_runtime_root(self.db_path)
+        if runtime.exists() or runtime.is_symlink():
+            if runtime.is_symlink() or runtime.is_file():
+                runtime.unlink()
+            else:
+                import shutil
+                shutil.rmtree(runtime)
         runtime.symlink_to(outside_runtime)
 
         result = db.purge_run_log(self.conn)
@@ -1690,7 +963,7 @@ class TestRuntimeHistoryPurge(unittest.TestCase):
         done_id = db.add_task(self.conn, "Runtime swap")
         db.update_task(self.conn, done_id, status="done")
         self._write_transcript(done_id, "old.log", "inside\n", 8 * 86400)
-        runtime = Path(self.db_path).resolve().parent / ".kanban-orchestra"
+        runtime = db.get_runtime_root(self.db_path)
 
         outside_runtime = Path(self.tmpdir.name) / "outside-runtime"
         outside_task = outside_runtime / "artifacts" / f"task-{done_id}"
@@ -1704,7 +977,7 @@ class TestRuntimeHistoryPurge(unittest.TestCase):
         swapped = {"done": False}
 
         def swap_then_open(path, *, dir_fd=None):
-            if path == ".kanban-orchestra" and not swapped["done"]:
+            if path == runtime.name and not swapped["done"]:
                 swapped["done"] = True
                 os.rename(runtime, moved_runtime)
                 os.symlink(outside_runtime, runtime)
@@ -3578,6 +2851,7 @@ class TestTaskCLI(unittest.TestCase):
             [sys.executable, self.task_py] + list(args),
             input=input_text,
             capture_output=True, text=True, env=env or self.env,
+            cwd=self.tmpdir.name,
         )
         return result
 
@@ -4083,7 +3357,7 @@ class TestTaskCLI(unittest.TestCase):
         try:
             restore_result = self._run("restore", env=restored_env)
             self.assertNotEqual(restore_result.returncode, 0)
-            self.assertIn("fresh database", restore_result.stderr)
+            self.assertIn("Migration required", restore_result.stderr)
         finally:
             for suffix in ("", "-shm", "-wal"):
                 path = Path(restored_db_path + suffix)
@@ -4651,9 +3925,14 @@ class TestAgentTranscriptCapture(unittest.TestCase):
             verb="commit-make",
             agent_name="codex",
             pid=4242,
-            db_path=self.db_path,
+            db_path=db.get_connection_db_path(self.conn) or self.db_path,
+            queue_id=self.conn.orchestra_queue_id,
         )
-        mock_clear.assert_called_once_with("rec-1", db_path=self.db_path)
+        mock_clear.assert_called_once_with(
+            "rec-1",
+            db_path=db.get_connection_db_path(self.conn) or self.db_path,
+            queue_id=self.conn.orchestra_queue_id,
+        )
 
     def test_run_agent_logs_failure_summary_and_saves_full_transcript(self):
         tid = db.add_task(self.conn, "Transcript failure", coder_agent="codex")
@@ -4717,6 +3996,7 @@ class TestCLIReviewerIdentityAndRoundEnforcement(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=self.env,
+            cwd=str(Path(self.db_path).parent),
         )
         return result
 
@@ -4815,7 +4095,8 @@ class TestWorkspaceResolution(unittest.TestCase):
             workspace = db.get_workspace(str(nested))
 
             self.assertEqual(workspace["repo_root"], Path(tmpdir).resolve())
-            self.assertEqual(workspace["db_path"], Path(tmpdir).resolve() / "kanban-orchestra.db")
+            self.assertEqual(workspace["db_path"], Path(db.get_db_path()))
+            self.assertNotEqual(workspace["db_path"].parent, Path(tmpdir).resolve())
 
     def test_get_instance_identity_uses_launch_repo_root(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4824,22 +4105,27 @@ class TestWorkspaceResolution(unittest.TestCase):
             nested.mkdir(parents=True)
             custom_db = Path(tmpdir) / "state" / "custom.sqlite3"
 
-            identity = db.get_instance_identity(str(custom_db), cwd=str(nested))
+            conn = db.connect(str(custom_db), repo_root=tmpdir)
+            queue_id = conn.orchestra_queue_id
+            conn.close()
+            identity = db.get_instance_identity(str(custom_db), cwd=str(nested), queue_id=queue_id)
 
             self.assertEqual(identity["repo_root"], str(Path(tmpdir).resolve()))
             self.assertEqual(identity["repo_label"], Path(tmpdir).name)
             self.assertEqual(identity["db_path"], str(custom_db.resolve()))
-            self.assertEqual(identity["runtime_root"], str((custom_db.parent / ".kanban-orchestra").resolve()))
-            self.assertEqual(identity["lock_path"], str((custom_db.parent / "kanban-orchestra.lock").resolve()))
+            runtime = custom_db.parent / "queues" / queue_id
+            self.assertEqual(identity["runtime_root"], str(runtime.resolve()))
+            self.assertEqual(identity["lock_path"], str((runtime / "kanban-orchestra.lock").resolve()))
 
-    def test_get_instance_identity_falls_back_to_db_parent_outside_git(self):
+    def test_get_instance_identity_uses_isolated_db_parent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "kanban.db"
 
             identity = db.get_instance_identity(str(db_path), cwd=tmpdir)
 
             self.assertEqual(identity["repo_root"], str(Path(tmpdir).resolve()))
-            self.assertEqual(identity["repo_label"], Path(tmpdir).name)
+            self.assertNotEqual(Path(identity["repo_root"]), db.get_state_root())
+            self.assertEqual(identity["db_path"], str(db_path.resolve()))
 
     def test_get_orchestra_dir_uses_env_var(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4895,23 +4181,25 @@ class TestKanbanCLI(unittest.TestCase):
             cwd=cwd or self.repo_root,
         )
 
-    def test_kanban_creates_db_in_repo_root(self):
-        db_path = self.repo_root / "kanban-orchestra.db"
-        self.assertFalse(db_path.exists())
+    def test_kanban_creates_queue_in_central_db(self):
+        legacy_db = self.repo_root / "kanban-orchestra.db"
+        self.assertFalse(legacy_db.exists())
 
         result = self._run_kanban()
 
-        self.assertEqual(result.returncode, 0)
-        self.assertTrue(db_path.exists())
-        self.assertIn("Status: created kanban database", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(legacy_db.exists())
+        self.assertTrue(Path(self.env["KANBAN_DB"]).is_file())
+        self.assertIn("Status: created kanban queue", result.stdout)
+        self.assertIn("Queue:", result.stdout)
 
-    def test_kanban_reuses_existing_db(self):
+    def test_kanban_reuses_existing_queue(self):
         first = self._run_kanban()
         second = self._run_kanban()
 
-        self.assertEqual(first.returncode, 0)
-        self.assertEqual(second.returncode, 0)
-        self.assertIn("Status: using existing kanban database", second.stdout)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("Status: using existing kanban queue", second.stdout)
 
     def test_kanban_fails_without_orchestra_dir(self):
         self.env.pop("ORCHESTRA_DIR")
@@ -4921,15 +4209,16 @@ class TestKanbanCLI(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ORCHESTRA_DIR is not set", result.stderr)
 
-    def test_task_cli_defaults_to_repo_root_db(self):
+    def test_task_cli_does_not_create_a_worktree_database(self):
         nested = self.repo_root / "subdir"
         nested.mkdir()
 
         result = self._run_task("add", "Repo root task", cwd=nested)
 
-        self.assertEqual(result.returncode, 0)
-        self.assertTrue((self.repo_root / "kanban-orchestra.db").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.repo_root / "kanban-orchestra.db").exists())
         self.assertFalse((nested / "kanban-orchestra.db").exists())
+        self.assertTrue(Path(self.env["KANBAN_DB"]).is_file())
 
     def test_kanban_writes_all_db_artifacts_to_gitignore(self):
         result = self._run_kanban()
@@ -4974,11 +4263,16 @@ class TestInitTestRepo(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 cwd=repo_tmp,
-                env={**os.environ, "ORCHESTRA_DIR": str(orchestra_dir)},
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key != "KANBAN_DB"
+                } | {"ORCHESTRA_DIR": str(orchestra_dir)},
                 check=True,
             )
 
             self.assertIn("Test repo ready.", result.stdout)
+            self.assertTrue((Path(repo_tmp) / "kanban-orchestra.db").is_file())
             conn = db.connect(str(Path(repo_tmp) / "kanban-orchestra.db"))
             try:
                 rows = conn.execute(
@@ -5628,7 +4922,7 @@ class TestOrchestratorRuntime(unittest.TestCase):
         )
         rt = db.get_runtime(self.conn)
         self.assertIsNotNone(rt)
-        self.assertEqual(rt["singleton"], 1)
+        self.assertTrue(rt["queue_id"])
         self.assertEqual(rt["status"], "idle")
         self.assertEqual(rt["pid"], 12345)
         self.assertEqual(rt["active_agents"], 0)
@@ -5703,45 +4997,6 @@ class TestOrchestratorRuntime(unittest.TestCase):
         db.update_runtime(self.conn, status="waiting-dirty", status_message="waiting")
         self.assertEqual(db.get_runtime(self.conn)["status"], "waiting-dirty")
 
-    def test_stale_runtime_status_constraint_is_migrated_preserving_row(self):
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        try:
-            legacy_sql = db.SCHEMA_SQL.replace(
-                "CHECK(status IN ('idle', 'waiting-dirty', 'running', 'starting', 'stopping', 'stopped', 'hard-break', 'error'))",
-                "CHECK(status IN ('idle', 'running', 'stopping', 'stopped', 'error'))",
-            )
-            legacy = sqlite3.connect(tmp.name)
-            try:
-                legacy.executescript(legacy_sql)
-                legacy.execute(
-                    """INSERT INTO orchestrator_runtime (
-                        singleton, status, pid, started_at, last_heartbeat_at,
-                        current_step, active_agents, status_message
-                    ) VALUES (1, 'stopped', 123, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
-                              'none', 0, 'preserved')"""
-                )
-                legacy.commit()
-            finally:
-                legacy.close()
-
-            migrated = db.connect(tmp.name)
-            try:
-                rt = db.get_runtime(migrated)
-                self.assertEqual(rt["status"], "stopped")
-                self.assertEqual(rt["pid"], 123)
-                self.assertEqual(rt["status_message"], "preserved")
-                db.update_runtime(migrated, status="starting")
-                self.assertEqual(db.get_runtime(migrated)["status"], "starting")
-                db.update_runtime(migrated, status="waiting-dirty")
-                self.assertEqual(db.get_runtime(migrated)["status"], "waiting-dirty")
-            finally:
-                migrated.close()
-        finally:
-            for suffix in ("", "-shm", "-wal"):
-                path = tmp.name + suffix
-                if os.path.exists(path):
-                    os.unlink(path)
 
     def test_runtime_current_step_check_constraint(self):
         with self.assertRaises(Exception):
@@ -6061,7 +5316,10 @@ class TestMainLoop(unittest.TestCase):
                 orchestrator.main_loop(self.conn)
 
         recover.assert_called_once_with(self.conn)
-        start_unblock.assert_called_once_with(self.tmp.name)
+        start_unblock.assert_called_once()
+        unblock_path = start_unblock.call_args.args[0]
+        self.assertEqual(Path(unblock_path).resolve(), Path(self.tmp.name).resolve())
+        self.assertEqual(start_unblock.call_args.kwargs["queue_id"], self.conn.orchestra_queue_id)
         self.assertEqual(db.get_task(self.conn, tid)["status"], "ready")
 
 
@@ -6218,7 +5476,7 @@ class TestSmartUnblockThread(unittest.TestCase):
     def test_start_delegates_to_the_watcher_with_task_defaults(self):
         calls = []
 
-        def fake_run_watcher(db_path, *, agent=None, interval=None, stop_event=None):
+        def fake_run_watcher(db_path, *, agent=None, interval=None, stop_event=None, queue_id=None):
             calls.append((db_path, agent, interval, stop_event))
 
         with patch.object(smart_unblock, "run_watcher", side_effect=fake_run_watcher):
@@ -6235,7 +5493,7 @@ class TestSmartUnblockThread(unittest.TestCase):
     def test_stop_sets_stop_event_and_terminates_active_consultation(self):
         released = threading.Event()
 
-        def blocking_run_watcher(db_path, *, agent=None, interval=None, stop_event=None):
+        def blocking_run_watcher(db_path, *, agent=None, interval=None, stop_event=None, queue_id=None):
             stop_event.wait()
             released.set()
 
@@ -6280,7 +5538,7 @@ class TestSmartUnblockThread(unittest.TestCase):
         stop_calls = []
 
         with (
-            patch.object(orchestrator, "start_smart_unblock", side_effect=lambda p: start_calls.append(p)),
+            patch.object(orchestrator, "start_smart_unblock", side_effect=lambda *args, **kwargs: start_calls.append(args[0] if args else kwargs.get("db_path"))),
             patch.object(orchestrator, "stop_smart_unblock", side_effect=lambda: stop_calls.append(True)),
             patch.object(orchestrator, "start_heartbeat"),
             patch.object(orchestrator, "stop_heartbeat"),
@@ -6445,6 +5703,7 @@ class TestSmartUnblockNativeRecovery(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(task_cli), "continue", str(task_id)],
             env=env,
+            cwd=self.repo_root,
             capture_output=True,
             text=True,
         )
@@ -6470,6 +5729,7 @@ class TestSmartUnblockNativeRecovery(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, str(task_cli), "continue", str(task_id)],
                 env=env,
+                cwd=self.repo_root,
                 capture_output=True,
                 text=True,
             )
@@ -6537,6 +5797,7 @@ class TestSmartUnblockNativeRecovery(unittest.TestCase):
                 "stale-gate-renamed",
             ],
             env=env,
+            cwd=self.repo_root,
             capture_output=True,
             text=True,
         )
@@ -6549,6 +5810,7 @@ class TestSmartUnblockNativeRecovery(unittest.TestCase):
         continue_result = subprocess.run(
             [sys.executable, str(task_cli), "continue", str(blocked_id)],
             env=env,
+            cwd=self.repo_root,
             capture_output=True,
             text=True,
         )
@@ -6885,7 +6147,8 @@ class TestSingletonLock(unittest.TestCase):
         self.assertIn("pid=", contents)
         self.assertIn("started_at=", contents)
         self.assertIn("role=orchestrator", contents)
-        self.assertIn(f"repo_root={Path(self.tmpdir.name).resolve()}", contents)
+        self.assertIn(f"lock_path={self.lock_path.resolve()}", contents)
+        self.assertNotIn(f"repo_root={db.get_state_root()}", contents)
         self.assertIn(f"lock_path={self.lock_path.resolve()}", contents)
 
     def test_second_process_cannot_acquire_while_locked(self):
@@ -6914,7 +6177,7 @@ class TestSingletonLock(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         dirty_check.assert_not_called()
         request_start.assert_called_once()
-        mock_connect.assert_not_called()
+        mock_connect.assert_called()
         mock_log.assert_any_call("busy")
         mock_log.assert_any_call("Requested dashboard start via /tmp/dashboard-start-request")
 
@@ -6931,11 +6194,13 @@ class TestSingletonLock(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         dirty_check.assert_not_called()
         request_start.assert_not_called()
-        mock_connect.assert_not_called()
+        mock_connect.assert_called()
         mock_log.assert_any_call("busy")
 
     def test_request_dashboard_start_creates_presence_file(self):
         db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        conn = db.connect(db_path)
+        conn.close()
 
         request_path = orchestrator.request_dashboard_start(db_path)
 
@@ -6945,6 +6210,8 @@ class TestSingletonLock(unittest.TestCase):
 
     def test_read_dashboard_start_request_returns_preferred_port(self):
         db_path = str(Path(self.tmpdir.name) / "kanban-orchestra.db")
+        conn = db.connect(db_path)
+        conn.close()
         request_path = orchestrator.request_dashboard_start(db_path)
         request_path.write_text("start\nport=8433\n", encoding="utf-8")
 
@@ -6977,6 +6244,7 @@ class TestSingletonLock(unittest.TestCase):
             fake_process.poll.return_value = None
 
             with patch.object(orchestrator.subprocess, "Popen", return_value=fake_process) as mock_popen, \
+                 patch.object(db, "get_repo_root", side_effect=RuntimeError("no worktree")), \
                  patch.object(orchestrator, "log"):
                 process = orchestrator.start_dashboard(db_path, preferred_port=8765)
 
@@ -6987,14 +6255,11 @@ class TestSingletonLock(unittest.TestCase):
             self.assertTrue(popen_args[1].endswith("dashboard.py"))
             self.assertEqual(popen_kwargs["cwd"], str(Path(tmpdir).resolve()))
             self.assertEqual(popen_kwargs["env"]["KO_DASH_PORT"], "8765")
-            self.assertEqual(
-                popen_kwargs["env"]["KO_DASHBOARD_METADATA_PATH"],
-                str(Path(tmpdir).resolve() / ".kanban-orchestra" / "dashboard.json"),
-            )
-            self.assertEqual(
-                orchestrator._dashboard_metadata_path_for_process,
-                Path(tmpdir).resolve() / ".kanban-orchestra" / "dashboard.json",
-            )
+            metadata_path = Path(popen_kwargs["env"]["KO_DASHBOARD_METADATA_PATH"])
+            self.assertEqual(metadata_path.name, "dashboard.json")
+            self.assertIn("queues", metadata_path.parts)
+            self.assertEqual(orchestrator._dashboard_metadata_path_for_process, metadata_path)
+            self.assertNotEqual(metadata_path.parent, db.get_state_root())
             orchestrator._dashboard_process = None
             orchestrator._dashboard_metadata_path_for_process = None
 
@@ -7091,8 +6356,8 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "log") as mock_log:
             orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
-        clear_request.assert_called_once_with("/tmp/kanban.db")
-        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=None)
+        clear_request.assert_called_once_with("/tmp/kanban.db", queue_id=None)
+        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=None, queue_id=None)
         mock_update.assert_called_once()
         self.assertIn("explicit request", mock_update.call_args.kwargs["status_message"])
         mock_log.assert_called_once_with("Dashboard started with PID 4321 by explicit request")
@@ -7110,7 +6375,7 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "log"):
             orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
-        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=8433)
+        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=8433, queue_id=None)
 
     def test_handle_dashboard_start_request_does_not_drop_port_zero(self):
         conn = MagicMock()
@@ -7125,7 +6390,7 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "log"):
             orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
-        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=0)
+        start_dashboard.assert_called_once_with("/tmp/kanban.db", preferred_port=0, queue_id=None)
 
     def test_handle_dashboard_start_request_noops_when_dashboard_is_running(self):
         conn = MagicMock()
@@ -7140,7 +6405,7 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "log") as mock_log:
             orchestrator.handle_dashboard_start_request(conn, "/tmp/kanban.db")
 
-        clear_request.assert_called_once_with("/tmp/kanban.db")
+        clear_request.assert_called_once_with("/tmp/kanban.db", queue_id=None)
         start_dashboard.assert_not_called()
         mock_update.assert_not_called()
         mock_log.assert_called_once_with("Dashboard start requested; dashboard is already running")
@@ -7158,7 +6423,10 @@ class TestOrchestratorLockMetadata(unittest.TestCase):
 
     def test_read_singleton_lock_metadata_parses_identity_file(self):
         lock_path = Path(self.tmpdir.name) / "kanban-orchestra.lock"
-        identity = db.get_instance_identity(self.db_path, lock_path=lock_path)
+        conn = db.connect(self.db_path)
+        queue_id = conn.orchestra_queue_id
+        conn.close()
+        identity = db.get_instance_identity(self.db_path, lock_path=lock_path, queue_id=queue_id)
         lock_path.write_text(
             "".join(f"{key}={value}\n" for key, value in identity.items()),
             encoding="utf-8",
@@ -7169,7 +6437,10 @@ class TestOrchestratorLockMetadata(unittest.TestCase):
         self.assertEqual(metadata["repo_root"], str(Path(self.tmpdir.name).resolve()))
         self.assertEqual(metadata["repo_label"], Path(self.tmpdir.name).name)
         self.assertEqual(metadata["db_path"], str(Path(self.db_path).resolve()))
-        self.assertEqual(metadata["runtime_root"], str((Path(self.tmpdir.name) / ".kanban-orchestra").resolve()))
+        self.assertEqual(
+            metadata["runtime_root"],
+            str((Path(self.db_path).resolve().parent / "queues" / queue_id).resolve()),
+        )
         self.assertEqual(metadata["lock_path"], str(lock_path.resolve()))
 
     def test_read_singleton_lock_metadata_missing_file_returns_empty_dict(self):
@@ -7191,6 +6462,7 @@ class TestActiveAgentProcesses(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def test_register_and_clear_active_agent_metadata(self):
+        db.connect(self.db_path).close()
         with patch.object(active_agent_processes, "is_pid_alive", return_value=True), \
              patch.object(active_agent_processes.os, "getpgid", return_value=4242):
             record_id = active_agent_processes.register_active_agent(
@@ -7212,6 +6484,24 @@ class TestActiveAgentProcesses(unittest.TestCase):
         active_agent_processes.clear_active_agent(record_id, db_path=self.db_path)
 
         self.assertFalse(metadata_path.exists())
+
+
+def _fleet_queue_runtime(root):
+    """Register a temporary worktree queue and return its runtime directory."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    row = db.lookup_queue_by_path(root)
+    if row is None:
+        conn = db.connect(repo_root=root)
+        try:
+            queue_id = conn.orchestra_queue_id
+        finally:
+            conn.close()
+    else:
+        queue_id = row["id"]
+    runtime = db.get_runtime_root(queue_id=queue_id)
+    runtime.mkdir(parents=True, exist_ok=True)
+    return runtime
 
 
 class TestFleetConfig(unittest.TestCase):
@@ -7285,9 +6575,8 @@ class TestFleetConfig(unittest.TestCase):
     def test_process_state_reports_dashboard_and_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
-            lock_path = root / "kanban-orchestra.lock"
+            runtime = _fleet_queue_runtime(root)
+            lock_path = _fleet_queue_runtime(root) / "kanban-orchestra.lock"
             lock_path.write_text(f"role=orchestrator\npid={os.getpid()}\n", encoding="utf-8")
             (runtime / "dashboard.json").write_text(
                 json.dumps({"role": "dashboard", "pid": os.getpid()}),
@@ -7307,7 +6596,7 @@ class TestFleetConfig(unittest.TestCase):
     def test_process_state_reports_running_without_dashboard_for_external_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            lock_path = root / "kanban-orchestra.lock"
+            lock_path = _fleet_queue_runtime(root) / "kanban-orchestra.lock"
             lock_path.write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
@@ -7325,8 +6614,7 @@ class TestFleetConfig(unittest.TestCase):
     def test_open_dashboard_refuses_dead_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = _fleet_queue_runtime(root)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -7348,8 +6636,7 @@ class TestFleetConfig(unittest.TestCase):
     def test_open_dashboard_requires_accepting_endpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = _fleet_queue_runtime(root)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -7371,8 +6658,7 @@ class TestFleetConfig(unittest.TestCase):
     def test_open_dashboard_prints_live_url(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = _fleet_queue_runtime(root)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -7404,8 +6690,7 @@ class TestFleetConfig(unittest.TestCase):
     def test_open_dashboard_prints_preferred_tailscale_url(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = _fleet_queue_runtime(root)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -7441,8 +6726,7 @@ class TestFleetConfig(unittest.TestCase):
     def test_open_dashboard_local_flag_prints_localhost_url(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = _fleet_queue_runtime(root)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -7582,7 +6866,7 @@ class TestSupertaskDB(unittest.TestCase):
 
             with self.assertRaises(RuntimeError) as ctx:
                 db.connect(tmp.name)
-            self.assertIn("legacy schema", str(ctx.exception))
+            self.assertIn("Migration required", str(ctx.exception))
         finally:
             os.unlink(tmp.name)
 
@@ -8132,6 +7416,7 @@ class TestSupertaskCLI(unittest.TestCase):
         return subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=self.env,
+            cwd=str(Path(self.db_path).parent),
         )
 
     def _add_supertask(self, title="My supertask", branch="feat"):
@@ -8390,6 +7675,7 @@ class TestContinueBlockedTask(unittest.TestCase):
         return subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=self.env,
+            cwd=self.tmpdir.name,
         )
 
     def _block_at_review_cap(self, *, stash_ref="stash@{0}", review_round=None):
@@ -8943,7 +8229,7 @@ class TestTaskPlanningDB(unittest.TestCase):
 
             with self.assertRaises(RuntimeError) as ctx:
                 db.connect(tmp.name)
-            self.assertIn("missing the 'task_skips' table", str(ctx.exception))
+            self.assertIn("Migration required", str(ctx.exception))
         finally:
             os.unlink(tmp.name)
 
@@ -8972,6 +8258,7 @@ class TestTaskPlanningCLI(unittest.TestCase):
         return subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=self.env,
+            cwd=str(Path(self.db_path).parent),
         )
 
     def test_add_defaults_to_commit_make(self):
@@ -9951,6 +9238,7 @@ class TestFollowUpCLI(unittest.TestCase):
         return subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=self.env,
+            cwd=str(Path(self.db_path).parent),
         )
 
     def _add_task(self, title, branch="feat", coder_agent=None, reviewer_agent=None):
@@ -10036,6 +9324,11 @@ class TestFollowUpCLI(unittest.TestCase):
         first = self._run("follow-up", str(child_id), "--description", "First follow-up")
         self.assertEqual(first.returncode, 0, first.stderr)
         first_id = json.loads(first.stdout)["id"]
+        conn = db.connect(self.db_path)
+        try:
+            db.update_task(conn, child_id, status="ready")
+        finally:
+            conn.close()
         self._set_running(first_id)
         second = self._run("follow-up", str(first_id), "--description", "Nested follow-up")
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -10194,6 +9487,7 @@ class TestFollowUpOrchestrator(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                cwd=str(Path(self.tmp.name).parent),
                 env={
                     **os.environ,
                     "KANBAN_DB": self.tmp.name,
@@ -10361,6 +9655,7 @@ class TestFollowUpOrchestrator(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                cwd=str(Path(self.tmp.name).parent),
                 env={
                     **os.environ,
                     "KANBAN_DB": self.tmp.name,
@@ -10461,35 +9756,21 @@ class TestFollowUpOrchestrator(unittest.TestCase):
         self.assertEqual(updated["next_step"], "commit-review")
         self.assertIsNone(updated["follow_up_task_id"])
 
-    def test_commit_make_path_a_missing_follow_up_task_recovers(self):
-        """If follow_up_task_id points to a non-existent task, current still advances to commit-review."""
+    def test_dangling_follow_up_reference_is_rejected(self):
+        """A follow-up id must name a task on the same queue."""
         tid = db.add_task(self.conn, "Task with ghost follow-up", coder_agent="claude", branch="feat",
                           skips=["commit-plan"])
         db.update_task(self.conn, tid, status="running", next_step="commit-make")
-        # Use a raw connection (no FK enforcement) to simulate a ghost follow_up_task_id
         raw_conn = sqlite3.connect(self.tmp.name)
         try:
-            raw_conn.execute("UPDATE tasks SET follow_up_task_id = 9999 WHERE id = ?", (tid,))
-            raw_conn.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                raw_conn.execute(
+                    "UPDATE tasks SET follow_up_task_id = 9999 WHERE id = ?",
+                    (tid,),
+                )
         finally:
             raw_conn.close()
-        task = db.get_task(self.conn, tid)
-
-        def fake_coder(name, prompt, task_id, conn, verb, **kw):
-            db.add_comment(conn, task_id, "Commit message\n\nTask 99",
-                           kind="commit-message", author=name)
-            return 0
-
-        with patch.object(orchestrator, "run_agent", side_effect=fake_coder), \
-             patch.object(orchestrator, "ensure_branch", return_value=True), \
-             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
-            result = orchestrator.advance(task, self.conn)
-
-        self.assertTrue(result)
-        updated = db.get_task(self.conn, tid)
-        self.assertEqual(updated["status"], "ready")
-        self.assertEqual(updated["next_step"], "commit-review")
-        self.assertEqual(updated["follow_up_task_id"], 9999)  # preserved even when follow-up not found
+        self.assertIsNone(db.get_task(self.conn, tid)["follow_up_task_id"])
 
     def test_commit_make_skip_review_with_follow_up_queues_follow_up(self):
         """When commit-review is skipped and a follow-up was declared, the follow-up must
@@ -10577,6 +9858,7 @@ class TestFollowUpReviewRejectionRework(unittest.TestCase):
         return subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=self.env,
+            cwd=str(Path(self.db_path).parent),
         )
 
     def test_follow_up_blocked_after_review_rejection_and_rework(self):
@@ -11120,6 +10402,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, task_py, "add", "CLI flag test"],
             capture_output=True, text=True, env=env,
+            cwd=str(Path(self.tmp.name).parent),
         )
         self.assertEqual(r.returncode, 0)
         tid = json.loads(r.stdout)["id"]
@@ -11129,6 +10412,7 @@ class TestDeferredBuildPolicy(unittest.TestCase):
             [sys.executable, task_py, "comment", str(tid),
              "Build generated new file", "--deferred-build-changed"],
             capture_output=True, text=True, env=env,
+            cwd=str(Path(self.tmp.name).parent),
         )
         self.assertEqual(r2.returncode, 0, r2.stderr)
 
@@ -11368,6 +10652,7 @@ class TestCommitFooter(unittest.TestCase):
         return subprocess.run(
             [sys.executable, self.task_py] + list(args),
             capture_output=True, text=True, env=env,
+            cwd=str(Path(self.tmp.name).parent),
         )
 
     def test_provider_model_display_name(self):
@@ -11746,6 +11031,7 @@ class TestFinalizationFooter(unittest.TestCase):
             [sys.executable, self.task_py, "add", "Finalization footer test", "--branch", "test"],
             capture_output=True, text=True,
             env={**os.environ, "KANBAN_DB": self.tmp.name, "KANBAN_NONINTERACTIVE": "1"},
+            cwd=str(Path(self.tmp.name).parent),
         )
         tid = json.loads(r.stdout)["id"]
         db.update_task(self.conn, tid, coder_agent=agent)

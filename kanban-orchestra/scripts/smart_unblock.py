@@ -70,22 +70,29 @@ _CONSULTATION_LOCK = threading.Lock()
 # ── Paths ──────────────────────────────────────────────────────────────
 
 
-def _runtime_root(db_path: str | None = None) -> Path:
-    root = db.get_runtime_root(db_path)
+def _runtime_root(db_path: str | None = None, queue_id: str | None = None) -> Path:
+    root = db.get_runtime_root(db_path, queue_id=queue_id)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def watcher_lock_path(db_path: str | None = None) -> Path:
-    return _runtime_root(db_path) / LOCK_FILE_NAME
+def watcher_lock_path(db_path: str | None = None, queue_id: str | None = None) -> Path:
+    return _runtime_root(db_path, queue_id=queue_id) / LOCK_FILE_NAME
 
 
-def watcher_state_path(db_path: str | None = None) -> Path:
-    return _runtime_root(db_path) / STATE_FILE_NAME
+def watcher_state_path(db_path: str | None = None, queue_id: str | None = None) -> Path:
+    return _runtime_root(db_path, queue_id=queue_id) / STATE_FILE_NAME
 
 
 def _repo_root(db_path: str | None = None) -> Path:
-    return Path(db.get_db_path(db_path)).resolve().parent
+    """Return the worktree for Git recovery, not the database directory."""
+    explicit = os.environ.get("ORCHESTRA_REPO_ROOT")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    path = Path(db.get_db_path(db_path)).resolve()
+    if path.parent != db.get_state_root():
+        return path.parent
+    return db.get_repo_root()
 
 
 # ── Lock and consultation lifecycle ────────────────────────────────────
@@ -198,12 +205,12 @@ def find_dispatchable_task(conn, db_path: str | None = None):
     return db.find_ready_task(conn, exclude_ids=exclude)
 
 
-def acquire_watcher_lock(db_path: str | None = None, *, agent: str, interval: int):
-    """Take the repo-scoped watcher lock, or raise WatcherAlreadyRunning.
+def acquire_watcher_lock(db_path: str | None = None, *, agent: str, interval: int, queue_id: str | None = None):
+    """Take the queue-scoped watcher lock, or raise WatcherAlreadyRunning.
 
     The returned handle must stay open for the lifetime of the watcher.
     """
-    lock_path = watcher_lock_path(db_path)
+    lock_path = watcher_lock_path(db_path, queue_id=queue_id)
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -411,13 +418,17 @@ def _newest_transcript_tail(paths: list[str]) -> dict:
     return {"path": newest, "tail": "\n".join(lines[-MAX_TRANSCRIPT_LINES:])}
 
 
-def _transcript_tails(task_id: int, db_path: str | None = None) -> tuple[dict, dict]:
+def _transcript_tails(
+    task_id: int,
+    db_path: str | None = None,
+    queue_id: str | None = None,
+) -> tuple[dict, dict]:
     """Return the newest task transcript and the newest watcher transcript.
 
     The watcher's own consultation transcripts are kept separate so they can be
     offered to the LLM as prior context without disturbing the fingerprint.
     """
-    task_dir = db.get_artifacts_root(db_path) / f"task-{task_id}"
+    task_dir = db.get_artifacts_root(db_path, queue_id=queue_id) / f"task-{task_id}"
     candidates = [p for p in glob.glob(str(task_dir / "*.log")) if os.path.isfile(p)]
     task_logs = [p for p in candidates if not _is_watcher_transcript(p)]
     watcher_logs = [p for p in candidates if _is_watcher_transcript(p)]
@@ -440,7 +451,10 @@ def collect_block_evidence(conn, task_id: int, db_path: str | None = None) -> di
     other_comments = [c for c in comments if c.get("author") != WATCHER_AUTHOR]
 
     run_log = [r for r in db.get_run_log(conn, task_id) if r.get("author") != WATCHER_AUTHOR]
-    transcript, watcher_transcript = _transcript_tails(task_id, db_path)
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    if not isinstance(queue_id, str):
+        queue_id = None
+    transcript, watcher_transcript = _transcript_tails(task_id, db_path, queue_id=queue_id)
 
     return {
         "task": {k: v for k, v in task.items() if k != "updated_at"},
@@ -559,6 +573,7 @@ def invoke_unblock_agent(
     *,
     timeout: int = AGENT_TIMEOUT,
     stop_event: threading.Event | None = None,
+    queue_id: str | None = None,
 ) -> dict:
     """Run the configured LLM on the prompt and capture its transcript.
 
@@ -584,7 +599,9 @@ def invoke_unblock_agent(
     transcript_path = ""
     transcript_file = None
     try:
-        path = db.new_agent_transcript_path(task_id, WATCHER_VERB, agent, db_path=db_path)
+        path = db.new_agent_transcript_path(
+            task_id, WATCHER_VERB, agent, db_path=db_path, queue_id=queue_id
+        )
         transcript_file = path.open("w", encoding="utf-8")
         transcript_path = str(path)
     except (RuntimeError, OSError):
@@ -895,7 +912,14 @@ def poll_once(
         _set_lock_field("consultation_task_id", task_id)
         try:
             outcome = invoke_unblock_agent(
-                agent, prompt, task_id, db_path, stop_event=stop_event
+                agent,
+                prompt,
+                task_id,
+                db_path,
+                stop_event=stop_event,
+                queue_id=getattr(conn, "orchestra_queue_id", None)
+                if isinstance(getattr(conn, "orchestra_queue_id", None), str)
+                else None,
             )
             if outcome.get("interrupted"):
                 # The consultation never reached a decision; reconsider after restart.
@@ -1018,16 +1042,17 @@ def run_watcher(
     interval: int = POLL_INTERVAL,
     max_cycles: int | None = None,
     stop_event: threading.Event | None = None,
+    queue_id: str | None = None,
 ) -> int:
     """Hold the repo lock and poll for blocked tasks until stopped."""
     agent = agent or config.agent_registry.effective().role("unblocker")["agent"]
     stop_event = stop_event or threading.Event()
-    handle = acquire_watcher_lock(db_path, agent=agent, interval=interval)
+    handle = acquire_watcher_lock(db_path, agent=agent, interval=interval, queue_id=queue_id)
 
     cycles = 0
     try:
         while not stop_event.is_set():
-            conn = db.connect(db_path)
+            conn = db.connect(db_path, queue_id=queue_id) if queue_id else db.connect(db_path)
             try:
                 poll_once(conn, db_path, agent=agent, stop_event=stop_event)
             except Exception as exc:  # keep the watcher alive across bad cycles

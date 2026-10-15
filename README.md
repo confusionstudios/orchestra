@@ -420,12 +420,11 @@ Reports remain local under `.kanban-orchestra/agent-smoke/`.
 
 ## Operating Model
 
-Kanban state belongs to the launched work repo:
-
-- `kanban-orchestra.db` — durable SQLite task state
-- `kanban-orchestra.sql` — portable database dump
-- `.kanban-orchestra/` — runtime metadata, transcripts, and logs
-- `kanban-orchestra.lock` — repo-scoped orchestrator ownership
+Kanban state is one local database shared by the worktrees on this machine.
+On macOS it defaults to `$HOME/Library/Application Support/Orchestra/orchestra.db`.
+Each worktree has its own queue, lock, log, and transcripts under that state
+directory. Checkout-local `.kanban-orchestra/agents.yaml` remains an agent
+preference file, not the task database.
 
 These files are local runtime state and belong in the work repo's
 `.gitignore`; coders stage with `git add .`, so unignored runtime files can end

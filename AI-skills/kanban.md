@@ -83,10 +83,11 @@ least one target path you plan to modify under that root.
    - `$ORCHESTRA_DIR`: the Orchestra checkout that provides wrappers and
      implementation files; it may be the same path as the current repo root.
 5. Canonical paths:
-   - DB: `<repo-root>/kanban-orchestra.db`
-   - SQL dump: `<repo-root>/kanban-orchestra.sql`
-   - Runtime dir: `<repo-root>/.kanban-orchestra/`
-   - Orchestrator output: `<repo-root>/.kanban-orchestra/orchestrator.log`
+   - DB: the central store, by default `$HOME/Library/Application Support/Orchestra/orchestra.db` on macOS. `KANBAN_DB` overrides it.
+   - SQL dump: `orchestra.sql` beside that database
+   - Queue runtime: `<state-root>/queues/<queue-id>/`
+   - Orchestrator output: `<state-root>/queues/<queue-id>/orchestrator.log`
+   - Checkout-local preferences: `<repo-root>/.kanban-orchestra/agents.yaml`
    - Orchestra repo root: `$ORCHESTRA_DIR`
    - Kanban Orchestra root: `$ORCHESTRA_DIR/kanban-orchestra/`
    - Scripts: `$ORCHESTRA_DIR/kanban-orchestra/scripts/`
@@ -411,7 +412,7 @@ reviewer state, and current orchestrator output.
 CLI-level state check via `orchestrator_runtime`:
 
 ```bash
-sqlite3 kanban-orchestra.db "select status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
+sqlite3 "$HOME/Library/Application Support/Orchestra/orchestra.db" "select queue_id, status, current_task_id, current_step, current_branch, review_round, active_agents, status_message, last_heartbeat_at from orchestrator_runtime;"
 ```
 
 Read the result like this:

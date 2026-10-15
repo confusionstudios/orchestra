@@ -113,21 +113,21 @@ class SingletonLockError(RuntimeError):
     """Raised when another orchestrator instance already holds the repo lock."""
 
 
-def _singleton_lock_path(db_path=None, lock_path=None):
-    """Resolve the singleton lock file path for the current workspace."""
+def _singleton_lock_path(db_path=None, lock_path=None, queue_id=None):
+    """Resolve the singleton lock file path for one queue."""
     if lock_path is not None:
         return Path(lock_path).resolve()
-    return db.get_lock_path(db_path)
+    return db.get_lock_path(db_path, queue_id=queue_id)
 
 
-def acquire_singleton_lock(db_path=None, lock_path=None):
+def acquire_singleton_lock(db_path=None, lock_path=None, queue_id=None):
     """Acquire the repo-scoped singleton lock or raise if it is already held."""
     global _singleton_lock_handle
 
     if _singleton_lock_handle is not None:
         raise RuntimeError("Singleton lock is already held by this process.")
 
-    path = _singleton_lock_path(db_path=db_path, lock_path=lock_path)
+    path = _singleton_lock_path(db_path=db_path, lock_path=lock_path, queue_id=queue_id)
     handle = path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -141,7 +141,7 @@ def acquire_singleton_lock(db_path=None, lock_path=None):
             f"Another Kanban orchestrator instance is already running for {repo_root}{pid_detail}."
         ) from exc
 
-    identity = db.get_instance_identity(db_path, lock_path=path)
+    identity = db.get_instance_identity(db_path, lock_path=path, queue_id=queue_id)
     handle.seek(0)
     handle.truncate()
     lock_fields = {
@@ -173,9 +173,9 @@ def release_singleton_lock():
         _singleton_lock_handle = None
 
 
-def _heartbeat_loop(db_path):
+def _heartbeat_loop(db_path, queue_id=None):
     """Background thread that updates last_heartbeat_at every HEARTBEAT_INTERVAL seconds."""
-    conn = db.connect(db_path)
+    conn = db.connect(db_path, queue_id=queue_id) if queue_id else db.connect(db_path)
     try:
         while not _heartbeat_stop.wait(HEARTBEAT_INTERVAL):
             try:
@@ -186,10 +186,12 @@ def _heartbeat_loop(db_path):
         conn.close()
 
 
-def start_heartbeat(db_path):
+def start_heartbeat(db_path, queue_id=None):
     global _heartbeat_thread
     _heartbeat_stop.clear()
-    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, args=(db_path,), daemon=True)
+    _heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop, args=(db_path, queue_id), daemon=True,
+    )
     _heartbeat_thread.start()
 
 
@@ -211,7 +213,7 @@ _smart_unblock_stop = threading.Event()
 _smart_unblock_thread = None
 
 
-def _smart_unblock_loop(db_path):
+def _smart_unblock_loop(db_path, queue_id=None):
     """Reassess blocked tasks on SMART_UNBLOCK_INTERVAL until told to stop."""
     try:
         smart_unblock.run_watcher(
@@ -219,6 +221,7 @@ def _smart_unblock_loop(db_path):
             agent=config.agent_registry.effective().role("unblocker")["agent"],
             interval=SMART_UNBLOCK_INTERVAL,
             stop_event=_smart_unblock_stop,
+            queue_id=queue_id,
         )
     except smart_unblock.WatcherAlreadyRunning as exc:
         log(f"smart-unblock: {exc}; recovery already running for this repo")
@@ -226,11 +229,11 @@ def _smart_unblock_loop(db_path):
         log(f"smart-unblock thread failed: {exc}")
 
 
-def start_smart_unblock(db_path):
+def start_smart_unblock(db_path, queue_id=None):
     global _smart_unblock_thread
     _smart_unblock_stop.clear()
     _smart_unblock_thread = threading.Thread(
-        target=_smart_unblock_loop, args=(db_path,), daemon=True,
+        target=_smart_unblock_loop, args=(db_path, queue_id), daemon=True,
     )
     _smart_unblock_thread.start()
 
@@ -286,17 +289,20 @@ def _run_idle_maintenance(conn):
         log(db.format_purge_summary(result))
 
 
-def _dashboard_metadata_path(db_path=None):
-    return db.get_runtime_root(db_path) / "dashboard.json"
+def _dashboard_metadata_path(db_path=None, queue_id=None):
+    try:
+        return db.get_runtime_root(db_path, queue_id=queue_id) / "dashboard.json"
+    except RuntimeError:
+        return Path(db.get_db_path(db_path)).resolve().parent / ".kanban-orchestra" / "dashboard.json"
 
 
-def _dashboard_start_request_path(db_path=None):
-    return db.get_runtime_root(db_path) / DASHBOARD_START_REQUEST_FILE
+def _dashboard_start_request_path(db_path=None, queue_id=None):
+    return db.get_runtime_root(db_path, queue_id=queue_id) / DASHBOARD_START_REQUEST_FILE
 
 
-def request_dashboard_start(db_path=None):
+def request_dashboard_start(db_path=None, queue_id=None):
     """Ask the running repo orchestrator to start its dashboard."""
-    path = _dashboard_start_request_path(db_path)
+    path = _dashboard_start_request_path(db_path, queue_id=queue_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text("start\n", encoding="utf-8")
@@ -304,8 +310,8 @@ def request_dashboard_start(db_path=None):
     return path
 
 
-def _read_dashboard_start_request(db_path=None):
-    path = _dashboard_start_request_path(db_path)
+def _read_dashboard_start_request(db_path=None, queue_id=None):
+    path = _dashboard_start_request_path(db_path, queue_id=queue_id)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -325,9 +331,9 @@ def _read_dashboard_start_request(db_path=None):
     return True
 
 
-def _clear_dashboard_start_request(db_path=None):
+def _clear_dashboard_start_request(db_path=None, queue_id=None):
     try:
-        _dashboard_start_request_path(db_path).unlink()
+        _dashboard_start_request_path(db_path, queue_id=queue_id).unlink()
     except FileNotFoundError:
         pass
     except OSError as exc:
@@ -345,24 +351,46 @@ def _remove_dashboard_metadata(path=None, db_path=None):
         log(f"Could not remove dashboard metadata: {exc}")
 
 
-def start_dashboard(db_path=None, *, host="127.0.0.1", preferred_port=None):
+def start_dashboard(db_path=None, *, host="127.0.0.1", preferred_port=None, repo_root=None, queue_id=None):
     """Start the matching repo dashboard as a child of this orchestrator."""
     global _dashboard_metadata_path_for_process, _dashboard_process
 
     if _dashboard_process is not None and _dashboard_process.poll() is None:
         return _dashboard_process
 
-    metadata_path = _dashboard_metadata_path(db_path)
+    bound = None
+    try:
+        bound = db.launch_connection(db_path, repo_root=repo_root, queue_id=queue_id)
+        queue_id = db.connection_queue_id(bound)
+        worktree = db.execution_root(bound, repo_root=repo_root)
+        db_file = db.get_connection_db_path(bound) or db.get_db_path(db_path)
+    except (RuntimeError, OSError):
+        worktree = Path(repo_root).resolve() if repo_root else Path(db.get_db_path(db_path)).resolve().parent
+        db_file = db.get_db_path(db_path)
+        if bound is not None:
+            bound.close()
+        bound = None
+    else:
+        bound.close()
+    metadata_path = (
+        db.get_runtime_root(db_file, queue_id=queue_id) / "dashboard.json"
+        if queue_id
+        else worktree / ".kanban-orchestra" / "dashboard.json"
+    )
     _remove_dashboard_metadata(metadata_path)
     dashboard_path = Path(__file__).resolve().parent / "dashboard.py"
     env = os.environ.copy()
     if preferred_port is not None:
         env["KO_DASH_PORT"] = str(preferred_port)
     env["KO_DASHBOARD_METADATA_PATH"] = str(metadata_path)
+    env["KANBAN_DB"] = str(db_file)
+    env["ORCHESTRA_REPO_ROOT"] = str(worktree)
+    if queue_id:
+        env["ORCHESTRA_QUEUE_ID"] = queue_id
     stdout = _log_fh if _log_fh is not None else subprocess.DEVNULL
     process = subprocess.Popen(
         [sys.executable, str(dashboard_path)],
-        cwd=str(Path(db.get_db_path(db_path)).resolve().parent),
+        cwd=str(worktree),
         env=env,
         stdout=stdout,
         stderr=subprocess.STDOUT if _log_fh is not None else subprocess.DEVNULL,
@@ -426,17 +454,20 @@ def check_dashboard_process(conn, db_path=None):
 
 def handle_dashboard_start_request(conn, db_path=None):
     """Consume an explicit dashboard-start request, if one exists."""
-    request = _read_dashboard_start_request(db_path)
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    if not isinstance(queue_id, str) or not queue_id:
+        queue_id = None
+    request = _read_dashboard_start_request(db_path, queue_id=queue_id)
     if request is None or request is False:
         return
 
-    _clear_dashboard_start_request(db_path)
+    _clear_dashboard_start_request(db_path, queue_id=queue_id)
     if _dashboard_process is not None and _dashboard_process.poll() is None:
         log("Dashboard start requested; dashboard is already running")
         return
 
     preferred_port = request if type(request) is int else None
-    process = start_dashboard(db_path, preferred_port=preferred_port)
+    process = start_dashboard(db_path, preferred_port=preferred_port, queue_id=queue_id)
     db.update_runtime(
         conn,
         status_message=f"Dashboard started with PID {process.pid} by explicit request",
@@ -2557,7 +2588,8 @@ def recover_running_tasks(conn):
     not mixed with fresh votes in the new run.
     """
     rows = conn.execute(
-        "SELECT * FROM tasks WHERE status = 'running'"
+        "SELECT * FROM tasks WHERE status = 'running' AND queue_id = ?",
+        (db.connection_queue_id(conn),),
     ).fetchall()
     for row in rows:
         task = db._row_to_task(row)
@@ -2699,8 +2731,12 @@ def process_pinned_task(task, conn):
                            coder_agent=snapshot["roles"][primary]["spec"],
                            reviewer_agent=snapshot["roles"][reviewer]["spec"])
             db.save_agent_snapshot(conn, task_id, snapshot)
-        db.update_task(conn, task_id, status="running")
-        current = db.get_task(conn, task_id)
+        claimed = db.claim_ready_task(conn, task_id)
+        if claimed is None:
+            log("Task was no longer ready on this queue", task_id)
+            update_runtime_after_task(conn, task_id, False)
+            return False
+        current = claimed
 
         try:
             db.update_runtime(
@@ -2807,10 +2843,17 @@ def main_loop(conn, *, db_path=None):
 
     # Initialize runtime and start heartbeat
     init_runtime(conn)
-    start_heartbeat(db.get_db_path())
+    resolved_db = db.get_connection_db_path(conn) or db_path or db.get_db_path()
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    if not isinstance(queue_id, str):
+        queue_id = None
+    start_heartbeat(resolved_db, queue_id=queue_id)
+    try:
+        repo_root = db.execution_root(conn)
+    except RuntimeError:
+        repo_root = Path(resolved_db).resolve().parent
 
-    stop_file = Path(db.get_db_path()).parent / STOP_AFTER_TASK_FILE
-    repo_root = Path(db_path or db.get_db_path()).resolve().parent
+    stop_file = repo_root / STOP_AFTER_TASK_FILE
     blocked_gate_logged_task_ids = set()
     startup_recovered = False
     smart_unblock_started = False
@@ -2849,7 +2892,7 @@ def main_loop(conn, *, db_path=None):
             recover_running_tasks(conn)
             startup_recovered = True
         if not smart_unblock_started:
-            start_smart_unblock(db.get_db_path())
+            start_smart_unblock(resolved_db, queue_id=queue_id)
             smart_unblock_started = True
         runtime = db.get_runtime(conn)
         if runtime and runtime.get("status") == "waiting-dirty":
@@ -2911,19 +2954,31 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     db_path = db.get_db_path()
-    try:
-        config.configure_agents(Path(db_path).resolve().parent)
-        config.agent_snapshot()
-        config.agent_snapshot("supertask")
-    except ValueError as exc:
-        print(f"Agent configuration error: {exc}", file=sys.stderr)
-        return 1
-
     conn = None
     try:
-        lock_path = acquire_singleton_lock(db_path=db_path)
+        try:
+            conn = db.launch_connection()
+            db.configure_for_connection(conn)
+            config.agent_snapshot()
+            config.agent_snapshot("supertask")
+        except db.MigrationRequired as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"Agent configuration error: {exc}", file=sys.stderr)
+            return 1
+        block_reason = db.queue_dispatch_block_reason(conn)
+        if block_reason:
+            print(block_reason, file=sys.stderr)
+            return 1
+        db_path = db.get_connection_db_path(conn) or db_path
+        queue_id = getattr(conn, "orchestra_queue_id", None)
+        if not isinstance(queue_id, str):
+            queue_id = None
 
-        log_path = db.get_orchestrator_log_path(db_path)
+        lock_path = acquire_singleton_lock(db_path=db_path, queue_id=queue_id)
+
+        log_path = db.get_orchestrator_log_path(db_path, queue_id=queue_id) if queue_id else db.get_orchestrator_log_path(db_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         _log_fh = log_path.open("a", encoding="utf-8", buffering=1)
 
@@ -2944,20 +2999,27 @@ def main(argv=None):
         log(f"Logging to {log_path}")
         log(f"Acquired singleton lock: {lock_path}")
         if not args.no_dashboard:
-            start_dashboard(db_path, preferred_port=args.dashboard_port)
+            start_dashboard(
+                db_path,
+                preferred_port=args.dashboard_port,
+                repo_root=getattr(conn, "orchestra_repo_root", None),
+                queue_id=queue_id,
+            )
 
-        conn = db.connect(db_path)
-        conn.execute("INSERT INTO agent_worker_config(singleton, fingerprint) VALUES (1, ?) "
-                     "ON CONFLICT(singleton) DO UPDATE SET fingerprint=excluded.fingerprint",
-                     (config.agent_registry.effective().fingerprint,))
-        conn.commit()
+        if queue_id:
+            conn.execute(
+                """INSERT INTO agent_worker_config(queue_id, fingerprint) VALUES (?, ?)
+                   ON CONFLICT(queue_id) DO UPDATE SET fingerprint=excluded.fingerprint""",
+                (queue_id, config.agent_registry.effective().fingerprint),
+            )
+            conn.commit()
         global _log_conn
         _log_conn = conn
         main_loop(conn, db_path=db_path)
     except SingletonLockError as e:
         log(str(e))
         if not args.no_dashboard:
-            request_path = request_dashboard_start(db_path)
+            request_path = request_dashboard_start(db_path, queue_id=queue_id)
             log(f"Requested dashboard start via {request_path}")
             return 0
         return 1

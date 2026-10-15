@@ -100,15 +100,24 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
 
 
 def _open_repo_db(repo: fleet.FleetRepo) -> sqlite3.Connection | None:
-    """Open a repo Kanban DB read-only without creating or migrating it."""
+    """Open the central database read-only, bound to this worktree's queue."""
     if repo.root is None:
         return None
-    db_path = repo.root / "kanban-orchestra.db"
-    if not db_path.exists():
+    queue = fleet._registered_queue(repo.root)
+    if queue is None:
+        return None
+    db_path = Path(db.get_db_path())
+    if not db_path.is_file():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(
+            db._readonly_uri(db_path),
+            uri=True,
+            factory=db.OrchestraConnection,
+        )
         conn.row_factory = sqlite3.Row
+        conn.orchestra_queue_id = queue["id"]
+        conn.orchestra_repository_id = queue["repository_id"]
         return conn
     except sqlite3.Error:
         return None
@@ -156,8 +165,8 @@ def _current_task(
         return None
     try:
         row = conn.execute(
-            "SELECT id, title FROM tasks WHERE id = ?",
-            (task_id,),
+            "SELECT id, title FROM tasks WHERE id = ? AND queue_id = ?",
+            (task_id, getattr(conn, "orchestra_queue_id", None)),
         ).fetchone()
     except sqlite3.Error:
         return None
@@ -170,14 +179,18 @@ def _queue_counts(conn: sqlite3.Connection | None) -> tuple[int, int, int]:
     if conn is None:
         return 0, 0, 0
     try:
+        queue_id = getattr(conn, "orchestra_queue_id", None)
         ready = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'ready'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND queue_id = ?",
+            (queue_id,),
         ).fetchone()[0]
         icebox = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'none'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'none' AND queue_id = ?",
+            (queue_id,),
         ).fetchone()[0]
         done_rows = conn.execute(
-            "SELECT done_at FROM tasks WHERE status = 'done'"
+            "SELECT done_at FROM tasks WHERE status = 'done' AND queue_id = ?",
+            (queue_id,),
         ).fetchall()
     except sqlite3.Error:
         return 0, 0, 0

@@ -62,6 +62,26 @@ def _repo_root_for_subprocess():
     return repo_root
 
 
+def _bound_queue_id(conn):
+    queue_id = getattr(conn, "orchestra_queue_id", None)
+    return queue_id if isinstance(queue_id, str) else None
+
+
+def _child_env(conn):
+    """Pass queue identity to a child without changing its worktree cwd."""
+    env = os.environ.copy()
+    queue_id = _bound_queue_id(conn)
+    if queue_id:
+        env["ORCHESTRA_QUEUE_ID"] = queue_id
+    db_file = db.get_connection_db_path(conn) if conn is not None else None
+    if db_file:
+        env["KANBAN_DB"] = db_file
+    worktree = db.connection_worktree(conn) if conn is not None else None
+    if worktree is not None:
+        env["ORCHESTRA_REPO_ROOT"] = str(worktree)
+    return env
+
+
 # Process-local ACK cache: (task_id, agent_name, purpose) entries mean the agent
 # has already responded to that probe for this task in the current process
 # lifetime. "run" and "review" are distinct — a shallow run ping cannot prove
@@ -209,13 +229,15 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=0, start_new_session=True, cwd=proc_cwd,
+            env=_child_env(conn),
         )
         active_record_id = active_agent_processes.register_active_agent(
             task_id=task_id,
             verb="ping",
             agent_name=agent_name,
             pid=proc.pid,
-            db_path=db.get_db_path(),
+            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+            queue_id=_bound_queue_id(conn),
         )
     except FileNotFoundError:
         log(f"Agent binary not found for '{agent_name}' during ping", task_id)
@@ -277,7 +299,11 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
         pass
     proc.wait()
     if active_record_id:
-        active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
+        active_agent_processes.clear_active_agent(
+            active_record_id,
+            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+            queue_id=_bound_queue_id(conn),
+        )
 
     if acked:
         if purpose == "review":
@@ -418,6 +444,7 @@ def run_agent(
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, start_new_session=True, cwd=proc_cwd,
+            env=_child_env(conn),
         )
     except FileNotFoundError:
         message = f"Agent CLI executable not found: {cmd[0]} (selected agent: {agent_name})"
@@ -430,7 +457,8 @@ def run_agent(
             task_id,
             verb,
             agent_name,
-            db_path=db.get_db_path(),
+            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+            queue_id=_bound_queue_id(conn),
         )
     except RuntimeError:
         transcript_path = None
@@ -445,7 +473,8 @@ def run_agent(
         verb=verb,
         agent_name=agent_name,
         pid=proc.pid,
-        db_path=db.get_db_path(),
+        db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+        queue_id=_bound_queue_id(conn),
     )
 
     if proc_registry is not None:
@@ -490,7 +519,11 @@ def run_agent(
             pass
         proc.wait()
         if active_record_id:
-            active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
+            active_agent_processes.clear_active_agent(
+            active_record_id,
+            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+            queue_id=_bound_queue_id(conn),
+        )
         cancel_message = f"{agent_name} cancelled during {verb}"
         if transcript_path is not None:
             cancel_message += f". Partial transcript: {transcript_path}"
@@ -499,7 +532,11 @@ def run_agent(
 
     proc.wait()
     if active_record_id:
-        active_agent_processes.clear_active_agent(active_record_id, db_path=db.get_db_path())
+        active_agent_processes.clear_active_agent(
+            active_record_id,
+            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+            queue_id=_bound_queue_id(conn),
+        )
     log(f"{agent_name} exited with code {proc.returncode}", task_id)
     tail_summary = _summarize_transcript_tail(transcript_tail)
     if proc.returncode == 0:

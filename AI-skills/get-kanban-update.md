@@ -10,7 +10,7 @@ This command is for quickly reading the state of a Kanban Orchestra pipeline wit
 
 ## How it works
 
-Runs the canonical status wrapper from `$ORCHESTRA_DIR` against the current repo's `kanban-orchestra.db`, then prints a structured plain-text report covering:
+Runs the canonical status wrapper from `$ORCHESTRA_DIR` against the current worktree's queue in the central Orchestra database, then prints a structured plain-text report covering:
 
 - **ORCHESTRATOR** — status (idle / waiting-dirty / running / starting / stopped / hard-break / stale / error) and heartbeat age
 - **ACTIVE TASK** — ID, title, branch, coder, step, review-round, and review progress if in commit-review
@@ -22,10 +22,11 @@ Runs the canonical status wrapper from `$ORCHESTRA_DIR` against the current repo
 ## Prerequisites
 
 - `$ORCHESTRA_DIR` must point at the Orchestra checkout root and contain `bin/ko-get-update`
-- The current repo root must contain `kanban-orchestra.db`
-- The current repo root is the Orchestra instance identity; the
-  `kanban-orchestra.lock` metadata and `.kanban-orchestra/` files apply only to
-  that repo.
+- The command infers the queue from the current worktree. A legacy
+  `kanban-orchestra.db` in that worktree is a migration-required diagnostic;
+  it is not opened or deleted.
+- Queue lock, log, and dashboard files live under the central state directory
+  for that queue. Agent preference files stay in the checkout.
 
 ## Command
 

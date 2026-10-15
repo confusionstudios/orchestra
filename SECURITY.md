@@ -57,6 +57,6 @@ There is no formal bug bounty or guaranteed response SLA.
 ## Handling Secrets
 
 Do not commit API keys, model-provider tokens, local agent transcripts,
-`kanban-orchestra.db`, `.kanban-orchestra/`,
-`shared_scripts/agents.local.yaml`, or work-repo source that is not
-intended to be public.
+the central Orchestra database, queue runtime files, checkout-local
+`.kanban-orchestra/` preferences, `shared_scripts/agents.local.yaml`, or
+work-repo source that is not intended to be public.

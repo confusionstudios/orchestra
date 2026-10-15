@@ -5,7 +5,6 @@ import io
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -16,41 +15,54 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db
 import fleet
 
 
+def queue_files(root) -> Path:
+    """Register a worktree queue and return its durable runtime directory."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    row = db.lookup_queue_by_path(root)
+    if row is None:
+        conn = db.connect(repo_root=root)
+        try:
+            queue_id = conn.orchestra_queue_id
+        finally:
+            conn.close()
+    else:
+        queue_id = row["id"]
+    runtime = db.get_runtime_root(queue_id=queue_id)
+    runtime.mkdir(parents=True, exist_ok=True)
+    return runtime
+
+
 def write_runtime(root, **overrides):
-    fields = {
-        "singleton": 1,
-        "status": "idle",
-        "current_task_id": None,
-        "current_step": "none",
-        "active_agents": 0,
-    }
-    fields.update(overrides)
-    conn = sqlite3.connect(root / "kanban-orchestra.db")
+    root = Path(root)
+    conn = db.connect(repo_root=root)
     try:
-        conn.execute(
-            """
-            CREATE TABLE orchestrator_runtime (
-                singleton INTEGER PRIMARY KEY,
-                status TEXT,
-                current_task_id INTEGER,
-                current_step TEXT,
-                active_agents INTEGER
-            )
-            """
+        task_id = overrides.get("current_task_id")
+        if task_id is not None:
+            existing = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO tasks (
+                           id, repository_id, queue_id, title, status, next_step
+                       ) VALUES (?, ?, ?, 'runtime task', 'running', 'commit-make')""",
+                    (task_id, conn.orchestra_repository_id, conn.orchestra_queue_id),
+                )
+                conn.commit()
+        db.upsert_runtime(
+            conn,
+            status=overrides.get("status", "idle"),
+            pid=overrides.get("pid"),
+            current_task_id=task_id,
+            current_step=overrides.get("current_step", "none"),
+            active_agents=overrides.get("active_agents", 0),
+            status_message=overrides.get("status_message"),
+            current_branch=overrides.get("current_branch"),
+            review_round=overrides.get("review_round", 0),
         )
-        conn.execute(
-            """
-            INSERT INTO orchestrator_runtime
-                (singleton, status, current_task_id, current_step, active_agents)
-            VALUES
-                (:singleton, :status, :current_task_id, :current_step, :active_agents)
-            """,
-            fields,
-        )
-        conn.commit()
     finally:
         conn.close()
 
@@ -141,7 +153,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_process_state_ignores_metadata_for_a_different_repo_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            lock_path = root / "kanban-orchestra.lock"
+            lock_path = queue_files(root) / "kanban-orchestra.lock"
             lock_path.write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root / 'other'}\n",
                 encoding="utf-8",
@@ -159,9 +171,9 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_prints_dashboard_url_when_metadata_is_live(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
-            (root / "kanban-orchestra.lock").write_text(
+            runtime = queue_files(root)
+            runtime.mkdir(parents=True, exist_ok=True)
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -196,12 +208,12 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_summarizes_the_current_managed_repo(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = queue_files(root)
+            runtime.mkdir(parents=True, exist_ok=True)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -233,12 +245,12 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_summarizes_current_repo_preferred_dashboard_below_table(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = queue_files(root)
+            runtime.mkdir(parents=True, exist_ok=True)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -288,7 +300,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_process_state_reports_running_busy_from_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -312,8 +324,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_hides_dashboard_url_when_orchestrator_is_stopped(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = queue_files(root)
+            runtime.mkdir(parents=True, exist_ok=True)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {
@@ -338,7 +350,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_prints_missing_dashboard_in_combined_process_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -364,7 +376,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_prints_waiting_dirty_as_running_service(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -396,7 +408,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_discover_running_repos_marks_live_processes_as_unmanaged(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -444,7 +456,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_status_prints_unmanaged_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -461,6 +473,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_request_dashboard_start_creates_presence_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
+            queue_files(root)
             repo = fleet.FleetRepo("repo", root, root)
 
             request_path = fleet.request_dashboard_start(repo)
@@ -471,6 +484,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_request_dashboard_start_can_include_preferred_port(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
+            queue_files(root)
             repo = fleet.FleetRepo("repo", root, root)
 
             request_path = fleet.request_dashboard_start(repo, preferred_port=8433)
@@ -483,7 +497,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_process_state_reports_running_without_dashboard_for_external_orchestrator(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            (root / "kanban-orchestra.lock").write_text(
+            (queue_files(root) / "kanban-orchestra.lock").write_text(
                 f"role=orchestrator\npid={os.getpid()}\nrepo_root={root}\n",
                 encoding="utf-8",
             )
@@ -805,8 +819,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_logs_tails_repo_local_orchestrator_log(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = queue_files(root)
+            runtime.mkdir(parents=True, exist_ok=True)
             log_path = runtime / "orchestrator.log"
             log_path.write_text("started\n", encoding="utf-8")
             repo = fleet.FleetRepo("repo", root, root)
@@ -1098,8 +1112,8 @@ class TestFleetOperatorFlows(unittest.TestCase):
     def test_open_dashboard_rejects_metadata_for_a_different_repo_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir).resolve()
-            runtime = root / ".kanban-orchestra"
-            runtime.mkdir()
+            runtime = queue_files(root)
+            runtime.mkdir(parents=True, exist_ok=True)
             (runtime / "dashboard.json").write_text(
                 json.dumps(
                     {

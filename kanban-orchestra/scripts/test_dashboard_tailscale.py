@@ -672,6 +672,11 @@ class TestSchedulePublishDashboard(unittest.TestCase):
 
 
 class TestDashboardStartupIntegration(unittest.TestCase):
+    def setUp(self):
+        self._previous_cwd = os.getcwd()
+        os.chdir(Path(os.environ["KANBAN_DB"]).parent)
+        self.addCleanup(lambda: os.chdir(self._previous_cwd))
+
     def test_repo_dashboard_publishes_selected_port_and_records_remote_url(self):
         uv = MagicMock()
         uv.run = MagicMock()

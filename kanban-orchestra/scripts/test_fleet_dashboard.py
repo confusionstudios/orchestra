@@ -57,17 +57,31 @@ def _init_git_repo(root: Path, branch: str = "master") -> None:
     _git(root, "branch", "-M", branch)
 
 
+def _queue_runtime(root: Path) -> Path:
+    row = db.lookup_queue_by_path(root)
+    if row is None:
+        conn = db.connect(repo_root=root)
+        try:
+            queue_id = conn.orchestra_queue_id
+        finally:
+            conn.close()
+    else:
+        queue_id = row["id"]
+    runtime = db.get_runtime_root(queue_id=queue_id)
+    runtime.mkdir(parents=True, exist_ok=True)
+    return runtime
+
+
 def _write_lock(root: Path, pid: int | None = None) -> None:
     pid = os.getpid() if pid is None else pid
-    (root / "kanban-orchestra.lock").write_text(
+    (_queue_runtime(root) / "kanban-orchestra.lock").write_text(
         f"role=orchestrator\npid={pid}\nrepo_root={root}\n",
         encoding="utf-8",
     )
 
 
 def _write_dashboard_metadata(root: Path, url: str = "http://127.0.0.1:8427") -> None:
-    runtime = root / ".kanban-orchestra"
-    runtime.mkdir(parents=True, exist_ok=True)
+    runtime = _queue_runtime(root)
     (runtime / "dashboard.json").write_text(
         json.dumps(
             {
@@ -82,30 +96,8 @@ def _write_dashboard_metadata(root: Path, url: str = "http://127.0.0.1:8427") ->
 
 
 def _insert_runtime(conn, **fields) -> None:
-    payload = {
-        "singleton": 1,
-        "status": "idle",
-        "current_task_id": None,
-        "current_step": "none",
-        "active_agents": 0,
-        "status_message": None,
-        "current_branch": None,
-        "review_round": 0,
-    }
-    payload.update(fields)
-    conn.execute(
-        """
-        INSERT INTO orchestrator_runtime (
-            singleton, status, current_task_id, current_step, active_agents,
-            status_message, current_branch, review_round
-        ) VALUES (
-            :singleton, :status, :current_task_id, :current_step, :active_agents,
-            :status_message, :current_branch, :review_round
-        )
-        """,
-        payload,
-    )
-    conn.commit()
+    fields.pop("singleton", None)
+    db.upsert_runtime(conn, **fields)
 
 
 def _collect(repo: fleet.FleetRepo) -> fleet_dashboard.FleetCard:
@@ -130,7 +122,7 @@ class FleetDashboardRepoTest(unittest.TestCase):
         self.home = Path(self.tmpdir.name).resolve()
         self.root = self.home / "dans-data" / "midi"
         _init_git_repo(self.root, "feature/device-sync")
-        self.conn = db.connect(str(self.root / "kanban-orchestra.db"))
+        self.conn = db.connect(repo_root=self.root)
         self.repo = fleet.FleetRepo("midi", self.root, self.root)
         self.home_patch = patch.object(fleet.Path, "home", return_value=self.home)
         self.home_patch.start()
