@@ -84,8 +84,10 @@ def watcher_state_path(db_path: str | None = None, queue_id: str | None = None) 
     return _runtime_root(db_path, queue_id=queue_id) / STATE_FILE_NAME
 
 
-def _repo_root(db_path: str | None = None) -> Path:
+def _repo_root(db_path: str | None = None, queue_id: str | None = None) -> Path:
     """Return the worktree for Git recovery, not the database directory."""
+    if queue_id:
+        return Path(db.get_instance_identity(db_path, queue_id=queue_id)["repo_root"])
     explicit = db.matching_inherited_repo_root(db_path=db_path)
     if explicit is not None:
         return explicit
@@ -98,10 +100,10 @@ def _repo_root(db_path: str | None = None) -> Path:
 # ── Lock and consultation lifecycle ────────────────────────────────────
 
 
-def read_watcher_metadata(db_path: str | None = None) -> dict:
+def read_watcher_metadata(db_path: str | None = None, queue_id: str | None = None) -> dict:
     """Read best-effort `key=value` metadata written by the running watcher."""
     try:
-        lines = watcher_lock_path(db_path).read_text(encoding="utf-8").splitlines()
+        lines = watcher_lock_path(db_path, queue_id=queue_id).read_text(encoding="utf-8").splitlines()
     except (FileNotFoundError, OSError):
         return {}
     metadata = {}
@@ -117,7 +119,7 @@ def _metadata_int(metadata: dict, key: str) -> int | None:
     return int(value) if value.isdigit() else None
 
 
-def _probe_watcher_lock(db_path: str | None = None) -> tuple[bool, dict]:
+def _probe_watcher_lock(db_path: str | None = None, queue_id: str | None = None) -> tuple[bool, dict]:
     """Return ``(running, metadata)`` via a race-safe lock probe.
 
     Attempt a non-blocking exclusive lock. If the probe acquires it, no live
@@ -126,7 +128,7 @@ def _probe_watcher_lock(db_path: str | None = None) -> tuple[bool, dict]:
     probe gets ``BlockingIOError``, a live watcher holds the flock and the
     metadata is authoritative for the consultation gate.
     """
-    lock_path = watcher_lock_path(db_path)
+    lock_path = watcher_lock_path(db_path, queue_id=queue_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         handle = lock_path.open("a+", encoding="utf-8")
@@ -136,20 +138,20 @@ def _probe_watcher_lock(db_path: str | None = None) -> tuple[bool, dict]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return True, read_watcher_metadata(db_path)
+            return True, read_watcher_metadata(db_path, queue_id=queue_id)
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:
             pass
-        return False, read_watcher_metadata(db_path)
+        return False, read_watcher_metadata(db_path, queue_id=queue_id)
     finally:
         handle.close()
 
 
-def watcher_status(db_path: str | None = None) -> dict:
+def watcher_status(db_path: str | None = None, queue_id: str | None = None) -> dict:
     """Return the watcher's running state plus its recorded metadata."""
-    lock_path = watcher_lock_path(db_path)
-    running, metadata = _probe_watcher_lock(db_path)
+    lock_path = watcher_lock_path(db_path, queue_id=queue_id)
+    running, metadata = _probe_watcher_lock(db_path, queue_id=queue_id)
     pid = metadata.get("pid")
     # Consultation fields are live only while the flock is held.
     consultation_task_id = (
@@ -166,28 +168,28 @@ def watcher_status(db_path: str | None = None) -> dict:
         "agent": metadata.get("agent"),
         "interval": int(metadata["interval"]) if metadata.get("interval", "").isdigit() else None,
         "started_at": metadata.get("started_at"),
-        "repo_root": str(_repo_root(db_path)),
+        "repo_root": str(_repo_root(db_path, queue_id=queue_id)),
         "lock_path": str(lock_path),
-        "state_path": str(watcher_state_path(db_path)),
+        "state_path": str(watcher_state_path(db_path, queue_id=queue_id)),
     }
 
 
-def active_consultation_task_id(db_path: str | None = None) -> int | None:
+def active_consultation_task_id(db_path: str | None = None, queue_id: str | None = None) -> int | None:
     """Return the task id held under the shared consultation dispatch gate.
 
     Authoritative only while the watcher lock is actually held; stale lock-file
     bytes left after crash/SIGKILL do not keep the gate active.
     """
-    return watcher_status(db_path).get("consultation_task_id")
+    return watcher_status(db_path, queue_id=queue_id).get("consultation_task_id")
 
 
-def is_consultation_gated(task_id: int, db_path: str | None = None) -> bool:
+def is_consultation_gated(task_id: int, db_path: str | None = None, queue_id: str | None = None) -> bool:
     """True when ``task_id`` is held under the shared consultation dispatch gate.
 
     The gate covers main-queue dispatch and pinned-task continuation: while it
     is set, the task must not be marked ``running`` or advanced further.
     """
-    consulting = active_consultation_task_id(db_path)
+    consulting = active_consultation_task_id(db_path, queue_id=queue_id)
     return consulting is not None and consulting == int(task_id)
 
 
@@ -200,7 +202,7 @@ def find_dispatchable_task(conn, db_path: str | None = None):
     window before rollback restores ``blocked``.
     """
     resolved = db_path or db.get_connection_db_path(conn)
-    consulting = active_consultation_task_id(resolved)
+    consulting = active_consultation_task_id(resolved, queue_id=db.connection_queue_id(conn))
     exclude = [consulting] if consulting is not None else None
     return db.find_ready_task(conn, exclude_ids=exclude)
 
@@ -366,9 +368,9 @@ def terminate_active_consultation() -> bool:
 # ── Repeated-block suppression state ───────────────────────────────────
 
 
-def read_state(db_path: str | None = None) -> dict:
+def read_state(db_path: str | None = None, queue_id: str | None = None) -> dict:
     try:
-        raw = watcher_state_path(db_path).read_text(encoding="utf-8")
+        raw = watcher_state_path(db_path, queue_id=queue_id).read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
         return {}
     try:
@@ -378,8 +380,8 @@ def read_state(db_path: str | None = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def write_state(state: dict, db_path: str | None = None) -> None:
-    path = watcher_state_path(db_path)
+def write_state(state: dict, db_path: str | None = None, queue_id: str | None = None) -> None:
+    path = watcher_state_path(db_path, queue_id=queue_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -443,7 +445,7 @@ def collect_block_evidence(conn, task_id: int, db_path: str | None = None) -> di
     keys, which are excluded from the fingerprint below. The LLM still sees its
     own earlier reasoning, but the watcher cannot retrigger itself.
     """
-    repo_root = _repo_root(db_path)
+    repo_root = db.execution_root(conn)
     task = db.get_task(conn, task_id) or {}
 
     comments = db.get_comments(conn, task_id)
@@ -620,7 +622,7 @@ def invoke_unblock_agent(
     try:
         proc = subprocess.Popen(
             cmd,
-            cwd=str(_repo_root(db_path)),
+            cwd=str(_repo_root(db_path, queue_id=queue_id)),
             stdin=subprocess.DEVNULL,
             stdout=transcript_file or subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
@@ -828,7 +830,8 @@ def poll_once(
 ) -> list[dict]:
     """Consider every blocked task once and return one result per task."""
     agent = agent or config.agent_registry.effective().role("unblocker")["agent"]
-    state = read_state(db_path)
+    queue_id = db.connection_queue_id(conn)
+    state = read_state(db_path, queue_id=queue_id)
     blocked = db.list_tasks(conn, status="blocked", page_size=None)
     results = []
 
@@ -1031,7 +1034,7 @@ def poll_once(
 
     blocked_keys = {str(row["id"]) for row in blocked}
     state = {k: v for k, v in state.items() if k in blocked_keys}
-    write_state(state, db_path)
+    write_state(state, db_path, queue_id=queue_id)
     return results
 
 

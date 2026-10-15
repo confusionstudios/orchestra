@@ -76,6 +76,32 @@ class TestCentralQueues(unittest.TestCase):
         self.assertEqual(db.list_tasks(self.conn_b, all_queues=True).__len__(), 2)
         self.assertEqual(len(db.list_tasks(self.conn_b)), 1)
 
+    def test_smart_unblock_dispatch_and_state_stay_with_the_selected_queue(self):
+        import smart_unblock
+
+        path = str(self.db_path)
+        queue_a = db.connection_queue_id(self.conn_a)
+        queue_b = db.connection_queue_id(self.conn_b)
+        task_a = db.add_task(self.conn_a, "Queue A", branch="a", status="ready")
+        task_b = db.add_task(self.conn_b, "Queue B", branch="b", status="ready")
+        handle = smart_unblock.acquire_watcher_lock(
+            path, agent="sonnet", interval=1, queue_id=queue_a
+        )
+        try:
+            smart_unblock._set_lock_field("consultation_task_id", task_a)
+            self.assertIsNone(smart_unblock.find_dispatchable_task(self.conn_a))
+            self.assertEqual(smart_unblock.find_dispatchable_task(self.conn_b)["id"], task_b)
+            self.assertTrue(smart_unblock.is_consultation_gated(task_a, path, queue_a))
+            self.assertEqual(smart_unblock.watcher_status(path, queue_a)["repo_root"], str(self.repo_a.resolve()))
+        finally:
+            smart_unblock.release_watcher_lock(handle)
+
+        smart_unblock.write_state({"keep": "queue-b"}, path, queue_b)
+        smart_unblock.run_watcher(path, agent="sonnet", max_cycles=1, queue_id=queue_a)
+        self.assertEqual(smart_unblock.read_state(path, queue_a), {})
+        self.assertEqual(smart_unblock.read_state(path, queue_b), {"keep": "queue-b"})
+        self.assertFalse(smart_unblock.watcher_status(path, queue_a)["running"])
+
     def test_missing_and_retired_worktrees_do_not_release_tasks(self):
         task_id = db.add_task(self.conn_a, "Stay put", branch="a", status="ready", skips=["commit-plan"])
         missing = self.root / "missing-worktree"

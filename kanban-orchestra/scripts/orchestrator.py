@@ -2703,7 +2703,7 @@ def process_pinned_task(task, conn):
 
         # Shared consultation gate: never mark running while smart-unblock still
         # holds this task for validation/rollback (including a rogue ready).
-        if smart_unblock.is_consultation_gated(task_id, db_path):
+        if smart_unblock.is_consultation_gated(task_id, db_path, db.connection_queue_id(conn)):
             log(
                 "Pinned task is under smart-unblock consultation; "
                 "not marking running until validation/rollback completes",
@@ -2822,7 +2822,7 @@ def process_pinned_task(task, conn):
         if current["status"] == "ready" and current["next_step"] != "none":
             # Same gate as find_dispatchable_task: a rogue consultation can flip
             # blocked→ready after advance() returns; do not pin-continue it.
-            if smart_unblock.is_consultation_gated(task_id, db_path):
+            if smart_unblock.is_consultation_gated(task_id, db_path, db.connection_queue_id(conn)):
                 log(
                     "Pinned task became ready during smart-unblock consultation; "
                     "not continuing until validation/rollback completes",
