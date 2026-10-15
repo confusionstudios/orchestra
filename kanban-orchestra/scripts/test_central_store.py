@@ -239,24 +239,36 @@ class TestCentralQueues(unittest.TestCase):
         )
         self.assertIsNone(db.get_runtime(self.conn_a)["current_task_id"])
 
-        source_messages = [row["message"] for row in db.get_orchestrator_run_log(self.conn_a)]
-        dest_messages = [row["message"] for row in db.get_orchestrator_run_log(conn_linked)]
-        self.assertNotIn("child log", source_messages)
-        self.assertIn("child log", dest_messages)
+        historical = db.get_run_log(conn_linked, child)
+        self.assertIn("child log", [row["message"] for row in historical])
         self.assertTrue(all(
-            row["queue_id"] == conn_linked.orchestra_queue_id
-            for row in db.get_run_log(conn_linked, child)
+            row["queue_id"] == self.conn_a.orchestra_queue_id for row in historical
         ))
-        transcript_message = next(
-            row["message"]
-            for row in db.get_run_log(conn_linked, child)
-            if row["message"].startswith("Transcript:")
+        source_messages = [row["message"] for row in db.get_orchestrator_run_log(self.conn_a)]
+        self.assertIn("child log", source_messages)
+        self.assertNotIn(
+            "child log",
+            [row["message"] for row in db.get_orchestrator_run_log(conn_linked)],
         )
-        new_path = Path(transcript_message.split("Transcript: ", 1)[1])
-        self.assertTrue(new_path.is_file())
-        self.assertEqual(new_path.read_text(encoding="utf-8"), "trace\n")
-        self.assertIn(conn_linked.orchestra_queue_id, str(new_path))
-        self.assertFalse(transcript.exists())
+        transcript_message = next(
+            row["message"] for row in historical if row["message"].startswith("Transcript:")
+        )
+        recorded_path = Path(transcript_message.split("Transcript: ", 1)[1])
+        self.assertEqual(recorded_path, transcript)
+        self.assertEqual(transcript.read_text(encoding="utf-8"), "trace\n")
+        self.assertIn(self.conn_a.orchestra_queue_id, str(transcript))
+
+        db.add_run_log(conn_linked, child, "ran on destination", author="orchestrator")
+        new_rows = [
+            row for row in db.get_run_log(conn_linked, child)
+            if row["message"] == "ran on destination"
+        ]
+        self.assertEqual(len(new_rows), 1)
+        self.assertEqual(new_rows[0]["queue_id"], conn_linked.orchestra_queue_id)
+        self.assertIn(
+            "ran on destination",
+            [row["message"] for row in db.get_orchestrator_run_log(conn_linked)],
+        )
 
     def test_status_entry_points_bind_the_invoking_worktree(self):
         title_a = "Visible from repo A"
@@ -435,20 +447,21 @@ class TestCentralQueues(unittest.TestCase):
         dest_child.mkdir(parents=True)
         (dest_child / "existing.log").write_text("keep\n", encoding="utf-8")
 
-        with self.assertRaises(ValueError):
-            db.reassign_task_queue(self.conn_a, child, conn_linked.orchestra_queue_id)
+        moved = db.reassign_task_queue(self.conn_a, child, conn_linked.orchestra_queue_id)
+        self.assertEqual(moved["queue_id"], conn_linked.orchestra_queue_id)
+        self.assertEqual(
+            db.get_task(conn_linked, parent)["queue_id"], conn_linked.orchestra_queue_id,
+        )
 
-        self.assertEqual(
-            db.get_task(self.conn_a, parent)["queue_id"], self.conn_a.orchestra_queue_id,
-        )
-        self.assertEqual(
-            db.get_task(self.conn_a, child)["queue_id"], self.conn_a.orchestra_queue_id,
-        )
-        source_rows = db.get_run_log(self.conn_a, parent)
+        source_rows = db.get_run_log(conn_linked, parent)
         self.assertIn("parent log", [row["message"] for row in source_rows])
         self.assertTrue(all(
             row["queue_id"] == self.conn_a.orchestra_queue_id for row in source_rows
         ))
+        self.assertIn(
+            "parent log",
+            [row["message"] for row in db.get_orchestrator_run_log(self.conn_a)],
+        )
         self.assertNotIn(
             "parent log",
             [row["message"] for row in db.get_orchestrator_run_log(conn_linked)],
@@ -591,3 +604,433 @@ class TestCentralQueues(unittest.TestCase):
         self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
         self.assertEqual(path_a.read_text(encoding="utf-8"), "start\n")
         self.assertFalse(path_b.exists())
+
+    def test_reassign_refuses_a_running_family(self):
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        linked = self.root / "repo-a-linked"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "linked", str(linked)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        conn_linked = db.connect(str(self.db_path), repo_root=linked)
+        self.addCleanup(conn_linked.close)
+        parent = db.add_task(self.conn_a, "Parent", kind="supertask", branch="a")
+        child = db.add_task(self.conn_a, "Child", parent_task_id=parent, branch="a")
+        db.update_task(self.conn_a, child, status="running")
+
+        with self.assertRaises(ValueError) as ctx:
+            db.reassign_task_queue(self.conn_a, parent, conn_linked.orchestra_queue_id)
+
+        self.assertIn("running", str(ctx.exception).lower())
+        self.assertEqual(db.get_task(self.conn_a, child)["status"], "running")
+        self.assertEqual(db.get_task(self.conn_a, child)["queue_id"], self.conn_a.orchestra_queue_id)
+        self.assertEqual(db.get_task(self.conn_a, parent)["queue_id"], self.conn_a.orchestra_queue_id)
+
+    def test_dump_restore_round_trips_two_queues(self):
+        parent = db.add_task(self.conn_a, "Parent", kind="supertask", branch="a")
+        child = db.add_task(self.conn_a, "Child", parent_task_id=parent, branch="a")
+        follow = db.add_task(self.conn_a, "Follow", branch="a")
+        db.update_task(self.conn_a, parent, follow_up_task_id=follow)
+        other = db.add_task(
+            self.conn_b, "Other", branch="b", status="ready", skips=["commit-plan"],
+        )
+        task_py = str(Path(__file__).resolve().parent / "task.py")
+        env = os.environ.copy()
+        env["KANBAN_DB"] = str(self.db_path)
+        env["ORCHESTRA_STATE_DIR"] = str(self.db_path.parent)
+        env.pop("ORCHESTRA_QUEUE_ID", None)
+        env.pop("ORCHESTRA_REPO_ROOT", None)
+        env["KANBAN_NONINTERACTIVE"] = "1"
+        dumped = subprocess.run(
+            [sys.executable, task_py, "dump"],
+            cwd=self.repo_a, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(dumped.returncode, 0, dumped.stderr)
+        sql_path = self.db_path.parent / "orchestra.sql"
+        self.assertIn(str(sql_path), dumped.stdout)
+        self.assertNotIn("kanban-orchestra.sql", dumped.stdout)
+        self.assertIn("BEGIN TRANSACTION;", sql_path.read_text(encoding="utf-8"))
+
+        self.conn_a.close()
+        self.conn_b.close()
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.db_path) + suffix).unlink(missing_ok=True)
+        self.db_path.rename(self.db_path.with_suffix(".aside"))
+
+        restored = subprocess.run(
+            [sys.executable, task_py, "restore"],
+            cwd=self.repo_a, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertNotIn("Traceback", restored.stderr)
+        self.assertTrue(self.db_path.is_file())
+        self.assertIn(str(sql_path), restored.stdout)
+
+        check = sqlite3.connect(self.db_path)
+        check.row_factory = sqlite3.Row
+        try:
+            self.assertGreaterEqual(
+                check.execute("SELECT COUNT(*) FROM queues").fetchone()[0], 2,
+            )
+            parent_row = check.execute(
+                "SELECT id, queue_id, follow_up_task_id FROM tasks WHERE title = 'Parent'"
+            ).fetchone()
+            child_row = check.execute(
+                "SELECT parent_task_id, queue_id FROM tasks WHERE id = ?",
+                (child,),
+            ).fetchone()
+            follow_row = check.execute(
+                "SELECT id, queue_id FROM tasks WHERE id = ?",
+                (follow,),
+            ).fetchone()
+            other_row = check.execute(
+                "SELECT queue_id, status FROM tasks WHERE id = ?",
+                (other,),
+            ).fetchone()
+            self.assertEqual(child_row["parent_task_id"], parent)
+            self.assertEqual(child_row["queue_id"], parent_row["queue_id"])
+            self.assertEqual(parent_row["follow_up_task_id"], follow)
+            self.assertEqual(follow_row["queue_id"], parent_row["queue_id"])
+            self.assertNotEqual(other_row["queue_id"], parent_row["queue_id"])
+            self.assertEqual(other_row["status"], "ready")
+            self.assertEqual(
+                check.execute("PRAGMA integrity_check").fetchone()[0], "ok",
+            )
+            self.assertEqual(check.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            check.close()
+
+        def listed(cwd: Path) -> str:
+            result = subprocess.run(
+                [sys.executable, task_py, "list"],
+                cwd=cwd, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            return result.stdout
+
+        from_a = listed(self.repo_a)
+        from_b = listed(self.repo_b)
+        self.assertIn("Parent", from_a)
+        self.assertIn("Child", from_a)
+        self.assertNotIn("Other", from_a)
+        self.assertIn("Other", from_b)
+        self.assertNotIn("Parent", from_b)
+
+        bad_db = self.root / "bad-restore" / "orchestra.db"
+        bad_db.parent.mkdir()
+        (bad_db.parent / "orchestra.sql").write_text("this is not sql;\n", encoding="utf-8")
+        bad_env = dict(env)
+        bad_env["KANBAN_DB"] = str(bad_db)
+        bad_env["ORCHESTRA_STATE_DIR"] = str(bad_db.parent)
+        failed = subprocess.run(
+            [sys.executable, task_py, "restore"],
+            cwd=self.repo_a, env=bad_env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Error:", failed.stderr)
+        self.assertNotIn("Traceback", failed.stderr)
+        self.assertFalse(bad_db.exists())
+
+    def test_recreated_worktree_does_not_inherit_or_dispatch_stale_work(self):
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        worktree = self.root / "wt"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "feat", str(worktree)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        conn = db.connect(str(self.db_path), repo_root=worktree)
+        old_queue = conn.orchestra_queue_id
+        task_id = db.add_task(
+            conn, "Old ready", branch="feat", status="ready", skips=["commit-plan"],
+        )
+        conn.close()
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "other", str(worktree)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+
+        hinted = db.connect(str(self.db_path), queue_id=old_queue)
+        self.addCleanup(hinted.close)
+        self.assertIsNotNone(db.queue_dispatch_block_reason(hinted))
+        self.assertIsNone(db.find_ready_task(hinted))
+        self.assertIsNone(db.claim_ready_task(hinted, task_id))
+        self.assertEqual(db.get_task(hinted, task_id)["status"], "ready")
+        self.assertEqual(db.get_task(hinted, task_id)["queue_id"], old_queue)
+
+        task_py = str(Path(__file__).resolve().parent / "task.py")
+        env = os.environ.copy()
+        env["KANBAN_DB"] = str(self.db_path)
+        env["ORCHESTRA_STATE_DIR"] = str(self.db_path.parent)
+        env["ORCHESTRA_QUEUE_ID"] = old_queue
+        env["ORCHESTRA_REPO_ROOT"] = str(worktree)
+        env["KANBAN_NONINTERACTIVE"] = "1"
+        stale = subprocess.run(
+            [sys.executable, task_py, "list", "--status", "ready"],
+            cwd=worktree, env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("does not carry queue", stale.stderr)
+        self.assertNotIn("Old ready", stale.stdout)
+        self.assertNotIn("Traceback", stale.stderr)
+
+        fresh_env = dict(env)
+        fresh_env.pop("ORCHESTRA_QUEUE_ID")
+        fresh_env.pop("ORCHESTRA_REPO_ROOT")
+        fresh = subprocess.run(
+            [sys.executable, task_py, "list", "--status", "ready"],
+            cwd=worktree, env=fresh_env, capture_output=True, text=True,
+        )
+        self.assertEqual(fresh.returncode, 0, fresh.stderr)
+        self.assertEqual(json.loads(fresh.stdout), [])
+
+        conn_new = db.connect(str(self.db_path), repo_root=worktree)
+        self.addCleanup(conn_new.close)
+        self.assertNotEqual(conn_new.orchestra_queue_id, old_queue)
+        self.assertEqual(conn_new.orchestra_repository_id, self.conn_a.orchestra_repository_id)
+        retired = conn_new.execute(
+            "SELECT state FROM queues WHERE id = ?",
+            (old_queue,),
+        ).fetchone()
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(db.get_task(conn_new, task_id)["queue_id"], old_queue)
+        self.assertEqual(db.list_tasks(conn_new, status="ready"), [])
+
+    def test_live_owner_blocks_a_reused_path_until_the_identity_moves(self):
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "init"],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        worktree = self.root / "wt"
+        moved = self.root / "wt-moved"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "feat", str(worktree)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        conn = db.connect(str(self.db_path), repo_root=worktree)
+        old_queue = conn.orchestra_queue_id
+        task_id = db.add_task(conn, "Keep with the checkout", branch="feat")
+        conn.close()
+        subprocess.run(
+            ["git", "worktree", "move", str(worktree), str(moved)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "other", str(worktree)],
+            cwd=self.repo_a, check=True, capture_output=True, text=True,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            db.connect(str(self.db_path), repo_root=worktree)
+        self.assertIn(old_queue, str(ctx.exception))
+        holder = self.conn_b.execute(
+            "SELECT state, path FROM queues WHERE id = ?",
+            (old_queue,),
+        ).fetchone()
+        self.assertEqual(holder["state"], "enabled")
+
+        conn_moved = db.connect(str(self.db_path), repo_root=moved)
+        self.addCleanup(conn_moved.close)
+        self.assertEqual(conn_moved.orchestra_queue_id, old_queue)
+        self.assertEqual(db.get_task(conn_moved, task_id)["title"], "Keep with the checkout")
+        self.assertEqual(
+            conn_moved.execute("SELECT path FROM queues WHERE id = ?", (old_queue,)).fetchone()["path"],
+            str(moved.resolve()),
+        )
+
+        conn_new = db.connect(str(self.db_path), repo_root=worktree)
+        self.addCleanup(conn_new.close)
+        self.assertNotEqual(conn_new.orchestra_queue_id, old_queue)
+        self.assertEqual(db.list_tasks(conn_new), [])
+        self.assertEqual(db.get_task(conn_new, task_id)["queue_id"], old_queue)
+
+    def test_copied_checkout_does_not_steal_and_a_move_keeps_the_queue(self):
+        task_id = db.add_task(self.conn_a, "Stay", branch="a", status="ready", skips=["commit-plan"])
+        queue_id = self.conn_a.orchestra_queue_id
+        copied = self.root / "repo-a-copy"
+        shutil.copytree(self.repo_a, copied, symlinks=True)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            db.connect(str(self.db_path), repo_root=copied)
+        self.assertIn(str(self.repo_a.resolve()), str(ctx.exception))
+        held = self.conn_b.execute(
+            "SELECT path, state FROM queues WHERE id = ?",
+            (queue_id,),
+        ).fetchone()
+        self.assertEqual(held["path"], str(self.repo_a.resolve()))
+        self.assertEqual(held["state"], "enabled")
+
+        moved = self.root / "repo-a-moved"
+        self.repo_a.rename(moved)
+        conn_moved = db.connect(str(self.db_path), repo_root=moved)
+        self.addCleanup(conn_moved.close)
+        self.assertEqual(conn_moved.orchestra_queue_id, queue_id)
+        self.assertEqual(conn_moved.orchestra_repository_id, self.conn_a.orchestra_repository_id)
+        self.assertEqual(db.get_task(conn_moved, task_id)["title"], "Stay")
+        self.assertEqual(
+            conn_moved.execute("SELECT path FROM queues WHERE id = ?", (queue_id,)).fetchone()["path"],
+            str(moved.resolve()),
+        )
+
+    def test_moved_primary_keeps_its_queue_when_a_new_repo_reuses_the_path(self):
+        task_id = db.add_task(
+            self.conn_a, "Keep with the primary", branch="a", status="ready", skips=["commit-plan"],
+        )
+        old_queue = self.conn_a.orchestra_queue_id
+        repository_id = self.conn_a.orchestra_repository_id
+        old_path = self.conn_a.execute(
+            "SELECT path FROM queues WHERE id = ?",
+            (old_queue,),
+        ).fetchone()["path"]
+        moved = self.root / "repo-a-moved"
+        self.repo_a.rename(moved)
+        self.repo_a.mkdir()
+        _git_repo(self.repo_a)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            db.connect(str(self.db_path), repo_root=self.repo_a)
+        self.assertIn(old_queue, str(ctx.exception))
+        self.assertIn("cannot prove", str(ctx.exception))
+        self.assertIn("retire-queue", str(ctx.exception))
+        holder = self.conn_b.execute(
+            "SELECT state, path FROM queues WHERE id = ?",
+            (old_queue,),
+        ).fetchone()
+        self.assertEqual(holder["state"], "enabled")
+        self.assertEqual(holder["path"], old_path)
+
+        hinted = db.connect(str(self.db_path), queue_id=old_queue)
+        self.addCleanup(hinted.close)
+        self.assertIsNotNone(db.queue_dispatch_block_reason(hinted))
+        self.assertIsNone(db.claim_ready_task(hinted, task_id))
+        self.assertEqual(db.get_task(hinted, task_id)["status"], "ready")
+        self.assertEqual(db.get_task(hinted, task_id)["queue_id"], old_queue)
+
+        conn_moved = db.connect(str(self.db_path), repo_root=moved)
+        self.addCleanup(conn_moved.close)
+        self.assertEqual(conn_moved.orchestra_queue_id, old_queue)
+        self.assertEqual(conn_moved.orchestra_repository_id, repository_id)
+        self.assertEqual(db.get_task(conn_moved, task_id)["title"], "Keep with the primary")
+        self.assertEqual(db.get_task(conn_moved, task_id)["status"], "ready")
+        self.assertEqual(
+            conn_moved.execute(
+                "SELECT path, state FROM queues WHERE id = ?",
+                (old_queue,),
+            ).fetchone()["path"],
+            str(moved.resolve()),
+        )
+        self.assertEqual(
+            conn_moved.execute("SELECT state FROM queues WHERE id = ?", (old_queue,)).fetchone()["state"],
+            "enabled",
+        )
+        self.assertIsNone(db.queue_dispatch_block_reason(conn_moved))
+
+        conn_new = db.connect(str(self.db_path), repo_root=self.repo_a)
+        self.addCleanup(conn_new.close)
+        self.assertNotEqual(conn_new.orchestra_queue_id, old_queue)
+        self.assertEqual(db.list_tasks(conn_new, status="ready"), [])
+        self.assertEqual(db.get_task(conn_new, task_id)["queue_id"], old_queue)
+        self.assertIsNone(db.find_ready_task(conn_new))
+
+    def test_reclone_at_reused_primary_path_refuses_until_the_old_queue_is_retired(self):
+        task_id = db.add_task(
+            self.conn_a, "Old primary", branch="a", status="ready", skips=["commit-plan"],
+        )
+        old_queue = self.conn_a.orchestra_queue_id
+        shutil.rmtree(self.repo_a)
+        self.repo_a.mkdir()
+        _git_repo(self.repo_a)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            db.connect(str(self.db_path), repo_root=self.repo_a)
+        self.assertIn(old_queue, str(ctx.exception))
+        self.assertIn("cannot prove", str(ctx.exception))
+        self.assertIn("retire-queue", str(ctx.exception))
+        held = self.conn_b.execute(
+            "SELECT state FROM queues WHERE id = ?",
+            (old_queue,),
+        ).fetchone()
+        self.assertEqual(held["state"], "enabled")
+        self.assertEqual(db.get_task(self.conn_b, task_id)["queue_id"], old_queue)
+        self.assertEqual(db.get_task(self.conn_b, task_id)["status"], "ready")
+
+        db.retire_queue(self.conn_b, old_queue)
+        conn = db.connect(str(self.db_path), repo_root=self.repo_a)
+        self.addCleanup(conn.close)
+        self.assertNotEqual(conn.orchestra_queue_id, old_queue)
+        self.assertNotEqual(conn.orchestra_repository_id, self.conn_a.orchestra_repository_id)
+        retired = conn.execute(
+            "SELECT state FROM queues WHERE id = ?",
+            (old_queue,),
+        ).fetchone()
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(db.list_tasks(conn, status="ready"), [])
+        self.assertEqual(db.get_task(conn, task_id)["queue_id"], old_queue)
+        self.assertEqual(db.get_task(conn, task_id)["status"], "ready")
+        self.assertIsNone(db.find_ready_task(conn))
+
+    def test_explicit_database_ignores_unrelated_inherited_queue_context(self):
+        unrelated = self.root / "live-checkout"
+        unrelated.mkdir()
+        _git_repo(unrelated)
+        (unrelated / "AGENTS.md").write_text("ALLOW_TASKS_ON_MASTER\n", encoding="utf-8")
+        fresh = self.root / "isolated" / "orchestra.db"
+        task_py = str(Path(__file__).resolve().parent / "task.py")
+        env = os.environ.copy()
+        env["KANBAN_DB"] = str(fresh)
+        env["ORCHESTRA_STATE_DIR"] = str(fresh.parent)
+        env["ORCHESTRA_QUEUE_ID"] = "11111111-1111-4111-8111-111111111111"
+        env["ORCHESTRA_REPO_ROOT"] = str(unrelated.resolve())
+        env["KANBAN_NONINTERACTIVE"] = "1"
+
+        rejected = subprocess.run(
+            [sys.executable, task_py, "add", "On master", "--branch", "master"],
+            cwd=self.repo_a, env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotIn("Unknown queue", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        self.assertIn("ALLOW_TASKS_ON_MASTER", rejected.stderr)
+
+        added = subprocess.run(
+            [sys.executable, task_py, "add", "Isolated task", "--branch", "feat"],
+            cwd=self.repo_a, env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertNotIn("Unknown queue", added.stderr)
+        conn = db.connect(str(fresh), repo_root=self.repo_a)
+        self.addCleanup(conn.close)
+        self.assertEqual(
+            [task["title"] for task in db.list_tasks(conn)],
+            ["Isolated task"],
+        )
+        self.assertNotEqual(conn.orchestra_queue_id, env["ORCHESTRA_QUEUE_ID"])
+        self.assertNotEqual(db.connection_worktree(conn), unrelated.resolve())
+
+    def test_dispatch_fails_closed_without_queue_context(self):
+        raw = sqlite3.connect(self.db_path)
+        raw.row_factory = sqlite3.Row
+        try:
+            reason = db.queue_dispatch_block_reason(raw)
+        finally:
+            raw.close()
+        self.assertIsNotNone(reason)
+        self.assertIn("unavailable", reason.lower())
+
+    def test_main_loop_refuses_the_state_directory(self):
+        import orchestrator
+        conn = db.connect()
+        self.addCleanup(conn.close)
+        with self.assertRaises(RuntimeError) as ctx:
+            orchestrator.main_loop(conn)
+        self.assertIn("central state directory", str(ctx.exception).lower())

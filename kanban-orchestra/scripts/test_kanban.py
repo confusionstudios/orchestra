@@ -5792,6 +5792,7 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "request_dashboard_start", return_value=Path("/tmp/dashboard-start-request")) as request_start, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
+             patch.object(orchestrator.db, "queue_dispatch_block_reason", return_value=None), \
              patch.object(orchestrator.os, "setpgrp"), \
              patch.object(orchestrator.signal, "signal"):
             exit_code = orchestrator.main()
@@ -5809,6 +5810,7 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "request_dashboard_start") as request_start, \
              patch.object(orchestrator, "log") as mock_log, \
              patch.object(orchestrator.db, "connect") as mock_connect, \
+             patch.object(orchestrator.db, "queue_dispatch_block_reason", return_value=None), \
              patch.object(orchestrator.os, "setpgrp"), \
              patch.object(orchestrator.signal, "signal"):
             exit_code = orchestrator.main(["--no-dashboard"])
@@ -5844,6 +5846,7 @@ class TestSingletonLock(unittest.TestCase):
              patch.object(orchestrator, "acquire_singleton_lock") as mock_lock, \
              patch.object(orchestrator, "log"), \
              patch.object(orchestrator.db, "connect") as mock_connect, \
+             patch.object(orchestrator.db, "queue_dispatch_block_reason", return_value=None), \
              patch.object(orchestrator, "main_loop") as main_loop, \
              patch.object(orchestrator, "start_dashboard"), \
              patch.object(orchestrator, "stop_dashboard"), \

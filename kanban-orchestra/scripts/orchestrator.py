@@ -2840,18 +2840,15 @@ def process_pinned_task(task, conn):
 def main_loop(conn, *, db_path=None):
     """Poll for ready tasks and process them one at a time."""
     log("Kanban Orchestra started. Polling for ready tasks...")
+    resolved_db = db.get_connection_db_path(conn) or db_path or db.get_db_path()
+    repo_root = db.execution_root(conn)
 
     # Initialize runtime and start heartbeat
     init_runtime(conn)
-    resolved_db = db.get_connection_db_path(conn) or db_path or db.get_db_path()
     queue_id = getattr(conn, "orchestra_queue_id", None)
     if not isinstance(queue_id, str):
         queue_id = None
     start_heartbeat(resolved_db, queue_id=queue_id)
-    try:
-        repo_root = db.execution_root(conn)
-    except RuntimeError:
-        repo_root = Path(resolved_db).resolve().parent
 
     stop_file = repo_root / STOP_AFTER_TASK_FILE
     blocked_gate_logged_task_ids = set()

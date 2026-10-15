@@ -3,8 +3,8 @@
 
 ``preview`` only reads. ``cutover`` imports into a staging database, verifies
 it, and activates that file only after a rollback manifest is on disk.
-Legacy database bytes are not modified. After a successful activation their
-filenames are moved aside so normal runtime has one layout.
+Legacy database bytes are not modified. After a successful activation,
+untracked legacy database files are removed so normal runtime has one layout.
 """
 
 from __future__ import annotations
@@ -1550,16 +1550,25 @@ def cutover(
     if fail_after == "before-activation":
         raise CutoverError("Injected failure before activation")
 
+    queue_dirs = [
+        destination.parent / db.QUEUES_DIR_NAME / source["queue_id"]
+        for source in pending
+    ]
+    conflicts = [path for path in queue_dirs if path.exists()]
+    if conflicts:
+        raise CutoverError(
+            "Queue runtime already exists: " + ", ".join(str(path) for path in conflicts)
+        )
+    # These paths were absent, so this attempt owns them. Rollback may remove
+    # them. A directory that already existed is refused above and is not listed.
+    created_dirs = [str(path) for path in queue_dirs]
+
     destination_before = None
     if destination.is_file():
         destination_before = attempt_dir / "destination-before.db"
         _sqlite_backup(destination, destination_before)
         if not _integrity_ok(destination_before):
             raise CutoverError("Could not back up the current destination")
-    created_dirs = [
-        str(destination.parent / db.QUEUES_DIR_NAME / source["queue_id"])
-        for source in pending
-    ]
     manifest = {
         "attempt_id": attempt_id,
         "destination": str(destination),

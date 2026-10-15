@@ -142,6 +142,7 @@ def _listed_titles(cwd: Path, destination: Path) -> list[str]:
     env["KANBAN_DB"] = str(destination)
     env["KANBAN_NONINTERACTIVE"] = "1"
     env.pop("ORCHESTRA_QUEUE_ID", None)
+    env.pop("ORCHESTRA_REPO_ROOT", None)
     script = Path(__file__).resolve().parent / "task.py"
     result = subprocess.run(
         [sys.executable, str(script), "list"],
@@ -799,3 +800,32 @@ def test_retire_queue_keeps_ids_and_does_not_import(tmp_path):
         assert check.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
     finally:
         check.close()
+
+
+def test_preexisting_queue_directory_survives_activation_conflict(tmp_path):
+    source = tmp_path / "source"
+    _init_repo(source)
+    database = _legacy_db(source)
+    with _connect(database) as conn:
+        conn.execute(
+            """INSERT INTO tasks (title, status, next_step, kind, max_review_rounds)
+               VALUES ('Keep', 'ready', 'commit-make', 'commit', 3)"""
+        )
+        conn.commit()
+    destination = tmp_path / "central" / "orchestra.db"
+    queue_id = migrate_cutover.queue_identity(database)
+    sentinel = destination.parent / "queues" / queue_id / "sentinel.txt"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("keep\n", encoding="utf-8")
+    fleet_config = tmp_path / "empty-fleet.repos"
+    fleet_config.write_text("", encoding="utf-8")
+
+    with pytest.raises(migrate_cutover.CutoverError, match="already exists"):
+        migrate_cutover.cutover(destination, [source], fleet_config)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert sentinel.parent.is_dir()
+    assert not destination.exists()
+    assert database.is_file()
+    with _connect(database) as conn:
+        assert conn.execute("SELECT title FROM tasks").fetchone()[0] == "Keep"

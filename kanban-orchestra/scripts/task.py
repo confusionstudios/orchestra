@@ -33,6 +33,7 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -128,9 +129,9 @@ def _repo_root_for_policy(conn=None):
         bound = db.connection_worktree(conn)
         if bound is not None and bound.is_dir():
             return bound
-    explicit = os.environ.get("ORCHESTRA_REPO_ROOT")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
+    inherited = db.matching_inherited_repo_root(conn)
+    if inherited is not None:
+        return inherited
     if os.environ.get("KANBAN_DB"):
         parent = Path(os.environ["KANBAN_DB"]).expanduser().resolve().parent
         if parent != db.get_state_root():
@@ -1033,9 +1034,7 @@ def cmd_dump(args, conn):
     """Dump the central database to orchestra.sql beside that database."""
     db_path = db.get_connection_db_path(conn) or db.get_db_path()
     sql_path = str(Path(db_path).resolve().with_name("orchestra.sql"))
-    with open(sql_path, "w") as f:
-        for line in conn.iterdump():
-            f.write(line + "\n")
+    db.write_consistent_dump(conn, sql_path)
     print(f"Dumped to {sql_path}")
 
 
@@ -1106,7 +1105,7 @@ def cmd_get_commit_footer(args, conn):
 def cmd_restore(args):
     try:
         result = db.restore_dump()
-    except (FileNotFoundError, ValueError, OSError) as e:
+    except (FileNotFoundError, ValueError, OSError, RuntimeError, sqlite3.Error) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

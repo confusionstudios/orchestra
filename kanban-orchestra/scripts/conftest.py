@@ -26,6 +26,8 @@ def isolated_orchestra_state(tmp_path, monkeypatch):
     state.mkdir()
     monkeypatch.setenv("ORCHESTRA_STATE_DIR", str(state))
     monkeypatch.setenv("KANBAN_DB", str(state / "orchestra.db"))
+    monkeypatch.delenv("ORCHESTRA_QUEUE_ID", raising=False)
+    monkeypatch.delenv("ORCHESTRA_REPO_ROOT", raising=False)
     scripts = Path(__file__).resolve().parent
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))

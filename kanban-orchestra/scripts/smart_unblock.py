@@ -86,9 +86,9 @@ def watcher_state_path(db_path: str | None = None, queue_id: str | None = None) 
 
 def _repo_root(db_path: str | None = None) -> Path:
     """Return the worktree for Git recovery, not the database directory."""
-    explicit = os.environ.get("ORCHESTRA_REPO_ROOT")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
+    explicit = db.matching_inherited_repo_root(db_path=db_path)
+    if explicit is not None:
+        return explicit
     path = Path(db.get_db_path(db_path)).resolve()
     if path.parent != db.get_state_root():
         return path.parent

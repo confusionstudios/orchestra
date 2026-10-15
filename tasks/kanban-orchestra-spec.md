@@ -48,10 +48,13 @@ the mutable branch name.
 
 Each task belongs to one repository and one queue. Child and follow-up links
 stay inside that repository and queue. Moving a task requires an enabled
-queue in the same repository and moves its parent, children, follow-ups,
-run history, and queue-local transcripts together. A missing or retired
-worktree does not make its unfinished tasks runnable on another queue, and
-claim checks that again after the worker has started.
+queue in the same repository and moves its parent, children, and follow-ups
+together. A family that contains a running task cannot be moved. Run rows
+keep the queue where that run happened, and their transcript files stay
+there. A later run on the destination queue records that queue. A missing
+or retired worktree does not make its unfinished tasks runnable on another
+queue, and claim checks that again after the worker has started. Dispatch
+also requires the checkout at the queue path to carry that queue's identity.
 
 Checkout-local files stay with the worktree: `.kanban-orchestra/agents.yaml`,
 the model cache, and the Git-directory identity files. The stop file
@@ -303,9 +306,10 @@ These rules define the system.
   and artifacts remain in the central store.
 - Do not point an existing worker at the central file until cutover has
   finished and the old worker is stopped.
-- `task dump` writes `orchestra.sql` beside the central database. `task restore`
-  loads a current-schema dump into an empty central database. A legacy dump
-  is not a migration.
+- `task dump` writes `orchestra.sql` beside the central database from one
+  consistent snapshot. `task restore` loads that dump into an empty central
+  database and checks the schema, integrity, and foreign keys without
+  choosing a single queue. A legacy dump is not a migration.
 - Until an operator runs an approved cutover, stable tooling from the primary
   Orchestra checkout keeps using each worktree's existing legacy database,
   including the development queue for this repository. That development
@@ -314,13 +318,26 @@ These rules define the system.
 
 ## Worktree Registration and Closeout
 
-- Creating a worktree registers a new queue in the central store. Bootstrap
-  does not create or copy `kanban-orchestra.db`. An empty approved
+- Creating a worktree registers a new queue in the central store. A checkout
+  with no queue identity file does not adopt an older queue that used the
+  same path. That older queue is retired only when it belongs to this same
+  repository and Git can list every live checkout, none of which still
+  carries its queue identity. Unfinished tasks stay on the retired queue.
+  If a listed checkout still carries the identity, registration stops with
+  a diagnostic. A different repository at that path, including a new clone
+  created after the old primary checkout moved, cannot prove the old owner
+  is gone. Registration stops with a diagnostic and leaves the old queue
+  enabled. Open the checkout that carries its identity file, or retire the
+  queue with `task retire-queue --queue-id <id> --abandon-unfinished` when
+  that checkout is actually gone. A checkout that keeps its identity file
+  keeps that queue, including when the directory itself moves, and is
+  refused while another live checkout still carries the same identity.
+  Bootstrap does not create or copy `kanban-orchestra.db`. An empty approved
   `.worktreeinclude` is valid. Auth files and runtime state are not copied.
 - Fleet starts a linked worktree only when the central store has an enabled
-  queue for that path. If the worktree has a queue identity file, it must
-  name that same queue. A legacy database is reported as migration-required
-  and is not started.
+  queue for that path and the checkout's queue identity file names that
+  queue. A reused path without that identity is not the old queue. A legacy
+  database is reported as migration-required and is not started.
 - Closing a worktree stops that worktree's worker, proves the branch landed,
   and retires the queue with `task retire-queue`. It does not import a
   database or renumber tasks. Unfinished tasks require
@@ -1001,8 +1018,9 @@ For multiple repos, `ko-fleet` reads a private flat path list from
 is one primary git repo root. `~` and environment variables are expanded.
 Display names come from the directory basename. Fleet discovers linked
 worktrees with `git worktree list --porcelain` and includes a linked worktree
-when that checkout has an enabled queue in the central database and, when a
-queue identity file is present, that file names the same queue. A legacy
+when that checkout has an enabled queue in the central database and its
+queue identity file names that same queue. A path match without that
+identity file is not registration. A legacy
 per-worktree database is reported as migration-required and is not started,
 read, or deleted. Fleet does not initialize worktrees and does not keep a
 second registration list. Invalid or missing primary paths remain errors. A

@@ -615,6 +615,34 @@ class TestResumeAndRetryProtocol(SmartUnblockTestCase):
         self.assertEqual(db.get_task(self.conn, task_id)["status"], "ready")
 
 
+class TestExplicitDatabaseRepoRoot(SmartUnblockTestCase):
+    def test_repo_root_uses_explicit_database_without_matching_kanban_db(self):
+        inherited = self.repo_root / "live-checkout"
+        inherited.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=inherited, check=True)
+        explicit_dir = self.repo_root / "isolated"
+        explicit_dir.mkdir()
+        explicit_db = explicit_dir / "orchestra.db"
+        isolated = db.connect(str(explicit_db))
+        isolated.close()
+        other_db = inherited / "other.db"
+
+        with patch.dict(
+            os.environ,
+            {
+                "ORCHESTRA_REPO_ROOT": str(inherited.resolve()),
+                "KANBAN_DB": str(other_db),
+            },
+        ):
+            from_other_db = smart_unblock._repo_root(str(explicit_db))
+        self.assertEqual(from_other_db, explicit_dir.resolve())
+
+        with patch.dict(os.environ, {"ORCHESTRA_REPO_ROOT": str(inherited.resolve())}):
+            os.environ.pop("KANBAN_DB", None)
+            without_kanban_db = smart_unblock._repo_root(str(explicit_db))
+        self.assertEqual(without_kanban_db, explicit_dir.resolve())
+
+
 class TestStandaloneWatcherRemoved(unittest.TestCase):
     def test_ko_unblock_wrapper_is_gone(self):
         repo_root = Path(__file__).resolve().parents[2]

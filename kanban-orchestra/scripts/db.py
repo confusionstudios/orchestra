@@ -564,6 +564,151 @@ def _read_or_create_identity(path: Path) -> str:
     return value
 
 
+def _checkout_identity(repo_root: Path) -> tuple[str | None, str | None]:
+    """Return the repository and queue ids recorded in a checkout."""
+    repo_dir, queue_dir = _identity_dirs(repo_root)
+    return (
+        _read_identity(repo_dir / REPOSITORY_ID_FILENAME),
+        _read_identity(queue_dir / QUEUE_ID_FILENAME),
+    )
+
+
+def _checkout_owns_queue(repo_root: Path, queue_id: str, repository_id: str) -> bool:
+    recorded_repo, recorded_queue = _checkout_identity(repo_root)
+    return recorded_queue == queue_id and recorded_repo == repository_id
+
+
+def _repository_checkouts(root: Path) -> list[Path] | None:
+    """Return every checkout of this repository.
+
+    None means the listing failed, so a missing identity file is not proof
+    that a queue is gone. A directory that is not a Git checkout is only
+    itself.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        found.append(resolved)
+
+    if _git_dir(root, "--git-common-dir") is None:
+        add(root)
+        return found
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            add(Path(line.split(" ", 1)[1]))
+    if not found:
+        return None
+    return found
+
+
+def _path_owner_disposition(queue_id: str, repository_id: str, root: Path) -> str:
+    """Return whether the enabled queue at ``root`` is live, gone, or unknown.
+
+    ``gone`` means this checkout belongs to that queue's repository and every
+    listed live checkout lacks its queue identity. ``live`` means one of those
+    checkouts still carries it. ``unknown`` means this checkout cannot list
+    that repository, so the owner is not provably gone.
+    """
+    try:
+        recorded_repo, _recorded_queue = _checkout_identity(root)
+    except RuntimeError:
+        return "unknown"
+    if recorded_repo != repository_id:
+        return "unknown"
+    checkouts = _repository_checkouts(root)
+    if checkouts is None:
+        return "unknown"
+    for checkout in checkouts:
+        if not checkout.is_dir():
+            continue
+        try:
+            _repo, recorded_queue = _checkout_identity(checkout)
+        except RuntimeError:
+            return "unknown"
+        if recorded_queue == queue_id:
+            return "live"
+    return "gone"
+
+
+def _queue_still_lives_at(queue_id: str, path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    try:
+        _recorded_repo, recorded_queue = _checkout_identity(path)
+    except RuntimeError:
+        return True
+    return recorded_queue == queue_id
+
+
+def _retire_enabled_queue(conn: sqlite3.Connection, queue_id: str) -> None:
+    conn.execute(
+        """UPDATE queues
+           SET state = 'retired', retired_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND state = 'enabled'""",
+        (queue_id,),
+    )
+
+
+def _release_stale_path_owner(
+    conn: sqlite3.Connection,
+    path_text: str,
+    root: Path,
+    *,
+    except_id: str | None = None,
+) -> None:
+    """Retire an enabled queue at this path only when its identity is provably gone.
+
+    A live checkout that still carries the queue id keeps the path. A primary
+    that moved out of this repository's view is not retired. Registration
+    stops with a diagnostic until that checkout reconnects or an operator
+    retires the queue.
+    """
+    sql = "SELECT id, repository_id FROM queues WHERE path = ? AND state = 'enabled'"
+    params: list[str] = [path_text]
+    if except_id is not None:
+        sql += " AND id != ?"
+        params.append(except_id)
+    holder = conn.execute(sql, params).fetchone()
+    if holder is None:
+        return
+    disposition = _path_owner_disposition(holder["id"], holder["repository_id"], root)
+    retire_cmd = f"task retire-queue --queue-id {holder['id']} --abandon-unfinished"
+    if disposition == "gone":
+        _retire_enabled_queue(conn, holder["id"])
+        return
+    if disposition == "live":
+        raise RuntimeError(
+            f"Enabled queue {holder['id']} still owns {root}. "
+            "This checkout will not take its tasks. Open the checkout that "
+            "carries its identity file, or retire it with "
+            f"{retire_cmd}."
+        )
+    raise RuntimeError(
+        f"Enabled queue {holder['id']} owns {root}, and this checkout cannot "
+        "prove that queue's checkout is gone. This checkout will not take its "
+        "tasks. Open the checkout that carries its identity file, or retire it "
+        f"with {retire_cmd} if that checkout no longer exists."
+    )
+
+
 def connection_queue_id(conn: sqlite3.Connection) -> str:
     queue_id = getattr(conn, "orchestra_queue_id", None)
     if not _is_id(queue_id):
@@ -811,9 +956,17 @@ def _sole_or_default_queue(conn: sqlite3.Connection) -> tuple[sqlite3.Row, bool]
 def ensure_queue(conn: sqlite3.Connection, repo_root: str | Path) -> tuple[sqlite3.Row, bool]:
     """Register or refresh the enabled queue for a worktree.
 
-    A legacy ``kanban-orchestra.db`` in the worktree aborts before any queue
-    row is inserted. Retired queues stay retired. A missing directory is not
-    given a replacement queue.
+    A checkout with no queue identity file gets a new queue. It does not
+    adopt an older row that used the same path. That older row is retired
+    only when this checkout is the same repository and every listed live
+    checkout lacks the old queue identity. When the old owner cannot be
+    proven gone, including a primary that moved before a new repository
+    reused its path, registration stops with a diagnostic and the old queue
+    stays enabled. A checkout that carries an identity file keeps that queue,
+    including after its directory moves, and is refused while another live
+    checkout still carries the same identity. A legacy ``kanban-orchestra.db``
+    aborts before any queue row is inserted. Retired queues stay retired. A
+    missing directory is not given a replacement queue.
     """
     root = Path(repo_root).expanduser().resolve()
     if not root.is_dir():
@@ -829,48 +982,47 @@ def ensure_queue(conn: sqlite3.Connection, repo_root: str | Path) -> tuple[sqlit
     queue_file = queue_dir / QUEUE_ID_FILENAME
     existing_queue_id = _read_identity(queue_file)
     created = False
-    if existing_queue_id:
-        row = conn.execute("SELECT * FROM queues WHERE id = ?", (existing_queue_id,)).fetchone()
-        if row is None:
-            _insert_queue(conn, repository_id, path_text, queue_id=existing_queue_id)
-            created = True
-        elif row["repository_id"] != repository_id:
-            raise RuntimeError(
-                f"Queue {existing_queue_id} belongs to a different repository than {root}"
-            )
-        elif row["state"] != "enabled":
-            raise RuntimeError(
-                f"Queue for {root} is retired. Its tasks stay on that queue "
-                "and will not run on another worktree."
-            )
-        elif row["path"] != path_text:
-            clash = conn.execute(
-                """SELECT id FROM queues
-                   WHERE path = ? AND state = 'enabled' AND id != ?""",
-                (path_text, existing_queue_id),
-            ).fetchone()
-            if clash:
-                raise RuntimeError(f"Another enabled queue already uses {root}")
-            conn.execute(
-                "UPDATE queues SET path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (path_text, existing_queue_id),
-            )
-        conn.commit()
-        return conn.execute("SELECT * FROM queues WHERE id = ?", (existing_queue_id,)).fetchone(), created
-
-    row = conn.execute(
-        "SELECT * FROM queues WHERE path = ? AND state = 'enabled'",
-        (path_text,),
-    ).fetchone()
-    if row is not None:
-        if row["repository_id"] != repository_id:
-            raise RuntimeError(f"Enabled queue at {root} belongs to another repository")
-        _write_identity(queue_file, row["id"])
-        conn.commit()
-        return row, False
-
-    qid = str(uuid.uuid4())
     try:
+        if existing_queue_id:
+            row = conn.execute(
+                "SELECT * FROM queues WHERE id = ?",
+                (existing_queue_id,),
+            ).fetchone()
+            if row is None:
+                _release_stale_path_owner(conn, path_text, root)
+                _insert_queue(conn, repository_id, path_text, queue_id=existing_queue_id)
+                created = True
+            elif row["repository_id"] != repository_id:
+                raise RuntimeError(
+                    f"Queue {existing_queue_id} belongs to a different repository than {root}"
+                )
+            elif row["state"] != "enabled":
+                raise RuntimeError(
+                    f"Queue for {root} is retired. Its tasks stay on that queue "
+                    "and will not run on another worktree."
+                )
+            elif row["path"] != path_text:
+                recorded = Path(row["path"]) if row["path"] else None
+                if recorded is not None and _queue_still_lives_at(existing_queue_id, recorded):
+                    raise RuntimeError(
+                        f"Queue {existing_queue_id} is still live at {recorded}. "
+                        f"Refusing to point it at {root} while that checkout exists."
+                    )
+                _release_stale_path_owner(
+                    conn, path_text, root, except_id=existing_queue_id,
+                )
+                conn.execute(
+                    "UPDATE queues SET path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (path_text, existing_queue_id),
+                )
+            conn.commit()
+            return conn.execute(
+                "SELECT * FROM queues WHERE id = ?",
+                (existing_queue_id,),
+            ).fetchone(), created
+
+        _release_stale_path_owner(conn, path_text, root)
+        qid = str(uuid.uuid4())
         _insert_queue(conn, repository_id, path_text, queue_id=qid)
         _write_identity(queue_file, qid)
         conn.commit()
@@ -903,8 +1055,9 @@ def lookup_queue_by_path(repo_root: str | Path, *, db_path: str | None = None) -
 def queue_registration_error(repo_root: str | Path) -> str | None:
     """Return why a worktree's on-disk queue identity is unsafe to run.
 
-    A missing identity file is not an error: the central row addressed by
-    path is the registration. A present identity file must name that row.
+    A path match is not registration. The checkout's Git identity files
+    must name the enabled queue stored for that path. A missing identity
+    file does not inherit an older queue that used the path.
     """
     root = Path(repo_root).expanduser().resolve()
     try:
@@ -914,24 +1067,23 @@ def queue_registration_error(repo_root: str | Path) -> str | None:
     if row is None:
         return None
     try:
-        _repo_dir, queue_dir = _identity_dirs(root)
-        recorded = _read_identity(queue_dir / QUEUE_ID_FILENAME)
+        owns = _checkout_owns_queue(root, row["id"], row["repository_id"])
     except RuntimeError as exc:
         return str(exc)
-    if recorded and recorded != row["id"]:
-        return (
-            f"Queue identity file at {queue_dir / QUEUE_ID_FILENAME} "
-            f"does not match the central queue {row['id']} for {root}."
-        )
-    return None
+    if owns:
+        return None
+    return (
+        f"Checkout at {root} does not carry queue {row['id']}. "
+        "A reused path does not inherit that queue's tasks."
+    )
 
 
 def queue_dispatch_block_reason(conn: sqlite3.Connection) -> str | None:
     """Return why this queue must not claim tasks, or None when dispatch is allowed."""
     try:
         row = _require_queue(conn, connection_queue_id(conn))
-    except (RuntimeError, sqlite3.Error, TypeError):
-        return None
+    except (RuntimeError, sqlite3.Error, TypeError) as exc:
+        return f"Queue dispatch is unavailable: {exc}"
     if row["state"] != "enabled":
         return (
             f"Queue {row['id']} is retired. Its tasks stay on that queue "
@@ -940,10 +1092,20 @@ def queue_dispatch_block_reason(conn: sqlite3.Connection) -> str | None:
     path = row["path"] or ""
     if not path:
         return None
-    if not Path(path).is_dir():
+    checkout = Path(path)
+    if not checkout.is_dir():
         return (
             f"Worktree {path} is missing. Tasks on queue {row['id']} "
             "will not run on a different queue."
+        )
+    try:
+        owns = _checkout_owns_queue(checkout, row["id"], row["repository_id"])
+    except (RuntimeError, OSError) as exc:
+        return f"Queue dispatch is unavailable: {exc}"
+    if not owns:
+        return (
+            f"Checkout at {path} does not carry queue {row['id']}. "
+            "Refusing to dispatch its tasks into a different checkout."
         )
     return None
 
@@ -1081,6 +1243,96 @@ def _recover_missing_start_times(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _database_has_queue(db_path: str, queue_id: str) -> bool:
+    if not _is_id(queue_id):
+        return False
+    path = Path(db_path)
+    if not path.is_file() or _peek_database_kind(path) != "current":
+        return False
+    conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30.0)
+    try:
+        row = conn.execute("SELECT 1 FROM queues WHERE id = ?", (queue_id,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return row is not None
+
+
+def _inherited_queue_id(db_path: str | None) -> str | None:
+    """Return an inherited queue id only when that queue is in the selected database."""
+    raw = os.environ.get("ORCHESTRA_QUEUE_ID")
+    if not raw or not _is_id(raw):
+        return None
+    if _database_has_queue(get_db_path(db_path), raw):
+        return raw
+    return None
+
+
+def _assert_inherited_queue_matches_invoking_checkout(conn: sqlite3.Connection) -> None:
+    """Refuse a stale queue hint when this checkout is the queue's recorded path."""
+    try:
+        cwd_root = get_repo_root()
+    except RuntimeError:
+        return
+    row = _require_queue(conn, connection_queue_id(conn))
+    path = row["path"] or ""
+    if not path or Path(path).resolve() != cwd_root:
+        return
+    try:
+        owns = _checkout_owns_queue(cwd_root, row["id"], row["repository_id"])
+    except (RuntimeError, OSError) as exc:
+        raise RuntimeError(f"Queue dispatch is unavailable: {exc}") from exc
+    if not owns:
+        raise RuntimeError(
+            f"Checkout at {cwd_root} does not carry queue {row['id']}. "
+            "A stale queue hint cannot run that queue's tasks in this checkout."
+        )
+
+
+def matching_inherited_repo_root(
+    conn: sqlite3.Connection | None = None,
+    *,
+    db_path: str | None = None,
+) -> Path | None:
+    """Return ``ORCHESTRA_REPO_ROOT`` when it belongs to the selected database.
+
+    An open connection or an explicit ``db_path`` selects that database.
+    ``KANBAN_DB`` is used only when neither was given. An inherited checkout
+    is ignored when the selected database does not contain that checkout's
+    queue. Callers then keep using the selected database's own worktree or
+    parent directory.
+    """
+    raw = os.environ.get("ORCHESTRA_REPO_ROOT")
+    if not raw:
+        return None
+    root = Path(raw).expanduser().resolve()
+    db_file = get_connection_db_path(conn) if conn is not None else None
+    if not db_file and db_path:
+        db_file = get_db_path(db_path)
+    if not db_file:
+        db_file = os.environ.get("KANBAN_DB")
+    if not db_file:
+        return root
+    db_file = str(Path(db_file).expanduser().resolve())
+    if conn is not None:
+        bound = connection_worktree(conn)
+        if bound is not None and bound.is_dir() and bound.resolve() == root:
+            return root
+    row = lookup_queue_by_path(root, db_path=db_file)
+    if row is not None:
+        try:
+            if _checkout_owns_queue(root, row["id"], row["repository_id"]):
+                return root
+        except RuntimeError:
+            return None
+        return None
+    parent = Path(db_file).parent
+    if parent == root or parent.is_relative_to(root):
+        return root
+    return None
+
+
 def launch_connection(
     db_path: str | None = None,
     *,
@@ -1091,29 +1343,42 @@ def launch_connection(
     """Open the database the way a CLI or worker process should.
 
     An explicit queue, repository, or working directory selects that queue.
-    ``ORCHESTRA_QUEUE_ID`` does the same. An explicit database binds the
-    invoking worktree when one can be inferred, even if another queue is
-    already the only row. A path-less default queue is used only when no
-    worktree can be inferred and the database has at most one queue.
+    ``ORCHESTRA_QUEUE_ID`` selects a queue only when that queue exists in the
+    selected database. A hint for some other database is ignored, and a hint
+    for a queue whose recorded checkout no longer carries that identity is
+    refused. An explicit database binds the invoking worktree when one can
+    be inferred, even if another queue is already the only row. A path-less
+    default queue is used only when no worktree can be inferred and the
+    database has at most one queue.
     """
-    selected_queue = queue_id or os.environ.get("ORCHESTRA_QUEUE_ID")
+    inherited = None if queue_id else _inherited_queue_id(db_path)
+    selected_queue = queue_id or inherited
     if selected_queue or repo_root is not None or cwd is not None:
-        return connect(db_path, repo_root=repo_root, queue_id=selected_queue, cwd=cwd)
-    if db_path or os.environ.get("KANBAN_DB"):
+        conn = connect(db_path, repo_root=repo_root, queue_id=selected_queue, cwd=cwd)
+    elif db_path or os.environ.get("KANBAN_DB"):
         path = get_db_path(db_path)
         try:
             root = get_repo_root()
         except RuntimeError:
             root = None
         if root is not None:
-            return connect(path, repo_root=root)
-        if _queue_count(path) <= 1:
-            return connect(path)
-        raise RuntimeError(
-            "This Orchestra database has more than one queue. "
-            "Open it from a worktree or pass queue_id."
-        )
-    return connect(repo_root=get_repo_root(cwd))
+            conn = connect(path, repo_root=root)
+        elif _queue_count(path) <= 1:
+            conn = connect(path)
+        else:
+            raise RuntimeError(
+                "This Orchestra database has more than one queue. "
+                "Open it from a worktree or pass queue_id."
+            )
+    else:
+        conn = connect(repo_root=get_repo_root(cwd))
+    if inherited:
+        try:
+            _assert_inherited_queue_matches_invoking_checkout(conn)
+        except Exception:
+            conn.close()
+            raise
+    return conn
 
 
 def launch_worktree_connection(db_path: str | None = None) -> OrchestraConnection:
@@ -1180,11 +1445,53 @@ def _cleanup_db_artifacts(db_path: str) -> None:
             pass
 
 
+def write_consistent_dump(conn: sqlite3.Connection, sql_path: str | Path) -> None:
+    """Write one SQL dump from a single consistent snapshot of ``conn``."""
+    snapshot = sqlite3.connect(":memory:")
+    try:
+        conn.backup(snapshot)
+        path = Path(sql_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for line in snapshot.iterdump():
+                handle.write(line + "\n")
+    finally:
+        snapshot.close()
+
+
+def _validate_restored_database(db_path: str) -> None:
+    """Check schema, integrity, and foreign keys without binding a queue."""
+    kind = _peek_database_kind(db_path)
+    if kind != "current":
+        raise ValueError(
+            f"Restored database at {db_path} is {kind}, not the current Orchestra schema"
+        )
+    conn = sqlite3.connect(_readonly_uri(Path(db_path)), uri=True, timeout=30.0)
+    try:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            detail = integrity[0] if integrity else "no result"
+            raise ValueError(f"Restored database failed integrity check: {detail}")
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise ValueError(
+                "Restored database failed foreign key check "
+                f"({len(violations)} violation(s))"
+            )
+    finally:
+        conn.close()
+
+
 def restore_dump(
     db_path: str | None = None,
     sql_path: str | None = None,
 ) -> dict[str, str]:
-    """Restore a SQL dump into a fresh central database file."""
+    """Restore a SQL dump into a fresh central database file.
+
+    Validation covers the schema, integrity, and foreign keys for every
+    queue in the dump. It does not select a sole queue, and a failed
+    restore removes a database file that this call created.
+    """
     target_db_path = get_db_path(db_path)
     target_sql_path = sql_path or str(Path(target_db_path).resolve().with_name("orchestra.sql"))
     db_preexisted = os.path.exists(target_db_path)
@@ -1210,8 +1517,7 @@ def restore_dump(
         finally:
             raw_conn.close()
 
-        conn = connect(target_db_path)
-        conn.close()
+        _validate_restored_database(target_db_path)
     except Exception:
         if not db_preexisted:
             _cleanup_db_artifacts(target_db_path)
@@ -1328,54 +1634,14 @@ def _task_family_ids(conn, task_id):
     return seen
 
 
-def _relocate_task_artifacts(db_path, task_ids, source_queue_id, dest_queue_id):
-    """Move task transcript directories onto the destination queue.
-
-    Returns ``(destination, source)`` pairs so the caller can undo a move
-    when the database transaction rolls back.
-    """
-    source_root = get_artifacts_root(db_path, queue_id=source_queue_id)
-    dest_root = get_artifacts_root(db_path, queue_id=dest_queue_id)
-    dest_root.mkdir(parents=True, exist_ok=True)
-    planned = []
-    for task_id in task_ids:
-        src = source_root / f"{TASK_ARTIFACT_DIR_PREFIX}{task_id}"
-        if not src.exists() and not src.is_symlink():
-            continue
-        if src.is_symlink() or not src.is_dir():
-            raise ValueError(f"refusing to move unsafe artifacts for task {task_id}")
-        dst = dest_root / src.name
-        if dst.exists() or dst.is_symlink():
-            raise ValueError(
-                f"destination queue already has artifacts for task {task_id}"
-            )
-        planned.append((src, dst))
-    moved = []
-    try:
-        for src, dst in planned:
-            src.rename(dst)
-            moved.append((dst, src))
-    except Exception:
-        _restore_relocated_artifacts(moved)
-        raise
-    return moved
-
-
-def _restore_relocated_artifacts(moved):
-    for dst, src in reversed(moved):
-        try:
-            if dst.exists() and not src.exists():
-                dst.rename(src)
-        except OSError:
-            pass
-
-
 def reassign_task_queue(conn, task_id, queue_id):
     """Move a task family onto another enabled queue in the same repository.
 
-    Parent, child, and follow-up links stay together. Their run history and
-    queue-local transcripts move with them, and the source queue stops
-    treating a moved task as its current task.
+    Parent, child, and follow-up links stay together. A family that contains
+    a running task cannot be moved. Existing run rows keep the queue where
+    that run happened, and their transcript files stay beside that queue.
+    A later run on the destination records the destination queue. The source
+    queue stops treating a moved task as its current task.
     """
     task = get_task(conn, task_id)
     if task is None:
@@ -1390,8 +1656,6 @@ def reassign_task_queue(conn, task_id, queue_id):
     family = _task_family_ids(conn, task_id)
     family_ids = tuple(family)
     placeholders = ", ".join("?" for _ in family_ids)
-    db_path = get_connection_db_path(conn)
-    moved = []
     conn.execute("BEGIN IMMEDIATE")
     try:
         owners = conn.execute(
@@ -1409,50 +1673,25 @@ def reassign_task_queue(conn, task_id, queue_id):
                 WHERE status = 'running' AND id IN ({placeholders})""",
             family_ids,
         ).fetchone()
-        running_there = conn.execute(
-            f"""SELECT 1 FROM tasks
-                WHERE queue_id = ? AND status = 'running'
-                  AND id NOT IN ({placeholders})""",
-            (queue_id, *family_ids),
-        ).fetchone()
-        if running_here is not None and running_there is not None:
-            raise ValueError("destination queue already has a running task")
+        if running_here is not None:
+            raise ValueError(
+                "cannot move a task family while one of its tasks is running"
+            )
         conn.execute(
             f"""UPDATE tasks
                 SET queue_id = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id IN ({placeholders})""",
             (queue_id, *family_ids),
         )
-        if db_path:
-            source_root = str(get_artifacts_root(db_path, queue_id=source_queue_id))
-            dest_root = str(get_artifacts_root(db_path, queue_id=queue_id))
-            conn.execute(
-                f"""UPDATE run_log
-                    SET queue_id = ?,
-                        message = REPLACE(message, ?, ?)
-                    WHERE task_id IN ({placeholders})""",
-                (queue_id, source_root, dest_root, *family_ids),
-            )
-        else:
-            conn.execute(
-                f"""UPDATE run_log SET queue_id = ?
-                    WHERE task_id IN ({placeholders})""",
-                (queue_id, *family_ids),
-            )
         conn.execute(
             f"""UPDATE orchestrator_runtime
                 SET current_task_id = NULL, updated_at = CURRENT_TIMESTAMP
                 WHERE queue_id = ? AND current_task_id IN ({placeholders})""",
             (source_queue_id, *family_ids),
         )
-        if db_path:
-            moved = _relocate_task_artifacts(
-                db_path, family_ids, source_queue_id, queue_id
-            )
         conn.commit()
     except Exception:
         conn.rollback()
-        _restore_relocated_artifacts(moved)
         raise
     return get_task(conn, task_id)
 

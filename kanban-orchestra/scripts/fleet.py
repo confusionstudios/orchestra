@@ -327,11 +327,14 @@ def orchestra_database_usable(root: Path) -> bool:
     """Return whether this checkout has an enabled queue in the central store.
 
     A legacy per-worktree database does not count: Fleet must not treat it as
-    a live queue. Callers surface migration-required separately.
+    a live queue. A path match without this checkout's queue identity is not
+    usable either. Callers surface migration-required separately.
     """
     if db.legacy_database_file(root) is not None:
         return False
-    return _registered_queue(root) is not None
+    if _registered_queue(root) is None:
+        return False
+    return db.queue_registration_error(root) is None
 
 
 def configured_primary_repos(*, missing_ok: bool = False) -> list[FleetRepo]:
