@@ -10,13 +10,4 @@ while [[ -L "$_ko_script" ]]; do
 done
 source "$(cd -P -- "$(dirname -- "$_ko_script")" && pwd)/_ko-common"
 
-if [[ $# -eq 0 ]]; then
-  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  if [[ -z "$repo_root" ]]; then
-    echo "error: ko-get-update must run inside a git repo unless --db is passed" >&2
-    exit 1
-  fi
-  set -- --db "$repo_root/kanban-orchestra.db"
-fi
-
 exec "$ko_python" "$ORCHESTRA_DIR/kanban-orchestra/scripts/get_kanban_update.py" "$@"
