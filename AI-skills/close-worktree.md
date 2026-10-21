@@ -175,13 +175,15 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
    "$ORCHESTRA_DIR/bin/ko-task" list --status running
    "$ORCHESTRA_DIR/bin/ko-task" list --status pending_subtasks
    ```
-2. If any unfinished task exists, stop and ask the operator to confirm
-   retirement. Do not move those tasks to another queue. After an explicit
-   yes, retire with the abandon flag. If every task is done, omit the flag:
+2. If every task is done, retire without abandoning any work:
    ```bash
-   "$ORCHESTRA_DIR/bin/ko-task" retire-queue --abandon-unfinished
+   "$ORCHESTRA_DIR/bin/ko-task" retire-queue
    ```
+   If any unfinished task exists, stop and ask the operator to confirm
+   retirement. Only after an explicit yes, add `--abandon-unfinished`.
+   Do not move those tasks to another queue.
 3. Require the JSON result's `task_ids` to be the source queue's existing ids.
+   Record its `queue_id` as `$queue_id` for the history check below.
    Stop if retirement fails. Do not import a database, renumber tasks, or
    delete history. The central queue row becomes `retired` and its tasks stay
    on that queue.
@@ -204,8 +206,14 @@ forcing a merge, deleting a worktree, or continuing after a failed check.
      test "$(git -C "$target_root" rev-parse HEAD)" != "$target_head" || exit 1
      test "$(git -C "$target_root" rev-parse HEAD)" = "$landed_commit" || exit 1
      ```
-2. Confirm `"$ORCHESTRA_DIR/bin/ko-task" list --status done` can read the
-   retired queue's history. Task ids are unchanged. Do not expect an id map.
+2. From the target checkout, read the retired queue by its recorded id:
+   ```bash
+   cd "$target_root"
+   "$ORCHESTRA_DIR/bin/ko-task" list --status done --queue-id "$queue_id"
+   ```
+   Implicit selection from the source worktree refuses a retired queue.
+   Confirm its history is readable and task ids are unchanged. Do not expect
+   an id map.
 3. Remove the source with normal Git worktree removal only:
    ```bash
    git -C "$target_root" worktree remove "$source_root"
