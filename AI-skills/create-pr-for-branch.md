@@ -21,7 +21,34 @@ Create and publish a GitHub PR for the current branch against the appropriate ta
    - If `.github/PULL_REQUEST_TEMPLATE/` contains templates, choose the one that best matches the branch scope.
    - Use the repository template's headings and intent; remove placeholder comments and omit optional sections when they do not add value.
    - If no repository template exists, use the fallback format below.
-7. Draft a PR title and body following the selected template or fallback format.
+7. Draft a PR title and body following the selected template or fallback format. Include the review/convergence record below when AI reviews occurred.
+
+### Review and Convergence Record
+
+When AI reviews were performed, include a short record in **Notes**, using one
+sentence or bullet per reviewer/model. Use the available review outputs and
+recorded commands; do not invent missing history or infer a past model version
+from what an alias resolves to today.
+
+- Identify the reviewer/model, the number of completed review rounds, and scope:
+  whole PR or the specific files/behavior covered by a focused review.
+- Distinguish first-pass approval from approval after revisions. Include the
+  outcome sequence when useful, plus the concrete fixes or important findings
+  that resulted; avoid a transcript of every comment.
+- Count only completed reviews with usable verdicts. Stalled, interrupted,
+  blank, or failed attempts do not increase the count or imply approval.
+  Mention them separately only when they materially limit or explain coverage.
+- Update the record after convergence to describe the final revision. Do not
+  imply that a focused review approved the whole PR, or that approval of an
+  earlier revision covers later substantive changes. If no AI reviews occurred,
+  omit the review record; this skill does not require commissioning a review.
+
+Illustrative Notes entries (not actual review history):
+
+```markdown
+- Claude Opus 5.5: 2 whole-PR rounds (rejected → approved); fixed duplicate job claims and verified the regression.
+- Gemini 4 Argon: 1 focused API review; approved on the first pass.
+```
 
 ## Publish
 
@@ -50,7 +77,7 @@ Sections, in order:
 - **Why** (optional) — Explain the motivation for this PR when it adds useful context. Do not repeat the implementation. Omit the entire section when empty.
 - **Work** — Main implementation work only, as concise Markdown bullets. If a bullet is not part of the main story, move it to **Other**.
 - **Other** (optional) — Related or bundled work that does not belong in the main story. Omit the entire section when empty.
-- **Notes** (optional) — Useful process detail, such as validation, migrations, review context, or follow-up/fix commits. Scan the commit log for meaningful follow-up/fix commits and summarize them here when they add reviewer value. Omit the entire section when empty.
+- **Notes** (optional) — Useful process detail, such as validation, migrations, review context, or follow-up/fix commits. Scan the commit log for meaningful follow-up/fix commits and summarize them here when they add reviewer value. Include the review/convergence record when AI reviews occurred. Omit the entire section when empty.
 
 ### Style
 
