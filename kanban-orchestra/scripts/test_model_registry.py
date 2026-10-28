@@ -171,14 +171,14 @@ def test_parallel_provider_refreshes_keep_both_entries(tmp_path, monkeypatch):
 
 def test_changed_auth_scope_does_not_erase_other_account_cache(tmp_path, monkeypatch):
     fake_path(tmp_path, monkeypatch, 'codex')
-    monkeypatch.setenv('OPENAI_API_KEY', 'first-account')
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'first-account'))
     assert model_registry.refresh(tmp_path, 'codex', timeout=2)['state'] == 'fresh'
-    monkeypatch.setenv('OPENAI_API_KEY', 'second-account')
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'second-account'))
     monkeypatch.setenv('FAKE_MODE_CODEX', 'fail')
     changed = model_registry.refresh(tmp_path, 'codex', timeout=2)
     assert changed['state'] == 'unavailable' and not changed['models']
     assert 'authentication required' in changed['reason']
-    monkeypatch.setenv('OPENAI_API_KEY', 'first-account')
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'first-account'))
     assert [item['id'] for item in model_registry.view(tmp_path, 'codex')['models']] == ['first', 'second']
 
 
@@ -259,18 +259,18 @@ def test_model_choices_include_aliases_and_local_role_selections(tmp_path, monke
 
 def test_auth_change_during_discovery_is_not_saved_as_new_account(tmp_path, monkeypatch):
     fake_path(tmp_path, monkeypatch, 'codex')
-    monkeypatch.setenv('OPENAI_API_KEY', 'before')
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'before'))
     good = model_registry.refresh(tmp_path, 'codex', timeout=2)
     original = model_registry._codex
 
     def changed(timeout):
         result = original(timeout)
-        monkeypatch.setenv('OPENAI_API_KEY', 'after')
+        monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'after'))
         return result
 
     monkeypatch.setattr(model_registry, '_codex', changed)
     result = model_registry.refresh(tmp_path, 'codex', timeout=2)
     assert result['state'] == 'unavailable'
     assert 'changed during discovery' in result['reason']
-    monkeypatch.setenv('OPENAI_API_KEY', 'before')
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'before'))
     assert model_registry.view(tmp_path, 'codex')['models'] == good['models']

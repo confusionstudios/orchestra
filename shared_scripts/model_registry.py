@@ -25,7 +25,7 @@ FRESH_DAYS = 7
 
 def scope(provider: str) -> str:
     # Hash context, including credentials, without recording their values.
-    names = {"codex": ("CODEX_HOME", "OPENAI_API_KEY"), "claude": ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY"),
+    names = {"codex": ("CODEX_HOME",), "claude": ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY"),
              "cursor": ("CURSOR_CONFIG_DIR", "CURSOR_API_KEY"), "kilo": ("KILO_API_KEY",),
              "antigravity": ("GOOGLE_API_KEY",)}[provider]
     context = [str(os.getuid()), str(Path.home().resolve())]
