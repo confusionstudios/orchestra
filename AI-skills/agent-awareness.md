@@ -134,6 +134,10 @@ value. Otherwise use the role default that matches the work, using the effective
 
 ## Verify Agent Output
 
+A caller timeout does not prove the underlying agent run has stopped. Before
+retrying, establish the original run's state and recover any completed result.
+If its state is unresolved, report that rather than launch duplicate work.
+
 A zero exit status proves that an agent CLI ran; it does not prove that the
 agent returned a usable response. Before relying on an unfamiliar route, send
 a tiny non-destructive ping and require a literal reply.

@@ -1,59 +1,33 @@
-Log concise development work notes to the configured Obsidian developer journal.
+Log concise weekly development outcomes to the configured Google Docs devlog.
 
-Use when asked to log work, record progress, update the journal, or save a
-session summary. Write to Obsidian, not Notion or a new repo document.
+Use when asked to log work, record progress, or update the development journal.
 
-## Where To Write
+Read `~/.config/agent-devlog.json` for `folder_url` and `documents` (a map from
+`YYYY H1` / `YYYY H2` to document URLs). Keep private destinations out of shared
+skills. If unconfigured, ask where to write; do not fall back to Obsidian.
+If Drive/Docs tools are unavailable, report that rather than claiming a write.
 
-- `$ORCH_DEVLOG_DIR` is the private journal directory. Never hardcode its personal
-  path in shared instructions. If unset, report that; do not choose a substitute.
-- Use a weekly file named `YYYY-MM-DD - Week.md`, where the date is the **Sunday
-  starting that week**, not today's date. Example: Friday 2026-10-23 belongs in
-  `2026-10-18 - Week.md`.
-- Within that file, use daily headings: `# 2026-10-23 - Friday`. Use the user's
-  local date; date historical work under the day it happened when known.
-- Open the expected week file directly. Listing an iCloud vault can be blocked
-  even when a particular note is accessible. A failed listing alone is not proof
-  that the journal is unavailable.
+Use the Google Drive/Docs tools. Choose the half-year from the work's local date:
+January–June is H1, July–December is H2. Documents are named `YYYY H1 Devlog` or
+`YYYY H2 Devlog`. If the document is not mapped, list the configured folder and
+reuse it by title; create it there only if missing. Prefer direct folder listing
+when global Drive search misses shared files.
 
-## What To Write
-
-Record human-readable outcomes from the requested conversation or period:
-what shipped, what changed, why it matters, and material blockers. Do not turn
-entries into file inventories, command transcripts, commit lists, or test reports.
-Do not investigate unrelated history unless the user requests a historical recap.
-Preserve exact user wording when requested; do not invent accomplishments.
-
-Start with the bold project name. One outcome uses `- **Project**: Outcome.`
-Several outcomes use one project bullet with indented entries:
+Native Google Docs structure (Markdown equivalent):
 
 ```markdown
-# 2026-10-23 - Friday
-
-- **Hogwarts Owl Dispatch**
-  - Released 3.2.1, fixing a crash when assigning a parcel to an owl on sick leave.
-  - Published the 3.3 beta with searchable delivery routes and a Hogsmeade postcode filter.
-- **Shire Pantry Planner**
-  - Added a second-breakfast slot so meal reminders stop overlapping elevenses.
-  - Fixed seed-cake quantities doubling when inviting a wizard to tea.
-- **Gotham Bat-Signal Scheduler**: Restored dusk alerts after the clock-tower time change.
+# 2026-10-25 - Week
+## Hogwarts Owl Dispatch
+- Released parcel tracking for Hogsmeade deliveries.
+- Fixed duplicate owl assignments.
 ```
 
-Append under the correct day and existing project group. Preserve other agents'
-entries and unrelated content. Create the week file or day heading if missing;
-replace existing notes only when explicitly asked. Avoid duplicate entries.
+Weeks start on Sunday. Projects use Heading 2, with ordinary bullets below.
+Use `$ORCH_DEVLOG_PROJECT` when set, otherwise the project's readable name.
+Reuse the existing week/project section; merge repeated progress into the final
+outcome. No daily headings, session reports, command inventories, or invented
+accomplishments. Keep useful blockers and link PR mentions to their actual URLs.
 
-## Helper
-
-```sh
-"$ORCHESTRA_DIR/AI-skills/devlog/scripts/log_work.py" --project "Project" "Outcome."
-```
-
-Use `--date YYYY-MM-DD` for a historical day. For several outcomes, pass one per
-line through stdin with `--stdin`. Project defaults to `$ORCH_DEVLOG_PROJECT`,
-then a readable name derived from the current Git repo.
-
-If writing directly, use the same layout and preserve existing content. Never
-truncate a note you cannot read; create a missing file without overwriting an
-existing one. Verify the saved entry and report the week filename. If access
-fails, report the specific limitation without claiming the note was updated.
+Read before editing, preserve unrelated entries, make scoped changes, and verify
+the result. Keep entries short. Obsidian notes are historical archives; the old
+Obsidian helper is not used for this workflow.

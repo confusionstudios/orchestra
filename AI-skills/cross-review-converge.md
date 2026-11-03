@@ -169,7 +169,12 @@ Add one sentence of task-specific context when it would materially improve the r
 
 ## Guardrails
 
-- Do not let a reviewer process run indefinitely. If it produces no output for 5 minutes, interrupt it and retry once with a tighter prompt or a longer shell-level timeout for broad or schema-sensitive diffs.
+- Do not let a reviewer process run indefinitely. If it produces no output for
+  5 minutes, investigate before retrying. A timeout or interruption of the caller
+  does not prove the underlying review stopped. Recover a completed result or
+  confirm termination before retrying once with a tighter prompt or a longer
+  timeout for broad or schema-sensitive diffs. If the original run's state cannot
+  be established, report it as blocked rather than starting duplicate work.
 - Do not commit unless the user asked to commit or the active workflow requires it.
 - Do not stage unrelated files.
 - If reviewer output conflicts with repo policy or user instructions, follow the higher-priority instruction and explain the conflict.
