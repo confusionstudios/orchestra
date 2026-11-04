@@ -21,77 +21,57 @@ Leave every recovery decision to that native loop. Monitor the repo with
    stopped or stale state honestly. Native unblocking runs only while the
    orchestrator itself is running.
 
-## Opening report
+## Status Line
 
-Immediately sample state and give one short plain-language summary:
+Start every user-facing status update with this format:
 
-- Orchestrator state: running, idle, stopped, stale, or error
-- Active task, phase, and agent when known
-- Ready queue depth or blocked task
-- One grounded clause from new agent output when available
-- Whether native smart unblocking is active (orchestrator running) or idle
-  because the orchestrator is stopped
-- Dashboard URL for this repo instance
+> Task **5 of 6** · **Make** · coder **Codex** · review round **5** — **Grok approved; now building and testing.**
+
+For planning, use **Plan** and **planner** in place of **Make** and **coder**.
+Map `commit-plan*` steps to Plan and `commit-make`, `commit-review`, and
+`commit-finalize` to Make. Keep the maker's identity visible during review;
+name the reviewer and its decision in the final clause when relevant.
+Use the task's saved agent choice, including role patches, rather than today's
+default. Show unknown fields as unknown; do not guess.
+
+Use the task's position and total only for an identifiable ordered batch or
+parent task, including its completed tasks. Do not derive them from task IDs
+or unrelated queue history. If the batch is unknown, use **Task #162**.
+Read `ko-task show <id>` for the exact persisted `review_round`; do not add one.
+Resolve the current step from runtime, falling back to the task's `next_step`.
+For blocked tasks, use the latest verb-bearing run-log entry and describe any
+recorded resume-step transition in the final clause. If the phase cannot be
+established, write **Phase unknown**.
+
+Ground the final clause in current runtime, durable review comments, run logs,
+or fresh output from the current phase. Distinguish intended work from work
+actually underway. If there is no fresh evidence, say **No new agent output.**
+For queued, blocked, waiting-dirty, stopped, or stale work, state that condition
+plainly; do not imply execution. If there is no active, blocked, or ready task,
+use **Idle — No active or queued work.**, qualifying stopped or unhealthy state
+when applicable.
+
+Keep the update to that line unless a blocker, a decision for the user, or an
+explicit request needs more detail. Narration also includes its dashboard link
+at startup. Show raw command output only when explicitly requested.
+
+## Opening Report
+
+Immediately sample state and report the Status Line above, followed by the
+current dashboard URL. Include orchestrator health or native smart-unblock
+state only when it explains a wait or blocker.
 
 Take the dashboard URL from the current `ko-get-update` `Dashboard:` line, or
-from this repo's queue runtime metadata (`dashboard.json` beside the lock file, `url`)
-when that metadata matches the monitored instance. Prefer the exact Tailscale
-Serve HTTPS mapping when one exists; otherwise use the localhost URL. Do not
-hard-code a host, Tailnet name, suffix, or dashboard URL. If the dashboard is
-not running, say so. Include the URL in this first visible update only; later
-samples stay concise and omit it.
-
-Use the update prefix below. Do not paste raw update output, JSON, logs,
-transcript dumps, or tables. Do not start a background recovery service.
-
-## Update prefix
-
-Immediately before every visible narration update, run:
-
-```bash
-date '+%H:%M:%S'
-```
-
-Prefix the update with the clock time, primary task, verb, and exact persisted
-`review_round`:
-
-```text
-[14:37:09] Task 162 · commit-review · round 2 — <short narration>
-```
+from this repo's queue runtime metadata (`dashboard.json` beside the lock file,
+`url`) when that metadata matches the monitored instance. Prefer the exact
+Tailscale Serve HTTPS mapping when one exists; otherwise use the localhost URL.
+Do not hard-code a host, Tailnet name, suffix, or dashboard URL. If the dashboard
+is not running, say so. Include the link only in the first visible update.
 
 Choose the primary task in this order: active task, blocking leaf task, next
-ready task. Always read that task with `ko-task show <id>` to obtain its exact
-`review_round` and task fields. Resolve an active task's verb from runtime
-`current_step`, falling back to task `next_step`; resolve a ready task's verb
-from `next_step`.
-
-For a blocked task, use the latest verb-bearing run-log entry. If the stored
-`resume_next_step` exists and differs from that verb, include it as a
-transition:
-
-```text
-[14:38:12] Task 162 · blocked · commit-review → commit-make · round 2 — <short narration>
-```
-
-If the resume step is absent or matches the blocked verb, show only the
-blocked verb. If no authoritative verb exists, write `verb unknown`; never
-guess one:
-
-```text
-[14:38:12] Task 162 · blocked · verb unknown · round 2 — <short narration>
-```
-
-Use the task row's numeric round without converting it to one-based display.
-If there is genuinely no active, blocked, or ready task, use:
-
-```text
-[14:39:05] Idle — No active or queued work.
-```
-
-Generate the time immediately before writing the update so investigation does
-not leave it stale. Do not include a timezone or fractional seconds. Recovery
-notices, unchanged-state updates, questions, and the final idle report all use
-the same prefix contract.
+ready task. Use the same Status Line for later progress updates, recovery
+notices, unchanged-state updates, and the final idle report. Do not paste JSON,
+logs, transcript dumps, or tables unless explicitly requested.
 
 ## Monitoring loop
 

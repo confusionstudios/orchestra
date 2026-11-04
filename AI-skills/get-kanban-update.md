@@ -2,6 +2,40 @@ Print a concise plain-text Kanban Orchestra status update for the current repo.
 
 This command is for quickly reading the state of a Kanban Orchestra pipeline without opening the dashboard. It is especially useful for external agents or scripts that need to reason about pipeline health and act accordingly.
 
+## Status Line
+
+Start every user-facing status update with this format:
+
+> Task **5 of 6** · **Make** · coder **Codex** · review round **5** — **Grok approved; now building and testing.**
+
+For planning, use **Plan** and **planner** in place of **Make** and **coder**.
+Map `commit-plan*` steps to Plan and `commit-make`, `commit-review`, and
+`commit-finalize` to Make. Keep the maker's identity visible during review;
+name the reviewer and its decision in the final clause when relevant.
+Use the task's saved agent choice, including role patches, rather than today's
+default. Show unknown fields as unknown; do not guess.
+
+Use the task's position and total only for an identifiable ordered batch or
+parent task, including its completed tasks. Do not derive them from task IDs
+or unrelated queue history. If the batch is unknown, use **Task #162**.
+Read `ko-task show <id>` for the exact persisted `review_round`; do not add one.
+Resolve the current step from runtime, falling back to the task's `next_step`.
+For blocked tasks, use the latest verb-bearing run-log entry and describe any
+recorded resume-step transition in the final clause. If the phase cannot be
+established, write **Phase unknown**.
+
+Ground the final clause in current runtime, durable review comments, run logs,
+or fresh output from the current phase. Distinguish intended work from work
+actually underway. If there is no fresh evidence, say **No new agent output.**
+For queued, blocked, waiting-dirty, stopped, or stale work, state that condition
+plainly; do not imply execution. If there is no active, blocked, or ready task,
+use **Idle — No active or queued work.**, qualifying stopped or unhealthy state
+when applicable.
+
+Keep the update to that line unless a blocker, a decision for the user, or an
+explicit request needs more detail. Narration also includes its dashboard link
+at startup. Show raw command output only when explicitly requested.
+
 ## When to use
 
 - You want a quick summary of whether the pipeline is healthy
@@ -70,4 +104,5 @@ The **ATTENTION** line is the quick answer. Common values:
 3. Check that `$ORCHESTRA_DIR` is set and that `"$ORCHESTRA_DIR/bin/ko-get-update"` exists. If not, stop and tell the user the Orchestra tooling environment is not configured.
 4. Run `"$ORCHESTRA_DIR/bin/ko-kanban"` when this worktree has no central queue yet. A legacy `kanban-orchestra.db` in the worktree is not that queue; leave it for `ko-migrate`.
 5. Run: `"$ORCHESTRA_DIR/bin/ko-get-update"`
-6. Report the output to the user verbatim, then offer a brief interpretation if they want one.
+6. Read the primary task (active, blocking leaf, then next ready) with `ko-task show <id>`. Inspect comments, run logs, or current-phase output as needed to ground its status.
+7. Report the Status Line above; include raw output only when explicitly requested.
