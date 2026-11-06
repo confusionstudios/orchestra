@@ -64,9 +64,10 @@ Both preference files are ignored by Git. Pulling an update does not copy them
 between computers. Local preferences are optional; the tracked baseline works
 without them.
 
-## Optional Claude Launcher
+## Optional Local Launchers
 
-The public Claude default is the executable `claude`. To opt into a local
+The public defaults are `claude` for Claude execution/discovery and `agent` for
+Cursor execution (`agent --list-models` for discovery). To opt into a local
 launcher, the operator may add this to the shared ignored
 `$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`:
 
@@ -74,29 +75,49 @@ launcher, the operator may add this to the shared ignored
 version: 1
 launchers:
   claude: local-claude-launcher
+  cursor:
+    run: [local-cursor-launcher, run]
+    models: [local-cursor-launcher, models]
 ```
 
-Use a single executable name on `PATH` or an absolute executable path (paths
-containing spaces are supported); `~` is expanded. Shell commands, argument
-lists, and relative paths are unsupported. The launcher must accept Claude CLI
-arguments unchanged. No helper is selected merely because it is installed.
+Each provider entry is optional. Claude retains its single executable string.
+Cursor requires exactly two nonempty argument lists: `run` is the prefix for
+normal and review execution; `models` is the complete model-listing command.
+They may name different executables. Each first element must be an executable
+name on `PATH` or an absolute path (spaces supported); `~` is expanded there.
+Relative executable paths, shell command strings, and placeholders are unsupported.
+Arguments are passed literally without a shell. Cursor run prefixes receive the
+resolved CLI arguments unchanged; models prefixes receive no extra arguments.
+Claude launchers must accept Claude CLI arguments unchanged.
+No helper is selected merely because it is installed.
 An explicitly configured launcher that is unavailable fails with an error;
-there is no fallback to `claude`. This setting is supported only in the shared
+there is no fallback to a public CLI. This setting is supported only in the shared
 file, keeping repository preferences independent of machine-specific paths.
 
-The setting covers fixed Claude keys, semantic aliases, `claude:model`, role
-patches, normal workers, ad-hoc review resolution, and Claude model discovery.
+These settings cover fixed Claude and Cursor keys, semantic aliases such as
+`grok`, `claude:model`, `cursor:model`, role patches, normal workers, ad-hoc
+review resolution, and model discovery.
 Models, flags, and the single prompt argument are retained. Provider identity
-remains Claude. Workers use the work repository as their working directory and
-empty stdin. Discovery sends its initialization protocol to the selected
-launcher and scopes its cache to that launcher setting. Changing the launcher
-invalidates discovery metadata from the previous route; ordinary resolution
+remains the canonical provider. Workers use the work repository as their working
+directory and empty stdin. Claude discovery sends its initialization protocol to the selected
+launcher. Cursor discovery invokes the configured `models` prefix with empty
+stdin. Its cache scope includes both Cursor prefixes, and the effective registry
+fingerprint includes launcher configuration. Invalid or missing configured
+commands fail clearly; failed refreshes preserve last-good metadata on disk,
+with metadata from a different scope hidden until a successful refresh.
+Cursor scope also tracks metadata (never contents) for the login keychain and
+native CLI `auth.json`: `~/.cursor/auth.json` on macOS,
+`$XDG_CONFIG_HOME/cursor/auth.json` (default `~/.config/cursor/auth.json`) on
+Linux, and `%APPDATA%/Cursor/auth.json` on Windows. An explicit
+`CURSOR_CONFIG_DIR` additionally tracks `<CURSOR_CONFIG_DIR>/auth.json` for
+launchers using that directory; it does not replace native credential tracking.
+Changing the launcher invalidates discovery metadata from the previous route; ordinary resolution
 never queries the provider.
 
 Restart workers and dashboards after an operator changes preferences. Existing
 tasks retain their saved executable and arguments, including snapshots that
-still name plain `claude`. Explicitly reselect a task's agent to replace that
-role's snapshot; changing the launcher does not rewrite admitted tasks.
+still name a previously configured launcher. Explicitly reselect a task's agent
+to replace that role's snapshot; changing the launcher does not rewrite admitted tasks.
 
 For a harmless resolver-only check from a work repository, run:
 
@@ -104,8 +125,8 @@ For a harmless resolver-only check from a work repository, run:
 "$ORCHESTRA_DIR/bin/ko-task" agents
 ```
 
-Inspect the resolved Claude executable and model arguments. This does not
-launch Claude or perform discovery. Run discovery separately only when ready
+Inspect the resolved executable, prefix, and model arguments. This does not
+launch an agent or perform discovery. Run discovery separately only when ready
 to use the launcher's authentication context.
 
 ## Optional Shell-Default Migration

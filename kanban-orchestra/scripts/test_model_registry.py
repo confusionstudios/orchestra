@@ -182,6 +182,67 @@ def test_changed_auth_scope_does_not_erase_other_account_cache(tmp_path, monkeyp
     assert [item['id'] for item in model_registry.view(tmp_path, 'codex')['models']] == ['first', 'second']
 
 
+@pytest.mark.parametrize('platform,environment,relative', [
+    ('darwin', {}, '.cursor/auth.json'),
+    ('linux', {}, '.config/cursor/auth.json'),
+    ('linux', {'XDG_CONFIG_HOME': 'xdg'}, 'xdg/cursor/auth.json'),
+    ('win32', {}, 'AppData/Roaming/Cursor/auth.json'),
+    ('win32', {'APPDATA': 'roaming'}, 'roaming/Cursor/auth.json'),
+])
+def test_cursor_auth_metadata_scope(tmp_path, monkeypatch, platform, environment, relative):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(model_registry.sys, 'platform', platform)
+    for name in ('CURSOR_CONFIG_DIR', 'XDG_CONFIG_HOME', 'APPDATA'):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, str(tmp_path / value))
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', tmp_path / 'shared.yaml')
+    # scope() may read launcher preferences, but must never open credentials.
+    original_open = Path.open
+    def guarded_open(path, *args, **kwargs):
+        assert path.name not in ('auth.json', 'login.keychain-db')
+        return original_open(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', guarded_open)
+    unrelated = model_registry.scope('codex')
+    for path in (tmp_path / relative, tmp_path / 'Library/Keychains/login.keychain-db',
+                 tmp_path / 'custom/auth.json'):
+        if path.parent.name == 'custom':
+            monkeypatch.setenv('CURSOR_CONFIG_DIR', str(path.parent))
+        before = model_registry.scope('cursor')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Only fake metadata is required; these are empty files, not credentials.
+        path.touch()
+        created = model_registry.scope('cursor')
+        assert created != before
+        info = path.stat()
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
+        assert model_registry.scope('cursor') != created
+        path.unlink()
+        assert model_registry.scope('cursor') == before
+        assert model_registry.scope('codex') == unrelated
+
+
+def test_cursor_auth_file_change_hides_but_preserves_last_good_cache(tmp_path, monkeypatch):
+    fake_path(tmp_path, monkeypatch, 'cursor')
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(model_registry.sys, 'platform', 'darwin')
+    monkeypatch.delenv('CURSOR_CONFIG_DIR', raising=False)
+    monkeypatch.setattr(agent_registry, 'SHARED_CONFIG_PATH', tmp_path / 'shared.yaml')
+    assert model_registry.refresh(tmp_path, 'cursor', timeout=2)['state'] == 'fresh'
+    cached, _ = model_registry.read(tmp_path)
+    auth = tmp_path / '.cursor/auth.json'
+    auth.parent.mkdir()
+    auth.touch()
+    assert model_registry.view(tmp_path, 'cursor')['models'] == []
+    monkeypatch.setenv('FAKE_MODE_AGENT', 'fail')
+    failed = model_registry.refresh(tmp_path, 'cursor', timeout=2)
+    assert failed['state'] == 'unavailable' and not failed['models']
+    assert 'authentication required' in failed['reason']
+    assert model_registry.read(tmp_path)[0]['providers'] == cached['providers']
+    auth.unlink()
+    assert model_registry.view(tmp_path, 'cursor')['models'][0]['id'] == 'new-model'
+
+
 def test_old_success_becomes_stale_without_erasing_models(tmp_path, monkeypatch):
     fake_path(tmp_path, monkeypatch, 'codex')
     model_registry.refresh(tmp_path, 'codex', timeout=2)

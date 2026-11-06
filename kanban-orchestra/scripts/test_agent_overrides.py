@@ -44,7 +44,7 @@ defaults:
         assert "review" in review and 'model_reasoning_effort="high"' in review
         assert review.index('model_reasoning_effort="high"') < review.index("review")
         assert "--trust" not in registry.command("quick")
-        assert registry.command("quick")[3:5] == ["--model", "composer-next"]
+        assert registry.command("quick")[2:4] == ["--model", "composer-next"]
         assert registry.role("coder")["patch"] == {"model": "gpt-6.1-sol"}
         assert registry.role("coder", "claude:sonnet-next")["patch"] == {}
         assert registry.command("claude:sonnet-next")[1:3] == ["--model", "sonnet-next"]
@@ -335,7 +335,7 @@ def test_repo_alias_overrides_shared_alias(tmp_path, monkeypatch):
     root.mkdir()
     local = write_config(root, 'version: 1\naliases: {grok: "cursor:repo-model"}\n')
     registry = agent_registry.EffectiveRegistry(root)
-    assert registry.command('grok')[4] == 'repo-model'
+    assert registry.command('grok')[3] == 'repo-model'
     assert registry.alias_sources['grok'] == str(local)
 
 
@@ -359,14 +359,14 @@ def test_shared_alias_change_preserves_saved_task_and_changes_fingerprint(tmp_pa
         shared.write_text('version: 1\naliases: {grok: "cursor:after"}\n')
         after = config.configure_agents(tmp_path)
         assert after.fingerprint != before.fingerprint
-        assert config.agent_snapshot()['roles']['coder']['run'][4] == 'after'
-        assert agent_runner._resolve_command_template('grok', conn=connection, task_id=task_id, verb='commit-make')[4] == 'before'
+        assert config.agent_snapshot()['roles']['coder']['run'][3] == 'after'
+        assert agent_runner._resolve_command_template('grok', conn=connection, task_id=task_id, verb='commit-make')[3] == 'before'
         with pytest.raises(ValueError, match='restart the worker'):
             config.check_worker_config(connection)
         shared.unlink()
         restored = config.configure_agents(tmp_path)
         assert restored.fingerprint == 'missing'
-        assert restored.command('grok')[4] == 'cursor-grok-4.6-high'
+        assert restored.command('grok')[3] == 'cursor-grok-4.6-high'
     finally:
         connection.close()
 
@@ -393,7 +393,7 @@ def test_unconfigured_resolver_honors_shared_alias(tmp_path, monkeypatch):
     def reject_git(*args, **kwargs):
         pytest.fail('Unconfigured alias resolution must not invoke Git')
     monkeypatch.setattr(agent_registry.subprocess, 'run', reject_git)
-    assert agent_registry.resolve_agent_command('grok')[4] == 'shared-model'
+    assert agent_registry.resolve_agent_command('grok')[3] == 'shared-model'
 
 
 def test_repo_agent_patch_restores_baseline_over_shared_alias(tmp_path, monkeypatch):
@@ -433,7 +433,7 @@ defaults:
     assert registry.role('planner') == {'agent': 'sonnet', 'patch': {}, 'source': str(local)}
     assert registry.role('coder')['source'] == str(shared)
     snapshot = config.agent_snapshot()
-    assert snapshot['roles']['coder']['run'][4] == 'shared-model'
+    assert snapshot['roles']['coder']['run'][3] == 'shared-model'
     monkeypatch.setenv('ORCHESTRA_DEFAULT_CODER', 'codex')
     assert registry.role('coder') == {'agent': 'codex', 'patch': {}, 'source': 'environment'}
     assert registry.role('coder', 'sonnet') == {'agent': 'sonnet', 'patch': {}, 'source': 'task'}

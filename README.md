@@ -298,7 +298,7 @@ and dynamic provider/model specs:
 | `haiku`, `sonnet`, `opus`, `fable`, `claude` | Claude Code | Product fallbacks: `sonnet` for coder/planner; `opus` for supertask planner |
 | `codex` | OpenAI Codex CLI | Product fallback for reviewer, plan reviewer, and supertask reviewer |
 | `antigravity` | Antigravity (`agy`) | Runs through its non-interactive print mode |
-| `cursor:<model>` | Cursor Agent via GUI relay | Routes through `remote-control-cursor run` and passes the exact model string to Cursor; `grok` has a tracked baseline target; use `ko-task agents` to inspect its effective model |
+| `cursor:<model>` | Cursor Agent | Uses `agent` or the explicit shared local launcher and passes the exact model string to Cursor; `grok` has a tracked baseline target; use `ko-task agents` to inspect its effective model |
 | `kilo:<model>` | Kilo Code | Passes the exact model string to Kilo; `kilo` uses its auto/free model |
 | `codex:<model>`, `claude:<model>`, `antigravity:<model>` | Respective CLIs | Use the provider's normal invocation flags with the supplied model ID |
 
@@ -332,8 +332,14 @@ Claude defaults to plain `claude`. An operator can explicitly set
 executable name on `PATH` or an absolute path. Helpers are never auto-detected;
 a configured unavailable launcher fails without fallback. This applies to
 Claude aliases, dynamic models, role patches, reviews, and model discovery.
+Cursor defaults to plain `agent`. Its optional shared setting is
+`launchers: {cursor: {run: [local-cursor-launcher, run], models: [local-cursor-launcher, models]}}`.
+Both nonempty argument lists are required: `run` prefixes resolved execution
+arguments, and `models` is the complete discovery command. They may use different
+executables. Cursor overrides also cover fixed agents, aliases, dynamic models,
+role patches and reviews; discovery cache scope includes both prefixes.
 Repo files cannot override the launcher. Saved task commands retain their
-executable. See [local launcher configuration](docs/agent-configuration-upgrade.md#optional-claude-launcher)
+executable. See [local launcher configuration](docs/agent-configuration-upgrade.md#optional-local-launchers)
 for configuration and resolver-only verification.
 
 An environment setting such as `ORCHESTRA_DEFAULT_CODER=grok` keeps selecting

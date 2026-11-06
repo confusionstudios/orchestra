@@ -441,7 +441,7 @@ ROLE_FALLBACKS = {
 LOCAL_CONFIG_NAME = Path(".kanban-orchestra/agents.yaml")
 MODEL_CACHE_NAME = Path(".kanban-orchestra/model-cache.json")
 _PROVIDER_EXECUTABLES = {
-    "codex": "codex", "claude": "claude", "cursor": "remote-control-cursor",
+    "codex": "codex", "claude": "claude", "cursor": "agent",
     "kilo": "kilo", "antigravity": "agy",
 }
 
@@ -597,35 +597,60 @@ def _patch_options(command: list[str], options: dict[str, Any], *, value_options
     return result
 
 
-def _validate_launchers(raw: Any) -> dict[str, str]:
-    if not isinstance(raw, dict) or set(raw) - {"claude"}:
-        raise ValueError("launchers: expected a mapping with only claude")
+def _launcher_executable(value: Any, field: str) -> str:
+    if (not isinstance(value, str) or not value.strip()
+            or any(char in value for char in "\x00\r\n{}")):
+        raise ValueError(f"{field}: expected one executable name or absolute path")
+    value = os.path.expanduser(value)
+    if not Path(value).is_absolute() and ("/" in value or any(c.isspace() for c in value)):
+        raise ValueError(f"{field}: use one executable name or absolute path, without arguments")
+    return value
+
+
+def _validate_launchers(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) - {"claude", "cursor"}:
+        raise ValueError("launchers: expected a mapping with only claude and cursor")
     result = {}
     for provider, value in raw.items():
-        if (not isinstance(value, str) or not value.strip()
-                or any(char in value for char in "\x00\r\n{}")):
-            raise ValueError(f"launchers.{provider}: expected one executable name or absolute path")
-        value = os.path.expanduser(value)
-        if not Path(value).is_absolute() and ("/" in value or any(c.isspace() for c in value)):
-            raise ValueError(f"launchers.{provider}: use one executable name or absolute path, without arguments")
-        result[provider] = value
+        field = f"launchers.{provider}"
+        if provider == "claude":
+            result[provider] = _launcher_executable(value, field)
+            continue
+        if not isinstance(value, dict) or set(value) != {"run", "models"}:
+            raise ValueError(f"{field}: expected run and models command prefixes")
+        result[provider] = {}
+        for purpose, prefix in value.items():
+            if (not isinstance(prefix, list) or not prefix
+                    or any(not isinstance(part, str) or not part or any(c in part for c in "\x00\r\n{}") for part in prefix)):
+                raise ValueError(f"{field}.{purpose}: expected a nonempty argument list without placeholders")
+            result[provider][purpose] = [_launcher_executable(prefix[0], f"{field}.{purpose}"), *prefix[1:]]
     return result
 
 
-def provider_launcher(provider: str, *, launchers: dict[str, str] | None = None, validate: bool = True) -> str:
-    """Read only explicit shared opt-ins; executable presence never selects a route."""
+def provider_command(provider: str, *, purpose: str = "run", launchers: dict[str, Any] | None = None,
+                     validate: bool = True) -> list[str]:
+    """Read explicit shared prefixes; executable presence never selects a route."""
     if launchers is None:
         try:
             raw = yaml.safe_load(SHARED_CONFIG_PATH.read_bytes())
         except FileNotFoundError:
             raw = {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{SHARED_CONFIG_PATH}: invalid launcher configuration: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError(f"{SHARED_CONFIG_PATH}: expected configuration mapping")
         launchers = _validate_launchers(raw.get("launchers", {}))
-    executable = launchers.get(provider, _PROVIDER_EXECUTABLES[provider])
-    if validate and provider in launchers and not shutil.which(executable):
-        raise ValueError(f"{SHARED_CONFIG_PATH}: launchers.{provider}: configured executable unavailable: {executable}")
-    return executable
+    if provider == "cursor":
+        command = launchers.get(provider, {"run": ["agent"], "models": ["agent", "--list-models"]})[purpose]
+    else:
+        command = [launchers.get(provider, _PROVIDER_EXECUTABLES[provider])]
+    if validate and provider in launchers and not shutil.which(command[0]):
+        raise ValueError(f"{SHARED_CONFIG_PATH}: launchers.{provider}: configured executable unavailable: {command[0]}")
+    return list(command)
+
+
+def provider_launcher(provider: str, *, launchers: dict[str, Any] | None = None, validate: bool = True) -> str:
+    return provider_command(provider, launchers=launchers, validate=validate)[0]
 
 
 class EffectiveRegistry:
@@ -637,7 +662,7 @@ class EffectiveRegistry:
         self.reviews = dict(AGENT_REVIEW_CMD)
         self.labels = dict(AGENT_DISPLAY_LABELS)
         self.aliases = dict(AGENT_ALIASES)
-        self.launchers: dict[str, str] = {}
+        self.launchers: dict[str, Any] = {}
         self.defaults: dict[str, dict[str, Any]] = {}
         self.default_sources: dict[str, str] = {}
         self.default_field_sources: dict[str, dict[str, str]] = {}
@@ -890,8 +915,9 @@ class EffectiveRegistry:
     def command(self, spec: str, *, review: bool = False, patch: dict[str, Any] | None = None) -> list[str] | None:
         """Resolve identity and patches before substituting the machine-local executable."""
         command = self._command(spec, review=review, patch=patch)
-        if command and command[0] == _PROVIDER_EXECUTABLES["claude"]:
-            command[0] = provider_launcher("claude", launchers=self.launchers)
+        if command and command[0] in (_PROVIDER_EXECUTABLES["claude"], _PROVIDER_EXECUTABLES["cursor"]):
+            provider = _provider_for(command)
+            command = provider_command(provider, launchers=self.launchers) + command[1:]
         return command
 
     def label(self, spec: str) -> str | None:

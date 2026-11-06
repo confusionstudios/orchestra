@@ -13,6 +13,7 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -24,10 +25,27 @@ FRESH_DAYS = 7
 
 
 def _executable(provider):
-    if provider == "claude":
-        from agent_registry import provider_launcher
-        return provider_launcher(provider, validate=False)
+    if provider in ("claude", "cursor"):
+        from agent_registry import provider_command
+        return provider_command(provider, purpose="models", validate=False)[0]
     return EXECUTABLES[provider]
+
+
+def _cursor_auth_files():
+    # Native CLI file credentials use platform paths independently of its
+    # general config directory. Also cover launchers using CURSOR_CONFIG_DIR.
+    home = Path.home()
+    if sys.platform == "darwin":
+        native = home / ".cursor/auth.json"
+    elif sys.platform == "win32":
+        native = Path(os.environ.get("APPDATA") or home / "AppData/Roaming") / "Cursor/auth.json"
+    else:
+        native = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "cursor/auth.json"
+    paths = [home / "Library/Keychains/login.keychain-db", native]
+    configured = os.environ.get("CURSOR_CONFIG_DIR", "")
+    if configured.strip():
+        paths.append(Path(configured) / "auth.json")
+    return paths
 
 
 def scope(provider: str) -> str:
@@ -38,11 +56,25 @@ def scope(provider: str) -> str:
     context = [str(os.getuid()), str(Path.home().resolve())]
     if provider == "claude":
         context.append(_executable(provider))
+    if provider == "cursor":
+        # Hash raw configuration too: invalid explicit settings must remain diagnosable
+        # and must not expose metadata from the last valid route.
+        from agent_registry import SHARED_CONFIG_PATH
+        import yaml
+        try:
+            contents = SHARED_CONFIG_PATH.read_bytes()
+        except FileNotFoundError:
+            contents = b""
+        try:
+            raw = yaml.safe_load(contents) or {}
+            context.append(json.dumps(raw.get("launchers", {}).get("cursor"), sort_keys=True))
+        except (AttributeError, TypeError, ValueError, yaml.YAMLError):
+            context.append(hashlib.sha256(contents).hexdigest())
     context.extend(f"{name}={os.environ.get(name, '')}" for name in names)
     auth_files = {
         "codex": [Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"],
         "claude": [Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / ".credentials.json"],
-        "cursor": [Path.home() / "Library/Keychains/login.keychain-db"],
+        "cursor": _cursor_auth_files() if provider == "cursor" else [],
         "kilo": [Path.home() / ".config/kilo/auth.json"],
         "antigravity": [Path.home() / ".config/agy/auth.json"],
     }
@@ -118,8 +150,12 @@ def view(root: Path, provider: str):
                 "models": [], "last_success": None}
     if not entry:
         return {"state": "unavailable", "reason": diagnostic or "never refreshed; run ko-task models refresh", "models": [], "last_success": None}
-    if not shutil.which(_executable(provider)):
-        reason = f"{_executable(provider)} executable missing"
+    try:
+        executable = _executable(provider)
+    except (ValueError, OSError) as exc:
+        return {"state": "unavailable", "reason": str(exc), "models": [], "last_success": None}
+    if not shutil.which(executable):
+        reason = f"{executable} executable missing"
         if entry.get("models"):
             reason += "; cached list retained"
         return {"state": "unavailable", "reason": reason,
@@ -341,8 +377,11 @@ def _claude(timeout):
 
 
 def _listing(provider, timeout):
-    command = {"cursor": ["agent", "--list-models"], "kilo": ["kilo", "models"],
-               "antigravity": ["agy", "models"]}[provider]
+    if provider == "cursor":
+        from agent_registry import provider_command
+        command = provider_command(provider, purpose="models")
+    else:
+        command = {"kilo": ["kilo", "models"], "antigravity": ["agy", "models"]}[provider]
     lines = list(_lines(command, timeout=timeout))
     body = "\n".join(lines).strip()
     try:

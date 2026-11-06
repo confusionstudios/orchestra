@@ -40,8 +40,27 @@ unavailable launcher fails clearly without fallback. Repo-local launcher
 settings are unsupported. Resolve through the registry for fixed Claude keys,
 `claude:model`, aliases, role patches, and ad-hoc reviews: it replaces only the
 executable after provider/model selection and option patches. Claude discovery
-uses the same setting and isolates cached metadata by launcher. Saved task
-snapshots keep their executable until that role is explicitly reselected.
+uses the same setting and isolates cached metadata by launcher.
+
+Cursor defaults to plain `agent`, with `agent --list-models` for discovery.
+An optional shared Cursor setting has exactly this shape:
+
+```yaml
+launchers:
+  cursor:
+    run: [local-cursor-launcher, run]
+    models: [local-cursor-launcher, models]
+```
+
+Both values are nonempty argument lists beginning with an executable name or
+absolute path. They may name different executables; arguments are literal,
+without shell evaluation or placeholders. `run` prefixes the resolved Cursor
+arguments after model and role option patches for fixed keys, aliases, dynamic
+models, workers and reviews. `models` is the complete discovery command.
+Resolve calls through the registry to use the effective configured host launcher.
+Missing or invalid explicit settings fail without fallback. Both prefixes scope
+discovery metadata; launcher configuration also affects registry fingerprints.
+Saved task snapshots keep their executable until that role is explicitly reselected.
 Use `ko-task agents` for a resolver-only check before any live ping or discovery.
 
 Registry `aliases` are Orchestra semantic names. They target an existing fixed
@@ -115,8 +134,8 @@ and option settings. For a direct spec with no role patch,
 registry aliases such as `grok`, and provider/model specs such as
 `cursor:claude-opus-4-8-high`. Keep the call
 non-interactive, run it from the repo root, and include task-specific context
-in the prompt. Cursor specs resolve through `remote-control-cursor run` so the
-agent executes in the signed-in GUI session. Do not feed resolver source code
+in the prompt. Cursor specs use the effective configured host launcher, or the
+public `agent` CLI when unconfigured. Do not feed resolver source code
 through stdin; agent CLIs may consume inherited stdin as additional prompt
 content. Use `python -c`, a script file, or another invocation that leaves the
 child process stdin clean.
@@ -182,5 +201,5 @@ At the time this skill was written, useful keys included:
 - `kilo-opus-4.6`
 - `kilo-opus-4.7`
 - `kilo-sonnet-4.6`
-- `cursor:<exact-model-id>` for dynamic Cursor Agent model specs; use `agent --list-models` for live account IDs
+- `cursor:<exact-model-id>` for dynamic Cursor Agent model specs; use `ko-task models refresh cursor` and `ko-task models list cursor` for IDs from the configured route
 - `kilo:<model>` for dynamic Kilo model specs

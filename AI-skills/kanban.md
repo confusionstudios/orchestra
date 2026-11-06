@@ -39,7 +39,7 @@ Use `"$ORCHESTRA_DIR/bin/ko-task" agents` to inspect effective defaults and thei
 sources. Selection follows explicit task agent, then environment, then worktree-local
 role, then the primary checkout's role for a linked worktree, then shared
 role, then product fallback. A linked worktree reads the primary preferences
-in place. Shared aliases/defaults and optional Claude launcher overrides live in
+in place. Shared aliases/defaults and optional Claude/Cursor launcher overrides live in
 `$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`; repo overrides live in
 `.kanban-orchestra/agents.yaml`. Both are optional and ignored by Git.
 Restart workers and dashboards after edits; saved task commands remain fixed.
