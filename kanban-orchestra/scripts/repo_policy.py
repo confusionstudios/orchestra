@@ -37,3 +37,14 @@ def read_allow_tasks_on_master(repo_root) -> bool:
     Freeform prose mentioning the marker name does not count.
     """
     return _read_standalone_marker(repo_root, "ALLOW_TASKS_ON_MASTER")
+
+
+def read_no_automatic_git_push(repo_root) -> bool:
+    """Return True when AGENTS.md opts out of automatic pushing.
+
+    The marker must appear as a standalone line (after stripping whitespace):
+        NO_AUTOMATIC_GIT_PUSH
+    A missing AGENTS.md and freeform prose mentioning the marker do not opt out.
+    This policy is independent of deferred-build validation.
+    """
+    return _read_standalone_marker(repo_root, "NO_AUTOMATIC_GIT_PUSH")

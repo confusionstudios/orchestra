@@ -26,6 +26,9 @@ def isolated_orchestra_state(tmp_path, monkeypatch):
     state.mkdir()
     monkeypatch.setenv("ORCHESTRA_STATE_DIR", str(state))
     monkeypatch.setenv("KANBAN_DB", str(state / "orchestra.db"))
+    # Keep finalization tests from pushing this checkout. The helper treats this
+    # as a test interlock and does not record a push comment.
+    monkeypatch.setenv("ORCHESTRA_SUPPRESS_AUTOMATIC_PUSH", "1")
     monkeypatch.delenv("ORCHESTRA_QUEUE_ID", raising=False)
     monkeypatch.delenv("ORCHESTRA_REPO_ROOT", raising=False)
     scripts = Path(__file__).resolve().parent

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db
 import config
 import repo_policy
+import automatic_push
 import task as task_cli
 import orchestrator_lock
 import agent_runner
@@ -1777,8 +1778,58 @@ def _finalize_commit(task, conn, done_without_commit=False):
                        kind="comment", author="orchestrator")
         db.update_runtime(conn, status_message=f"Task {task_id} done (commit finalized)")
         log("Task done (commit finalized)", task_id)
+        if new_hash:
+            try:
+                _attempt_automatic_push(task, conn, new_hash)
+            except Exception as exc:
+                log(
+                    "Automatic push bookkeeping failed: "
+                    + automatic_push.sanitize_reason(str(exc)),
+                    task_id,
+                )
+        else:
+            log("Automatic push skipped: commit hash is unavailable", task_id)
     _queue_follow_up_if_needed(db.get_task(conn, task_id), conn)
     _check_parent_completion(task_id, conn)
+
+
+def _attempt_automatic_push(task, conn, commit_hash):
+    """Best-effort push after the local commit is already recorded as done."""
+    if os.environ.get(automatic_push.SUPPRESS_ENV) == "1":
+        return
+    task_id = task["id"]
+    try:
+        repo_root = _repo_root()
+        if not repo_root or repo_root.startswith("("):
+            attempt = automatic_push.PushAttempt.skipped("repository root is unavailable")
+        else:
+            attempt = automatic_push.attempt_automatic_push(
+                repo_root,
+                task.get("branch") or "",
+                commit_hash,
+            )
+    except Exception as exc:
+        attempt = automatic_push.PushAttempt.failed(f"unexpected error: {exc}")
+    if attempt.status == "pushed":
+        destination = " ".join(
+            part for part in (attempt.remote, attempt.remote_branch) if part
+        )
+        log(f"Pushed {commit_hash} to {destination}".rstrip(), task_id)
+        return
+    if attempt.status == "suppressed":
+        return
+    label = "skipped" if attempt.status == "skipped" else "failed"
+    reason = attempt.reason or "no reason recorded"
+    message = f"Automatic push {label} for commit {commit_hash}: {reason}."
+    try:
+        db.add_comment(conn, task_id, message, kind="comment", author="orchestrator")
+    except Exception as exc:
+        log(
+            "Could not record automatic push outcome: "
+            + automatic_push.sanitize_reason(str(exc)),
+            task_id,
+        )
+    log(message, task_id)
 
 
 def _commit_staged_diff_from_recorded_message(task, conn):

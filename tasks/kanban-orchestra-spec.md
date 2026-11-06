@@ -241,7 +241,7 @@ These rules define the system.
 - `id` is the durable task identity. `commit_hash` is not.
 - Only the orchestrator advances workflow state during normal operation.
 - Review outcomes are stored as comments; the orchestrator derives `last_review_decision`.
-- `done` means the task's commit was finalized and submitted.
+- `done` means the task's local commit was finalized. A later push is best-effort and does not decide `done`.
 - A task must have a branch before it can be set to `ready`.
 - A task should have a meaningful `next_step` before it is set to `ready`.
 - Tasks on `master` or `main` are disabled by default unless the work repo
@@ -541,6 +541,7 @@ Rules:
 - The real git commit is not created until approval.
 - Finalization uses a plain `git commit`, never amend.
 - The orchestrator records the resulting `HEAD` as `commit_hash`.
+- After that local commit is recorded, the orchestrator attempts one normal push when the repository has not opted out and the destination is already an unambiguous existing upstream. The attempt does not amend the commit, create a remote branch, or change `commit_hash`.
 - If `commit-make` becomes blocked after local changes exist, the orchestrator stages and stashes WIP, records `stash_ref`, and leaves a durable comment.
 
 ## Deferred Full-Build Validation (CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER)
@@ -647,6 +648,79 @@ surfaces `allow_tasks_on_master: yes` for tasks on `master` or `main`.
 
 `repo_policy.read_allow_tasks_on_master(repo_root)` is the single parsing
 function. CLI and orchestrator behavior is driven by this function's output.
+
+## Automatic Push (NO_AUTOMATIC_GIT_PUSH)
+
+Automatic pushing is independent of deferred-build validation. A successful
+local commit stays complete whether or not the push runs.
+
+### Policy Marker
+
+Repositories opt out by adding this exact standalone line to their root
+`AGENTS.md`:
+
+```
+NO_AUTOMATIC_GIT_PUSH
+```
+
+The marker must appear as a standalone line (leading/trailing whitespace is
+ignored). A missing `AGENTS.md`, freeform prose containing the name, and colon
+variants such as `NO_AUTOMATIC_GIT_PUSH: true` do not qualify. This repository
+does not add that marker as part of implementing the feature.
+
+`repo_policy.read_no_automatic_git_push(repo_root)` is the single parsing
+function.
+
+An explicit human request to push overrides this opt-out in ad-hoc commit
+guidance. It does not authorize a force-push, a new remote branch, or a
+different destination. Kanban finalization does not ask the coder to push;
+the orchestrator owns that attempt.
+
+### Eligibility
+
+After a successful commit, push by default only when every check below holds:
+
+- The checkout is attached and is the expected task branch.
+- That branch has exactly one upstream, the upstream remote is not `.`, and the
+  upstream ref is the same branch name on that remote.
+- Fetch configuration has exactly one URL. At most one push URL is configured
+  on that same remote. The effective push destination is the single URL from
+  `git remote get-url --push`: the push URL when one is set, otherwise the
+  fetch URL, including one `pushInsteadOf` or `insteadOf` rewrite.
+- `branch.<name>.pushRemote` and `remote.pushDefault` do not select a different
+  remote. Multiple URLs, multiple push refspecs, globs, force refspecs, mirror
+  configuration, and `push.default=matching` are unsafe.
+- The branch already exists on that effective push destination. Its tip is read
+  from that destination before any write. `git ls-remote <remote>` reads the
+  fetch URL, so a different push URL or push rewrite is queried directly. A
+  second fetch-style rewrite of the resolved push URL is not the destination.
+  Missing objects are fetched for that one ref from the push destination only.
+  Divergent or unverifiable history is skipped.
+- The push itself is one noninteractive, bounded `git push` of
+  `refs/heads/<branch>:refs/heads/<branch>` to the configured remote name, with
+  no force, upstream creation, follow-tags, recurse-submodules, mirror, or
+  fallback destination. The remote name keeps the repository's configured
+  transport and credential helper.
+
+Git applies the repository's configured transport, including a push URL, URL
+rewrite, and credential helper. Orchestra does not replace that route with a
+hardcoded host or credential, and push comments omit URLs and secrets.
+
+### Bookkeeping
+
+The orchestrator records `commit_hash`, `status=done`, and `next_step=none`
+before the push. Follow-up queueing and parent completion still run when the
+push is skipped or fails, including when destination checks, subprocess
+errors, timeouts, or server rejection are the cause.
+
+Skipped and failed attempts become a durable orchestrator comment containing
+the full commit hash and a concise sanitized reason. A successful push is
+logged for the operator and does not add push-status text to the Git commit
+message. `DONE_WITHOUT_COMMIT` does not attempt a push.
+
+Approved finalization and skipped-review finalization both use this path.
+Ad-hoc `git-commit` and `git-commit-lite` guidance uses the same eligibility
+rules and reports a skipped or failed push to the user.
 
 ## CLI Contract
 
@@ -784,6 +858,8 @@ Required behavior:
   `deferred-build-changed` comment and exit without committing; the orchestrator
   re-enters review. If the build is clean, proceed to commit.
 - Create the real commit with plain `git commit`.
+- Do not push. The orchestrator attempts the automatic push after it records
+  the local commit. Do not put push status in the commit message.
 
 ### `commit-review`
 
@@ -843,6 +919,9 @@ A later healthy reviewer, smart-unblock recovery, reviewer switch, or explicit h
 - `commit_hash <- HEAD`
 - `status -> done`
 - `next_step -> none`
+- The orchestrator then attempts the automatic push described in Automatic
+  Push. A skipped or failed push leaves these fields unchanged and adds a
+  durable comment with the full commit hash and reason.
 
 ## Task Planning Workflow
 

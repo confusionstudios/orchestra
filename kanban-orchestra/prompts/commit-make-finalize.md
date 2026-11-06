@@ -58,11 +58,19 @@ the task requires detail:
    ```
    git commit -m "<message>"
    ```
-   Use a plain `git commit`; never amend.
+   Use a plain `git commit`; never amend. Do not run `git push`. After this
+   local commit succeeds, the orchestrator attempts one normal push when the
+   branch already has a single safe upstream, the effective push destination
+   already contains that branch, and the repository has not opted out with a
+   standalone `NO_AUTOMATIC_GIT_PUSH` line in `AGENTS.md`. The effective
+   destination is the resolved push URL, which can differ from the fetch URL.
+   A skipped or failed push does not undo the commit. The orchestrator records
+   that outcome; do not put push status in the commit message, and do not push
+   again from this step.
 
    **No-commit: signal `DONE_WITHOUT_COMMIT`.** Use only when the approved
    task is genuinely commit-free by design — e.g. an external action already
-   happened, or the diff was intentionally empty:
+   happened, or the diff was intentionally empty. Do not push on this path.
    ```
    cat <<'EOF' | task comment <id> --message-stdin --done-without-commit
    <reason no commit is needed>

@@ -9718,6 +9718,39 @@ class TestRepoPolicy(unittest.TestCase):
         result = repo_policy.read_allow_tasks_on_master(self.tmpdir)
         self.assertFalse(result)
 
+    def test_no_automatic_git_push_missing_file_returns_false(self):
+        self.assertFalse(repo_policy.read_no_automatic_git_push(self.tmpdir))
+
+    def test_no_automatic_git_push_standalone_present_returns_true(self):
+        self._write_agents_md("NO_AUTOMATIC_GIT_PUSH\n")
+        self.assertTrue(repo_policy.read_no_automatic_git_push(self.tmpdir))
+
+    def test_no_automatic_git_push_with_whitespace_returns_true(self):
+        self._write_agents_md("  NO_AUTOMATIC_GIT_PUSH  \n")
+        self.assertTrue(repo_policy.read_no_automatic_git_push(Path(self.tmpdir)))
+
+    def test_no_automatic_git_push_prose_mention_does_not_match(self):
+        self._write_agents_md(
+            "A prose mention of NO_AUTOMATIC_GIT_PUSH does not disable automatic pushing.\n"
+        )
+        self.assertFalse(repo_policy.read_no_automatic_git_push(self.tmpdir))
+
+    def test_no_automatic_git_push_colon_variant_does_not_match(self):
+        self._write_agents_md("NO_AUTOMATIC_GIT_PUSH: true\n")
+        self.assertFalse(repo_policy.read_no_automatic_git_push(self.tmpdir))
+
+    def test_no_automatic_git_push_is_independent_of_deferred_build(self):
+        self._write_agents_md("CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER\n")
+        self.assertFalse(repo_policy.read_no_automatic_git_push(self.tmpdir))
+        self.assertTrue(repo_policy.read_skip_build_until_approved(self.tmpdir))
+        self._write_agents_md("NO_AUTOMATIC_GIT_PUSH\n")
+        self.assertTrue(repo_policy.read_no_automatic_git_push(self.tmpdir))
+        self.assertFalse(repo_policy.read_skip_build_until_approved(self.tmpdir))
+
+    def test_this_checkout_does_not_opt_out_of_automatic_push(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        self.assertFalse(repo_policy.read_no_automatic_git_push(repo_root))
+
 
 class TestDeferredBuildPolicy(unittest.TestCase):
     """Tests for CODER_SKIP_BUILD_UNTIL_APPROVED_BY_KANBAN_REVIEWER orchestrator behavior."""
@@ -10047,6 +10080,242 @@ class TestDeferredBuildPolicy(unittest.TestCase):
         deferred = [c for c in comments if c["kind"] == "deferred-build-changed"]
         self.assertEqual(len(deferred), 1)
         self.assertEqual(deferred[0]["message"], "Build generated new file")
+
+
+class TestAutomaticPushFinalization(unittest.TestCase):
+    """Push failures stay best-effort after the local commit is recorded."""
+
+    def setUp(self):
+        self._ack_patcher = patch.object(orchestrator, "ensure_agent_acked")
+        self._ack_patcher.start()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.conn = db.connect(self.tmp.name)
+        self._suppress = os.environ.pop(orchestrator.automatic_push.SUPPRESS_ENV, None)
+        self._push_patcher = patch.object(
+            orchestrator.automatic_push,
+            "attempt_automatic_push",
+            return_value=orchestrator.automatic_push.PushAttempt.suppressed(),
+        )
+        self.push = self._push_patcher.start()
+
+    def tearDown(self):
+        self._push_patcher.stop()
+        self._ack_patcher.stop()
+        self.conn.close()
+        os.unlink(self.tmp.name)
+        if self._suppress is None:
+            os.environ.pop(orchestrator.automatic_push.SUPPRESS_ENV, None)
+        else:
+            os.environ[orchestrator.automatic_push.SUPPRESS_ENV] = self._suppress
+
+    def _failed(self, reason):
+        return orchestrator.automatic_push.PushAttempt.failed(reason)
+
+    def test_approved_push_failure_records_hash_and_queues_follow_up(self):
+        tid = db.add_task(
+            self.conn, "Finalize", coder_agent="claude", branch="b", skips=["commit-plan"],
+        )
+        follow_id = db.add_task(
+            self.conn,
+            "Next",
+            coder_agent="claude",
+            branch="b",
+            skips=["commit-plan", "commit-plan-review"],
+        )
+        db.update_task(
+            self.conn,
+            tid,
+            status="running",
+            next_step="commit-make",
+            last_review_decision="approve",
+            follow_up_task_id=follow_id,
+        )
+        commit = "a" * 40
+        self.push.return_value = self._failed("push was rejected")
+        with patch.object(orchestrator, "run_agent", return_value=0), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", side_effect=["b" * 40, commit, commit]), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, tid), self.conn))
+
+        updated = db.get_task(self.conn, tid)
+        follow = db.get_task(self.conn, follow_id)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["commit_hash"], commit)
+        self.assertEqual(updated["follow_up_task_id"], follow_id)
+        self.assertEqual(follow["status"], "ready")
+        self.assertEqual(follow["next_step"], "commit-make")
+        messages = [comment["message"] for comment in db.get_comments(self.conn, tid)]
+        failed = [message for message in messages if message.startswith("Automatic push failed")]
+        self.assertEqual(failed, [f"Automatic push failed for commit {commit}: push was rejected."])
+        self.assertNotIn("Automatic push", next(message for message in messages if message.startswith("Task complete:")))
+        self.push.assert_called_once()
+        self.assertEqual(self.push.call_args.args[1:], ("b", commit))
+
+    def test_push_failure_still_queues_parent_review(self):
+        parent_id = db.add_task(
+            self.conn, "Parent", kind="supertask", branch="feat", coder_agent="claude",
+        )
+        db.update_task(self.conn, parent_id, status="pending_subtasks")
+        done_id = db.add_task(
+            self.conn, "Child 1", parent_task_id=parent_id,
+            sequence_index=100, branch="feat", coder_agent="claude",
+        )
+        active_id = db.add_task(
+            self.conn, "Child 2", parent_task_id=parent_id,
+            sequence_index=200, branch="feat", coder_agent="claude",
+        )
+        db.update_task(self.conn, done_id, status="done")
+        db.update_task(
+            self.conn, active_id, status="running", next_step="commit-make",
+            last_review_decision="approve",
+        )
+        commit = "c" * 40
+        self.push.return_value = self._failed("git command timed out")
+        with patch.object(orchestrator, "run_agent", return_value=0), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", side_effect=["d" * 40, commit, commit]), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, active_id), self.conn))
+
+        child = db.get_task(self.conn, active_id)
+        parent = db.get_task(self.conn, parent_id)
+        self.assertEqual(child["status"], "done")
+        self.assertEqual(child["commit_hash"], commit)
+        self.assertEqual(parent["status"], "ready")
+        self.assertEqual(parent["next_step"], "commit-review-supertask")
+        self.assertIsNone(parent["commit_hash"])
+        messages = [comment["message"] for comment in db.get_comments(self.conn, active_id)]
+        self.assertIn(f"Automatic push failed for commit {commit}: git command timed out.", messages)
+
+    def test_push_exception_keeps_done_and_redacts_secrets(self):
+        tid = db.add_task(self.conn, "Boom", coder_agent="claude", branch="b", skips=["commit-plan"])
+        follow_id = db.add_task(
+            self.conn, "Later", coder_agent="claude", branch="b",
+            skips=["commit-plan", "commit-plan-review"],
+        )
+        db.update_task(
+            self.conn, tid, status="running", next_step="commit-make",
+            last_review_decision="approve", follow_up_task_id=follow_id,
+        )
+        token = "ghp_" + ("a" * 36)
+        commit = "e" * 40
+        self.push.side_effect = RuntimeError(
+            f"Authentication failed token {token} for https://user:secret@example.com/repo.git"
+        )
+        with patch.object(orchestrator, "run_agent", return_value=0), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", side_effect=["f" * 40, commit, commit]), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, tid), self.conn))
+
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["commit_hash"], commit)
+        self.assertEqual(db.get_task(self.conn, follow_id)["status"], "ready")
+        failed = [
+            comment["message"] for comment in db.get_comments(self.conn, tid)
+            if comment["message"].startswith("Automatic push failed")
+        ]
+        self.assertEqual(len(failed), 1)
+        self.assertIn(commit, failed[0])
+        self.assertNotIn(token, failed[0])
+        self.assertNotIn("example.com", failed[0])
+        self.assertIn("[redacted]", failed[0])
+
+    def test_successful_push_does_not_add_a_push_comment(self):
+        tid = db.add_task(self.conn, "Pushed", coder_agent="claude", branch="b")
+        db.update_task(
+            self.conn, tid, status="running", next_step="commit-make",
+            last_review_decision="approve",
+        )
+        commit = "a" * 40
+        self.push.return_value = orchestrator.automatic_push.PushAttempt.pushed("origin", "b")
+        with patch.object(orchestrator, "run_agent", return_value=0), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", side_effect=["b" * 40, commit, commit]), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, tid), self.conn))
+
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["commit_hash"], commit)
+        messages = [comment["message"] for comment in db.get_comments(self.conn, tid)]
+        self.assertFalse(any(message.startswith("Automatic push") for message in messages))
+        self.assertIn("Task complete: commit finalized locally on branch 'b'.", messages)
+
+    def test_skipped_review_records_push_skip_without_changing_commit_message(self):
+        tid = db.add_task(
+            self.conn, "Skip review", coder_agent="claude", branch="b", skips=["commit-review"],
+        )
+        db.update_task(self.conn, tid, status="running", next_step="commit-make")
+        commit = "a" * 40
+        self.push.return_value = orchestrator.automatic_push.PushAttempt.skipped(
+            "repository opts out of automatic push"
+        )
+
+        def fake_coder(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(conn, task_id, "Ship the change\n\nTask 1", kind="commit-message", author=name)
+            return 0
+
+        real_run = orchestrator.subprocess.run
+
+        def fake_run(args, *args_rest, **kwargs):
+            if list(args)[:2] == ["git", "commit"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return real_run(args, *args_rest, **kwargs)
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_coder), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", return_value=commit), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False), \
+             patch.object(orchestrator.repo_policy, "read_skip_build_until_approved", return_value=False), \
+             patch.object(orchestrator.subprocess, "run", side_effect=fake_run) as mock_commit:
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, tid), self.conn))
+
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["next_step"], "none")
+        self.assertEqual(updated["commit_hash"], commit)
+        messages = [comment["message"] for comment in db.get_comments(self.conn, tid)]
+        self.assertIn(
+            f"Automatic push skipped for commit {commit}: repository opts out of automatic push.",
+            messages,
+        )
+        commit_inputs = [
+            call.kwargs.get("input", "")
+            for call in mock_commit.call_args_list
+            if call.args and call.args[0][:2] == ["git", "commit"]
+        ]
+        self.assertEqual(len(commit_inputs), 1)
+        self.assertNotIn("Automatic push", commit_inputs[0])
+        self.assertNotIn("not pushed", commit_inputs[0].lower())
+
+    def test_done_without_commit_does_not_attempt_push(self):
+        tid = db.add_task(self.conn, "No commit", coder_agent="claude", branch="b")
+        db.update_task(
+            self.conn, tid, status="running", next_step="commit-make",
+            last_review_decision="approve",
+        )
+
+        def fake_agent(name, prompt, task_id, conn, verb, **kw):
+            db.add_comment(conn, task_id, "Nothing to commit", kind="done-without-commit", author=name)
+            return 0
+
+        with patch.object(orchestrator, "run_agent", side_effect=fake_agent), \
+             patch.object(orchestrator, "ensure_branch", return_value=True), \
+             patch.object(orchestrator, "get_head_commit_hash", return_value="a" * 40), \
+             patch.object(orchestrator, "is_worktree_dirty", return_value=False):
+            self.assertTrue(orchestrator.advance(db.get_task(self.conn, tid), self.conn))
+
+        updated = db.get_task(self.conn, tid)
+        self.assertEqual(updated["status"], "done")
+        self.assertIsNone(updated["commit_hash"])
+        self.push.assert_not_called()
+        messages = [comment["message"] for comment in db.get_comments(self.conn, tid)]
+        self.assertFalse(any(message.startswith("Automatic push") for message in messages))
 
 
 class TestAgentRegistryAliases(unittest.TestCase):

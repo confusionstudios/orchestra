@@ -20,6 +20,8 @@ There is no build step for this repo.
 Do not queue or run Kanban Orchestra tasks on `master` or `main` in this repo.
 Use a feature branch for orchestrated work.
 
+Successful commits attempt a normal push when the current branch already has one safe upstream. A prose mention of NO_AUTOMATIC_GIT_PUSH does not disable that behavior; only a standalone marker line does. An explicit request to push still authorizes a push.
+
 Before staging changes that could affect executable behavior, run the unit tests
 from this checkout:
 
