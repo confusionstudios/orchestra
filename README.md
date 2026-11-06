@@ -318,7 +318,7 @@ defaults:
   planner: {agent: codex}
 ```
 
-This shared file accepts `version`, `aliases`, and `defaults`. It overrides the
+This shared file accepts `version`, `aliases`, `defaults`, and optional `launchers`. It overrides the
 product baseline; work-repository aliases, agents, and role entries take
 precedence over it. A primary repo role entry replaces that shared role entry
 in full. A linked worktree reads the primary checkout's
@@ -326,6 +326,15 @@ in full. A linked worktree reads the primary checkout's
 role entry overrides one field at a time, so the other inherited fields keep
 their sources. Orchestra does not copy preferences, auth, databases, locks, or
 runtime state into the worktree.
+
+Claude defaults to plain `claude`. An operator can explicitly set
+`launchers: {claude: local-claude-launcher}` in this shared file to use one
+executable name on `PATH` or an absolute path. Helpers are never auto-detected;
+a configured unavailable launcher fails without fallback. This applies to
+Claude aliases, dynamic models, role patches, reviews, and model discovery.
+Repo files cannot override the launcher. Saved task commands retain their
+executable. See [local launcher configuration](docs/agent-configuration-upgrade.md#optional-claude-launcher)
+for configuration and resolver-only verification.
 
 An environment setting such as `ORCHESTRA_DEFAULT_CODER=grok` keeps selecting
 `grok` and uses its effective target. Editing the shared file does not require

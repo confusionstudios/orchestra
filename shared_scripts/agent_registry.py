@@ -12,6 +12,7 @@ from pathlib import Path
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 from typing import Any
 
@@ -596,6 +597,37 @@ def _patch_options(command: list[str], options: dict[str, Any], *, value_options
     return result
 
 
+def _validate_launchers(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict) or set(raw) - {"claude"}:
+        raise ValueError("launchers: expected a mapping with only claude")
+    result = {}
+    for provider, value in raw.items():
+        if (not isinstance(value, str) or not value.strip()
+                or any(char in value for char in "\x00\r\n{}")):
+            raise ValueError(f"launchers.{provider}: expected one executable name or absolute path")
+        value = os.path.expanduser(value)
+        if not Path(value).is_absolute() and ("/" in value or any(c.isspace() for c in value)):
+            raise ValueError(f"launchers.{provider}: use one executable name or absolute path, without arguments")
+        result[provider] = value
+    return result
+
+
+def provider_launcher(provider: str, *, launchers: dict[str, str] | None = None, validate: bool = True) -> str:
+    """Read only explicit shared opt-ins; executable presence never selects a route."""
+    if launchers is None:
+        try:
+            raw = yaml.safe_load(SHARED_CONFIG_PATH.read_bytes())
+        except FileNotFoundError:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"{SHARED_CONFIG_PATH}: expected configuration mapping")
+        launchers = _validate_launchers(raw.get("launchers", {}))
+    executable = launchers.get(provider, _PROVIDER_EXECUTABLES[provider])
+    if validate and provider in launchers and not shutil.which(executable):
+        raise ValueError(f"{SHARED_CONFIG_PATH}: launchers.{provider}: configured executable unavailable: {executable}")
+    return executable
+
+
 class EffectiveRegistry:
     """Validated, immutable-for-one-process view of one work repository."""
 
@@ -605,6 +637,7 @@ class EffectiveRegistry:
         self.reviews = dict(AGENT_REVIEW_CMD)
         self.labels = dict(AGENT_DISPLAY_LABELS)
         self.aliases = dict(AGENT_ALIASES)
+        self.launchers: dict[str, str] = {}
         self.defaults: dict[str, dict[str, Any]] = {}
         self.default_sources: dict[str, str] = {}
         self.default_field_sources: dict[str, dict[str, str]] = {}
@@ -653,8 +686,11 @@ class EffectiveRegistry:
             raise ValueError(f"{path}: cannot read configuration: {exc}") from exc
         try:
             raw = yaml.safe_load(contents)
-            if shared and (not isinstance(raw, dict) or set(raw) - {"version", "aliases", "defaults"}):
-                raise ValueError("shared overrides accept only version, aliases, and defaults")
+            if shared and (not isinstance(raw, dict) or set(raw) - {"version", "aliases", "defaults", "launchers"}):
+                raise ValueError("shared overrides accept only version, aliases, defaults, and launchers")
+            if shared:
+                self.launchers = _validate_launchers(raw.get("launchers", {}))
+                raw = {key: value for key, value in raw.items() if key != "launchers"}
             self._load(raw, source=path, merge_defaults=merge_defaults)
         except (ValueError, yaml.YAMLError) as exc:
             raise ValueError(f"{path}: {exc}") from exc
@@ -762,12 +798,12 @@ class EffectiveRegistry:
             for key, value in patch.items():
                 merged[key] = value
                 fields[key] = str(source)
-            if "agent" in patch and self.command(patch["agent"]) is None:
+            if "agent" in patch and self._command(patch["agent"]) is None:
                 raise ValueError(f"defaults.{role}.agent: unknown agent {patch['agent']!r}")
             spec = merged.get("agent", ROLE_FALLBACKS[role])
             try:
-                self.command(spec, patch=merged)
-                self.command(spec, review=True, patch=merged)
+                self._command(spec, patch=merged)
+                self._command(spec, review=True, patch=merged)
             except ValueError as exc:
                 raise ValueError(f"defaults.{role}: {exc}") from exc
             self.defaults[role] = merged
@@ -820,7 +856,7 @@ class EffectiveRegistry:
     def _spec_provider(self, spec: str) -> str | None:
         """Return the provider of a resolved agent command, or None when unresolved."""
         try:
-            command = self.command(spec)
+            command = self._command(spec)
         except ValueError:
             return None
         if not command:
@@ -830,7 +866,7 @@ class EffectiveRegistry:
         except ValueError:
             return None
 
-    def command(self, spec: str, *, review: bool = False, patch: dict[str, Any] | None = None) -> list[str] | None:
+    def _command(self, spec: str, *, review: bool = False, patch: dict[str, Any] | None = None) -> list[str] | None:
         target = self._target(spec)
         command = (self.reviews.get(target) if review else None) or self.agents.get(target)
         if command is None:
@@ -851,6 +887,13 @@ class EffectiveRegistry:
                 command = _patch_options(command, patch["options"], value_options=self.option_values.get(target, ()))
         return command
 
+    def command(self, spec: str, *, review: bool = False, patch: dict[str, Any] | None = None) -> list[str] | None:
+        """Resolve identity and patches before substituting the machine-local executable."""
+        command = self._command(spec, review=review, patch=patch)
+        if command and command[0] == _PROVIDER_EXECUTABLES["claude"]:
+            command[0] = provider_launcher("claude", launchers=self.launchers)
+        return command
+
     def label(self, spec: str) -> str | None:
         target = self._target(spec)
         if target in self.labels:
@@ -868,7 +911,7 @@ class EffectiveRegistry:
             patch = self.defaults.get(name, {})
             spec = patch.get("agent", ROLE_FALLBACKS[name])
             source = self.default_sources.get(name, "product") if patch else "product"
-        if self.command(spec) is None:
+        if self._command(spec) is None:
             raise ValueError(f"{source}: {name} agent {spec!r} is invalid; choose an agent or provider:model")
         result = {"agent": spec, "patch": {key: value for key, value in patch.items() if key != "agent"}, "source": source}
         field_sources = self.default_field_sources.get(name, {})
@@ -897,7 +940,7 @@ class EffectiveRegistry:
                 model = parsed[1]
                 choices.setdefault(model, {"id": model, "label": name, "capabilities": {}, "sources": ["baseline"]})
         for name in (*self.agents, *self.aliases):
-            command = self.command(name)
+            command = self._command(name)
             if _provider_for(command) != provider:
                 continue
             model = _command_option(command, "-m", "--model")
@@ -907,7 +950,7 @@ class EffectiveRegistry:
                                   "sources": [self._layer_label(source)]}
         for role in ROLE_FALLBACKS:
             selection = self.role(role)
-            command = self.command(selection["agent"], patch=selection["patch"])
+            command = self._command(selection["agent"], patch=selection["patch"])
             model = _command_option(command, "-m", "--model")
             if model and _provider_for(command) == provider and selection["source"] != "product":
                 model_source = selection.get("field_sources", {}).get("model", selection["source"])
@@ -923,7 +966,7 @@ class EffectiveRegistry:
     def model_warnings(self) -> list[str]:
         warnings = []
         for name in (*self.agents, *self.aliases):
-            command = self.command(name)
+            command = self._command(name)
             provider = _provider_for(command)
             model = _command_option(command, "-m", "--model")
             listing = model_registry.view(self.path.parent.parent, provider)
@@ -931,7 +974,7 @@ class EffectiveRegistry:
                 warnings.append(f"{name}: configured {provider}:{model} absent from latest discovery; selection retained")
         for role in ROLE_FALLBACKS:
             selection = self.role(role)
-            command = self.command(selection["agent"], patch=selection["patch"])
+            command = self._command(selection["agent"], patch=selection["patch"])
             provider = _provider_for(command)
             model = _command_option(command, "-m", "--model")
             listing = model_registry.view(self.path.parent.parent, provider)

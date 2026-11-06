@@ -43,7 +43,7 @@ local configuration, not a promise that every account has that model.
 
 Repo preferences live at `.kanban-orchestra/agents.yaml` in the work repository.
 They may define agents, aliases, and defaults; the shared file supports aliases
-and defaults. Repo aliases take precedence over shared aliases. A repo role
+and defaults, plus installation-local launchers. Repo aliases take precedence over shared aliases. A repo role
 entry replaces the shared entry for that role.
 
 Role selection is explicit task/user choice, environment override, repo role,
@@ -63,6 +63,50 @@ Invalid legacy choices block with an explanation for the operator.
 Both preference files are ignored by Git. Pulling an update does not copy them
 between computers. Local preferences are optional; the tracked baseline works
 without them.
+
+## Optional Claude Launcher
+
+The public Claude default is the executable `claude`. To opt into a local
+launcher, the operator may add this to the shared ignored
+`$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`:
+
+```yaml
+version: 1
+launchers:
+  claude: local-claude-launcher
+```
+
+Use a single executable name on `PATH` or an absolute executable path (paths
+containing spaces are supported); `~` is expanded. Shell commands, argument
+lists, and relative paths are unsupported. The launcher must accept Claude CLI
+arguments unchanged. No helper is selected merely because it is installed.
+An explicitly configured launcher that is unavailable fails with an error;
+there is no fallback to `claude`. This setting is supported only in the shared
+file, keeping repository preferences independent of machine-specific paths.
+
+The setting covers fixed Claude keys, semantic aliases, `claude:model`, role
+patches, normal workers, ad-hoc review resolution, and Claude model discovery.
+Models, flags, and the single prompt argument are retained. Provider identity
+remains Claude. Workers use the work repository as their working directory and
+empty stdin. Discovery sends its initialization protocol to the selected
+launcher and scopes its cache to that launcher setting. Changing the launcher
+invalidates discovery metadata from the previous route; ordinary resolution
+never queries the provider.
+
+Restart workers and dashboards after an operator changes preferences. Existing
+tasks retain their saved executable and arguments, including snapshots that
+still name plain `claude`. Explicitly reselect a task's agent to replace that
+role's snapshot; changing the launcher does not rewrite admitted tasks.
+
+For a harmless resolver-only check from a work repository, run:
+
+```bash
+"$ORCHESTRA_DIR/bin/ko-task" agents
+```
+
+Inspect the resolved Claude executable and model arguments. This does not
+launch Claude or perform discovery. Run discovery separately only when ready
+to use the launcher's authentication context.
 
 ## Optional Shell-Default Migration
 

@@ -23,7 +23,7 @@ labels, and commands for the launched work repository with:
 
 Shared Git-ignored overrides live at
 `$ORCHESTRA_DIR/shared_scripts/agents.local.yaml`. Its `version: 1`
-and `aliases` and `defaults` mappings can redefine names and role choices for
+and `aliases`, `defaults`, and optional `launchers` mappings can redefine names and role choices for
 every work repo using that installation, without a Git commit or shell edit.
 Repo-local aliases and agents take precedence; repo role entries replace shared role entries.
 Explicit task choices and `ORCHESTRA_DEFAULT_*` exports take priority over
@@ -31,6 +31,18 @@ file-based role defaults. Remove persistent exports to use shared defaults.
 Use `ko-task agents` to inspect the source and resolved command. Restart workers
 and dashboards after editing either layer;
 existing task snapshots retain their selected commands.
+
+The public Claude launcher is plain `claude`. Only an explicit shared
+`launchers: {claude: local-claude-launcher}` setting selects another executable;
+installed helper detection never changes the route. Use one executable name on
+`PATH` or an absolute path, without shell syntax or arguments. A configured
+unavailable launcher fails clearly without fallback. Repo-local launcher
+settings are unsupported. Resolve through the registry for fixed Claude keys,
+`claude:model`, aliases, role patches, and ad-hoc reviews: it replaces only the
+executable after provider/model selection and option patches. Claude discovery
+uses the same setting and isolates cached metadata by launcher. Saved task
+snapshots keep their executable until that role is explicitly reselected.
+Use `ko-task agents` for a resolver-only check before any live ping or discovery.
 
 Registry `aliases` are Orchestra semantic names. They target an existing fixed
 key or `provider:model` spec and do not define their own commands. `grok` is

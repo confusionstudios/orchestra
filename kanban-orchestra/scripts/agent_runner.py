@@ -227,7 +227,7 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
     try:
         proc_cwd = _repo_root_for_subprocess()
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=0, start_new_session=True, cwd=proc_cwd,
             env=_child_env(conn),
         )
@@ -442,7 +442,7 @@ def run_agent(
 
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, start_new_session=True, cwd=proc_cwd,
             env=_child_env(conn),
         )

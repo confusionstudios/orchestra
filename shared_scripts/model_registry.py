@@ -23,12 +23,21 @@ TIMEOUT = 12
 FRESH_DAYS = 7
 
 
+def _executable(provider):
+    if provider == "claude":
+        from agent_registry import provider_launcher
+        return provider_launcher(provider, validate=False)
+    return EXECUTABLES[provider]
+
+
 def scope(provider: str) -> str:
     # Hash context, including credentials, without recording their values.
     names = {"codex": ("CODEX_HOME",), "claude": ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY"),
              "cursor": ("CURSOR_CONFIG_DIR", "CURSOR_API_KEY"), "kilo": ("KILO_API_KEY",),
              "antigravity": ("GOOGLE_API_KEY",)}[provider]
     context = [str(os.getuid()), str(Path.home().resolve())]
+    if provider == "claude":
+        context.append(_executable(provider))
     context.extend(f"{name}={os.environ.get(name, '')}" for name in names)
     auth_files = {
         "codex": [Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"],
@@ -109,8 +118,8 @@ def view(root: Path, provider: str):
                 "models": [], "last_success": None}
     if not entry:
         return {"state": "unavailable", "reason": diagnostic or "never refreshed; run ko-task models refresh", "models": [], "last_success": None}
-    if not shutil.which(EXECUTABLES[provider]):
-        reason = f"{EXECUTABLES[provider]} executable missing"
+    if not shutil.which(_executable(provider)):
+        reason = f"{_executable(provider)} executable missing"
         if entry.get("models"):
             reason += "; cached list retained"
         return {"state": "unavailable", "reason": reason,
@@ -316,7 +325,7 @@ def _codex(timeout):
 
 def _claude(timeout):
     message = {"type": "control_request", "request_id": "models", "request": {"subtype": "initialize"}}
-    command = ["claude", "--print", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json"]
+    command = [_executable("claude"), "--print", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json"]
     with closing(_lines(command, [message], timeout)) as lines:
         for line in lines:
             event = json.loads(line)
@@ -373,8 +382,8 @@ def refresh(root: Path, provider: str, timeout=TIMEOUT):
     with lock.open("a+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
-            if not shutil.which(EXECUTABLES[provider]):
-                raise FileNotFoundError(f"{EXECUTABLES[provider]} executable missing")
+            if not shutil.which(_executable(provider)):
+                raise FileNotFoundError(f"{_executable(provider)} executable missing")
             initial_scope = scope(provider)
             models = _codex(timeout) if provider == "codex" else _claude(timeout) if provider == "claude" else _listing(provider, timeout)
             if scope(provider) != initial_scope:
