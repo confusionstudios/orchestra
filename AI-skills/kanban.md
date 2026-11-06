@@ -276,6 +276,13 @@ launches every valid selected stopped instance and reuses one that is already
 live. A dirty worktree starts in `waiting-dirty` with its dashboard and
 heartbeat live, while invalid primary config remains a hard failure.
 
+After worker startup, `ko-fleet start` also starts or reuses the singleton Fleet
+Dashboard and prints its preferred URL without opening a browser. This applies
+to selected-repo starts and already-running workers. Repeated or concurrent
+starts share the existing dashboard startup lock and readiness checks. A Fleet
+Dashboard startup failure exits nonzero after reporting the worker results and
+status. Use `ko-fleet dashboard` to open the Fleet Dashboard explicitly.
+
 Graceful stop after the current task finishes:
 
 ```bash

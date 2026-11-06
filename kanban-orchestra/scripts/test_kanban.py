@@ -6423,6 +6423,7 @@ class TestFleetConfig(unittest.TestCase):
              patch.object(fleet, "wait_dashboard_ready", return_value=True) as wait_dashboard, \
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"), \
              redirect_stdout(out):
             fleet.start([repo])

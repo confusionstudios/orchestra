@@ -256,6 +256,12 @@ instance per configured repo:
 "$ORCHESTRA_DIR/bin/ko-fleet" dashboard
 ```
 
+`ko-fleet start` also starts or reuses the singleton Fleet Dashboard and prints
+its preferred URL without opening a browser. This includes selected-repo starts
+and starts where the selected workers are already running. Use `ko-fleet dashboard`
+to open it explicitly. If Fleet Dashboard startup fails, the command reports
+the error and exits nonzero after showing the selected workers' results and status.
+
 The private config at `~/.config/orchestra/fleet.repos` contains one primary
 repo root per line; blank lines and `#` comments are allowed. Fleet discovers
 an initialized linked worktree from Git and does not keep a second

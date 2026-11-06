@@ -1056,6 +1056,9 @@ dashboard selection all use this discovered set.
 - reuses an instance whose singleton lock is already live
 - starts dirty selected repos in the observable `waiting-dirty` state
 - refuses selected starts when any selected repo configuration is invalid
+- ensures the singleton Fleet Dashboard is running after worker startup, including selected-repo starts and already-running workers, and prints its preferred URL without opening a browser
+- reuses the Fleet Dashboard startup lock, live metadata validation, port selection, and preferred URL resolution used by `ko-fleet dashboard`; repeated and concurrent starts reuse the singleton
+- reports Fleet Dashboard startup failures with a nonzero exit after showing worker results and status; invalid selected config prevents Fleet Dashboard startup as well as worker startup
 - keeps process-supervision details behind the fleet command
 
 `ko-fleet stop`:

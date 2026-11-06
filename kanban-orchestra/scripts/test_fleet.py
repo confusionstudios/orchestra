@@ -538,6 +538,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"):
             fleet.start([repo])
 
@@ -571,6 +572,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"):
             fleet.start(repos)
 
@@ -595,6 +597,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"):
             fleet.start([running, stopped])
 
@@ -609,6 +612,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet, "wait_dashboard_ready", return_value=True), \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"):
             fleet.start([dirty, clean])
 
@@ -627,11 +631,13 @@ class TestFleetOperatorFlows(unittest.TestCase):
         with patch.object(fleet, "require_tool"), \
              patch.object(fleet, "orchestra_bin", return_value=Path("/opt/orchestra/bin/ko-orchestrator")), \
              patch.object(fleet, "repo_process_state") as repo_process_state, \
+             patch.object(fleet, "ensure_fleet_dashboard") as ensure_dashboard, \
              redirect_stderr(err), \
              self.assertRaises(SystemExit):
             fleet.start(repos)
 
         repo_process_state.assert_not_called()
+        ensure_dashboard.assert_not_called()
         self.assertIn("missing-one", err.getvalue())
         self.assertIn("missing-two", err.getvalue())
 
@@ -656,6 +662,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet.subprocess, "run", side_effect=fake_run), \
              patch.object(fleet, "wait_dashboard_ready", side_effect=fake_wait), \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"):
             fleet.start(repos)
 
@@ -672,6 +679,7 @@ class TestFleetOperatorFlows(unittest.TestCase):
              patch.object(fleet, "wait_dashboard_ready", return_value=True) as wait_dashboard, \
              patch.object(fleet.subprocess, "run") as run, \
              patch.object(fleet.time, "sleep"), \
+             patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
              patch.object(fleet, "print_status"), \
              redirect_stdout(out):
             fleet.start([repo])
@@ -680,6 +688,63 @@ class TestFleetOperatorFlows(unittest.TestCase):
         wait_dashboard.assert_called_once_with(repo)
         run.assert_not_called()
         self.assertIn("dashboard started", out.getvalue())
+
+    def test_start_ensures_fleet_dashboard_without_opening_browser(self):
+        repo = fleet.FleetRepo("selected", Path("/tmp/selected"), Path("/tmp/selected"))
+        payload = {"url": "http://127.0.0.1:8426"}
+        for running in (False, True):
+            for dashboard_live in (False, True):
+                with self.subTest(running=running, dashboard_live=dashboard_live), \
+                     patch.object(fleet, "require_tool"), \
+                     patch.object(fleet, "orchestra_bin"), \
+                     patch.object(fleet, "repo_process_state", return_value=(
+                         ("running/idle", "123", "456", "orch-selected") if running
+                         else ("stopped", "-", "-", "-")
+                     )), \
+                     patch.object(fleet, "start_tmux_session", return_value=True) as worker, \
+                     patch.object(fleet, "_fleet_dashboard_start_lock", return_value=nullcontext()), \
+                     patch.object(fleet, "fleet_dashboard_live_payload", return_value=payload if dashboard_live else None), \
+                     patch.object(fleet, "start_fleet_dashboard_process") as dashboard, \
+                     patch.object(fleet, "wait_fleet_dashboard_ready", return_value=payload), \
+                     patch.object(fleet, "preferred_dashboard_url", return_value="https://node.example.ts.net:8426/") as preferred, \
+                     patch.object(fleet, "_open_dashboard_url") as open_url, \
+                     patch.object(fleet.time, "sleep"), \
+                     patch.object(fleet, "print_status") as status, \
+                     redirect_stdout(io.StringIO()) as out:
+                    fleet.start([repo])
+
+                self.assertEqual(worker.call_count, 0 if running else 1)
+                self.assertEqual(dashboard.call_count, 0 if dashboard_live else 1)
+                status.assert_called_once_with([repo])
+                preferred.assert_called_once_with(payload["url"], prefer_local=False)
+                open_url.assert_not_called()
+                self.assertIn("https://node.example.ts.net:8426/", out.getvalue())
+
+    def test_start_reports_fleet_dashboard_failures_after_worker_results(self):
+        repo = fleet.FleetRepo("selected", Path("/tmp/selected"), Path("/tmp/selected"))
+        for failure in (None, OSError("spawn denied"), OSError("lock denied")):
+            with self.subTest(failure=failure), \
+                 patch.object(fleet, "require_tool"), \
+                 patch.object(fleet, "orchestra_bin"), \
+                 patch.object(fleet, "repo_process_state", return_value=("stopped", "-", "-", "-")), \
+                 patch.object(fleet, "start_tmux_session", return_value=True) as worker, \
+                 patch.object(fleet, "_fleet_dashboard_start_lock", side_effect=failure if failure and "lock" in str(failure) else None, return_value=nullcontext()), \
+                 patch.object(fleet, "fleet_dashboard_live_payload", return_value=None), \
+                 patch.object(fleet, "start_fleet_dashboard_process", side_effect=failure if failure and "spawn" in str(failure) else None), \
+                 patch.object(fleet, "wait_fleet_dashboard_ready", return_value=None), \
+                 patch.object(fleet.time, "sleep"), \
+                 patch.object(fleet, "print_status") as status, \
+                 redirect_stdout(io.StringIO()) as out, \
+                 redirect_stderr(io.StringIO()) as err, \
+                 self.assertRaises(SystemExit) as raised:
+                fleet.start([repo])
+
+            self.assertEqual(raised.exception.code, 1)
+            worker.assert_called_once()
+            status.assert_called_once_with([repo])
+            self.assertIn("selected: started", out.getvalue())
+            self.assertIn("fleet dashboard startup failed", err.getvalue())
+            self.assertIn(str(failure) if failure else "did not become ready", err.getvalue())
 
     def test_stop_stops_fleet_owned_session(self):
         repo = fleet.FleetRepo("repo", Path("/tmp/repo"), Path("/tmp/repo"))
@@ -1394,6 +1459,7 @@ while True:
                  patch.object(fleet.subprocess, "run") as run, \
                  patch.object(fleet, "wait_dashboard_ready", return_value=True), \
                  patch.object(fleet.time, "sleep"), \
+                 patch.object(fleet, "ensure_fleet_dashboard", return_value="http://127.0.0.1:8426"), \
                  patch.object(fleet, "print_status"):
                 fleet.start(selected)
 

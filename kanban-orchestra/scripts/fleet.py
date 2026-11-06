@@ -1184,6 +1184,11 @@ def start(repos: list[FleetRepo], *, precheck: bool = True) -> None:
     time.sleep(0.5)
     print()
     print_status(repos)
+    try:
+        url = ensure_fleet_dashboard()
+        print(dashboard_tailscale.format_dashboard_line(url))
+    except (OSError, RuntimeError) as exc:
+        die(f"fleet dashboard startup failed: {exc}")
 
 
 def stop(repos: list[FleetRepo]) -> None:
@@ -1423,7 +1428,7 @@ def start_fleet_dashboard_process() -> subprocess.Popen:
     """Spawn the Fleet Dashboard server as a detached background process."""
     script = Path(__file__).resolve().parent / "fleet_dashboard.py"
     if not script.exists():
-        die(f"expected script not found: {script}")
+        raise RuntimeError(f"expected script not found: {script}")
     metadata_path = fleet_dashboard_metadata_path()
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -1438,19 +1443,28 @@ def start_fleet_dashboard_process() -> subprocess.Popen:
     )
 
 
-def open_or_start_fleet_dashboard(*, prefer_local: bool = False) -> None:
-    """Open a running Fleet Dashboard, or start one and print its preferred URL."""
+def ensure_fleet_dashboard(*, prefer_local: bool = False) -> str:
+    """Start or reuse the singleton Fleet Dashboard and return its preferred URL."""
     with _fleet_dashboard_start_lock():
         payload = fleet_dashboard_live_payload()
         if payload is None:
             start_fleet_dashboard_process()
             payload = wait_fleet_dashboard_ready()
             if payload is None:
-                die("fleet dashboard did not become ready")
+                raise RuntimeError("fleet dashboard did not become ready")
     url = payload.get("url")
     if not url:
-        die("fleet dashboard metadata is missing a URL")
-    _open_dashboard_url(preferred_dashboard_url(str(url), prefer_local=prefer_local))
+        raise RuntimeError("fleet dashboard metadata is missing a URL")
+    return preferred_dashboard_url(str(url), prefer_local=prefer_local)
+
+
+def open_or_start_fleet_dashboard(*, prefer_local: bool = False) -> None:
+    """Open a running Fleet Dashboard, or start one and print its preferred URL."""
+    try:
+        url = ensure_fleet_dashboard(prefer_local=prefer_local)
+    except (OSError, RuntimeError) as exc:
+        die(f"fleet dashboard startup failed: {exc}")
+    _open_dashboard_url(url)
 
 
 def init_config() -> None:
