@@ -33,6 +33,22 @@ DEFAULT_MAX_REVIEW_ROUNDS = config.MAX_REVIEW_ROUNDS
 RUN_LOG_RETENTION_DAYS = 7
 COMPLETED_TASK_STATUS = "done"
 TASK_ARTIFACT_DIR_PREFIX = "task-"
+# Agent phases stored in orchestrator_runtime.current_step. "none" is idle.
+# Planning, review, and finalization are commit-plan, commit-review, and
+# commit-make; the other names are the same contract for supertask, pull
+# request, and other tasks.
+RUNTIME_EXECUTING_STEPS = frozenset({
+    "commit-make",
+    "commit-review",
+    "commit-make-supertask",
+    "commit-review-supertask",
+    "commit-plan",
+    "commit-plan-review",
+    "pull-request-make",
+    "pull-request-review",
+    "other-make",
+    "other-review",
+})
 _QUEUE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )

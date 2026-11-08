@@ -93,6 +93,18 @@ def _write_active_agents(
     )
 
 
+def live_agents(
+    db_path: str | None = None,
+    *,
+    queue_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return registered agent processes whose pids are still alive."""
+    return [
+        record for record in _read_active_agents(db_path, queue_id=queue_id)
+        if is_pid_alive(_coerce_int(record.get("pid")))
+    ]
+
+
 def register_active_agent(
     *,
     task_id: int,

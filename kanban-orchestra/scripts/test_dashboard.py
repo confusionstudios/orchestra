@@ -10,6 +10,7 @@ import asyncio
 import errno as errno_mod
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import active_agent_processes
 import db
 import dashboard
 
@@ -2032,6 +2034,332 @@ class TestCurrentAgentOutputPanel(unittest.TestCase):
         self.assertIn("first", html)
         self.assertIn("second", html)
         self.assertIn('data-stick-to-bottom="true"', html)
+
+
+class TestTaskLiveAgentOutput(unittest.TestCase):
+    """Ticket pages show live agent output only for the executing task."""
+
+    def setUp(self):
+        self.conn, self.db_path = _fresh_conn()
+        os.environ["KANBAN_DB"] = self.db_path
+        self.addCleanup(lambda: os.environ.pop("KANBAN_DB", None))
+        _use_implicit_queue(self, self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+        runtime = db.get_runtime_root(self.db_path)
+        if runtime.exists():
+            for path in sorted(runtime.rglob("*"), reverse=True):
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            runtime.rmdir()
+            queues = runtime.parent
+            if queues.exists() and not any(queues.iterdir()):
+                queues.rmdir()
+        os.unlink(self.db_path)
+
+    def _stamp(self, age=timedelta()):
+        return (datetime.now(timezone.utc) - age).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _write_transcript(self, task_id, name, text):
+        task_dir = db.get_artifacts_root(
+            self.db_path, queue_id=self.conn.orchestra_queue_id,
+        ) / f"task-{task_id}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        path = task_dir / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _put_runtime(self, task_id, **overrides):
+        fields = {
+            "status": "running",
+            "pid": os.getpid(),
+            "started_at": self._stamp(),
+            "last_heartbeat_at": self._stamp(),
+            "current_task_id": task_id,
+            "current_step": "commit-make",
+            "active_agents": 1,
+            "status_message": "working",
+        }
+        fields.update(overrides)
+        db.upsert_runtime(self.conn, **fields)
+        return db.get_runtime(self.conn)
+
+    def _register_agent(self, task_id, verb, pid=4242):
+        with patch.object(active_agent_processes, "is_pid_alive", return_value=True), \
+             patch.object(active_agent_processes.os, "getpgid", return_value=pid):
+            active_agent_processes.register_active_agent(
+                task_id=task_id,
+                verb=verb,
+                agent_name="codex",
+                pid=pid,
+                db_path=self.db_path,
+                queue_id=self.conn.orchestra_queue_id,
+            )
+
+    def _event_data(self, chunks, event_name):
+        for chunk in chunks:
+            text = chunk.decode() if isinstance(chunk, bytes) else chunk
+            event = None
+            data = None
+            for line in text.splitlines():
+                if line.startswith("event: "):
+                    event = line[len("event: "):]
+                elif line.startswith("data: "):
+                    data = json.loads(line[len("data: "):])
+            if event == event_name:
+                return data
+        self.fail(f"missing {event_name}")
+
+    def test_executing_steps_match_runtime_check_constraint(self):
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'orchestrator_runtime'"
+        ).fetchone()
+        match = re.search(
+            r"current_step\s+TEXT\s+CHECK\(current_step IN \((.*?)\)\)",
+            row[0],
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        values = set(re.findall(r"'([^']+)'", match.group(1)))
+        self.assertEqual(values - {"none"}, set(db.RUNTIME_EXECUTING_STEPS))
+
+    def test_active_matching_ticket_shows_live_output_for_executing_phases(self):
+        tid = db.add_task(self.conn, "Active ticket")
+        phases = {
+            "commit-plan": "planning output",
+            "commit-review": "review output",
+            "commit-make": "finalization output",
+            "pull-request-make": "pull request output",
+            "other-review": "other review output",
+            "commit-make-supertask": "supertask output",
+        }
+        for step, text in phases.items():
+            with self.subTest(step=step):
+                self._write_transcript(
+                    tid,
+                    f"20260603-010000-000000-{step}-codex.log",
+                    text + "\n",
+                )
+                runtime = self._put_runtime(tid, current_step=step)
+                html = dashboard.render_task_live_agent_output(tid, runtime, self.conn)
+                self.assertIn("current-agent-output-panel", html)
+                self.assertIn(text, html)
+                self.assertIn(step, html)
+
+    def test_nonmatching_ticket_hides_the_other_transcript(self):
+        active = db.add_task(self.conn, "Executing ticket")
+        self._write_transcript(
+            active,
+            "20260603-010000-000000-commit-make-codex.log",
+            "other task transcript\n",
+        )
+        runtime = self._put_runtime(active)
+        for status in ("ready", "done", "blocked", "none"):
+            with self.subTest(status=status):
+                ticket = db.add_task(self.conn, f"{status} ticket")
+                db.update_task(self.conn, ticket, status=status)
+                db.add_run_log(
+                    self.conn, ticket, f"historical transcript for {status}", author="orchestrator",
+                )
+                html = dashboard.render_task_live_agent_output(ticket, runtime, self.conn)
+                page_log = dashboard.render_run_log_panel(ticket, self.conn)
+                self.assertEqual(html, "")
+                self.assertNotIn("other task transcript", html)
+                self.assertIn(f"historical transcript for {status}", page_log)
+
+    def test_inactive_runtime_with_retained_task_id_hides_panel(self):
+        tid = db.add_task(self.conn, "Retained ticket")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "stale retained output\n",
+        )
+        cases = {
+            "idle": {"status": "idle"},
+            "stopped": {"status": "stopped"},
+            "waiting-dirty": {"status": "waiting-dirty"},
+            "error": {"status": "error"},
+            "stopping": {"status": "stopping"},
+            "starting": {"status": "starting"},
+            "hard-break": {"status": "hard-break"},
+            "stale-heartbeat": {"last_heartbeat_at": self._stamp(timedelta(seconds=120))},
+            "missing-heartbeat": {"last_heartbeat_at": None},
+            "picked-up-before-agent": {"active_agents": 0},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(state=name):
+                runtime = self._put_runtime(tid, **overrides)
+                html = dashboard.render_task_live_agent_output(tid, runtime, self.conn)
+                overview = dashboard.render_current_agent_output_panel(runtime, self.conn)
+                self.assertEqual(html, "")
+                self.assertNotIn("stale retained output", html)
+                self.assertIn("stale retained output", overview)
+
+    def test_parallel_agent_report_shows_live_verbs_for_the_current_task(self):
+        tid = db.add_task(self.conn, "Parallel ticket")
+        other = db.add_task(self.conn, "Other ticket")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "make output\n",
+        )
+        self._write_transcript(
+            tid,
+            "20260603-010001-000000-commit-review-codex.log",
+            "parallel review output\n",
+        )
+        self._write_transcript(
+            other,
+            "20260603-010002-000000-commit-review-codex.log",
+            "other task transcript\n",
+        )
+        self._register_agent(tid, "commit-review", pid=4242)
+        self._register_agent(other, "commit-review", pid=4243)
+        runtime = self._put_runtime(tid, current_step="none", active_agents=0)
+
+        with patch.object(active_agent_processes, "is_pid_alive", return_value=True):
+            html = dashboard.render_task_live_agent_output(tid, runtime, self.conn)
+            other_html = dashboard.render_task_live_agent_output(other, runtime, self.conn)
+
+        self.assertIn("parallel review output", html)
+        self.assertNotIn("other task transcript", html)
+        self.assertNotIn("make output", html)
+        self.assertEqual(other_html, "")
+
+    def test_parallel_report_adds_a_second_live_verb_beside_the_runtime_step(self):
+        tid = db.add_task(self.conn, "Parallel ticket")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "make output\n",
+        )
+        self._write_transcript(
+            tid,
+            "20260603-010001-000000-commit-review-codex.log",
+            "parallel review output\n",
+        )
+        self._register_agent(tid, "commit-review", pid=4242)
+        runtime = self._put_runtime(tid, current_step="commit-make", active_agents=1)
+
+        with patch.object(active_agent_processes, "is_pid_alive", return_value=True):
+            html = dashboard.render_task_live_agent_output(tid, runtime, self.conn)
+
+        self.assertIn("make output", html)
+        self.assertIn("parallel review output", html)
+        self.assertIn('id="current-agent-output-panel"', html)
+        self.assertIn('id="current-agent-output-panel-1"', html)
+
+    def test_ping_or_dead_agent_report_does_not_open_the_panel(self):
+        tid = db.add_task(self.conn, "Ping ticket")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "should stay hidden\n",
+        )
+        self._register_agent(tid, "ping", pid=4242)
+        runtime = self._put_runtime(tid, active_agents=0)
+
+        with patch.object(active_agent_processes, "is_pid_alive", return_value=True):
+            ping_html = dashboard.render_task_live_agent_output(tid, runtime, self.conn)
+        self.assertEqual(ping_html, "")
+
+        self._register_agent(tid, "commit-make", pid=4244)
+        with patch.object(active_agent_processes, "is_pid_alive", return_value=False):
+            dead_html = dashboard.render_task_live_agent_output(tid, runtime, self.conn)
+        self.assertEqual(dead_html, "")
+        self.assertNotIn("should stay hidden", dead_html)
+
+    def test_initial_page_and_overview_use_different_eligibility(self):
+        from fastapi.testclient import TestClient
+
+        tid = db.add_task(self.conn, "Visible ticket", branch="feat-live")
+        other = db.add_task(self.conn, "Queued ticket", branch="feat-queued")
+        db.update_task(self.conn, other, status="ready")
+        db.add_run_log(self.conn, other, "historical transcript for queued", author="orchestrator")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "matching live output\n",
+        )
+        self._put_runtime(tid)
+        client = TestClient(dashboard.app)
+
+        active_page = client.get(f"/task/{tid}")
+        queued_page = client.get(f"/task/{other}")
+        overview = client.get("/")
+
+        self.assertEqual(active_page.status_code, 200)
+        self.assertIn("matching live output", active_page.text)
+        self.assertIn("current-agent-output-panel", active_page.text)
+        self.assertEqual(queued_page.status_code, 200)
+        self.assertNotIn("matching live output", queued_page.text)
+        self.assertNotIn("current-agent-output-panel", queued_page.text)
+        self.assertIn("task-agent-output-wrap", queued_page.text)
+        self.assertIn("historical transcript for queued", queued_page.text)
+        self.assertIn("Run Log", queued_page.text)
+        self.assertIn("matching live output", overview.text)
+        self.assertIn('id="agent-output-wrap"', overview.text)
+
+    def test_sse_hides_panel_when_execution_leaves_the_ticket(self):
+        tid = db.add_task(self.conn, "Live ticket", branch="feat-live")
+        other = db.add_task(self.conn, "Next ticket", branch="feat-next")
+        db.add_run_log(self.conn, tid, "historical transcript kept", author="orchestrator")
+        self._write_transcript(
+            tid,
+            "20260603-010000-000000-commit-make-codex.log",
+            "matching live output\n",
+        )
+        self._write_transcript(
+            other,
+            "20260603-010000-000000-commit-make-codex.log",
+            "other task transcript\n",
+        )
+        self._put_runtime(tid)
+
+        flipped = {"done": False}
+
+        def fast_sleep(_seconds):
+            if flipped["done"]:
+                return
+            conn = db.connect(self.db_path)
+            try:
+                db.update_runtime(
+                    conn,
+                    status="running",
+                    current_task_id=other,
+                    current_step="commit-make",
+                    active_agents=1,
+                    last_heartbeat_at=self._stamp(),
+                )
+            finally:
+                conn.close()
+            flipped["done"] = True
+
+        response = dashboard.events_task(tid)
+
+        async def read_two_cycles():
+            agen = response.body_iterator
+            try:
+                first = [await anext(agen) for _ in range(5)]
+                second = [await anext(agen) for _ in range(5)]
+                return first, second
+            finally:
+                await agen.aclose()
+
+        with patch.object(dashboard.time, "sleep", side_effect=fast_sleep):
+            first, second = asyncio.run(read_two_cycles())
+
+        first_agent = self._event_data(first, "task_agent_output")
+        second_agent = self._event_data(second, "task_agent_output")
+        second_log = self._event_data(second, "task_log")
+        self.assertIn("matching live output", first_agent)
+        self.assertIn("current-agent-output-panel", first_agent)
+        self.assertEqual(second_agent, "")
+        self.assertNotIn("other task transcript", second_agent)
+        self.assertIn("historical transcript kept", second_log)
 
 
 class TestGlobalRunLogPanel(unittest.TestCase):

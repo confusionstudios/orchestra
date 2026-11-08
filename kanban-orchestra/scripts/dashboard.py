@@ -38,6 +38,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Stre
 from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import active_agent_processes
 import config
 import dashboard_tailscale
 import db
@@ -1730,6 +1731,61 @@ def _latest_agent_transcript_for_step(
     return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
+def _same_task_id(left, right) -> bool:
+    """True when two task id values refer to the same task."""
+    try:
+        return int(left) == int(right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _active_agent_count(runtime: dict) -> int:
+    """Return the runtime row's active agent count, or zero when it is unusable."""
+    try:
+        return int(runtime.get("active_agents") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reported_executing_verbs(task_id: int, conn) -> list[str]:
+    """Return executing verbs for live agent processes registered to this task."""
+    if conn is None:
+        return []
+    records = active_agent_processes.live_agents(
+        _connection_db_path(conn),
+        queue_id=_connection_queue_id(conn),
+    )
+    verbs = []
+    for record in records:
+        if not _same_task_id(record.get("task_id"), task_id):
+            continue
+        verb = record.get("verb") or ""
+        if verb in db.RUNTIME_EXECUTING_STEPS and verb not in verbs:
+            verbs.append(verb)
+    return verbs
+
+
+def task_live_agent_output_eligible(task_id: int, runtime: dict | None, conn=None) -> bool:
+    """True when this ticket is the task an agent is executing right now.
+
+    The runtime row must name this task, report status ``running``, and have a
+    fresh heartbeat. Idle, stopped, and stale rows do not qualify even when
+    they still store this task id. An agent is executing when that row's
+    ``active_agents`` count is positive on an executing step, or when the
+    queue's live agent-process report lists an executing verb for this task.
+    Executing steps are the runtime ``current_step`` contract, so planning,
+    review, and finalization all qualify.
+    """
+    if runtime is None or not _same_task_id(runtime.get("current_task_id"), task_id):
+        return False
+    if _runtime_display_status(runtime.get("status") or "", runtime.get("last_heartbeat_at")) != "running":
+        return False
+    step = runtime.get("current_step") or ""
+    if step in db.RUNTIME_EXECUTING_STEPS and _active_agent_count(runtime) > 0:
+        return True
+    return bool(_reported_executing_verbs(task_id, conn))
+
+
 def current_agent_output_state(runtime: dict | None, conn) -> dict:
     """Return dashboard data for the current phase's latest agent transcript."""
     if runtime is None or not runtime.get("current_task_id"):
@@ -1780,7 +1836,12 @@ def current_agent_output_state(runtime: dict | None, conn) -> dict:
     }
 
 
-def render_current_agent_output_panel(runtime: dict | None, conn) -> str:
+def render_current_agent_output_panel(
+    runtime: dict | None,
+    conn,
+    *,
+    panel_id: str = "current-agent-output-panel",
+) -> str:
     """Render the active phase's live agent transcript tail."""
     state = current_agent_output_state(runtime, conn)
     if state.get("state") != "ready":
@@ -1790,7 +1851,7 @@ def render_current_agent_output_panel(runtime: dict | None, conn) -> str:
         if state.get("step"):
             task_meta += f'<p><strong>Step:</strong> {_esc(state["step"])}</p>'
         return f"""
-        <div class="card" id="current-agent-output-panel">
+        <div class="card" id="{_esc(panel_id)}">
           <h2>Agent Output</h2>
           {task_meta}
           <p class="muted">{_esc(state.get("message") or "No agent output available.")}</p>
@@ -1805,7 +1866,7 @@ def render_current_agent_output_panel(runtime: dict | None, conn) -> str:
     )
     path_display = _abbreviate_home(Path(state["path"]).resolve())
     return f"""
-    <div class="card" id="current-agent-output-panel">
+    <div class="card" id="{_esc(panel_id)}">
       <h2>Agent Output</h2>
       <p><strong>Task:</strong> <a href="/task/{_esc(state['task_id'])}">#{_esc(state['task_id'])}</a> &nbsp;
          <strong>Step:</strong> {_esc(state.get('step') or '')}</p>
@@ -1813,6 +1874,34 @@ def render_current_agent_output_panel(runtime: dict | None, conn) -> str:
       <p class="muted"><strong>Path:</strong> {_esc(path_display)} &nbsp; <strong>Updated:</strong> {_live_age(state.get('updated_at'))}</p>
       {output_html}
     </div>"""
+
+
+def render_task_live_agent_output(task_id: int, runtime: dict | None, conn) -> str:
+    """Render live agent output for one ticket, or nothing when it is inactive."""
+    if not task_live_agent_output_eligible(task_id, runtime, conn):
+        return ""
+
+    reported = _reported_executing_verbs(task_id, conn)
+    step = (runtime or {}).get("current_step") or ""
+    verbs = []
+    if step in db.RUNTIME_EXECUTING_STEPS and _active_agent_count(runtime) > 0:
+        verbs.append(step)
+    for verb in reported:
+        if verb not in verbs:
+            verbs.append(verb)
+    if not verbs:
+        return ""
+    if len(verbs) == 1 and verbs[0] == step:
+        return render_current_agent_output_panel(runtime, conn)
+
+    panels = []
+    for index, verb in enumerate(verbs):
+        scoped = dict(runtime)
+        scoped["current_task_id"] = task_id
+        scoped["current_step"] = verb
+        panel_id = "current-agent-output-panel" if index == 0 else f"current-agent-output-panel-{index}"
+        panels.append(render_current_agent_output_panel(scoped, conn, panel_id=panel_id))
+    return "\n".join(panels)
 
 
 def _slice_from_last_orchestrator_start(lines: list[str]) -> list[str]:
@@ -2846,7 +2935,7 @@ def _task_detail_response(
     header_html = render_task_header(form_task or task, conn, edit_error=edit_error, prev_id=prev_id, next_id=next_id)
     runtime_html = render_task_runtime_panel(task, runtime, ready_error=ready_error)
     comments_html = render_comments_panel(task_id, conn)
-    agent_output_html = render_current_agent_output_panel(runtime, conn)
+    agent_output_html = render_task_live_agent_output(task_id, runtime, conn)
     log_html = render_run_log_panel(task_id, conn)
 
     body = f"""
@@ -3226,7 +3315,7 @@ def events_task(task_id: int):
                     header_html = render_task_header(task, conn, prev_id=prev_id, next_id=next_id)
                     runtime_html = render_task_runtime_panel(task, runtime)
                     comments_html = render_comments_panel(task_id, conn)
-                    agent_output_html = render_current_agent_output_panel(runtime, conn)
+                    agent_output_html = render_task_live_agent_output(task_id, runtime, conn)
                     log_html = render_run_log_panel(task_id, conn)
                 else:
                     header_html = '<div class="card" id="task-header"><p class="muted">Task not found.</p></div>'
