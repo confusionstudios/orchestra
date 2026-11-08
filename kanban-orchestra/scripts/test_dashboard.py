@@ -1578,6 +1578,58 @@ class TestTaskHeader(unittest.TestCase):
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
 
+    def test_fenced_code_preserves_whitespace_and_escapes_html(self):
+        long_line = "token-" * 40
+        description = (
+            "Run `<script>` carefully.\n\n"
+            "```py\n"
+            "def greet():\n"
+            "    return '<ok>'\n"
+            "```\n\n"
+            "```\n"
+            f"{long_line}\n"
+            "```\n"
+        )
+        rendered = dashboard._md_html(description)
+        self.assertIn("<code>&lt;script&gt;</code>", rendered)
+        self.assertIn(
+            "<pre><code class=\"language-py\">def greet():\n"
+            "    return '&lt;ok&gt;'\n"
+            "</code></pre>",
+            rendered,
+        )
+        self.assertIn(f"<pre><code>{long_line}\n</code></pre>", rendered)
+        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("<ok>", rendered)
+        self.assertNotIn("<pre><code>&lt;script&gt;", rendered)
+
+        task = {
+            "id": 11,
+            "koid": "ko-code",
+            "title": "Code blocks",
+            "description": description,
+            "commit_plan": "```\n    keep indent\n```\n",
+            "status": "none",
+            "next_step": "commit-make",
+            "branch": None,
+            "coder_agent": None,
+            "review_round": 0,
+            "last_review_decision": "none",
+            "commit_hash": None,
+        }
+        html = dashboard.render_task_header(task)
+        self.assertEqual(
+            html.count(
+                "<pre><code class=\"language-py\">def greet():\n"
+                "    return '&lt;ok&gt;'\n"
+                "</code></pre>"
+            ),
+            1,
+        )
+        self.assertIn("<pre><code>    keep indent\n</code></pre>", html)
+        self.assertIn(long_line, html)
+        self.assertIn("<code>&lt;script&gt;</code>", html)
+
     def test_validation_error_opens_inline_title_editor(self):
         task = {
             "id": 10,

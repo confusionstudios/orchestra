@@ -226,7 +226,12 @@ _md = MarkdownIt("commonmark", {"html": False})
 
 
 def _md_html(text: str | None) -> str:
-    """Render Markdown text to safe HTML. Returns empty string for None/empty."""
+    """Render Markdown text to safe HTML. Returns empty string for None/empty.
+
+    Raw HTML is escaped. Place the result in an element with class
+    ``markdown-body`` so fenced blocks use the block layout instead of the
+    inline ``code`` chip.
+    """
     if not text:
         return ""
     return _md.render(text)
@@ -1471,7 +1476,7 @@ def _render_commit_plan(plan: str | None) -> str:
     return (
         "<div class='task-plan'>"
         "<h3 class='task-plan-heading'>Plan</h3>"
-        f"<div class='task-plan-body'>{_md_html(plan)}</div>"
+        f"<div class='task-plan-body markdown-body'>{_md_html(plan)}</div>"
         "</div>"
     )
 
@@ -1490,7 +1495,7 @@ def render_task_header(task: dict, conn=None, edit_error: str | None = None, *, 
     title_display_attr = " hidden" if edit_error else ""
     title_form_hidden = "" if edit_error else " hidden"
     description_html = (
-        "<div class='task-description-body'>"
+        "<div class='task-description-body markdown-body'>"
         f"{_md_html(description_source)}"
         "</div>"
         if description_source
@@ -2145,14 +2150,54 @@ code {
 
 .task-description p { margin: 4px 0 8px; }
 .task-description ul, .task-description ol { margin: 4px 0 8px; padding-left: 24px; }
-.task-description code { background: #141414; color: #88c0d0; border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
+.task-description :not(pre) > code { background: #141414; color: #88c0d0; border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
 
 .task-plan { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
 .task-hierarchy { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
 .task-plan-heading { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 8px; }
 .task-plan-body p { margin: 4px 0 8px; }
 .task-plan-body ul, .task-plan-body ol { margin: 4px 0 8px; padding-left: 24px; }
-.task-plan-body code { background: #141414; color: #88c0d0; border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
+.task-plan-body :not(pre) > code { background: #141414; color: #88c0d0; border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
+
+.markdown-body {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.markdown-body pre {
+  display: block;
+  margin: 8px 0 12px;
+  padding: 12px 14px;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  background: #1e1e1e;
+  color: #f0f0f0;
+  border: 1px solid #3a3a3a;
+  border-radius: 3px;
+  line-height: 1.5;
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+  tab-size: 4;
+}
+
+.task-description .markdown-body pre code,
+.task-plan .markdown-body pre code,
+.markdown-body pre code {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-radius: 0;
+  font-size: 1em;
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+}
 
 .edit-form {
   display: grid;
@@ -2577,7 +2622,7 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .run-log .timestamp-absolute, .log-snippet .timestamp-absolute { color: #a0a0a0; }
 
 /* Scrollbars: keep the chrome as dark as the panels it sits in. */
-.run-log, .log-snippet, .card, .text-area {
+.run-log, .log-snippet, .card, .text-area, .markdown-body pre {
   scrollbar-width: thin;
   scrollbar-color: #2a2a2a transparent;
 }
@@ -2585,17 +2630,20 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .run-log::-webkit-scrollbar,
 .log-snippet::-webkit-scrollbar,
 .card::-webkit-scrollbar,
-.text-area::-webkit-scrollbar { width: 10px; height: 10px; }
+.text-area::-webkit-scrollbar,
+.markdown-body pre::-webkit-scrollbar { width: 10px; height: 10px; }
 
 .run-log::-webkit-scrollbar-track,
 .log-snippet::-webkit-scrollbar-track,
 .card::-webkit-scrollbar-track,
-.text-area::-webkit-scrollbar-track { background: transparent; }
+.text-area::-webkit-scrollbar-track,
+.markdown-body pre::-webkit-scrollbar-track { background: transparent; }
 
 .run-log::-webkit-scrollbar-thumb,
 .log-snippet::-webkit-scrollbar-thumb,
 .card::-webkit-scrollbar-thumb,
-.text-area::-webkit-scrollbar-thumb {
+.text-area::-webkit-scrollbar-thumb,
+.markdown-body pre::-webkit-scrollbar-thumb {
   background: #2a2a2a;
   border: 3px solid transparent;
   border-radius: 6px;
@@ -2605,7 +2653,8 @@ th { color: var(--muted); font-weight: normal; text-transform: uppercase; font-s
 .run-log::-webkit-scrollbar-thumb:hover,
 .log-snippet::-webkit-scrollbar-thumb:hover,
 .card::-webkit-scrollbar-thumb:hover,
-.text-area::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); background-clip: content-box; }
+.text-area::-webkit-scrollbar-thumb:hover,
+.markdown-body pre::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); background-clip: content-box; }
 """
 
 
