@@ -2253,6 +2253,10 @@ code {
   max-width: 100%;
 }
 
+.markdown-body h2 {
+  border-bottom-color: var(--accent-dim);
+}
+
 .markdown-body pre {
   display: block;
   margin: 8px 0 12px;
