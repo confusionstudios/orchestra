@@ -1,0 +1,44 @@
+Upstream MIT notice for the grill-me adaptation.
+
+Source repository: https://github.com/mattpocock/skills
+Upstream revision: 4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+Revision committer date: 2026-10-31
+
+Files read at that revision:
+- skills/productivity/grill-me/SKILL.md
+  blob 3947ff9c4ad980d14fc07fccbf659d47c114e81d
+  last changed in fcf0071560d32913c9d4f820e0d7ca467c881619 (2026-08-15)
+- skills/productivity/grilling/SKILL.md
+  blob d2f09a18e6a6c65c55f1271ba08dfeaf06f0bed3
+  last changed in 7739eaed7f8f3915437a8def198a6d0d7206dbc7 (2026-10-29)
+- LICENSE
+  blob f1dd2c09108dde1a5f56097cee8461b3ea834499
+  last changed in 2817544484ea89558aabd8a0360e042888fad713 (2026-03-13)
+
+The upstream grill-me skill delegates to grilling. The Orchestra skill inlines
+the useful interview instructions and does not depend on those skill names.
+The text below is the unmodified upstream LICENSE at the revision above.
+
+-----
+
+MIT License
+
+Copyright (c) 2026 Matt Pocock
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
