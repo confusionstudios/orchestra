@@ -6,7 +6,7 @@ Before doing anything else, determine which role applies:
 
 | Role | How to tell | What to do |
 |------|-------------|------------|
-| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for a one-shot status. Use `narrate` for a live feed that observes native orchestrator recovery. Use `task list/show/add/set` for task management. |
+| **Observer / operator** | Running ad-hoc, no orchestrator spawned you, or you are checking status for a user | Use `get-kanban-update` for a one-shot read-only status. Use `narrate` for a live read-only feed that observes native orchestrator recovery. Use `check-and-unblock` for a one-shot check that applies one clearly safe local unblock, then returns. Use `task list/show/add/set` for task management. |
 | **Sticky coder** | The orchestrator explicitly spawned you as the designated build agent for a specific task | Follow the full workflow for that task. |
 
 Default role: observer.
@@ -327,6 +327,8 @@ Notes:
   minute. It consults the effective `unblocker` role and either continues a
   recoverable task or leaves a durable `smart-unblock` comment. Narration
   observes those comments and does not start a separate recovery process.
+  `check-and-unblock` is the one-shot operator action: it may apply one
+  clearly safe local continue, and it does not replace native recovery or narration.
 
 ## Default operating pattern
 
@@ -454,6 +456,9 @@ Read the result like this:
 - List blocked tasks with `task list --status blocked`.
 - Native smart-unblock comments (author `smart-unblock`) record whether
   recovery was safe or what the operator must decide.
+- For one inspection that applies only a clearly safe continue and then
+  returns, use the `check-and-unblock` skill. It does not narrate and it
+  does not start a second recovery watcher.
 - Resume a review-cap block with
   `task continue <id> --add-review-rounds N`, or resume other blocks with
   `task continue <id> --next-step <step>`. Legacy pre-schema review-cap

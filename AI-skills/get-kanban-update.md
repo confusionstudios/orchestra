@@ -2,6 +2,8 @@ Print a concise plain-text Kanban Orchestra status update for the current repo.
 
 This command is for quickly reading the state of a Kanban Orchestra pipeline without opening the dashboard. It is especially useful for external agents or scripts that need to reason about pipeline health and act accordingly.
 
+This skill only reports status. To watch the queue until it is idle, use `narrate`. To apply one clearly safe local unblock and return, use `check-and-unblock`. Neither replaces the orchestrator's own smart-unblock loop.
+
 ## Status Line
 
 Start every user-facing status update with this format:

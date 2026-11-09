@@ -10,6 +10,10 @@ process. It may report native smart-unblock decisions as observed Kanban events.
 Leave every recovery decision to that native loop. Monitor the repo with
 `$ORCHESTRA_DIR/bin/ko-get-update` and `$ORCHESTRA_DIR/bin/ko-task`.
 
+To report status once without watching, use `get-kanban-update`. To act once
+on a clearly safe local unblock and return, use `check-and-unblock`. This
+skill stays a read-only narration loop.
+
 ## Prerequisites
 
 1. Resolve the repo root with `git rev-parse --show-toplevel`. Stop if the
@@ -55,7 +59,7 @@ Keep the update to that line unless a blocker, a decision for the user, or an
 explicit request needs more detail. Narration also includes its dashboard link
 at startup. Show raw command output only when explicitly requested.
 
-## Opening Report
+## Opening report
 
 Immediately sample state and report the Status Line above, followed by the
 current dashboard URL. Include orchestrator health or native smart-unblock

@@ -46,6 +46,7 @@ SKILL_TARGETS: dict[str, str] = {
 AGENTS = tuple(SKILL_TARGETS)
 KANBAN_SKILLS = frozenset(
     {
+        "check-and-unblock",
         "get-kanban-update",
         "kanban",
         "narrate",
