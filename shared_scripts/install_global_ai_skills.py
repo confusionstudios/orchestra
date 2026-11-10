@@ -47,6 +47,7 @@ AGENTS = tuple(SKILL_TARGETS)
 KANBAN_SKILLS = frozenset(
     {
         "check-and-unblock",
+        "fast-kanban",
         "get-kanban-update",
         "kanban",
         "narrate",
