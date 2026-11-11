@@ -23,6 +23,7 @@ from pathlib import Path
 import config
 import dashboard_tailscale
 import db
+import queue_control
 
 
 ORCHESTRA_ROOT = Path(os.environ.get("ORCHESTRA_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -537,6 +538,20 @@ def metadata_pid(path: Path | None, role: str, repo: FleetRepo | None = None) ->
         return None
 
 
+def repo_queue_control(repo: FleetRepo) -> dict:
+    """Read durable pause separately from worker liveness."""
+    queue = _registered_queue(repo.root) if repo.root else None
+    if queue is None:
+        return {"paused": False, "journal": {}}
+    conn = sqlite3.connect(db._readonly_uri(Path(db.get_db_path())), uri=True,
+                           factory=db.OrchestraConnection)
+    try:
+        conn.orchestra_queue_id = queue["id"]
+        return db.queue_control(conn)
+    finally:
+        conn.close()
+
+
 def repo_runtime_status(repo: FleetRepo) -> dict | None:
     """Read this queue's runtime row without creating or migrating a database."""
     if repo.root is None:
@@ -976,11 +991,16 @@ def print_status(repos: list[FleetRepo]) -> None:
     rows = []
     for repo in repos:
         status, orch_pid, dashboard_pid, tmux = repo_process_state(repo)
+        control = repo_queue_control(repo)
+        if control["paused"]:
+            status += "/Paused"
         if tmux == UNOWNED_SESSION:
             tmux = "-"
         dashboard_url = "-" if repo.error else dashboard_status_url(repo)
         owner = "managed" if repo.managed else "unmanaged"
         root_display = display_path(repo.root or repo.path)
+        if control["paused"]:
+            root_display += " (" + queue_control.describe(control) + ")"
         if repo.parent is not None:
             root_display = f"{root_display} parent {display_path(repo.parent)}"
         if repo.error:

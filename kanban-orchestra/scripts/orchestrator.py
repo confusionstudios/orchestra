@@ -31,6 +31,7 @@ import orchestrator_lock
 import agent_runner
 import prompt_builder
 import smart_unblock
+import queue_control
 
 # Import shared agent registry from the orchestra repo
 ORCHESTRA_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -568,6 +569,11 @@ def is_worktree_dirty(repo_root=None):
 
 
 def stash_task_wip(task_id, conn):
+    with queue_control.mutation_gate(conn):
+        return _stash_task_wip(task_id, conn)
+
+
+def _stash_task_wip(task_id, conn):
     """
     Stage all changes and stash them as orchestrator-preserved task WIP.
     Records the stash ref in the DB. Returns the stash ref string, or None on failure.
@@ -593,6 +599,11 @@ def stash_task_wip(task_id, conn):
 
 
 def restore_task_wip(task, conn):
+    with queue_control.mutation_gate(conn):
+        return _restore_task_wip(task, conn)
+
+
+def _restore_task_wip(task, conn):
     """
     Restore orchestrator-preserved task WIP, including the index.
 
@@ -937,7 +948,7 @@ def handle_commit_make(task, conn):
     # Read repo policy once; drives Path A validation enforcement and Path B gating.
     skip_build_policy = _skip_build_until_approved_active()
 
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
     prompt = prompt_builder.build_prompt(task, "commit-make", agent, comments)
 
     db.update_runtime(
@@ -958,7 +969,7 @@ def handle_commit_make(task, conn):
     # the latest existing commit-message comment.
     is_finalization = task["last_review_decision"] == "approve"
     if not is_finalization:
-        comments_before = db.get_comments(conn, task["id"])
+        comments_before = db.get_comments(conn, task["id"], current_attempt=True)
         commit_msg_count_before = sum(1 for c in comments_before if c["kind"] == "commit-message")
         # When the repo opts into deferred build validation, the coder must also write a
         # fresh validation comment explicitly stating deferral — so reviewers know the
@@ -968,7 +979,7 @@ def handle_commit_make(task, conn):
         head_before = get_head_commit_hash()
         # Capture the highest comment ID before the agent runs so we can scope the
         # DONE_WITHOUT_COMMIT check to signals written during this Path B run only.
-        comments_before = db.get_comments(conn, task["id"])
+        comments_before = db.get_comments(conn, task["id"], current_attempt=True)
         max_comment_id_before = max((c["id"] for c in comments_before), default=0)
 
     exit_code = run_agent(agent, prompt, task["id"], conn, "commit-make")
@@ -979,7 +990,7 @@ def handle_commit_make(task, conn):
         return False, False, False
 
     if not is_finalization:
-        comments_after = db.get_comments(conn, task["id"])
+        comments_after = db.get_comments(conn, task["id"], current_attempt=True)
         commit_msg_count_after = sum(1 for c in comments_after if c["kind"] == "commit-message")
         if commit_msg_count_after <= commit_msg_count_before:
             log(
@@ -1013,7 +1024,7 @@ def handle_commit_make(task, conn):
         # deferred-build-changed is only meaningful when the repo has opted into the policy.
         head_after = get_head_commit_hash()
         new_commit_created = head_after and head_after != head_before
-        comments_after = db.get_comments(conn, task["id"])
+        comments_after = db.get_comments(conn, task["id"], current_attempt=True)
         done_without_commit = any(
             c["kind"] == "done-without-commit" and c["id"] > max_comment_id_before
             for c in comments_after
@@ -1077,7 +1088,7 @@ def handle_commit_review(task, conn):
     reviewer = _task_reviewer(task)
     if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-review"):
         return "error"
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
 
     db.update_runtime(
         conn,
@@ -1105,7 +1116,7 @@ def handle_commit_review(task, conn):
     # The CLI persists the reviewer identity on the comment itself, so the
     # orchestrator should honor the recorded round decision rather than
     # assuming a single hardcoded reviewer name.
-    round_comments = db.get_comments(conn, task["id"])
+    round_comments = db.get_comments(conn, task["id"], current_attempt=True)
     current_round = task["review_round"]
     reviewer_decisions = [
         c for c in round_comments
@@ -1132,7 +1143,7 @@ def handle_pull_request_make(task, conn):
     agent = task.get("coder_agent") or DEFAULT_CODER
     db.update_task(conn, task["id"], coder_agent=agent)
     ensure_agent_acked(agent, task["id"], conn)
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
     max_comment_id_before = max((c["id"] for c in comments), default=0)
     prompt = prompt_builder.build_prompt(task, "pull-request-make", agent, comments)
 
@@ -1158,7 +1169,7 @@ def handle_pull_request_make(task, conn):
         log(f"pull-request-make failed with exit code {exit_code}", task["id"])
         return False
 
-    comments_after = db.get_comments(conn, task["id"])
+    comments_after = db.get_comments(conn, task["id"], current_attempt=True)
     new_metadata_comments = [
         c for c in comments_after
         if c["id"] > max_comment_id_before and GITHUB_PR_URL_RE.search(c.get("message") or "")
@@ -1188,7 +1199,7 @@ def handle_pull_request_review(task, conn):
     reviewer = _task_reviewer(task)
     if not _ensure_reviewer_acked(task, conn, reviewer, step="pull-request-review"):
         return "error"
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
 
     db.update_runtime(
         conn,
@@ -1220,7 +1231,7 @@ def handle_pull_request_review(task, conn):
         )
         return "error"
 
-    round_comments = db.get_comments(conn, task["id"])
+    round_comments = db.get_comments(conn, task["id"], current_attempt=True)
     current_round = task["review_round"]
     reviewer_decisions = [
         c for c in round_comments
@@ -1251,7 +1262,7 @@ def handle_other_make(task, conn):
     agent = task.get("coder_agent") or DEFAULT_CODER
     db.update_task(conn, task["id"], coder_agent=agent)
     ensure_agent_acked(agent, task["id"], conn)
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
     prompt = prompt_builder.build_prompt(task, "other-make", agent, comments)
 
     db.update_runtime(
@@ -1268,7 +1279,7 @@ def handle_other_make(task, conn):
         kind="comment",
         author="orchestrator",
     )
-    comments_before = db.get_comments(conn, task["id"])
+    comments_before = db.get_comments(conn, task["id"], current_attempt=True)
     max_comment_id_before = max((c["id"] for c in comments_before), default=0)
 
     exit_code = run_agent(agent, prompt, task["id"], conn, "other-make")
@@ -1278,7 +1289,7 @@ def handle_other_make(task, conn):
         log(f"other-make failed with exit code {exit_code}", task["id"])
         return False
 
-    comments_after = db.get_comments(conn, task["id"])
+    comments_after = db.get_comments(conn, task["id"], current_attempt=True)
     evidence_comments = [
         c for c in comments_after
         if c["id"] > max_comment_id_before
@@ -1311,7 +1322,7 @@ def handle_other_review(task, conn):
     reviewer = _task_reviewer(task)
     if not _ensure_reviewer_acked(task, conn, reviewer, step="other-review"):
         return "error"
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
 
     db.update_runtime(
         conn,
@@ -1343,7 +1354,7 @@ def handle_other_review(task, conn):
         )
         return "error"
 
-    round_comments = db.get_comments(conn, task["id"])
+    round_comments = db.get_comments(conn, task["id"], current_attempt=True)
     current_round = task["review_round"]
     reviewer_decisions = [
         c for c in round_comments
@@ -1374,7 +1385,7 @@ def handle_commit_make_supertask(task, conn):
     agent = task.get("coder_agent") or DEFAULT_SUPER_PLANNER
     db.update_task(conn, task["id"], coder_agent=agent)
     ensure_agent_acked(agent, task["id"], conn)
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
     prompt = prompt_builder.build_prompt(task, "commit-make-supertask", agent, comments)
 
     db.update_runtime(
@@ -1388,7 +1399,7 @@ def handle_commit_make_supertask(task, conn):
                    f"Starting commit-make-supertask with coder '{agent}'.",
                    kind="comment", author="orchestrator")
 
-    comments_before = db.get_comments(conn, task["id"])
+    comments_before = db.get_comments(conn, task["id"], current_attempt=True)
     commit_msg_count_before = sum(1 for c in comments_before if c["kind"] == "commit-message")
 
     exit_code = run_agent(agent, prompt, task["id"], conn, "commit-make-supertask")
@@ -1398,7 +1409,7 @@ def handle_commit_make_supertask(task, conn):
         log(f"commit-make-supertask failed with exit code {exit_code}", task["id"])
         return False
 
-    comments_after = db.get_comments(conn, task["id"])
+    comments_after = db.get_comments(conn, task["id"], current_attempt=True)
     commit_msg_count_after = sum(1 for c in comments_after if c["kind"] == "commit-message")
     if commit_msg_count_after <= commit_msg_count_before:
         log(
@@ -1422,7 +1433,7 @@ def handle_commit_review_supertask(task, conn):
     reviewer = _task_reviewer(task)
     if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-review-supertask"):
         return "error"
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
     children = db.get_child_tasks(conn, task["id"])
     follow_up_sources = {
         child["follow_up_task_id"]: child["id"]
@@ -1433,7 +1444,7 @@ def handle_commit_review_supertask(task, conn):
     for child in children:
         review_history = [
             comment
-            for comment in db.get_comments(conn, child["id"])
+            for comment in db.get_comments(conn, child["id"], current_attempt=True)
             if comment["kind"] in ("approval", "rejection")
         ]
         child_evidence.append(
@@ -1475,7 +1486,7 @@ def handle_commit_review_supertask(task, conn):
                        kind="comment", author="orchestrator")
         return "error"
 
-    round_comments = db.get_comments(conn, task["id"])
+    round_comments = db.get_comments(conn, task["id"], current_attempt=True)
     current_round = task["review_round"]
     reviewer_decisions = [
         c for c in round_comments
@@ -1504,7 +1515,7 @@ def handle_commit_plan(task, conn):
     snapshot = db.get_agent_snapshot(conn, task["id"])
     agent = snapshot["roles"]["planner"]["spec"] if snapshot else DEFAULT_PLANNER
     ensure_agent_acked(agent, task["id"], conn)
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
     prompt = prompt_builder.build_prompt(task, "commit-plan", agent, comments)
 
     db.update_runtime(
@@ -1557,7 +1568,7 @@ def handle_commit_plan_review(task, conn):
     reviewer = snapshot["roles"]["plan_reviewer"]["spec"] if snapshot else DEFAULT_PLAN_REVIEWER
     if not _ensure_reviewer_acked(task, conn, reviewer, step="commit-plan-review"):
         return "error"
-    comments = db.get_comments(conn, task["id"])
+    comments = db.get_comments(conn, task["id"], current_attempt=True)
 
     db.update_runtime(
         conn,
@@ -1573,7 +1584,7 @@ def handle_commit_plan_review(task, conn):
         kind="comment", author="orchestrator",
     )
     # Capture the ID of the start comment so we can find decisions written after it
-    all_comments_before = db.get_comments(conn, task["id"])
+    all_comments_before = db.get_comments(conn, task["id"], current_attempt=True)
     start_comment_id = all_comments_before[-1]["id"] if all_comments_before else 0
 
     prompt = prompt_builder.build_prompt(task, "commit-plan-review", reviewer, comments)
@@ -1588,7 +1599,7 @@ def handle_commit_plan_review(task, conn):
 
     # Find any new plan-approval or plan-rejection comment written during this run.
     # Uses distinct kinds so plan decisions never contaminate the commit-review round.
-    all_after = db.get_comments(conn, task["id"])
+    all_after = db.get_comments(conn, task["id"], current_attempt=True)
     reviewer_decisions = [
         c for c in all_after
         if c["id"] > start_comment_id
@@ -1836,7 +1847,7 @@ def _commit_staged_diff_from_recorded_message(task, conn):
     """Commit the staged diff using the latest recorded commit-message comment."""
     task_id = task["id"]
     commit_messages = [
-        c for c in db.get_comments(conn, task_id)
+        c for c in db.get_comments(conn, task_id, current_attempt=True)
         if c.get("kind") == "commit-message"
     ]
     if not commit_messages:
@@ -2638,6 +2649,9 @@ def recover_running_tasks(conn):
     KeyboardInterrupt handler — so stale reviewer votes from the interrupted round are
     not mixed with fresh votes in the new run.
     """
+    if db.queue_control(conn)["paused"]:
+        return
+
     rows = conn.execute(
         "SELECT * FROM tasks WHERE status = 'running' AND queue_id = ?",
         (db.connection_queue_id(conn),),
@@ -2727,6 +2741,15 @@ def update_runtime_after_task(conn, task_id, succeeded):
 
 
 def process_pinned_task(task, conn):
+    try:
+        return _process_pinned_task(task, conn)
+    except db.QueuePaused:
+        return False
+    finally:
+        queue_control.finish_attempt(conn, task["id"])
+
+
+def _process_pinned_task(task, conn):
     """
     Drive a picked task until it reaches a terminal state.
 
@@ -2736,9 +2759,12 @@ def process_pinned_task(task, conn):
     """
     current = task
     task_id = task["id"]
+    evidence = queue_control.capture_evidence(conn, task_id)
     db_path = db.get_connection_db_path(conn) or db.get_db_path()
 
     while True:
+        if db.queue_control(conn)["paused"]:
+            return False
         if _task_on_disallowed_master_branch(current):
             db.update_task(conn, task_id, status="blocked", next_step="none")
             db.add_comment(
@@ -2782,7 +2808,7 @@ def process_pinned_task(task, conn):
                            coder_agent=snapshot["roles"][primary]["spec"],
                            reviewer_agent=snapshot["roles"][reviewer]["spec"])
             db.save_agent_snapshot(conn, task_id, snapshot)
-        claimed = db.claim_ready_task(conn, task_id)
+        claimed = db.claim_ready_task(conn, task_id, attempt_evidence=evidence)
         if claimed is None:
             log("Task was no longer ready on this queue", task_id)
             update_runtime_after_task(conn, task_id, False)
@@ -2811,6 +2837,8 @@ def process_pinned_task(task, conn):
 
         try:
             succeeded = advance(current, conn)
+        except db.QueuePaused:
+            return False
         except KeyboardInterrupt:
             # Ctrl-C during processing — recover task, then re-raise
             # so main() can run the stopping→stopped shutdown path.
@@ -2857,6 +2885,8 @@ def process_pinned_task(task, conn):
             )
             return False
 
+        if db.queue_control(conn)["paused"]:
+            return False
         current = db.get_task(conn, task_id)
 
         # Propagate blocked child task to its parent supertask
@@ -2884,6 +2914,7 @@ def process_pinned_task(task, conn):
             log(f"Continuing pinned task at step={current['next_step']}", task_id)
             continue
 
+        queue_control.finish_attempt(conn, task_id)
         update_runtime_after_task(conn, task_id, succeeded)
         return succeeded
 
@@ -2921,6 +2952,15 @@ def main_loop(conn, *, db_path=None):
             db.update_runtime(conn, status="stopped",
                               status_message="Stopped")
             break
+
+        if db.queue_control(conn)["paused"]:
+            if smart_unblock_started:
+                stop_smart_unblock()
+                smart_unblock_started = False
+            state = queue_control.reconcile(conn)
+            set_runtime_idle(conn, status_message=queue_control.describe(state))
+            time.sleep(min(POLL_INTERVAL, 1))
+            continue
 
         if is_worktree_dirty(repo_root):
             if smart_unblock_started:
@@ -3015,7 +3055,7 @@ def main(argv=None):
         except ValueError as exc:
             print(f"Agent configuration error: {exc}", file=sys.stderr)
             return 1
-        block_reason = db.queue_dispatch_block_reason(conn)
+        block_reason = db.queue_dispatch_block_reason(conn, include_pause=False)
         if block_reason:
             print(block_reason, file=sys.stderr)
             return 1

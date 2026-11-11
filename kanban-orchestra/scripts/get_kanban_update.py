@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 import dashboard_tailscale
 import db
+import queue_control
 import fleet
 
 
@@ -229,6 +230,10 @@ def build_update(conn) -> str:
 
     # ── Orchestrator health ──────────────────────────────────────────────
     runtime = db.get_runtime(conn)
+    control = db.queue_control(conn)
+    if control["paused"]:
+        lines.append("QUEUE: " + queue_control.describe(control))
+        lines.append("")
 
     if runtime is None:
         lines.append("ORCHESTRATOR: no runtime row — orchestrator has never started")
@@ -340,6 +345,8 @@ def build_update(conn) -> str:
 
     # ── What likely needs attention ──────────────────────────────────────
     attention = _attention_summary(runtime, ready_tasks, blocked_tasks)
+    if control["paused"]:
+        attention = queue_control.describe(control) + "; explicitly resume after cleanup; interrupted ticket stays none"
     lines.append(f"ATTENTION: {attention}")
 
     fleet_line = _fleet_status_line(identity)

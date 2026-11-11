@@ -503,6 +503,37 @@ Useful operator rules:
 - A running orchestrator reassesses blocked tasks with the configured unblocker
   and either resumes a safely recoverable task or leaves a durable explanation.
 
+## Emergency Pause and Recovery
+
+Use `ko-task pause` in a queue's checkout, or add `--queue-id UUID` to select
+one queue explicitly. The repo and Fleet dashboards also provide Pause/Resume.
+Pause keeps the worker and dashboards alive, closes dispatch and smart-unblock,
+terminates the current agent's process group, archives owned staged/unstaged/
+untracked work, and returns the interrupted ticket to `none`. Its starting
+phase is reset, old decisions stay in history, and existing commits are kept.
+The pause persists across worker shutdown/startup. `ko-task resume` lets the
+same worker pick up other ready tickets; it does not ready the interrupted one.
+Stop-after-task remains the control for finishing the current ticket before
+shutting down.
+
+Inspect the control's JSON result, dashboard or `ko-get-update` for cleanup
+progress/errors. A missing clean ownership baseline, uncertain process exit or
+Git failure leaves files intact and the queue paused. Do not edit a checkout
+while its agent runs: a clean pre-attempt baseline establishes exclusive ticket
+ownership. Repair the reported problem and retry Pause. For manual recovery,
+stop that queue's worker, verify all agent processes exited, preserve its files
+explicitly and leave the checkout clean, then use
+`ko-task resume --resolve "how I saved the files and verified process exit"`.
+The explanation is recorded; unresolved errors are never bypassed silently.
+
+Pause WIP is linked from the ticket comment by immutable object ID and a durable
+`refs/orchestra/paused/<interruption-id>` ref. It is retained independently of
+ordinary task WIP and never restored by a fresh ready action. To explicitly
+restore it in the correct clean checkout, run
+`git stash apply --index refs/orchestra/paused/<interruption-id>`.
+See the [pause contract](tasks/kanban-orchestra-spec.md#emergency-queue-pause)
+for crash recovery and safety details.
+
 ## Security
 
 Orchestra runs coding agents in non-interactive YOLO-style modes as your local

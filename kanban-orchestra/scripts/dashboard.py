@@ -42,6 +42,7 @@ import active_agent_processes
 import config
 import dashboard_tailscale
 import db
+import queue_control
 import fleet
 import task as task_cli
 
@@ -710,6 +711,7 @@ def _get_prev_next_task_ids(conn, task_id: int) -> tuple[int | None, int | None]
 
 
 STATUS_BADGE_CLASS = {
+    "paused":   "badge-blocked",
     "none":     "badge-none",
     "ready":    "badge-ready",
     "running":  "badge-running",
@@ -1078,6 +1080,18 @@ def _hierarchy_summary_html(task: dict, conn) -> str:
 
 
 def render_health_card(runtime: dict | None, conn=None) -> str:
+    controls = ""
+    if conn is not None:
+        state = db.queue_control(conn)
+        action = "resume" if state["paused"] else "pause"
+        qid = db.connection_queue_id(conn)
+        controls = (f'<p>{_esc(queue_control.describe(state))}</p>'
+                    f'<form method="post" action="/queue/{qid}/{action}">'
+                    f'<button type="submit">{action.title()}</button></form>')
+    return _render_worker_health_card(runtime, conn).replace("</div>", controls + "</div>", 1)
+
+
+def _render_worker_health_card(runtime: dict | None, conn=None) -> str:
     """Render the orchestrator health card fragment."""
     if runtime is None:
         return """
@@ -3118,6 +3132,24 @@ def _is_local_origin(request: Request) -> bool:
                 return True
             return False
     return False
+
+
+@app.post("/queue/{queue_id}/{action}")
+def queue_action(queue_id: str, action: str, request: Request):
+    if not _is_local_origin(request):
+        return HTMLResponse("Forbidden: cross-origin request", status_code=403)
+    conn = _open_conn()
+    if conn is None:
+        return HTMLResponse("Database unavailable", status_code=503)
+    try:
+        if queue_id != db.connection_queue_id(conn) or action not in {"pause", "resume"}:
+            return HTMLResponse("Unknown queue/action", status_code=404)
+        queue_control.control(conn, action)
+    except ValueError as exc:
+        return HTMLResponse(_esc(str(exc)), status_code=409)
+    finally:
+        conn.close()
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/task/{task_id}/edit")

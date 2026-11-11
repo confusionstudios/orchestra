@@ -1494,3 +1494,82 @@ The next approved finalization updates `commit_hash` to the new landed commit.
 This document is the sole canonical spec for Kanban Orchestra.
 If another repo document disagrees with this file, this file wins until the code
 or the spec is intentionally updated.
+
+## Emergency Queue Pause
+
+`ko-task pause [--queue-id UUID]` and `ko-task resume [--queue-id UUID]`
+control exactly one queue, using the normal invoking-checkout/explicit-queue
+selection rules. Pause is separate from stop-after-task and worker shutdown:
+worker heartbeat and dashboards remain available. The durable pause flag is
+independent of runtime liveness, enabled/retired state, and checkout lifetime.
+An idle/offline queue can be paused without starting a worker. Shutdown and
+startup preserve the pause; only explicit Resume clears it.
+
+Pause and task claims serialize in a SQLite write transaction. Pause closes
+claims, pinned continuation, agent launches, startup recovery, dirty-worktree
+recovery and smart-unblock. Ordinary stash/restore operations acknowledge their
+result before Pause can select the attempt. Agent launch intent is durable
+before fork; process registration and the final launch acknowledgment serialize
+with Pause. Unacknowledged launches fail closed after a crash.
+
+The worker owns interruption cleanup, after its active lifecycle unwinds. An
+offline control may reconcile only while holding the worker's singleton lock.
+It terminates registered queue-owned process groups with bounded TERM/KILL,
+validates recorded process identity, verifies live descendants have exited, and
+retains metadata until verified exit. Standalone smart-unblock consultations
+use the same launch/cancellation gate and cannot apply decisions while paused.
+The pause journal reports requested, processes-stopped, archive-prepared,
+archived, and complete (or idle), together with actionable errors.
+
+Before first pickup, the worker records a clean baseline, checkout/repository/
+queue identity, original branch/HEAD and an attempt token in the claim transaction.
+This establishes exclusive ticket ownership of subsequent checkout changes;
+operators must not edit a checkout concurrently with its agent. Dirty or legacy
+attempts without this evidence, unexpected branch/identity changes, uncertain
+process exit and ambiguous saved-candidate/worktree combinations preserve files
+and leave the queue paused for manual attention. Pause never treats a matching
+branch or a running row alone as ownership evidence.
+
+After process exit and ownership verification, a unique archive marker is
+journaled before `git stash push --include-untracked`. The index is preserved
+without staging changes first. Restart discovers the marker if Git finished
+before SQLite acknowledged it. The verified stash object is pinned at
+`refs/orchestra/paused/<interruption-id>` and linked by immutable object ID in a
+ticket comment. An existing saved candidate is pinned before its automatic
+restore field is cleared. No-change interruptions never select an unrelated
+pre-existing stash. Git/permission failures or remaining dirty files preserve
+the checkout and leave cleanup incomplete. Archives have no automatic expiry.
+
+Reset and the recovery comment commit atomically. Only the interrupted ticket
+moves to `none` and its configured starting phase (including kind and planning
+skips). Its description, agent selections, skips, hierarchy, history, and
+existing commit hash remain. Transient review/plan/block/run fields are cleared.
+A comment cutoff isolates old approvals, validations, finalization decisions,
+and prompt evidence while retaining full history for CLI/dashboard inspection.
+The pause archive is outside `stash_ref` and is never automatically restored by
+readying the ticket. Explicit recovery, in the correct clean checkout, is:
+
+```sh
+git stash apply --index refs/orchestra/paused/<interruption-id>
+```
+
+Pause never resets HEAD or amends/recommits existing commits. HEAD after process
+exit is recorded in the recovery comment. A completed terminal transition wins
+the race and is preserved. Resume permits other ready tickets in the same
+worker; the interrupted ticket stays `none` until explicitly readied.
+
+Resume refuses unfinished cleanup. Repair the reported issue and retry Pause,
+or let the paused worker retry. For uncertain legacy ownership or an
+unacknowledged launch, stop this queue's worker, verify all its agent processes
+have exited, explicitly preserve/recover unfinished files, and leave its
+checkout clean. `ko-task resume --resolve "<manual recovery explanation>"`
+records an explicit operator attestation, reconciles the ticket, and resumes.
+It refuses a live worker, registered live/foreign processes, an active
+consultation or a dirty checkout. This exceptional path cannot discover
+unregistered processes; the operator must verify those before attesting.
+
+Repo dashboard, Fleet dashboard/status and `ko-get-update` show durable Paused
+state, cleanup progress/errors and worker liveness independently, including
+stopped queues. Dashboard Pause/Resume POSTs retain origin protections and
+validate exact queue identity. Resume controls never resolve safety errors
+implicitly.

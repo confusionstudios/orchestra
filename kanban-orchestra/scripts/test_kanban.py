@@ -11243,10 +11243,10 @@ class TestAgentPingACKGate(unittest.TestCase):
             agent_runner.ensure_agent_acked("sonnet", 40, self.conn)
 
         self.assertEqual(len(call_count), 3, "Should have pinged 3 times before success")
-        self.assertEqual(mock_time.sleep.call_count, 2, "Should have slept twice (once per failure)")
+        self.assertEqual(mock_time.sleep.call_count, 2 * agent_runner.PING_RETRY_INTERVAL * 5)
 
     def test_sleep_duration_matches_interval(self):
-        """Sleep between retries uses PING_RETRY_INTERVAL."""
+        """Retry delay polls pause every 200ms over PING_RETRY_INTERVAL."""
         ping_results = [False, True]
 
         with (
@@ -11256,7 +11256,8 @@ class TestAgentPingACKGate(unittest.TestCase):
         ):
             agent_runner.ensure_agent_acked("sonnet", 41, self.conn)
 
-        mock_time.sleep.assert_called_with(agent_runner.PING_RETRY_INTERVAL)
+        mock_time.sleep.assert_called_with(0.2)
+        self.assertEqual(mock_time.sleep.call_count, agent_runner.PING_RETRY_INTERVAL * 5)
 
     # ── runtime status messaging ─────────────────────────────────────
 

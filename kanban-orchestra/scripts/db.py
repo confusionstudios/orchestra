@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import config
+from queue_control_errors import QueuePaused
 
 SCHEMA_VERSION = 21
 LOCK_FILE_NAME = "kanban-orchestra.lock"
@@ -52,6 +53,45 @@ RUNTIME_EXECUTING_STEPS = frozenset({
 _QUEUE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+
+PAUSE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS queue_controls (
+    queue_id TEXT PRIMARY KEY REFERENCES queues(id),
+    paused INTEGER NOT NULL DEFAULT 0,
+    journal TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS queue_attempts (
+    queue_id TEXT PRIMARY KEY REFERENCES queues(id),
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    evidence TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_attempt_cutoffs (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    comment_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS queue_launch_intents (
+    id TEXT PRIMARY KEY,
+    queue_id TEXT NOT NULL REFERENCES queues(id)
+);
+"""
+
+
+def queue_control(conn):
+    try:
+        row = conn.execute("SELECT paused, journal FROM queue_controls WHERE queue_id=?",
+                           (connection_queue_id(conn),)).fetchone()
+    except sqlite3.OperationalError as exc:
+        # Read-only dashboards can inspect a database before its first upgrade.
+        if "no such table" in str(exc):
+            return {"paused": False, "journal": {}}
+        raise
+    return {"paused": bool(row[0]), "journal": json.loads(row[1])} if row else {"paused": False, "journal": {}}
+
+
+def check_not_paused(conn):
+    if conn is not None and queue_control(conn)["paused"]:
+        raise QueuePaused("Queue is paused")
+
 
 SCHEMA_SQL = f"""\
 CREATE TABLE IF NOT EXISTS repositories (
@@ -315,6 +355,9 @@ CREATE TABLE IF NOT EXISTS migration_attempts (
     finished_at     DATETIME
 );
 """
+
+
+SCHEMA_SQL += PAUSE_SCHEMA_SQL
 
 
 class MigrationRequired(RuntimeError):
@@ -1094,9 +1137,11 @@ def queue_registration_error(repo_root: str | Path) -> str | None:
     )
 
 
-def queue_dispatch_block_reason(conn: sqlite3.Connection) -> str | None:
+def queue_dispatch_block_reason(conn: sqlite3.Connection, *, include_pause=True) -> str | None:
     """Return why this queue must not claim tasks, or None when dispatch is allowed."""
     try:
+        if include_pause and queue_control(conn)["paused"]:
+            return "Queue is Paused; explicitly resume it to permit dispatch."
         row = _require_queue(conn, connection_queue_id(conn))
     except (RuntimeError, sqlite3.Error, TypeError) as exc:
         return f"Queue dispatch is unavailable: {exc}"
@@ -1228,6 +1273,7 @@ def connect(
     if kind in ("absent", "empty"):
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+    conn.executescript(PAUSE_SCHEMA_SQL)
     if queue_id is not None:
         _attach_queue(conn, _require_queue(conn, queue_id))
     elif repo_root is not None:
@@ -1939,6 +1985,15 @@ def update_task(conn, task_id, *, commit=True, **fields):
     if not fields:
         return
     require_task_queue(conn, task_id)
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    control = queue_control(conn)
+    if (control["paused"] and control["journal"].get("task_id") == task_id
+            and control["journal"].get("stage") not in ("complete", "idle")
+            and set(fields) & {"status", "next_step", "review_round", "last_review_decision",
+                              "commit_plan", "stash_ref", "block_reason", "resume_next_step"}):
+        conn.rollback()
+        raise QueuePaused("Interrupted attempt is frozen for pause cleanup")
     allowed = {
         "title", "description", "status", "next_step", "branch",
         "commit_hash", "stash_ref", "coder_agent", "reviewer_agent",
@@ -2395,11 +2450,23 @@ def add_comment(
     conn.commit()
 
 
-def get_comments(conn, task_id):
+def get_comments(conn, task_id, *, current_attempt=False):
     rows = conn.execute(
         "SELECT * FROM comments WHERE task_id = ? ORDER BY id ASC", (task_id,)
     ).fetchall()
-    return [dict(r) for r in rows]
+    try:
+        cutoff = conn.execute("SELECT comment_id FROM task_attempt_cutoffs WHERE task_id=?", (task_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        cutoff = None
+    if current_attempt and cutoff:
+        rows = [r for r in rows if r["id"] > cutoff[0]]
+    comments = [dict(r) for r in rows]
+    if cutoff:
+        for comment in comments:
+            comment["archived_attempt"] = comment["id"] <= cutoff[0]
+    return comments
 
 
 # ── Queries for orchestrator ───────────────────────────────────────────
@@ -2495,7 +2562,7 @@ def find_ready_task(conn, exclude_ids=None):
     return _row_to_task(row) if row else None
 
 
-def claim_ready_task(conn, task_id):
+def claim_ready_task(conn, task_id, *, attempt_evidence=None):
     """Atomically claim one ready task for this queue.
 
     Returns the claimed task, or None when it is no longer ready on this queue,
@@ -2527,6 +2594,10 @@ def claim_ready_task(conn, task_id):
             conn.rollback()
             return None
         update_task(conn, task_id, commit=False, status="running")
+        if attempt_evidence is not None:
+            conn.execute("DELETE FROM queue_attempts WHERE queue_id=? AND task_id != ?", (queue_id, task_id))
+            conn.execute("INSERT OR IGNORE INTO queue_attempts VALUES (?, ?, ?)",
+                         (queue_id, task_id, json.dumps(attempt_evidence)))
         conn.commit()
     except Exception:
         conn.rollback()

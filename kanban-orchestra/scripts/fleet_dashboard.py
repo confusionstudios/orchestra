@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import dashboard
 import dashboard_tailscale
 import db
+import queue_control
 import fleet
 
 app = FastAPI(title="Kanban Orchestra Fleet Dashboard")
@@ -53,6 +54,9 @@ class FleetCard:
     kind: str = "primary"
     parent: str | None = None
     selector: str = ""
+    queue_id: str | None = None
+    pause_detail: str | None = None
+    worker_status: str | None = None
 
 
 def collect_cards() -> list[FleetCard]:
@@ -66,6 +70,8 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
     runtime = fleet.repo_runtime_status(repo)
     conn = _open_repo_db(repo)
     try:
+        control = db.queue_control(conn) if conn is not None else {"paused": False, "journal": {}}
+        queue_id = db.connection_queue_id(conn) if conn is not None else None
         status = _product_status(process_status, conn)
         current_task = None
         if not repo.error and status != "stopped":
@@ -84,7 +90,7 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
         name=repo.label,
         path=fleet.display_path(repo.root or repo.path),
         branch=_repo_branch(repo),
-        status=status,
+        status="paused" if control["paused"] else status,
         invalid=bool(repo.error),
         current_task=current_task,
         ready_count=ready_count,
@@ -96,6 +102,9 @@ def collect_card(repo: fleet.FleetRepo) -> FleetCard:
         kind=repo.kind,
         parent=fleet.display_path(repo.parent) if repo.parent is not None else None,
         selector=repo.selector,
+        queue_id=queue_id,
+        pause_detail=queue_control.describe(control) if control["paused"] else None,
+        worker_status=process_status,
     )
 
 
@@ -558,16 +567,18 @@ FLEET_JS = r"""
   }
 
   root.addEventListener("click", async (event) => {
-    const button = event.target.closest("[data-start-repo]");
+    const button = event.target.closest("[data-start-repo], [data-queue-action]");
     if (!button || button.disabled) return;
-    const label = button.dataset.startRepo;
+    const label = button.dataset.startRepo || button.dataset.repo;
     const card = button.closest(".repo-record");
     if (!label || !card) return;
 
     button.disabled = true;
     button.classList.add("is-starting");
     try {
-      const response = await fetch("/repos/" + encodeURIComponent(label) + "/start", {
+      const action = button.dataset.queueAction || "start";
+      const query = button.dataset.queueId ? "?queue_id=" + encodeURIComponent(button.dataset.queueId) : "";
+      const response = await fetch("/repos/" + encodeURIComponent(label) + "/" + action + query, {
         method: "POST",
         headers: { Accept: "application/json" },
       });
@@ -706,6 +717,12 @@ def _branch_html(card: FleetCard) -> str:
 
 def _footer_html(card: FleetCard, *, local_access: bool) -> str:
     parts: list[str] = []
+    if card.queue_id and not card.invalid:
+        action = "resume" if card.status == "paused" else "pause"
+        parts.append(f'<button type="button" data-queue-action="{action}" '
+                     f'data-repo="{_esc(_start_selector(card))}" data-queue-id="{_esc(card.queue_id)}">{action.title()}</button>')
+    if card.pause_detail:
+        parts.append(f'<p>{_esc(card.pause_detail)}</p><p>Worker: {_esc(card.worker_status)}</p>')
     if card.last_start_failure:
         parts.append(
             '<div class="start-result" aria-live="polite">'
@@ -932,6 +949,28 @@ def _is_same_origin_request(request: Request) -> bool:
             and parsed.netloc.lower() in authorities
         )
     return False
+
+
+@app.post("/repos/{label}/pause")
+@app.post("/repos/{label}/resume")
+def control_repo(label: str, queue_id: str, request: Request):
+    if not _is_same_origin_request(request):
+        return JSONResponse({"error": "Forbidden: cross-origin request"}, status_code=403)
+    repo = _configured_repo(label)
+    if repo is None or repo.error or repo.root is None:
+        return JSONResponse({"error": "Unknown/invalid repo"}, status_code=404)
+    queue = fleet._registered_queue(repo.root)
+    if not queue or queue["id"] != queue_id:
+        return JSONResponse({"error": "Queue identity changed"}, status_code=409)
+    conn = db.connect(queue_id=queue_id)
+    try:
+        queue_control.control(conn, request.url.path.rsplit("/", 1)[1])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    finally:
+        conn.close()
+    card = collect_card(repo)
+    return JSONResponse(_start_payload(ok=True, card=card, local_access=_is_local_access(request)))
 
 
 @app.post("/repos/{label}/start")

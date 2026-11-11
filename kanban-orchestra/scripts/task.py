@@ -1050,7 +1050,7 @@ def get_commit_footer(task_id, conn):
                          if snapshot and snapshot["roles"][primary]["spec"] == agent
                          else config.get_agent_attribution(agent))
 
-    comments = db.get_comments(conn, task_id)
+    comments = db.get_comments(conn, task_id, current_attempt=True)
     approval_comments = [c for c in comments if c.get("kind") == "approval"]
     final_approval = approval_comments[-1] if approval_comments else None
     reviewer = final_approval.get("author") if final_approval else None
@@ -1214,6 +1214,10 @@ def build_parser():
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    for action in ("pause", "resume"):
+        p_control = sub.add_parser(action, parents=[queue_selector], help=f"{action.title()} only the selected queue")
+        if action == "resume":
+            p_control.add_argument("--resolve", help="Attest manual WIP preservation and process exit after stopping the worker; records your explanation")
 
     # add
     p_add = sub.add_parser("add", parents=[queue_selector])
@@ -1410,6 +1414,13 @@ def main():
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     try:
+        if args.command in ("pause", "resume"):
+            import queue_control
+            try:
+                _json_out(queue_control.control(conn, args.command, resolution=getattr(args, "resolve", None)))
+            except ValueError as exc:
+                parser.error(str(exc))
+            return
         try:
             registry = db.configure_for_connection(conn)
             config.agent_snapshot()

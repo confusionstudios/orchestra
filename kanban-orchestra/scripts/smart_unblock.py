@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
 import db
+import queue_control
+import active_agent_processes
 import task as task_module
 
 POLL_INTERVAL = 60
@@ -448,7 +450,7 @@ def collect_block_evidence(conn, task_id: int, db_path: str | None = None) -> di
     repo_root = db.execution_root(conn)
     task = db.get_task(conn, task_id) or {}
 
-    comments = db.get_comments(conn, task_id)
+    comments = db.get_comments(conn, task_id, current_attempt=True)
     prior_notes = [c for c in comments if c.get("author") == WATCHER_AUTHOR]
     other_comments = [c for c in comments if c.get("author") != WATCHER_AUTHOR]
 
@@ -619,18 +621,30 @@ def invoke_unblock_agent(
     consultation_env = dict(os.environ)
     consultation_env[task_module.SMART_UNBLOCK_CONSULTATION_ENV_VAR] = "1"
 
+    control = db.connect(db_path, queue_id=queue_id)
+    queue_id = db.connection_queue_id(control)
+    consultation_env["ORCHESTRA_QUEUE_ID"] = queue_id
+    consultation_env["KANBAN_DB"] = db.get_connection_db_path(control)
+    worktree = db.connection_worktree(control)
+    if worktree is not None:
+        consultation_env["ORCHESTRA_REPO_ROOT"] = str(worktree)
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(_repo_root(db_path, queue_id=queue_id)),
-            stdin=subprocess.DEVNULL,
-            stdout=transcript_file or subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-            env=consultation_env,
-        )
-    except (OSError, ValueError) as exc:
+        with queue_control.launch_gate(control):
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(_repo_root(db_path, queue_id=queue_id)),
+                stdin=subprocess.DEVNULL,
+                stdout=transcript_file or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+                env=consultation_env,
+            )
+            active_agent_processes.register_active_agent(
+                task_id=task_id, verb=WATCHER_VERB, agent_name=agent, pid=proc.pid,
+                db_path=db_path, queue_id=queue_id)
+    except (OSError, ValueError, db.QueuePaused) as exc:
+        control.close()
         if transcript_file is not None:
             transcript_file.close()
         return {
@@ -642,7 +656,11 @@ def invoke_unblock_agent(
 
     _register_consultation(proc)
     try:
-        returncode = _wait_for_consultation(proc, timeout, stop_event)
+        try:
+            with queue_control.watch_process(control, proc):
+                returncode = _wait_for_consultation(proc, timeout, stop_event)
+        except db.QueuePaused:
+            returncode = None
         if returncode is None:
             interrupted = stop_event is not None and stop_event.is_set()
             _terminate_process(proc)
@@ -659,6 +677,8 @@ def invoke_unblock_agent(
                 "transcript_path": transcript_path,
             }
     finally:
+        control.close()
+        active_agent_processes.clear_active_agent(pid=proc.pid, db_path=db_path, queue_id=queue_id)
         _register_consultation(None)
         if transcript_file is not None:
             transcript_file.close()
@@ -700,7 +720,7 @@ def _decision_pattern(agent: str) -> "re.Pattern[str]":
 def _new_comments_since(conn, task_id: int, before_ids: set) -> list[dict]:
     """Comments added to a task since `before_ids` was captured, oldest first."""
     return sorted(
-        (c for c in db.get_comments(conn, task_id) if c.get("id") not in before_ids),
+        (c for c in db.get_comments(conn, task_id, current_attempt=True) if c.get("id") not in before_ids),
         key=lambda c: c["id"],
     )
 
@@ -784,6 +804,11 @@ def _apply_resume_decision(conn, task_id: int, decision: dict) -> str | None:
     error string on failure, or None on success.
     """
     try:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        if db.queue_control(conn)["paused"]:
+            conn.rollback()
+            return "Queue is paused"
         task_module.continue_blocked_task(
             conn,
             task_id,
@@ -829,6 +854,8 @@ def poll_once(
     stop_event: threading.Event | None = None,
 ) -> list[dict]:
     """Consider every blocked task once and return one result per task."""
+    if db.queue_control(conn)["paused"]:
+        return []
     agent = agent or config.agent_registry.effective().role("unblocker")["agent"]
     queue_id = db.connection_queue_id(conn)
     state = read_state(db_path, queue_id=queue_id)
@@ -836,6 +863,8 @@ def poll_once(
     results = []
 
     for row in blocked:
+        if db.queue_control(conn)["paused"]:
+            break
         if stop_event is not None and stop_event.is_set():
             break
         task_id = row["id"]
@@ -845,7 +874,7 @@ def poll_once(
 
         # A durable human CONTINUE/RESUME is applied by the watcher itself so
         # operators do not race `task continue` / `task set` against dispatch.
-        human_continue = find_human_continue_since_block(db.get_comments(conn, task_id))
+        human_continue = find_human_continue_since_block(db.get_comments(conn, task_id, current_attempt=True))
         if human_continue is not None:
             blocked_snapshot = dict(db.get_task(conn, task_id) or row)
             resume_error = _apply_resume_decision(
@@ -905,7 +934,7 @@ def poll_once(
             results.append({"task_id": task_id, "action": "skipped-unchanged"})
             continue
 
-        before_comment_ids = {c["id"] for c in db.get_comments(conn, task_id)}
+        before_comment_ids = {c["id"] for c in db.get_comments(conn, task_id, current_attempt=True)}
         blocked_snapshot = dict(db.get_task(conn, task_id) or row)
         prompt = build_unblock_prompt(evidence, agent)
         # Hold the shared dispatch/status gate for the entire consultation
@@ -924,6 +953,8 @@ def poll_once(
                 if isinstance(getattr(conn, "orchestra_queue_id", None), str)
                 else None,
             )
+            if db.queue_control(conn)["paused"]:
+                return results
             if outcome.get("interrupted"):
                 # The consultation never reached a decision; reconsider after restart.
                 # Also reject any mid-flight status mutation the agent may have made.

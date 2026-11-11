@@ -18,6 +18,7 @@ from collections import deque
 import active_agent_processes
 import config
 import db
+import queue_control
 
 
 def _default_log(msg, task_id=None):
@@ -226,109 +227,111 @@ def ping_agent(agent_name, task_id, *, use_review_command=False, purpose=None, c
     active_record_id = None
     try:
         proc_cwd = _repo_root_for_subprocess()
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0, start_new_session=True, cwd=proc_cwd,
-            env=_child_env(conn),
-        )
-        active_record_id = active_agent_processes.register_active_agent(
-            task_id=task_id,
-            verb="ping",
-            agent_name=agent_name,
-            pid=proc.pid,
-            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
-            queue_id=_bound_queue_id(conn),
-        )
+        with queue_control.launch_gate(conn):
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                bufsize=0, start_new_session=True, cwd=proc_cwd,
+                env=_child_env(conn),
+            )
+            active_record_id = active_agent_processes.register_active_agent(
+                task_id=task_id,
+                verb="ping",
+                agent_name=agent_name,
+                pid=proc.pid,
+                db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+                queue_id=_bound_queue_id(conn),
+            )
     except FileNotFoundError:
         log(f"Agent binary not found for '{agent_name}' during ping", task_id)
         if close_comment_conn and comment_conn is not None:
             comment_conn.close()
         return False
 
-    def _review_comment_ready():
-        if comment_conn is None or expected_token is None:
-            return False
+    with queue_control.watch_process(conn, proc):
+        def _review_comment_ready():
+            if comment_conn is None or expected_token is None:
+                return False
+            try:
+                return _new_comment_has_ready_token(
+                    comment_conn, task_id, expected_token, watermark,
+                )
+            except Exception:
+                return False
+
+        # Drain stdout so the child cannot block on a full pipe. Run pings ACK on
+        # the first available characters (not a newline). Reviewer readiness never
+        # treats stdout as evidence — echoed prompt text can contain instructions.
+        acked = False
+        eof = False
+        deadline = time.monotonic() + PING_RETRY_INTERVAL
+        stdout = proc.stdout
+        fd = stdout.fileno() if stdout else None
         try:
-            return _new_comment_has_ready_token(
-                comment_conn, task_id, expected_token, watermark,
+            while time.monotonic() < deadline:
+                if purpose == "review" and _review_comment_ready():
+                    acked = True
+                    break
+                if eof:
+                    if purpose == "review":
+                        time.sleep(_REVIEW_PROBE_GRACE_SECONDS)
+                        acked = _review_comment_ready()
+                    break
+                if fd is None:
+                    eof = True
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select([stdout], [], [], min(remaining, 1.0))
+                if not readable:
+                    continue
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    eof = True
+                    continue
+                if purpose != "review" and chunk.strip():
+                    acked = True
+                    break
+        finally:
+            if close_comment_conn and comment_conn is not None:
+                comment_conn.close()
+        # Terminate the ping subprocess as soon as we have a verdict.
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        db.check_not_paused(conn)
+        if active_record_id:
+            active_agent_processes.clear_active_agent(
+                active_record_id,
+                db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+                queue_id=_bound_queue_id(conn),
             )
-        except Exception:
-            return False
 
-    # Drain stdout so the child cannot block on a full pipe. Run pings ACK on
-    # the first available characters (not a newline). Reviewer readiness never
-    # treats stdout as evidence — echoed prompt text can contain instructions.
-    acked = False
-    eof = False
-    deadline = time.monotonic() + PING_RETRY_INTERVAL
-    stdout = proc.stdout
-    fd = stdout.fileno() if stdout else None
-    try:
-        while time.monotonic() < deadline:
-            if purpose == "review" and _review_comment_ready():
-                acked = True
-                break
-            if eof:
-                if purpose == "review":
-                    time.sleep(_REVIEW_PROBE_GRACE_SECONDS)
-                    acked = _review_comment_ready()
-                break
-            if fd is None:
-                eof = True
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            readable, _, _ = select.select([stdout], [], [], min(remaining, 1.0))
-            if not readable:
-                continue
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                eof = True
-                continue
-            if purpose != "review" and chunk.strip():
-                acked = True
-                break
-    finally:
-        if close_comment_conn and comment_conn is not None:
-            comment_conn.close()
-    # Terminate the ping subprocess as soon as we have a verdict.
-    try:
-        proc.kill()
-    except OSError:
-        pass
-    proc.wait()
-    if active_record_id:
-        active_agent_processes.clear_active_agent(
-            active_record_id,
-            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
-            queue_id=_bound_queue_id(conn),
-        )
-
-    if acked:
-        if purpose == "review":
-            log(
-                f"Pre-flight reviewer probe: {agent_name} acknowledged the review/tool path "
-                f"— proceeding with task {task_id}",
-                task_id,
-            )
+        if acked:
+            if purpose == "review":
+                log(
+                    f"Pre-flight reviewer probe: {agent_name} acknowledged the review/tool path "
+                    f"— proceeding with task {task_id}",
+                    task_id,
+                )
+            else:
+                log(f"Pre-flight ping: {agent_name} responded — proceeding with task {task_id}", task_id)
         else:
-            log(f"Pre-flight ping: {agent_name} responded — proceeding with task {task_id}", task_id)
-    else:
-        if purpose == "review":
-            log(
-                f"Pre-flight reviewer probe: {agent_name} did not acknowledge the review/tool path "
-                f"— agent may be out of tokens, missing tools, or unavailable (task {task_id})",
-                task_id,
-            )
-        else:
-            log(
-                f"Pre-flight ping: {agent_name} produced no output — "
-                f"agent may be out of tokens or unavailable (task {task_id})",
-                task_id,
-            )
-    return acked
-
+            if purpose == "review":
+                log(
+                    f"Pre-flight reviewer probe: {agent_name} did not acknowledge the review/tool path "
+                    f"— agent may be out of tokens, missing tools, or unavailable (task {task_id})",
+                    task_id,
+                )
+            else:
+                log(
+                    f"Pre-flight ping: {agent_name} produced no output — "
+                    f"agent may be out of tokens or unavailable (task {task_id})",
+                    task_id,
+                )
+        return acked
 
 def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, purpose=None, verb=None):
     """
@@ -345,6 +348,7 @@ def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, p
     the caller can apply the bounded review-infrastructure retry policy
     instead of stalling forever.
     """
+    db.check_not_paused(conn)
     purpose = purpose or ("review" if use_review_command else "run")
     cache_key = (task_id, agent_name, purpose) if verb is None else (task_id, agent_name, purpose, verb)
     if cache_key in _agent_ack_cache:
@@ -380,7 +384,9 @@ def ensure_agent_acked(agent_name, task_id, conn, *, use_review_command=False, p
                 f"Agent may be out of tokens or unavailable. Retrying every minute."
             ),
         )
-        time.sleep(PING_RETRY_INTERVAL)
+        for _ in range(PING_RETRY_INTERVAL * 5):
+            db.check_not_paused(conn)
+            time.sleep(0.2)
 
 
 
@@ -441,11 +447,20 @@ def run_agent(
     log(f"Launching {agent_name} for {verb}", task_id)
 
     try:
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, start_new_session=True, cwd=proc_cwd,
-            env=_child_env(conn),
-        )
+        with queue_control.launch_gate(conn):
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True, cwd=proc_cwd,
+                env=_child_env(conn),
+            )
+            active_record_id = active_agent_processes.register_active_agent(
+                task_id=task_id,
+                verb=verb,
+                agent_name=agent_name,
+                pid=proc.pid,
+                db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+                queue_id=_bound_queue_id(conn),
+            )
     except FileNotFoundError:
         message = f"Agent CLI executable not found: {cmd[0]} (selected agent: {agent_name})"
         log(message, task_id)
@@ -468,90 +483,86 @@ def run_agent(
         launch_message += f". Transcript: {transcript_path}"
     db.add_run_log(conn, task_id, launch_message, verb=verb, author="orchestrator")
 
-    active_record_id = active_agent_processes.register_active_agent(
-        task_id=task_id,
-        verb=verb,
-        agent_name=agent_name,
-        pid=proc.pid,
-        db_path=db.get_connection_db_path(conn) or db.get_db_path(),
-        queue_id=_bound_queue_id(conn),
-    )
+
 
     if proc_registry is not None:
         proc_registry[agent_name] = proc
 
-    transcript_tail = deque(maxlen=3)
-    transcript_line_count = 0
+    with queue_control.watch_process(conn, proc):
+        transcript_tail = deque(maxlen=3)
+        transcript_line_count = 0
 
-    if transcript_path is not None:
-        with transcript_path.open("w", encoding="utf-8") as transcript:
-            transcript.write(f"# agent: {agent_name}\n")
-            transcript.write(f"# verb: {verb}\n")
-            transcript.write(f"# command: {_format_agent_command_for_transcript(cmd, prompt)}\n")
-            if proc_cwd:
-                transcript.write(f"# cwd: {proc_cwd}\n")
-            transcript.write("\n")
+        if transcript_path is not None:
+            with transcript_path.open("w", encoding="utf-8") as transcript:
+                transcript.write(f"# agent: {agent_name}\n")
+                transcript.write(f"# verb: {verb}\n")
+                transcript.write(f"# command: {_format_agent_command_for_transcript(cmd, prompt)}\n")
+                if proc_cwd:
+                    transcript.write(f"# cwd: {proc_cwd}\n")
+                transcript.write("\n")
 
+                for raw_line in proc.stdout or []:
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    transcript.write(raw_line)
+                    if raw_line and not raw_line.endswith("\n"):
+                        transcript.write("\n")
+                    line = raw_line.rstrip("\n")
+                    if line:
+                        transcript_line_count += 1
+                        transcript_tail.append(line)
+        else:
             for raw_line in proc.stdout or []:
                 if cancel_event and cancel_event.is_set():
                     break
-                transcript.write(raw_line)
-                if raw_line and not raw_line.endswith("\n"):
-                    transcript.write("\n")
                 line = raw_line.rstrip("\n")
                 if line:
                     transcript_line_count += 1
                     transcript_tail.append(line)
-    else:
-        for raw_line in proc.stdout or []:
-            if cancel_event and cancel_event.is_set():
-                break
-            line = raw_line.rstrip("\n")
-            if line:
-                transcript_line_count += 1
-                transcript_tail.append(line)
 
-    # If cancelled, kill the subprocess process group
-    if cancel_event and cancel_event.is_set():
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        # If cancelled, kill the subprocess process group
+        if cancel_event and cancel_event.is_set():
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            db.check_not_paused(conn)
+            if active_record_id:
+                active_agent_processes.clear_active_agent(
+                active_record_id,
+                db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+                queue_id=_bound_queue_id(conn),
+            )
+            cancel_message = f"{agent_name} cancelled during {verb}"
+            if transcript_path is not None:
+                cancel_message += f". Partial transcript: {transcript_path}"
+            db.add_run_log(conn, task_id, cancel_message, verb=verb, author="orchestrator")
+            return -1
+
         proc.wait()
+        db.check_not_paused(conn)
         if active_record_id:
             active_agent_processes.clear_active_agent(
-            active_record_id,
-            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
-            queue_id=_bound_queue_id(conn),
-        )
-        cancel_message = f"{agent_name} cancelled during {verb}"
-        if transcript_path is not None:
-            cancel_message += f". Partial transcript: {transcript_path}"
-        db.add_run_log(conn, task_id, cancel_message, verb=verb, author="orchestrator")
-        return -1
-
-    proc.wait()
-    if active_record_id:
-        active_agent_processes.clear_active_agent(
-            active_record_id,
-            db_path=db.get_connection_db_path(conn) or db.get_db_path(),
-            queue_id=_bound_queue_id(conn),
-        )
-    log(f"{agent_name} exited with code {proc.returncode}", task_id)
-    tail_summary = _summarize_transcript_tail(transcript_tail)
-    if proc.returncode == 0:
-        completion_message = (
-            f"{agent_name} completed {verb} with exit code 0"
-            f" after {transcript_line_count} transcript line"
-            f"{'' if transcript_line_count == 1 else 's'}"
-        )
-        if transcript_path is not None:
-            completion_message += f". Transcript: {transcript_path}"
-    else:
-        completion_message = f"{agent_name} failed {verb} with exit code {proc.returncode}"
-        if tail_summary:
-            completion_message += f". Tail: {tail_summary}"
-        if transcript_path is not None:
-            completion_message += f". Full transcript: {transcript_path}"
-    db.add_run_log(conn, task_id, completion_message, verb=verb, author="orchestrator")
-    return proc.returncode
+                active_record_id,
+                db_path=db.get_connection_db_path(conn) or db.get_db_path(),
+                queue_id=_bound_queue_id(conn),
+            )
+        log(f"{agent_name} exited with code {proc.returncode}", task_id)
+        tail_summary = _summarize_transcript_tail(transcript_tail)
+        if proc.returncode == 0:
+            completion_message = (
+                f"{agent_name} completed {verb} with exit code 0"
+                f" after {transcript_line_count} transcript line"
+                f"{'' if transcript_line_count == 1 else 's'}"
+            )
+            if transcript_path is not None:
+                completion_message += f". Transcript: {transcript_path}"
+        else:
+            completion_message = f"{agent_name} failed {verb} with exit code {proc.returncode}"
+            if tail_summary:
+                completion_message += f". Tail: {tail_summary}"
+            if transcript_path is not None:
+                completion_message += f". Full transcript: {transcript_path}"
+        db.add_run_log(conn, task_id, completion_message, verb=verb, author="orchestrator")
+        return proc.returncode
