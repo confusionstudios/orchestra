@@ -783,6 +783,27 @@ def test_rollback_refuses_work_added_after_activation(tmp_path, existing_destina
         assert conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "After cutover"
 
 
+@pytest.mark.parametrize("missing_limit", [True, False])
+def test_cutover_defaults_missing_review_limit_and_preserves_existing(tmp_path, missing_limit):
+    source = tmp_path / "source"
+    _init_repo(source)
+    legacy = _legacy_db(source)
+    with _connect(legacy) as conn:
+        conn.execute("INSERT INTO tasks (title, max_review_rounds) VALUES ('Old task', 7)")
+        if missing_limit:
+            conn.execute("ALTER TABLE tasks DROP COLUMN max_review_rounds")
+    destination = tmp_path / "central" / "orchestra.db"
+    fleet_config = tmp_path / "empty-fleet.repos"
+    fleet_config.write_text("", encoding="utf-8")
+
+    migrate_cutover.cutover(destination, [source], fleet_config)
+
+    with _connect(destination) as conn:
+        task = _task_row(conn, "Old task")
+        assert task["max_review_rounds"] == (db.DEFAULT_MAX_REVIEW_ROUNDS if missing_limit else 7)
+    assert not legacy.exists()
+
+
 def test_retire_queue_keeps_ids_and_does_not_import(tmp_path):
     database = tmp_path / "orchestra.db"
     conn = db.connect(str(database))

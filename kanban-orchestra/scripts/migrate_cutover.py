@@ -822,6 +822,7 @@ def _import_source(conn: sqlite3.Connection, source: dict, rows: dict, attempt_i
         old_id = int(task["id"])
         new_id = id_map[old_id]
         fields = {name: _cell(task, name) for name in TASK_COLUMNS}
+        fields["max_review_rounds"] = _cell(task, "max_review_rounds", db.DEFAULT_MAX_REVIEW_ROUNDS)
         if fields.get("kind") is None:
             fields["kind"] = "commit"
         if fields.get("status") == "running":
